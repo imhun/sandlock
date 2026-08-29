@@ -297,6 +297,9 @@ struct Runtime {
     http_acl_handle: Option<crate::transparent_proxy::HttpAclProxyHandle>,
     netns: Option<crate::network::netns::SandboxNetns>,
     dns_gateway_handle: Option<JoinHandle<()>>,
+    /// The sandbox's DNS gateway address (veth host end in netns mode, a
+    /// per-sandbox loopback address in the unprivileged shared-netns mode).
+    dns_gateway_addr: Option<std::net::Ipv4Addr>,
     #[allow(clippy::type_complexity)]
     on_bind: Option<Box<dyn Fn(&HashMap<u16, u16>) + Send + Sync>>,
     handlers: Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>,
@@ -1559,6 +1562,7 @@ impl Sandbox {
                 http_acl_handle: None,
                 netns: None,
                 dns_gateway_handle: None,
+                dns_gateway_addr: None,
                 on_bind: None,
                 handlers: Vec::new(),
                 ready_w: None,
@@ -1664,6 +1668,7 @@ impl Sandbox {
             http_acl_handle: None,
             netns: None,
             dns_gateway_handle: None,
+            dns_gateway_addr: None,
             on_bind: None,
             handlers: Vec::new(),
             ready_w: None,
@@ -2158,44 +2163,56 @@ impl Sandbox {
             Some(unsafe { OwnedFd::from_raw_fd(raw) })
         };
 
-        // ---- Per-sandbox netns, phase 2 (after the notif-fd read) ----
+        // ---- DNS gateway (after the notif-fd read) ----
         //
-        // The veth pair and both ends were configured in phase 1. Here we
-        // start the per-sandbox DNS gateway on gateway:53 (answering
-        // wildcard-suffix A queries with synthetic IPs and forwarding the
-        // rest upstream so normal DNS keeps working) and virtualize
-        // /etc/resolv.conf to point at it.
-        let mut netns_synthetic_dns: Option<crate::network::dns_synth::SyntheticDns> = None;
-        let netns_state = if let Some(n) = netns_early {
-            use crate::network::dns_gateway::{run_dns_gateway, worker_upstream_resolver};
-            use crate::seccomp::notif::PortAllow;
-
-            let suffixes: Vec<(String, PortAllow)> = resolved_net_allow
+        // Wildcard-domain rules are served by a per-sandbox DNS gateway on
+        // `<gateway>:53`: in netns mode the gateway is the veth host end
+        // (configured in phase 1); in the default unprivileged shared-netns
+        // mode it is a per-sandbox loopback address (`127.0.1.x`, since
+        // resolv.conf cannot express a port). The gateway answers
+        // wildcard-suffix A queries with synthetic IPs and forwards the rest
+        // upstream so normal DNS keeps working; /etc/resolv.conf is
+        // virtualized to point at it.
+        let wildcard_suffixes: Vec<(String, crate::seccomp::notif::PortAllow)> =
+            resolved_net_allow
                 .tcp
                 .wildcard_domains
                 .iter()
                 .chain(resolved_net_allow.udp.wildcard_domains.iter())
                 .cloned()
                 .collect();
+        let need_gateway = !wildcard_suffixes.is_empty() || netns_early.is_some();
+        let mut netns_synthetic_dns: Option<crate::network::dns_synth::SyntheticDns> = None;
+        let virtual_resolv_conf = if need_gateway {
+            use crate::network::dns_gateway::{run_dns_gateway, worker_upstream_resolver};
+
+            let gateway_ip = match &netns_early {
+                Some(n) => n.alloc.gateway_ip,
+                None => crate::network::dns_synth::allocate_gateway_addr().ok_or_else(|| {
+                    SandboxRuntimeError::Child(
+                        "per-sandbox DNS gateway pool exhausted (127.0.1.0/24)".into(),
+                    )
+                })?,
+            };
             let dns = crate::network::dns_synth::SyntheticDns::new();
             netns_synthetic_dns = Some(dns.clone());
-            let gateway_addr = std::net::SocketAddr::from((n.alloc.gateway_ip, 53));
+            let gateway_addr = std::net::SocketAddr::from((gateway_ip, 53));
             let upstream = worker_upstream_resolver();
             let dns_sock = tokio::net::UdpSocket::bind(gateway_addr)
                 .await
                 .map_err(|e| SandboxRuntimeError::Child(format!("bind DNS gateway: {}", e)))?;
-            let gateway_handle = tokio::spawn(run_dns_gateway(dns_sock, suffixes, dns, upstream));
+            let gateway_handle =
+                tokio::spawn(run_dns_gateway(dns_sock, wildcard_suffixes, dns, upstream));
             self.rt_mut().dns_gateway_handle = Some(gateway_handle);
-            Some(n)
+            self.rt_mut().dns_gateway_addr = Some(gateway_ip);
+            Some(format!(
+                "nameserver {}\noptions ndots:0 timeout:1 attempts:1\n",
+                gateway_ip
+            ))
         } else {
             None
         };
-        let virtual_resolv_conf = netns_state.as_ref().map(|n| {
-            format!(
-                "nameserver {}\noptions ndots:0 timeout:1 attempts:1\n",
-                n.alloc.gateway_ip
-            )
-        });
+        let netns_state = netns_early;
         let proxy_bind_ip: std::net::IpAddr = netns_state
             .as_ref()
             .map(|n| std::net::IpAddr::V4(n.alloc.gateway_ip))
@@ -2364,11 +2381,10 @@ impl Sandbox {
             net_state.http_acl_orig_dest = self.rt().http_acl_handle.as_ref().map(|h| h.orig_dest.clone());
             net_state.synthetic_dns =
                 netns_synthetic_dns.unwrap_or_else(crate::network::dns_synth::SyntheticDns::new);
-            net_state.netns_dns_addr = self
+            net_state.dns_gateway_addr = self
                 .rt()
-                .netns
-                .as_ref()
-                .map(|n| std::net::SocketAddr::from((n.alloc.gateway_ip, 53)));
+                .dns_gateway_addr
+                .map(|ip| std::net::SocketAddr::from((ip, 53)));
             net_state.bind_deny_ports = self.net_deny_bind.iter().copied().collect();
             if let Some(cb) = self.rt_mut().on_bind.take() {
                 net_state.port_map.on_bind = Some(cb);

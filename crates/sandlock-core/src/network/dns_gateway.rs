@@ -272,7 +272,7 @@ mod tests {
     #[test]
     fn a_response_echoes_question_and_ip() {
         let q = DnsQuery { id: 7, qname: "api.example.com".into() };
-        let ip: std::net::Ipv4Addr = "127.0.0.2".parse().unwrap();
+        let ip: std::net::Ipv4Addr = "10.250.0.2".parse().unwrap();
         let resp = build_a_response(&q, ip);
         assert_eq!(&resp[0..2], &7u16.to_be_bytes());
         assert!(resp.windows(4).any(|w| w == ip.octets()));
@@ -295,7 +295,7 @@ mod tests {
         let resp = handle_query(&q, &suffixes, &dns).await;
         assert!(
             resp.windows(4)
-                .any(|w| w == "127.0.0.2".parse::<std::net::Ipv4Addr>().unwrap().octets())
+                .any(|w| w == "10.250.0.2".parse::<std::net::Ipv4Addr>().unwrap().octets())
         );
         let q2 = query_bytes(2, "other.org");
         let resp2 = handle_query(&q2, &suffixes, &dns).await;

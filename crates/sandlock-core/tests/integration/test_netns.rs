@@ -27,13 +27,13 @@ fn base_policy() -> sandlock_core::SandboxBuilder {
         .fs_write("/tmp")
 }
 
-/// True when `ip` lies in the synthetic DNS range (127.0.0.2/8).
+/// True when `ip` lies in the synthetic DNS range (10.250.0.0/16).
 fn is_synthetic(ip: &str) -> bool {
     let Ok(ip) = ip.parse::<std::net::Ipv4Addr>() else {
         return false;
     };
     let n = u32::from(ip);
-    (0x7f00_0002..=0x7fff_fffe).contains(&n)
+    (0x0afa_0002..=0x0afa_fffe).contains(&n)
 }
 
 fn stdout_of(result: &sandlock_core::result::RunResult) -> String {

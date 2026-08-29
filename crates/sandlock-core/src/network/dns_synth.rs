@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -18,15 +19,27 @@ use tokio::sync::RwLock;
 /// supervisor memory a sandbox can force through unique-hostname lookups.
 pub const DEFAULT_CAPACITY: usize = 4096;
 
-/// First synthetic address (inclusive): `127.0.0.2`. The `127.0.0.2/8`
-/// block is reserved for synthetic DNS; `127.0.0.1` stays the plain
-/// loopback address. This is the same range the (to-be-retired)
-/// LD_PRELOAD egress library used, so one semantic applies across both
-/// enforcement paths.
-const SYNTHETIC_BASE: u32 = 0x7f00_0002;
-/// Last usable synthetic address (inclusive): `127.255.255.254`
-/// (`127.255.255.255` is the broadcast address).
-const SYNTHETIC_END: u32 = 0x7fff_fffe;
+/// First synthetic address (inclusive): `10.250.0.2`. Synthetic addresses
+/// are never routed — the on-behalf path reverse-looks the hostname and
+/// dials the real destination instead — so they live in a private
+/// `10.250.0.0/16` block that is deliberately disjoint from the per-sandbox
+/// DNS gateway addresses (`127.0.0.x` / `127.0.1.x`) and from the
+/// (to-be-retired) LD_PRELOAD egress library's `127.0.0.2/8` range.
+const SYNTHETIC_BASE: u32 = 0x0afa_0002;
+/// Last usable synthetic address (inclusive): `10.250.255.254`.
+const SYNTHETIC_END: u32 = 0x0afa_fffe;
+
+/// Per-sandbox DNS gateway address pool for the unprivileged (shared-netns)
+/// mode: each sandbox's gateway binds a `127.0.0.x` loopback address on
+/// port 53 (glibc's resolv.conf cannot express a port, so every sandbox
+/// needs its own loopback address). Loopback is a natural home for the
+/// gateway because it is per-host and never routed; it is disjoint from the
+/// synthetic range (`10.250.0.0/16`). Allocation is process-wide and
+/// atomic, mirroring the veth pool in netns mode.
+const GATEWAY_BASE: u32 = 0x7f00_0002; // 127.0.0.2
+const GATEWAY_END: u32 = 0x7f00_00fe; // 127.0.0.254
+
+static NEXT_GATEWAY: AtomicU32 = AtomicU32::new(0);
 
 /// One mapping entry: the hostname plus the generation counter of its
 /// last use, for LRU eviction.
@@ -182,6 +195,18 @@ pub fn wildcard_suffix_matches(hostname: &str, suffix: &str) -> bool {
         && hostname.as_bytes().get(before) == Some(&b'.')
 }
 
+/// Allocate the next per-sandbox DNS gateway address (`127.0.1.x`), or
+/// `None` when the pool is exhausted (127 sandboxes per process is far above
+/// any practical worker density).
+pub fn allocate_gateway_addr() -> Option<Ipv4Addr> {
+    let n = NEXT_GATEWAY.fetch_add(1, Ordering::Relaxed);
+    let addr = GATEWAY_BASE.checked_add(n)?;
+    if addr > GATEWAY_END {
+        return None;
+    }
+    Some(Ipv4Addr::from(addr))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,10 +258,12 @@ mod tests {
 
     #[test]
     fn is_synthetic_ip_boundaries() {
-        assert!(SyntheticDns::is_synthetic_ip("127.0.0.2".parse().unwrap()));
-        assert!(SyntheticDns::is_synthetic_ip("127.255.255.254".parse().unwrap()));
-        assert!(!SyntheticDns::is_synthetic_ip("127.0.0.1".parse().unwrap()));
-        assert!(!SyntheticDns::is_synthetic_ip("127.255.255.255".parse().unwrap()));
+        assert!(SyntheticDns::is_synthetic_ip("10.250.0.2".parse().unwrap()));
+        assert!(SyntheticDns::is_synthetic_ip("10.250.255.254".parse().unwrap()));
+        assert!(!SyntheticDns::is_synthetic_ip("10.250.0.1".parse().unwrap()));
+        assert!(!SyntheticDns::is_synthetic_ip("10.250.255.255".parse().unwrap()));
+        assert!(!SyntheticDns::is_synthetic_ip("127.0.0.2".parse().unwrap()));
+        assert!(!SyntheticDns::is_synthetic_ip("127.0.1.2".parse().unwrap()));
         assert!(!SyntheticDns::is_synthetic_ip("8.8.8.8".parse().unwrap()));
         assert!(!SyntheticDns::is_synthetic_ip("::1".parse().unwrap()));
     }
@@ -255,5 +282,15 @@ mod tests {
     fn wildcard_suffix_matches_is_case_insensitive() {
         assert!(wildcard_suffix_matches("API.Example.COM", "example.com"));
         assert!(wildcard_suffix_matches("api.example.com", "EXAMPLE.com"));
+    }
+
+    #[test]
+    fn gateway_addresses_are_sequential_and_outside_the_synthetic_range() {
+        let a = allocate_gateway_addr().unwrap();
+        let b = allocate_gateway_addr().unwrap();
+        assert_eq!(a, Ipv4Addr::new(127, 0, 0, 2));
+        assert_eq!(b, Ipv4Addr::new(127, 0, 0, 3));
+        assert!(!SyntheticDns::is_synthetic_ip(IpAddr::V4(a)));
+        assert!(!SyntheticDns::is_synthetic_ip(IpAddr::V4(b)));
     }
 }

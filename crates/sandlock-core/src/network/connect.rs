@@ -90,8 +90,14 @@ pub(super) async fn connect_on_behalf(
         // to a hostname the supervisor itself registered. A direct connect
         // to an unregistered synthetic address is refused, so the synthetic
         // range can never be used to borrow a wildcard rule (R4).
-        let dns_exempt = ns.is_netns_dns_dest(ip, dest_port);
-        let hostname = if SyntheticDns::is_synthetic_ip(ip) {
+        let dns_exempt = ns.is_dns_gateway_dest(ip, dest_port);
+        // The DNS gateway address must take precedence over the synthetic-IP
+        // check: in the unprivileged shared-netns mode the gateway lives on a
+        // 127.0.1.x loopback address, which is *inside* the synthetic range,
+        // but it is a supervisor service, not a synthetic destination — an
+        // unregistered synthetic reverse lookup must never refuse it (glibc's
+        // resolver connect()s its UDP socket to the nameserver first).
+        let hostname = if !dns_exempt && SyntheticDns::is_synthetic_ip(ip) {
             match ns.synthetic_dns.hostname_for(ip).await {
                 Some(h) => Some(h),
                 None => return NotifAction::Errno(ECONNREFUSED),
@@ -100,9 +106,7 @@ pub(super) async fn connect_on_behalf(
             None
         };
         // The sandbox's own DNS gateway must stay reachable even when the
-        // allowlist would otherwise deny it: glibc's resolver connect()s its
-        // UDP socket to the nameserver before sending (the send path already
-        // exempts the same endpoint).
+        // allowlist would otherwise deny it.
         if !dns_exempt {
             if let Err(e) =
                 destination_verdict_with_host(&effective, ip, dest_port, hostname.as_deref())

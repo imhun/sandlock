@@ -49,7 +49,7 @@ async fn resolve_send_destination(
     let ns = ctx.network.lock().await;
     // The sandbox's own DNS gateway must stay reachable regardless of the
     // allowlist (the resolver's UDP query itself travels this path).
-    if ns.is_netns_dns_dest(ip, dest_port) {
+    if ns.is_dns_gateway_dest(ip, dest_port) {
         return Ok(addr_bytes);
     }
     let hostname = if SyntheticDns::is_synthetic_ip(ip) {

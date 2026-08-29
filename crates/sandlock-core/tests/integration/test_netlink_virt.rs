@@ -30,8 +30,8 @@ async fn if_nameindex_returns_only_lo() {
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     assert!(
-        contents.contains("'lo'") && !contents.contains("'eth"),
-        "expected only lo, got: {}", contents
+        contents.contains("'lo'") && contents.contains("'eth0'"),
+        "expected lo + virtual eth0, got: {}", contents
     );
     assert!(result.success());
 }
@@ -451,8 +451,8 @@ async fn if_nameindex_works_under_destination_policy() {
     let contents = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     assert!(
-        contents.contains("'lo'") && !contents.contains("'eth"),
-        "netlink must keep working under a destination policy; expected only lo, got: {}",
+        contents.contains("'lo'") && contents.contains("'eth0'"),
+        "netlink must keep working under a destination policy; expected lo + virtual eth0, got: {}",
         contents
     );
     assert!(result.success());

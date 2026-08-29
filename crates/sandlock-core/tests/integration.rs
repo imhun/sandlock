@@ -40,6 +40,9 @@ mod test_network;
 #[path = "integration/test_netns.rs"]
 mod test_netns;
 
+#[path = "integration/test_wildcard_shared.rs"]
+mod test_wildcard_shared;
+
 #[path = "integration/test_netlink_virt.rs"]
 mod test_netlink_virt;
 
