@@ -580,6 +580,21 @@ sandlock_builder_t *sandlock_sandbox_builder_host_mask(sandlock_builder_t *b, co
 
 /**
  * # Safety
+ * `b` and `address` must be valid pointers.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_egress_proxy(sandlock_builder_t *b,
+                                                          const char *address);
+
+/**
+ * # Safety
+ * `b`, `username`, and `password` must be valid pointers.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_egress_proxy_credentials(sandlock_builder_t *b,
+                                                                      const char *username,
+                                                                      const char *password);
+
+/**
+ * # Safety
  * `b` must be a valid builder pointer.
  */
 sandlock_builder_t *sandlock_sandbox_builder_random_seed(sandlock_builder_t *b, uint64_t seed);

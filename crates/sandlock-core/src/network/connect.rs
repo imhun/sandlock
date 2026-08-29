@@ -123,7 +123,43 @@ pub(super) async fn connect_on_behalf(
             None
         };
         let orig_dest_map = ns.http_acl_orig_dest.clone();
+        let egress_proxy = ns.egress_proxy.clone();
         drop(ns);
+
+        // Egress proxy (Block C): after the allow/deny filter passes, tunnel
+        // TCP through the user's SOCKS5 upstream. The DNS gateway stays
+        // exempt, loopback port remap stays local (sandbox-internal services
+        // are not tunneled), and UDP/ICMP fall through to the direct path
+        // (E2B semantics: only TCP is tunneled). The proxy endpoint is dialed
+        // by the supervisor and is never in the sandbox's allowlist, so the
+        // sandbox cannot reach it directly and skip the tunnel.
+        if !dns_exempt {
+            if let Some(eg) = egress_proxy {
+                if protocol == crate::network::Protocol::Tcp && remap_port.is_none() {
+                    let dest = match &hostname {
+                        // A wildcard-domain destination keeps its name: the
+                        // proxy resolves it (ATYP=domain, remote DNS).
+                        Some(h) => crate::network::egress::Socks5Dest::Domain(h.clone()),
+                        None => match ip {
+                            IpAddr::V4(v) => crate::network::egress::Socks5Dest::V4(v),
+                            IpAddr::V6(v) => crate::network::egress::Socks5Dest::V6(v),
+                        },
+                    };
+                    let port = dest_port.unwrap_or(0);
+                    let is_v6 = sockaddr_is_ipv6(&addr_bytes);
+                    return match crate::network::egress::socks5_connect(
+                        dup_fd.as_raw_fd(),
+                        &eg,
+                        &dest,
+                        port,
+                        is_v6,
+                    ) {
+                        Ok(()) => NotifAction::ReturnValue(0),
+                        Err(_) => NotifAction::Errno(ECONNREFUSED),
+                    };
+                }
+            }
+        }
 
         // For a wildcard-domain destination the child's sockaddr carries the
         // synthetic IP. Resolve the hostname supervisor-side (dial-time DNS,

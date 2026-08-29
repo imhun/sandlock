@@ -299,6 +299,15 @@ class Sandbox:
     to the real destination; only the upstream sees the masked host. Matches
     the official ``maskRequestHost`` semantics."""
 
+    egress_proxy: Mapping[str, object] | None = None
+    """SOCKS5 egress proxy for all outbound TCP (after allow/deny filtering).
+    A dict with ``address`` (``host:port`` or ``[v6]:port``, resolved
+    supervisor-side at build time) and optional ``username``/``password``
+    (RFC 1929). UDP/ICMP are not tunneled. The proxy endpoint is dialed by
+    the supervisor and is never added to the sandbox's allowlist, so the
+    sandbox cannot reach it directly. The password is never serialized into
+    a profile or policy."""
+
     # Resource limits
     max_memory: str | int | None = None
     """Memory limit. String like '512M' or int bytes."""

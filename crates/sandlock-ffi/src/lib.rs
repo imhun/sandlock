@@ -697,6 +697,43 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_host_mask(
     Box::into_raw(Box::new(builder.host_mask(mask)))
 }
 
+/// Route all outbound TCP through a SOCKS5 proxy (`host:port` or
+/// `[v6]:port`), after allow/deny filtering.
+///
+/// # Safety
+/// `b` and `address` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_egress_proxy(
+    b: *mut SandboxBuilder,
+    address: *const c_char,
+) -> *mut SandboxBuilder {
+    if b.is_null() || address.is_null() {
+        return b;
+    }
+    let address = CStr::from_ptr(address).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.egress_proxy(address)))
+}
+
+/// Set the RFC 1929 username/password for the egress proxy.
+///
+/// # Safety
+/// `b`, `username`, and `password` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_egress_proxy_credentials(
+    b: *mut SandboxBuilder,
+    username: *const c_char,
+    password: *const c_char,
+) -> *mut SandboxBuilder {
+    if b.is_null() || username.is_null() || password.is_null() {
+        return b;
+    }
+    let username = CStr::from_ptr(username).to_str().unwrap_or("");
+    let password = CStr::from_ptr(password).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.egress_proxy_credentials(username, password)))
+}
+
 // ----------------------------------------------------------------
 // Sandbox Builder — isolation & determinism
 // ----------------------------------------------------------------

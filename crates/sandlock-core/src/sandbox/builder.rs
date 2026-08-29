@@ -118,6 +118,16 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "host-mask", value_name = "MASK"))]
     pub host_mask: Option<String>,
 
+    /// SOCKS5 egress proxy address (`host:port` or `[v6]:port`) for all
+    /// outbound TCP (after allow/deny filtering). UDP/ICMP are not tunneled.
+    #[cfg_attr(feature = "cli", arg(long = "egress-proxy", value_name = "HOST:PORT"))]
+    pub egress_proxy: Option<String>,
+
+    /// RFC 1929 username for the egress proxy.
+    pub egress_proxy_username: Option<String>,
+    /// RFC 1929 password for the egress proxy.
+    pub egress_proxy_password: Option<String>,
+
     /// Optional observation callback for HTTP learn mode. When set, the proxy is
     /// spawned even without ACL rules so every request is logged via this closure.
     #[cfg_attr(feature = "cli", clap(skip))]
@@ -292,6 +302,9 @@ impl Default for SandboxBuilder {
             http_inject_ca: Vec::new(),
             http_ca_out: None,
             host_mask: None,
+            egress_proxy: None,
+            egress_proxy_username: None,
+            egress_proxy_password: None,
             http_log_fn: None,
             max_memory: None,
             max_processes: None,
@@ -358,6 +371,9 @@ impl Clone for SandboxBuilder {
             http_inject_ca: self.http_inject_ca.clone(),
             http_ca_out: self.http_ca_out.clone(),
             host_mask: self.host_mask.clone(),
+            egress_proxy: self.egress_proxy.clone(),
+            egress_proxy_username: self.egress_proxy_username.clone(),
+            egress_proxy_password: self.egress_proxy_password.clone(),
             http_log_fn: self.http_log_fn.clone(),
             max_memory: self.max_memory,
             max_processes: self.max_processes,
@@ -585,6 +601,24 @@ impl SandboxBuilder {
     /// request's destination port.
     pub fn host_mask(mut self, mask: impl Into<String>) -> Self {
         self.host_mask = Some(mask.into());
+        self
+    }
+
+    /// Route all outbound TCP through this SOCKS5 proxy (`host:port` or
+    /// `[v6]:port`), after allow/deny filtering.
+    pub fn egress_proxy(mut self, address: impl Into<String>) -> Self {
+        self.egress_proxy = Some(address.into());
+        self
+    }
+
+    /// Set the RFC 1929 username and password for the egress proxy.
+    pub fn egress_proxy_credentials(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
+        self.egress_proxy_username = Some(username.into());
+        self.egress_proxy_password = Some(password.into());
         self
     }
 
@@ -1065,6 +1099,16 @@ impl SandboxBuilder {
             http_inject_ca: self.http_inject_ca,
             http_ca_out: self.http_ca_out,
             host_mask: self.host_mask,
+            egress_proxy: match self.egress_proxy {
+                Some(address) => {
+                    Some(crate::network::egress::EgressProxyConfig {
+                        address,
+                        username: self.egress_proxy_username,
+                        password: self.egress_proxy_password,
+                    })
+                }
+                None => None,
+            },
             http_log_fn: self.http_log_fn,
             max_memory: self.max_memory,
             max_processes: self.max_processes.unwrap_or(64),

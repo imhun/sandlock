@@ -201,6 +201,10 @@ _b_http_key = _builder_fn("sandlock_sandbox_builder_http_key", ctypes.c_char_p)
 _b_http_inject_ca = _builder_fn("sandlock_sandbox_builder_http_inject_ca", ctypes.c_char_p)
 _b_http_ca_out = _builder_fn("sandlock_sandbox_builder_http_ca_out", ctypes.c_char_p)
 _b_host_mask = _builder_fn("sandlock_sandbox_builder_host_mask", ctypes.c_char_p)
+_b_egress_proxy = _builder_fn("sandlock_sandbox_builder_egress_proxy", ctypes.c_char_p)
+_b_egress_proxy_credentials = _builder_fn(
+    "sandlock_sandbox_builder_egress_proxy_credentials", ctypes.c_char_p, ctypes.c_char_p
+)
 _b_user = _builder_fn("sandlock_sandbox_builder_user", ctypes.c_uint32, ctypes.c_uint32)
 _b_random_seed = _builder_fn("sandlock_sandbox_builder_random_seed", ctypes.c_uint64)
 _b_clean_env = _builder_fn("sandlock_sandbox_builder_clean_env", ctypes.c_bool)
@@ -1129,7 +1133,8 @@ class _NativePolicy:
         "net_allow", "net_deny", "net_allow_bind", "net_deny_bind",
         "port_remap", "netns",
         "http_allow", "http_deny", "http_ports", "http_ca", "http_key",
-        "http_inject_ca", "http_ca_out", "http_inject", "host_mask", "uid",
+        "http_inject_ca", "http_ca_out", "http_inject", "host_mask",
+        "egress_proxy", "uid",
         "random_seed", "time_start", "clean_env", "env",
         "extra_deny_syscalls", "extra_allow_syscalls", "max_open_files",
         "no_randomize_memory", "no_huge_pages", "no_coredump", "deterministic_dirs",
@@ -1240,6 +1245,28 @@ class _NativePolicy:
             b = _b_http_auth(b, _encode(auth_rule))
         if policy.host_mask:
             b = _b_host_mask(b, _encode(str(policy.host_mask)))
+        if policy.egress_proxy:
+            if not isinstance(policy.egress_proxy, dict):
+                raise ValueError("egress_proxy must be a dict")
+            unknown = set(policy.egress_proxy) - {"address", "username", "password"}
+            if unknown:
+                raise ValueError(
+                    f"egress_proxy unknown field(s): {sorted(unknown)}"
+                )
+            address = policy.egress_proxy.get("address")
+            if not isinstance(address, str) or not address:
+                raise ValueError("egress_proxy.address must be a non-empty string")
+            b = _b_egress_proxy(b, _encode(address))
+            username = policy.egress_proxy.get("username")
+            password = policy.egress_proxy.get("password")
+            if username is not None or password is not None:
+                if not isinstance(username, str) or not isinstance(password, str):
+                    raise ValueError(
+                        "egress_proxy.username/password must be strings"
+                    )
+                b = _b_egress_proxy_credentials(
+                    b, _encode(username), _encode(password)
+                )
 
         if policy.port_remap:
             b = _b_port_remap(b, True)

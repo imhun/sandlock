@@ -478,6 +478,12 @@ pub struct NetworkState {
     /// exactly this endpoint so the sandbox can resolve names through its
     /// own gateway without opening the rest of loopback.
     pub dns_gateway_addr: Option<std::net::SocketAddr>,
+    /// SOCKS5 egress proxy (Block C): when set, every TCP connect that passes
+    /// the destination filter is tunneled through this upstream instead of
+    /// being dialed directly. UDP/ICMP are not tunneled. The endpoint itself
+    /// is dialed by the supervisor and is never added to the sandbox's
+    /// allowlist, so the sandbox cannot reach the proxy directly.
+    pub egress_proxy: Option<crate::network::egress::EgressProxy>,
 }
 
 impl NetworkState {
@@ -494,6 +500,7 @@ impl NetworkState {
             http_acl_orig_dest: None,
             synthetic_dns: crate::network::dns_synth::SyntheticDns::new(),
             dns_gateway_addr: None,
+            egress_proxy: None,
         }
     }
 

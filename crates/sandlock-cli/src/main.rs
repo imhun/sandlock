@@ -108,6 +108,10 @@ struct RunArgs {
     #[arg(long = "on-error", value_name = "ACTION")]
     on_error: Option<String>,
 
+    /// RFC 1929 username/password for --egress-proxy (`USER:PASS`)
+    #[arg(long = "egress-proxy-auth", value_name = "USER:PASS")]
+    egress_proxy_auth: Option<String>,
+
     #[arg(long = "env", value_name = "KEY=VALUE")]
     env_vars: Vec<String>,
 
@@ -619,6 +623,12 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     for p in &pb.http_inject_ca { builder = builder.http_inject_ca(p); }
     if let Some(ref out) = pb.http_ca_out { builder = builder.http_ca_out(out); }
     if let Some(ref mask) = pb.host_mask { builder = builder.host_mask(mask); }
+    if let Some(ref auth) = args.egress_proxy_auth {
+        let (user, pass) = auth
+            .split_once(':')
+            .ok_or_else(|| anyhow!("--egress-proxy-auth must be USER:PASS, got {auth:?}"))?;
+        builder = builder.egress_proxy_credentials(user, pass);
+    }
     if pb.port_remap { builder = builder.port_remap(true); }
     if pb.no_randomize_memory { builder = builder.no_randomize_memory(true); }
     if pb.no_huge_pages { builder = builder.no_huge_pages(true); }

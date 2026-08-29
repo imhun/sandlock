@@ -114,6 +114,22 @@ class TestPolicyFromDict:
         })
         assert list(p.net_deny_bind) == [8080, "9000-9002"]
 
+    def test_network_egress_proxy_section(self):
+        p = policy_from_dict({
+            "network": {
+                "egress_proxy": {
+                    "address": "proxy.example.com:1080",
+                    "username": "user",
+                    "password": "pass",
+                },
+            },
+        })
+        assert p.egress_proxy == {
+            "address": "proxy.example.com:1080",
+            "username": "user",
+            "password": "pass",
+        }
+
     def test_http_section(self):
         p = policy_from_dict({
             "http": {

@@ -31,6 +31,7 @@ use crate::sys::structs::SeccompNotif;
 mod connect;
 pub(crate) mod dns_synth;
 pub(crate) mod dns_gateway;
+pub(crate) mod egress;
 pub(crate) mod materialize;
 pub(crate) mod netns;
 mod rules;
