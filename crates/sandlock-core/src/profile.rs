@@ -150,6 +150,10 @@ pub struct HttpSection {
     pub allow: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
+    /// Mask the outbound `Host`/authority for every proxied request;
+    /// ``${PORT}`` is replaced with the destination port.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_mask: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
@@ -321,6 +325,9 @@ pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), Sandlo
     for p in input.http.ports.iter() { b = b.http_port(*p); }
     for r in input.http.allow.iter() { b = b.http_allow(r); }
     for r in input.http.deny.iter()  { b = b.http_deny(r); }
+    if let Some(mask) = input.http.host_mask.as_deref() {
+        b = b.host_mask(mask);
+    }
 
     // [syscalls]
     if !input.syscalls.extra_allow.is_empty() {
@@ -423,6 +430,7 @@ pub fn format_net_rule(rule: &crate::sandbox::NetRule) -> String {
     let target = match &rule.target {
         NetTarget::AnyIp => "*".to_string(),
         NetTarget::Host(h) => h.clone(),
+        NetTarget::HostWildcard(s) => format!("*.{}", s),
         NetTarget::Cidr(c) => {
             // Bracket IPv6 only when a port suffix will follow, because a
             // bare addr:port is itself a valid IPv6 address.
@@ -582,6 +590,7 @@ pub fn sandbox_to_profile(s: &Sandbox, extra_denied: &[String]) -> ProfileInput 
             ports: s.http_ports.clone(),
             allow: http_allow,
             deny: http_deny,
+            host_mask: s.host_mask.clone(),
         },
         syscalls: SyscallsSection {
             extra_allow: s.extra_allow_syscalls.clone(),

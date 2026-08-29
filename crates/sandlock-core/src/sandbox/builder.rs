@@ -102,6 +102,13 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "http-ca-out", value_name = "PATH"))]
     pub http_ca_out: Option<PathBuf>,
 
+    /// Mask the outbound `Host`/authority for every proxied request:
+    /// ``${PORT}`` is replaced with the destination port, so
+    /// ``localhost:${PORT}`` forwards a request addressed to ``127.0.0.1:8080``
+    /// with ``Host: localhost:8080`` (official ``maskRequestHost`` semantics).
+    #[cfg_attr(feature = "cli", arg(long = "host-mask", value_name = "MASK"))]
+    pub host_mask: Option<String>,
+
     /// Optional observation callback for HTTP learn mode. When set, the proxy is
     /// spawned even without ACL rules so every request is logged via this closure.
     #[cfg_attr(feature = "cli", clap(skip))]
@@ -274,6 +281,7 @@ impl Default for SandboxBuilder {
             http_key: None,
             http_inject_ca: Vec::new(),
             http_ca_out: None,
+            host_mask: None,
             http_log_fn: None,
             max_memory: None,
             max_processes: None,
@@ -338,6 +346,7 @@ impl Clone for SandboxBuilder {
             http_key: self.http_key.clone(),
             http_inject_ca: self.http_inject_ca.clone(),
             http_ca_out: self.http_ca_out.clone(),
+            host_mask: self.host_mask.clone(),
             http_log_fn: self.http_log_fn.clone(),
             max_memory: self.max_memory,
             max_processes: self.max_processes,
@@ -550,6 +559,14 @@ impl SandboxBuilder {
 
     pub fn http_ca_out(mut self, path: impl Into<PathBuf>) -> Self {
         self.http_ca_out = Some(path.into());
+        self
+    }
+
+    /// Mask the outbound `Host`/authority for every request the HTTP ACL proxy
+    /// forwards. The token ``${PORT}`` (if present) is replaced with the
+    /// request's destination port.
+    pub fn host_mask(mut self, mask: impl Into<String>) -> Self {
+        self.host_mask = Some(mask.into());
         self
     }
 
@@ -1028,6 +1045,7 @@ impl SandboxBuilder {
             http_key: self.http_key,
             http_inject_ca: self.http_inject_ca,
             http_ca_out: self.http_ca_out,
+            host_mask: self.host_mask,
             http_log_fn: self.http_log_fn,
             max_memory: self.max_memory,
             max_processes: self.max_processes.unwrap_or(64),

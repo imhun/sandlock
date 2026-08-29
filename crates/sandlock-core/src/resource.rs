@@ -965,6 +965,7 @@ mod tests {
             virtual_hostname: None,
             has_http_acl: false,
             virtual_etc_hosts: String::new(),
+            virtual_resolv_conf: None,
             ca_inject_paths: Vec::new(),
             ca_inject_pem: None,
         }

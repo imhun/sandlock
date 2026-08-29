@@ -565,6 +565,45 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_http_deny(
     Box::into_raw(Box::new(builder.http_deny(rule)))
 }
 
+/// Declare a named credential loaded into the supervisor:
+/// `NAME=SOURCE` where SOURCE is `env:VAR`, `file:/path`, or `fd:N`.
+///
+/// # Safety
+/// `b`, `name`, and `source` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_credential(
+    b: *mut SandboxBuilder,
+    name: *const c_char,
+    source: *const c_char,
+) -> *mut SandboxBuilder {
+    if b.is_null() || name.is_null() || source.is_null() {
+        return b;
+    }
+    let name = CStr::from_ptr(name).to_str().unwrap_or("");
+    let source = CStr::from_ptr(source).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.credential(name, source)))
+}
+
+/// Add a credential-injection rule (the `--http-auth` grammar):
+/// `METHOD HOST/PATH AUTHSPEC CREDNAME [replace|add-only]`, where AUTHSPEC is
+/// `bearer | basic:<user> | header:<name> | apikey:<name> | query:<param>`.
+///
+/// # Safety
+/// `b` and `rule` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_http_auth(
+    b: *mut SandboxBuilder,
+    rule: *const c_char,
+) -> *mut SandboxBuilder {
+    if b.is_null() || rule.is_null() {
+        return b;
+    }
+    let rule = CStr::from_ptr(rule).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.http_auth(rule)))
+}
+
 /// # Safety
 /// `b` must be a valid pointer.
 #[no_mangle]
@@ -637,6 +676,25 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_http_ca_out(
     let path = CStr::from_ptr(path).to_str().unwrap_or("");
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.http_ca_out(path)))
+}
+
+/// Mask the outbound `Host`/authority for every request the HTTP ACL proxy
+/// forwards. The token ``${PORT}`` (if present) is replaced with the
+/// request's destination port.
+///
+/// # Safety
+/// `b` and `mask` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_host_mask(
+    b: *mut SandboxBuilder,
+    mask: *const c_char,
+) -> *mut SandboxBuilder {
+    if b.is_null() || mask.is_null() {
+        return b;
+    }
+    let mask = CStr::from_ptr(mask).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.host_mask(mask)))
 }
 
 // ----------------------------------------------------------------

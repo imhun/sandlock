@@ -203,15 +203,13 @@ pub const CLONE_NEWUTS: u64 = 0x0400_0000;
 pub const CLONE_NEWIPC: u64 = 0x0800_0000;
 pub const CLONE_NEWUSER: u64 = 0x1000_0000;
 pub const CLONE_NEWPID: u64 = 0x2000_0000;
-pub const CLONE_NEWNET: u64 = 0x4000_0000;
 
 pub const CLONE_NS_FLAGS: u64 = CLONE_NEWNS
     | CLONE_NEWCGROUP
     | CLONE_NEWUTS
     | CLONE_NEWIPC
     | CLONE_NEWUSER
-    | CLONE_NEWPID
-    | CLONE_NEWNET;
+    | CLONE_NEWPID;
 
 // ============================================================
 // Dangerous ioctls

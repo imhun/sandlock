@@ -1,4 +1,5 @@
-/target/
+/target*
+wheels/
 crates/sandlock-ffi/include/*
 !crates/sandlock-ffi/include/sandlock.h
 __pycache__/

@@ -391,7 +391,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     let real_uid = unsafe { libc::getuid() };
     let real_gid = unsafe { libc::getgid() };
 
-    // 5b. User namespace for --user (run-as uid/gid) mapping.
+    // 5. User namespace for --user (run-as uid/gid) mapping.
     //
     // Skip entirely when the requested identity already matches the current
     // uid/gid: there's no point unsharing a user namespace to map an identity

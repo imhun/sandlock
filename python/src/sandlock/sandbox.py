@@ -263,6 +263,36 @@ class Sandbox:
     """Path to write the active MITM CA public certificate (PEM). Never the
     private key. Useful for NODE_EXTRA_CA_CERTS and similar."""
 
+    http_inject: Sequence[Mapping[str, object]] = field(default_factory=list)
+    """Credential-injection rules applied by the HTTP ACL proxy after the ACL
+    check. Each entry is a dict:
+
+    - ``matcher``: ``"HOST"``, ``"HOST/PATH"``, or ``"METHOD HOST/PATH"``
+      (defaults to method ``*`` and path ``/*``). Hosts may be ``*.suffix``
+      wildcards.
+    - ``auth``: ``"bearer"`` | ``"basic:<user>"`` | ``"header:<name>"`` |
+      ``"apikey:<name>"`` | ``"query:<param>"``.
+    - ``secret``: where the secret is loaded, ``"env:VAR"`` | ``"file:/path"`` |
+      ``"fd:N"``. ``literal:`` is rejected (it would leak via ``ps``/history).
+      An ``env:`` var is stripped from the sandboxed child's environment.
+    - ``name`` (optional): credential name recorded in the audit trail; auto
+      ``inject<N>`` when omitted.
+    - ``on_existing`` (optional): ``"replace"`` (default; overwrites a
+      placeholder the SDK already set) or ``"add-only"`` (keep the child's
+      value when present).
+
+    Requires at least one ``http_allow``/``http_deny`` rule (the proxy runs
+    only then); HTTPS injection additionally needs ``http_ca``/``http_inject_ca``
+    so port 443 is intercepted."""
+
+    host_mask: str | None = None
+    """Mask the outbound ``Host``/authority for every request the HTTP ACL
+    proxy forwards. ``${PORT}`` (if present) is replaced with the request's
+    destination port, so ``localhost:${PORT}`` forwards a request addressed to
+    ``127.0.0.1:8080`` with ``Host: localhost:8080``. The connection still goes
+    to the real destination; only the upstream sees the masked host. Matches
+    the official ``maskRequestHost`` semantics."""
+
     # Resource limits
     max_memory: str | int | None = None
     """Memory limit. String like '512M' or int bytes."""

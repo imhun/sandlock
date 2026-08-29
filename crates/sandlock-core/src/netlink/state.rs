@@ -17,7 +17,9 @@ pub struct NetlinkState {
 
 impl NetlinkState {
     pub fn new() -> Self {
-        Self { cookies: Mutex::new(HashSet::new()) }
+        Self {
+            cookies: Mutex::new(HashSet::new()),
+        }
     }
 
     /// Register a new cookie fd injected into the child.

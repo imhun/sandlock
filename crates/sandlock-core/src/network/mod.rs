@@ -29,6 +29,8 @@ use crate::seccomp::notif::{read_child_mem, NotifAction};
 use crate::sys::structs::SeccompNotif;
 
 mod connect;
+pub(crate) mod dns_synth;
+pub(crate) mod dns_gateway;
 pub(crate) mod materialize;
 mod rules;
 mod send;
@@ -194,4 +196,3 @@ pub(crate) async fn handle_net(
         NotifAction::Continue
     }
 }
-

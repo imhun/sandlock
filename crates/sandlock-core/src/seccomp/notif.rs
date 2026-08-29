@@ -259,6 +259,10 @@ pub enum NetworkPolicy {
         /// Ports permitted for any IP (from `--net-allow :port` /
         /// `*:port`).
         any_ip_ports: HashSet<u16>,
+        /// Domain-suffix wildcard rules (`*.example.com`), matched against
+        /// the destination hostname carried by a synthetic DNS address
+        /// (see `network::dns_synth`). Empty unless wildcard rules exist.
+        wildcard_domains: Vec<(String, PortAllow)>,
     },
     /// Default-allow denylist: a connection is permitted unless the
     /// destination IP/port matches a deny rule. From `--net-deny`.
@@ -280,7 +284,7 @@ impl NetworkPolicy {
     /// and from a `DenyList` (both default-allow).
     pub fn denies_everything(&self) -> bool {
         match self {
-            NetworkPolicy::AllowList { per_ip, cidrs, any_ip_ports } => {
+            NetworkPolicy::AllowList { per_ip, cidrs, any_ip_ports, .. } => {
                 per_ip.is_empty() && cidrs.is_empty() && any_ip_ports.is_empty()
             }
             _ => false,
@@ -296,7 +300,7 @@ impl NetworkPolicy {
         let ip = ip.to_canonical();
         match self {
             NetworkPolicy::Unrestricted => true,
-            NetworkPolicy::AllowList { per_ip, cidrs, any_ip_ports } => {
+            NetworkPolicy::AllowList { per_ip, cidrs, any_ip_ports, .. } => {
                 if any_ip_ports.contains(&port) {
                     return true;
                 }
@@ -795,6 +799,11 @@ pub struct NotifPolicy {
     /// host's on-disk `/etc/hosts` never leaks in. The content is the
     /// loopback base plus any concrete hostnames resolved from `net_allow`.
     pub virtual_etc_hosts: String,
+    /// Synthetic `/etc/resolv.conf` served to the sandbox: `Some` when the
+    /// wildcard DNS gateway is active, so `openat("/etc/resolv.conf")`
+    /// returns a memfd pointing at the sandbox's loopback gateway and
+    /// wildcard-domain lookups hit the supervisor instead of the host.
+    pub virtual_resolv_conf: Option<String>,
     /// User-declared trust-bundle paths to splice the MITM CA into.
     pub ca_inject_paths: Vec<std::path::PathBuf>,
     /// Active MITM CA public cert (PEM bytes) to inject. `Some` only when
@@ -3082,6 +3091,7 @@ mod tests {
             per_ip: HashMap::new(),
             cidrs: vec![(IpCidr::parse("10.0.0.0/8").unwrap(), PortAllow::Specific(ports))],
             any_ip_ports: HashSet::new(),
+            wildcard_domains: Vec::new(),
         };
         assert!(policy.allows("10.1.2.3".parse().unwrap(), 80));   // in range, port ok
         assert!(!policy.allows("10.1.2.3".parse().unwrap(), 443)); // in range, wrong port
@@ -3095,6 +3105,7 @@ mod tests {
             per_ip: HashMap::new(),
             cidrs: vec![(IpCidr::parse("192.168.0.0/16").unwrap(), PortAllow::Any)],
             any_ip_ports: HashSet::new(),
+            wildcard_domains: Vec::new(),
         };
         assert!(policy.allows("192.168.5.5".parse().unwrap(), 9999)); // any port in range
         assert!(!policy.allows("10.0.0.1".parse().unwrap(), 9999));   // out of range
@@ -3125,6 +3136,7 @@ mod tests {
             per_ip,
             cidrs: vec![(IpCidr::parse("10.0.0.0/8").unwrap(), PortAllow::Any)],
             any_ip_ports: HashSet::new(),
+            wildcard_domains: Vec::new(),
         };
         assert!(policy.allows("::ffff:1.2.3.4".parse().unwrap(), 443));
         assert!(policy.allows("::ffff:10.1.2.3".parse().unwrap(), 443));

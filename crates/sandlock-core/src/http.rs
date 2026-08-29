@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::SandboxError;
 use crate::network::{NetAllow, NetTarget, Protocol};
+use crate::network::dns_synth::wildcard_suffix_matches;
 
 /// An HTTP access control rule.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -18,6 +19,8 @@ impl HttpRule {
     /// - `"GET api.example.com/v1/*"` -> method="GET", host="api.example.com", path="/v1/*"
     /// - `"* */admin/*"` -> method="*", host="*", path="/admin/*"
     /// - `"GET example.com"` -> method="GET", host="example.com", path="/*"
+    /// - `"GET *.example.com/v1/*"` -> host="*.example.com" (matches any
+    ///   subdomain of example.com, but not the bare domain)
     pub fn parse(s: &str) -> Result<Self, SandboxError> {
         let s = s.trim();
         let (method, rest) = s
@@ -41,6 +44,31 @@ impl HttpRule {
             (rest.to_string(), "/*".to_string())
         };
 
+        // Wildcard hosts must be well-formed `*.suffix`: the suffix must be a
+        // plausible DNS name (at least one dot, no empty labels) and carry no
+        // other rule metacharacters. Reject `**`, `*.`, `*.*`, `*.*.x`, etc.
+        // so a typo surfaces at parse time instead of silently matching nothing.
+        if host.starts_with("*.") {
+            let suffix = &host[2..];
+            let valid = !suffix.is_empty()
+                && !suffix.starts_with('.')
+                && !suffix.ends_with('.')
+                && suffix.contains('.')
+                && !suffix.split('.').any(|label| label.is_empty())
+                && !suffix
+                    .chars()
+                    .any(|c| matches!(c, '*' | '/' | ':' | ' ' | '\t'));
+            if !valid {
+                return Err(SandboxError::Invalid(format!(
+                    "invalid http rule host {host:?} (expected `*.example.com`)"
+                )));
+            }
+        } else if host != "*" && host.contains('*') {
+            return Err(SandboxError::Invalid(format!(
+                "invalid http rule host {host:?}: only `*` (any) and `*.suffix` wildcards are supported"
+            )));
+        }
+
         Ok(HttpRule {
             method: method.to_uppercase(),
             host,
@@ -56,14 +84,32 @@ impl HttpRule {
         if self.method != "*" && !self.method.eq_ignore_ascii_case(method) {
             return false;
         }
-        // Host match
-        if self.host != "*" && !self.host.eq_ignore_ascii_case(host) {
+        // Host match: `*` (any), `*.suffix` (any subdomain, not the bare
+        // domain, case-insensitive), or a literal host (case-insensitive).
+        if !host_matches(&self.host, host) {
             return false;
         }
         // Path match: normalize to prevent encoding/traversal bypasses.
         let normalized = normalize_path(path);
         prefix_or_exact_match(&self.path, &normalized)
     }
+}
+
+/// Match a rule host against an actual request host.
+///
+/// - `*` matches any host;
+/// - `*.suffix` matches any **subdomain** of `suffix` (e.g. `api.example.com`,
+///   `a.b.example.com`) but not the bare domain `example.com` itself — the same
+///   semantics as `--net-allow "*.example.com"` and the egress-proxy library;
+/// - anything else is a case-insensitive literal match.
+pub fn host_matches(rule_host: &str, host: &str) -> bool {
+    if rule_host == "*" {
+        return true;
+    }
+    if let Some(suffix) = rule_host.strip_prefix("*.") {
+        return wildcard_suffix_matches(host, suffix);
+    }
+    rule_host.eq_ignore_ascii_case(host)
 }
 
 /// Normalize an HTTP path to prevent ACL bypasses via encoding tricks.
@@ -190,10 +236,18 @@ pub(crate) fn extend_net_allow_for_http(
     }
 
     let mut wildcard_seen = false;
+    let mut wildcard_suffixes: Vec<String> = Vec::new();
     let mut concrete_hosts: Vec<String> = Vec::new();
     for rule in http_allow.iter().chain(http_deny.iter()) {
         if rule.host == "*" {
             wildcard_seen = true;
+        } else if let Some(suffix) = rule.host.strip_prefix("*.") {
+            if !wildcard_suffixes
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(suffix))
+            {
+                wildcard_suffixes.push(suffix.to_string());
+            }
         } else if !concrete_hosts
             .iter()
             .any(|host| host.eq_ignore_ascii_case(&rule.host))
@@ -215,6 +269,19 @@ pub(crate) fn extend_net_allow_for_http(
         net_allow.push(NetAllow {
             protocol: Protocol::Tcp,
             target: NetTarget::Host(host),
+            ports: http_ports.to_vec(),
+            all_ports: false,
+        });
+    }
+
+    // `*.suffix` HTTP rules map onto the wildcard hostname machinery rather
+    // than "any IP": the sandbox's DNS path hands subdomains a synthetic IP
+    // and the on-behalf connect path reverse-looks the hostname and matches
+    // the suffix, so only real subdomains of the suffix are reachable.
+    for suffix in wildcard_suffixes {
+        net_allow.push(NetAllow {
+            protocol: Protocol::Tcp,
+            target: NetTarget::HostWildcard(suffix),
             ports: http_ports.to_vec(),
             all_ports: false,
         });
@@ -321,6 +388,39 @@ mod tests {
     fn matches_wildcard_host() {
         let rule = HttpRule::parse("GET */v1/*").unwrap();
         assert!(rule.matches("GET", "any.host.com", "/v1/foo"));
+    }
+
+    #[test]
+    fn matches_wildcard_suffix_host() {
+        let rule = HttpRule::parse("GET *.example.com/v1/*").unwrap();
+        assert_eq!(rule.host, "*.example.com");
+        assert!(rule.matches("GET", "api.example.com", "/v1/foo"));
+        assert!(rule.matches("GET", "a.b.example.com", "/v1/foo"));
+        assert!(!rule.matches("GET", "example.com", "/v1/foo"), "bare domain excluded");
+        assert!(!rule.matches("GET", "badexample.com", "/v1/foo"), "partial suffix must not match");
+        assert!(!rule.matches("POST", "api.example.com", "/v1/foo"), "method still enforced");
+    }
+
+    #[test]
+    fn parse_rejects_malformed_wildcard_hosts() {
+        // `**`, `*.`, `*.*`, `*.*.x`, and an embedded `*` are all rejected.
+        for bad in [
+            "GET **.example.com/*",
+            "GET *./*",
+            "GET *.*/*",
+            "GET *.*.x/*",
+            "GET *foo.example.com/*",
+            "GET foo*.example.com/*",
+        ] {
+            assert!(HttpRule::parse(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn matches_wildcard_suffix_case_insensitive() {
+        let rule = HttpRule::parse("GET *.Example.COM/v1/*").unwrap();
+        assert!(rule.matches("GET", "API.example.com", "/v1/foo"));
+        assert!(!rule.matches("GET", "example.com", "/v1/foo"));
     }
 
     #[test]
@@ -497,5 +597,31 @@ mod tests {
         assert_eq!(net_allow[0].protocol, Protocol::Tcp);
         assert_eq!(net_allow[0].target, NetTarget::AnyIp);
         assert_eq!(net_allow[0].ports, vec![80]);
+    }
+
+    #[test]
+    fn extend_net_allow_for_http_uses_host_wildcard_for_suffix_rules() {
+        let allow = vec![
+            HttpRule::parse("GET *.example.com/v1/*").unwrap(),
+            HttpRule::parse("GET *.EXAMPLE.com/v2/*").unwrap(),
+            HttpRule::parse("GET api.example.com/v3/*").unwrap(),
+        ];
+        let mut net_allow = Vec::new();
+
+        extend_net_allow_for_http(&mut net_allow, &allow, &[], &[80, 443]);
+
+        // The wildcard suffix appears once (deduped case-insensitively) as a
+        // HostWildcard target; the concrete host stays a literal Host rule.
+        let wildcards: Vec<&NetAllow> = net_allow
+            .iter()
+            .filter(|n| matches!(n.target, NetTarget::HostWildcard(_)))
+            .collect();
+        assert_eq!(wildcards.len(), 1, "dedupe suffix across case variants");
+        assert!(matches!(&wildcards[0].target, NetTarget::HostWildcard(s) if s == "example.com"));
+        assert_eq!(wildcards[0].ports, vec![80, 443]);
+
+        assert!(net_allow.iter().any(
+            |n| matches!(&n.target, NetTarget::Host(h) if h == "api.example.com")
+        ));
     }
 }

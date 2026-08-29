@@ -43,7 +43,16 @@ fn main() {
     // Checkpoint restore is claimed only on x86_64 and riscv64 (see
     // `restore_interactive`); on those arches a stub build failure is fatal, not
     // a silent skip — a green build with no stub is how regressions slip past CI.
+    //
+    // The stub is a Linux freestanding binary: it needs GCC-only flags
+    // (`-fno-tree-loop-distribute-patterns`, `-Ttext-segment`) and a
+    // `-static -nostdlib` link, none of which clang/ld on macOS provide. The
+    // restore engine itself is exercised only inside Linux sandboxes, so on a
+    // non-Linux host a stub build failure downgrades to a warning instead of
+    // aborting the build (mirroring the rootfs-helper behavior above).
     let is_restore_arch = target.starts_with("x86_64") || is_riscv64;
+    let on_linux = std::env::var("CARGO_CFG_TARGET_OS").map(|os| os == "linux").unwrap_or(false);
+    let stub_failure_is_fatal = is_restore_arch && on_linux;
     let (ccs, fail_msg) = if is_riscv64 {
         if host.starts_with("riscv64") {
             (
@@ -86,7 +95,7 @@ fn main() {
             text_segment,
         ],
     ) {
-        if is_restore_arch {
+        if stub_failure_is_fatal {
             panic!("{fail_msg}");
         }
         println!("cargo:warning={fail_msg}");

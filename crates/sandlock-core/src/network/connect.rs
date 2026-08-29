@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::NotifAction;
+use crate::seccomp::notif::NetworkPolicy;
 use crate::sys::structs::{SeccompNotif, ECONNREFUSED};
 
 use super::materialize::{
@@ -16,7 +17,8 @@ use super::materialize::{
     set_port_in_sockaddr, sockaddr_is_ipv6,
 };
 use super::unix::connect_named_unix_on_behalf;
-use super::verdict::{destination_verdict, path_under_any};
+use super::verdict::{destination_verdict_with_host, path_under_any};
+use super::dns_synth::SyntheticDns;
 use super::query_socket_protocol;
 
 // ============================================================
@@ -84,8 +86,33 @@ pub(super) async fn connect_on_behalf(
             pfs.live_policy.clone()
         };
         let effective = ns.effective_network_policy(notif.pid, protocol, live_policy.as_ref());
-        if let Err(e) = destination_verdict(&effective, ip, dest_port) {
-            return NotifAction::Errno(e);
+        // Wildcard-domain path: a synthetic destination must resolve back
+        // to a hostname the supervisor itself registered. A direct connect
+        // to an unregistered synthetic address is refused, so the synthetic
+        // range can never be used to borrow a wildcard rule (R4).
+        let dns_exempt = ns.is_dns_gateway_dest(ip, dest_port);
+        // The DNS gateway address must take precedence over the synthetic-IP
+        // check: in the unprivileged shared-netns mode the gateway lives on a
+        // 127.0.1.x loopback address, which is *inside* the synthetic range,
+        // but it is a supervisor service, not a synthetic destination — an
+        // unregistered synthetic reverse lookup must never refuse it (glibc's
+        // resolver connect()s its UDP socket to the nameserver first).
+        let hostname = if !dns_exempt && SyntheticDns::is_synthetic_ip(ip) {
+            match ns.synthetic_dns.hostname_for(ip).await {
+                Some(h) => Some(h),
+                None => return NotifAction::Errno(ECONNREFUSED),
+            }
+        } else {
+            None
+        };
+        // The sandbox's own DNS gateway must stay reachable even when the
+        // allowlist would otherwise deny it.
+        if !dns_exempt {
+            if let Err(e) =
+                destination_verdict_with_host(&effective, ip, dest_port, hostname.as_deref())
+            {
+                return NotifAction::Errno(e);
+            }
         }
         let proxy = ns
             .http_acl_addr
@@ -98,7 +125,37 @@ pub(super) async fn connect_on_behalf(
         let orig_dest_map = ns.http_acl_orig_dest.clone();
         drop(ns);
 
-        let plan = match plan_connect_target(&addr_bytes, proxy, remap_port) {
+        // For a wildcard-domain destination the child's sockaddr carries the
+        // synthetic IP. Resolve the hostname supervisor-side (dial-time DNS,
+        // matching E2B semantics) and rewrite the connect target to a real
+        // address in the socket's own family; the resolved address must
+        // still pass the IP-level verdict, so a wildcard rule cannot be
+        // combined with DNS rebinding to reach an unlisted destination.
+        let resolved_ip = if hostname.is_some() {
+            match resolve_wildcard_destination(
+                &addr_bytes,
+                &effective,
+                dest_port,
+                hostname.as_deref().expect("checked above"),
+            )
+            .await
+            {
+                Ok(Some(ip)) => Some(ip),
+                Ok(None) => return NotifAction::Errno(ECONNREFUSED),
+                Err(e) => return NotifAction::Errno(e),
+            }
+        } else {
+            None
+        };
+        let plan_addr = match &resolved_ip {
+            Some(real_ip) => match rewrite_sockaddr_ip(&addr_bytes, *real_ip) {
+                Some(bytes) => bytes,
+                None => return NotifAction::Errno(ECONNREFUSED),
+            },
+            None => addr_bytes.clone(),
+        };
+
+        let plan = match plan_connect_target(&plan_addr, proxy, remap_port) {
             Ok(p) => p,
             Err(e) => return NotifAction::Errno(e),
         };
@@ -113,7 +170,12 @@ pub(super) async fn connect_on_behalf(
                 // The local-address probe must bind in the socket's own
                 // family, which for a v4-mapped destination is AF_INET6
                 // even though the canonical `ip` is V4.
-                record_orig_dest(map, dup_fd.as_raw_fd(), sockaddr_is_ipv6(&addr_bytes), ip);
+                record_orig_dest(
+                    map,
+                    dup_fd.as_raw_fd(),
+                    sockaddr_is_ipv6(&addr_bytes),
+                    resolved_ip.unwrap_or(ip),
+                );
             }
         }
         connect_dup(dup_fd.as_raw_fd(), &plan.addr)
@@ -244,6 +306,127 @@ fn plan_connect_target(
     })
 }
 
+/// Resolve a wildcard-domain destination to a real address supervisor-side
+/// and re-verify it against the policy. `None` means the lookup found no
+/// address in the socket's family (fail closed — the sandboxed connect is
+/// refused, never silently passed through).
+///
+/// The re-verification keeps the hostname context (the wildcard rule is what
+/// permitted this destination, so the resolved address must be judged with
+/// that same context) and additionally refuses private/reserved addresses:
+/// a wildcard rule grants the *name*, never the network ranges it resolves
+/// to, so DNS rebinding cannot turn `*.example.com` into a reachable
+/// `127.0.0.1` / RFC1918 target (SSRF guard).
+pub(super) async fn resolve_wildcard_destination(
+    addr_bytes: &[u8],
+    effective: &NetworkPolicy,
+    port: Option<u16>,
+    hostname: &str,
+) -> Result<Option<IpAddr>, i32> {
+    let port = match port {
+        Some(p) => p,
+        // A TCP connect without a port cannot be a wildcard-domain target;
+        // refuse rather than guess.
+        None => return Err(ECONNREFUSED),
+    };
+    let is_ipv6 = sockaddr_is_ipv6(addr_bytes);
+    let mut resolved: Option<IpAddr> = None;
+    if let Ok(addrs) = tokio::net::lookup_host(format!("{}:{}", hostname, port)).await {
+        for sa in addrs {
+            let ip = sa.ip();
+            let family_ok = match ip {
+                IpAddr::V4(_) => !is_ipv6,
+                IpAddr::V6(_) => is_ipv6,
+            };
+            if family_ok {
+                resolved = Some(ip);
+                break;
+            }
+        }
+    }
+    let ip = match resolved {
+        Some(ip) => ip,
+        None => return Ok(None),
+    };
+    if is_private_or_reserved(ip) {
+        return Err(ECONNREFUSED);
+    }
+    if destination_verdict_with_host(effective, ip, Some(port), Some(hostname)).is_err() {
+        return Err(ECONNREFUSED);
+    }
+    Ok(Some(ip))
+}
+
+/// True when `ip` is a private/reserved/loopback/link-local address that a
+/// wildcard-resolved destination must never reach.
+pub(super) fn is_private_or_reserved(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let n = u32::from(v4);
+            n == 0
+                || n >> 24 == 10          // RFC1918 10/8
+                || n >> 20 == 0xAC1       // RFC1918 172.16/12
+                || n >> 16 == 0xC0A8      // RFC1918 192.168/16
+                || n >> 24 == 127         // loopback
+                || n >> 16 == 0xA9FE      // link-local 169.254/16
+                || n >> 22 == 0x191       // CGNAT 100.64/10
+                || n >> 24 >= 224         // multicast, reserved, broadcast
+        }
+        IpAddr::V6(v6) => {
+            let n = u128::from(v6);
+            n == 0
+                || n == 1                 // ::1
+                || n >> 120 == 0xFF       // multicast
+                || (n >> 120) & 0xFE == 0xFC // ULA fc00::/7
+                || n >> 118 == 0x3FA      // link-local fe80::/10
+                || (n >> 32 == 0xFFFF && is_private_or_reserved(IpAddr::V4(std::net::Ipv4Addr::from((n & 0xFFFF_FFFF) as u32))))
+        }
+    }
+}
+
+
+/// Rebuild a sockaddr with the same family and port as `addr_bytes` but a
+/// different destination IP. `None` when the family cannot carry `ip`
+/// (e.g. a v4 address on a plain AF_INET6 sockaddr).
+pub(super) fn rewrite_sockaddr_ip(addr_bytes: &[u8], ip: IpAddr) -> Option<Vec<u8>> {
+    let port = parse_port_from_sockaddr(addr_bytes)?;
+    if sockaddr_is_ipv6(addr_bytes) {
+        let mut sa6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        sa6.sin6_family = libc::AF_INET6 as u16;
+        sa6.sin6_port = port.to_be();
+        sa6.sin6_addr.s6_addr = match ip {
+            IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
+            IpAddr::V6(v6) => v6.octets(),
+        };
+        Some(
+            unsafe {
+                std::slice::from_raw_parts(
+                    &sa6 as *const _ as *const u8,
+                    std::mem::size_of::<libc::sockaddr_in6>(),
+                )
+            }
+            .to_vec(),
+        )
+    } else {
+        let IpAddr::V4(v4) = ip else {
+            return None;
+        };
+        let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        sa.sin_family = libc::AF_INET as u16;
+        sa.sin_port = port.to_be();
+        sa.sin_addr.s_addr = u32::from_ne_bytes(v4.octets());
+        Some(
+            unsafe {
+                std::slice::from_raw_parts(
+                    &sa as *const _ as *const u8,
+                    std::mem::size_of::<libc::sockaddr_in>(),
+                )
+            }
+            .to_vec(),
+        )
+    }
+}
+
 /// Execute-phase helper for a proxy redirect: bind an ephemeral local address
 /// on `fd` (port 0, any address) and read it back with getsockname(), then
 /// record (local addr, original destination IP) so the proxy can resolve the
@@ -342,6 +525,49 @@ fn connect_dup(fd: RawFd, addr: &[u8]) -> NotifAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- wildcard SSRF guard ---
+
+    #[test]
+    fn private_and_reserved_ranges_are_refused() {
+        for s in [
+            "0.0.0.0",
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.1.1",
+            "127.0.0.1",
+            "127.0.0.2",
+            "169.254.169.254",
+            "100.64.0.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "fc00::1",
+            "fd00::1",
+            "fe80::1",
+            "ff02::1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(
+                is_private_or_reserved(s.parse().unwrap()),
+                "{} should be refused",
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn public_addresses_are_allowed() {
+        for s in ["93.184.216.34", "8.8.8.8", "2001:4860:4860::8888"] {
+            assert!(
+                !is_private_or_reserved(s.parse().unwrap()),
+                "{} should be allowed",
+                s
+            );
+        }
+    }
 
     // --- plan_connect_target tests (connect decide phase) ---
 
@@ -463,4 +689,3 @@ mod tests {
     }
 
 }
-

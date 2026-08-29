@@ -4,6 +4,7 @@
 // `unix`; connected sends carry no destination and skip the verdict (the
 // connect was gated when it happened).
 
+use std::net::IpAddr;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
@@ -22,13 +23,65 @@ use super::unix::{
     sendto_pinned_unix_on_behalf, unix_sendmsg_gate,
 };
 use super::verdict::{
-    check_ip_destination, classify_send_path, path_under_any, DestShape, SendPath,
+    classify_send_path, destination_verdict_with_host, path_under_any, DestShape, SendPath,
 };
 use super::{query_socket_protocol, socket_is_unix, Protocol};
+use super::dns_synth::SyntheticDns;
 
 // ============================================================
 // sendto_on_behalf / sendmsg_on_behalf — on-behalf (TOCTOU-safe)
 // ============================================================
+
+/// Resolve a non-connected IP send destination that may be a registered
+/// synthetic address (UDP wildcard domains): reverse-look the hostname,
+/// apply the wildcard/IP verdict (with the DNS-gateway exemption), then —
+/// for a wildcard hostname — resolve the real destination supervisor-side,
+/// apply the SSRF guard, and rewrite the sockaddr to the real address.
+/// Ordinary destinations return `addr_bytes` unchanged.
+async fn resolve_send_destination(
+    ctx: &Arc<SupervisorCtx>,
+    pid: u32,
+    protocol: Protocol,
+    ip: IpAddr,
+    dest_port: Option<u16>,
+    addr_bytes: Vec<u8>,
+) -> Result<Vec<u8>, i32> {
+    let ns = ctx.network.lock().await;
+    // The sandbox's own DNS gateway must stay reachable regardless of the
+    // allowlist (the resolver's UDP query itself travels this path).
+    if ns.is_dns_gateway_dest(ip, dest_port) {
+        return Ok(addr_bytes);
+    }
+    let hostname = if SyntheticDns::is_synthetic_ip(ip) {
+        match ns.synthetic_dns.hostname_for(ip).await {
+            Some(h) => Some(h),
+            // R4: a direct send to an unregistered synthetic address is
+            // refused — the range exists only to carry hostnames.
+            None => return Err(ECONNREFUSED),
+        }
+    } else {
+        None
+    };
+    let live_policy = {
+        let pfs = ctx.policy_fn.lock().await;
+        pfs.live_policy.clone()
+    };
+    let effective = ns.effective_network_policy(pid, protocol, live_policy.as_ref());
+    drop(ns);
+    destination_verdict_with_host(&effective, ip, dest_port, hostname.as_deref())?;
+    let Some(host) = hostname else {
+        return Ok(addr_bytes);
+    };
+    match super::connect::resolve_wildcard_destination(&addr_bytes, &effective, dest_port, &host)
+        .await
+    {
+        Ok(Some(real_ip)) => {
+            super::connect::rewrite_sockaddr_ip(&addr_bytes, real_ip).ok_or(ECONNREFUSED)
+        }
+        Ok(None) => Err(ECONNREFUSED),
+        Err(e) => Err(e),
+    }
+}
 
 /// Perform sendto() on behalf of the child process (TOCTOU-safe).
 ///
@@ -81,9 +134,19 @@ pub(super) async fn sendto_on_behalf(
             Some(p) => p,
             None => return NotifAction::Errno(ECONNREFUSED),
         };
-        if let Err(e) = check_ip_destination(ctx, notif.pid, protocol, ip, dest_port).await {
-            return NotifAction::Errno(e);
-        }
+        let addr_bytes = match resolve_send_destination(
+            ctx,
+            notif.pid,
+            protocol,
+            ip,
+            dest_port,
+            addr_bytes,
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(e) => return NotifAction::Errno(e),
+        };
 
         // 3. Copy data buffer from child memory
         let data = match read_child_mem(notif_fd, notif.id, notif.pid, buf_ptr, buf_len) {
@@ -378,7 +441,7 @@ async fn send_msghdr_on_behalf(
     // null `msg_name` for a denied address. A non-connected entry has its IP
     // destination validated on the immune copy before the send.
     let connected = hdr.connected();
-    let addr_bytes = if connected {
+    let mut addr_bytes = if connected {
         Vec::new()
     } else {
         match super::read_sockaddr(notif_fd, notif.id, notif.pid, hdr.name_ptr, hdr.namelen as usize) {
@@ -397,7 +460,8 @@ async fn send_msghdr_on_behalf(
         // A non-connected IP send must have a resolved protocol to key the
         // per-protocol allowlist. If it couldn't be resolved, fail closed.
         let protocol = protocol.ok_or(ECONNREFUSED)?;
-        check_ip_destination(ctx, notif.pid, protocol, ip, dest_port).await?;
+        addr_bytes =
+            resolve_send_destination(ctx, notif.pid, protocol, ip, dest_port, addr_bytes).await?;
     }
 
     // Translate SCM_RIGHTS / reject creds only for a unix socket; an IP socket's

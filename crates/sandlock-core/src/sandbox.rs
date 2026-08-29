@@ -162,6 +162,7 @@ impl TryFrom<&Sandbox> for Confinement {
         if sandbox.http_key.is_some() { unsupported.push("http_key"); }
         if !sandbox.http_inject_ca.is_empty() { unsupported.push("http_inject_ca"); }
         if sandbox.http_ca_out.is_some() { unsupported.push("http_ca_out"); }
+        if sandbox.host_mask.is_some() { unsupported.push("host_mask"); }
         if sandbox.max_memory.is_some() { unsupported.push("max_memory"); }
         if sandbox.max_processes != 64 { unsupported.push("max_processes"); }
         if sandbox.max_open_files.is_some() { unsupported.push("max_open_files"); }
@@ -295,6 +296,10 @@ struct Runtime {
     io_overrides: Option<(Option<i32>, Option<i32>, Option<i32>)>,
     extra_fds: Vec<(i32, i32)>,
     http_acl_handle: Option<crate::transparent_proxy::HttpAclProxyHandle>,
+    dns_gateway_handle: Option<JoinHandle<()>>,
+    /// The sandbox's DNS gateway address — a per-sandbox loopback address
+    /// (``127.0.1.x``) in the default unprivileged shared-netns mode.
+    dns_gateway_addr: Option<std::net::Ipv4Addr>,
     #[allow(clippy::type_complexity)]
     on_bind: Option<Box<dyn Fn(&HashMap<u16, u16>) + Send + Sync>>,
     handlers: Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>,
@@ -308,6 +313,15 @@ struct Runtime {
     // The interactive child took the terminal's foreground process group at
     // spawn; whoever reaps it must hand the foreground back to this process.
     tty_foreground_taken: bool,
+}
+
+/// Abort the per-sandbox DNS gateway task (best-effort). The loopback
+/// `127.0.1.x:53` listener dies with it, so a sandbox teardown does not leak
+/// a stale nameserver.
+fn abort_dns_gateway(rt: &mut Runtime) {
+    if let Some(h) = rt.dns_gateway_handle.take() {
+        h.abort();
+    }
 }
 
 /// A COW branch (one `upper` over the workdir) shared by every stage of a
@@ -459,6 +473,14 @@ pub struct Sandbox {
     /// Path to write the active MITM CA public cert (PEM) for external trust
     /// wiring (e.g. NODE_EXTRA_CA_CERTS). Never writes the private key.
     pub http_ca_out: Option<PathBuf>,
+    /// Mask the outbound `Host`/authority for every request the HTTP ACL proxy
+    /// forwards. The token ``${PORT}`` (if present) is replaced with the
+    /// request's destination port, so ``localhost:${PORT}`` maps a request to
+    /// ``127.0.0.1:8080`` onto ``Host: localhost:8080``. Matches the official
+    /// ``maskRequestHost`` semantics: the upstream sees the masked host while
+    /// the sandboxed child keeps addressing the real destination.
+    #[serde(default)]
+    pub host_mask: Option<String>,
     /// Optional observation callback for HTTP learn mode. When set the proxy is
     /// spawned even without ACL rules; every request is logged via this closure.
     #[serde(skip)]
@@ -622,6 +644,7 @@ impl Clone for Sandbox {
             http_key: self.http_key.clone(),
             http_inject_ca: self.http_inject_ca.clone(),
             http_ca_out: self.http_ca_out.clone(),
+            host_mask: self.host_mask.clone(),
             http_log_fn: self.http_log_fn.clone(),
             max_memory: self.max_memory,
             max_processes: self.max_processes,
@@ -935,6 +958,8 @@ impl Sandbox {
         if let Some(h) = rt.throttle_handle.take() { h.abort(); }
         if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
         if let Some(h) = rt.control_handle.take() { h.abort(); }
+
+        abort_dns_gateway(rt);
 
         // Clean up the per-sandbox runtime dir on normal exit.
         if let Some(ref dir) = rt.control_dir {
@@ -1533,6 +1558,8 @@ impl Sandbox {
                 io_overrides: None,
                 extra_fds: Vec::new(),
                 http_acl_handle: None,
+                dns_gateway_handle: None,
+                dns_gateway_addr: None,
                 on_bind: None,
                 handlers: Vec::new(),
                 ready_w: None,
@@ -1636,6 +1663,8 @@ impl Sandbox {
             io_overrides: None,
             extra_fds: Vec::new(),
             http_acl_handle: None,
+            dns_gateway_handle: None,
+            dns_gateway_addr: None,
             on_bind: None,
             handlers: Vec::new(),
             ready_w: None,
@@ -1760,7 +1789,12 @@ impl Sandbox {
         );
 
         let mut ca_inject_pem: Option<std::sync::Arc<Vec<u8>>> = None;
-        if !self.http_allow.is_empty() || !self.http_deny.is_empty() || self.http_log_fn.is_some() {
+        let http_acl_active = !self.http_allow.is_empty()
+            || !self.http_deny.is_empty()
+            || self.http_log_fn.is_some();
+        let mut ca_cert_pem: Option<String> = None;
+        let mut ca_key_pem: Option<String> = None;
+        if http_acl_active {
             // Generate an ephemeral CA when injection is requested without BYO.
             let generate = !self.http_inject_ca.is_empty();
             let ca_material = crate::transparent_proxy::resolve_ca(
@@ -1782,22 +1816,10 @@ impl Sandbox {
                 }
             }
 
-            let (cert_pem, key_pem) = match ca_material.as_ref() {
-                Some(cm) => (Some(cm.cert_pem.as_str()), Some(cm.key_pem.as_str())),
-                None => (None, None),
-            };
-
-            let handle = crate::transparent_proxy::spawn_transparent_proxy(
-                self.http_allow.clone(),
-                self.http_deny.clone(),
-                std::sync::Arc::clone(&self.inject),
-                cert_pem,
-                key_pem,
-                self.http_log_fn.clone(),
-            )
-            .await
-            .map_err(SandboxRuntimeError::Io)?;
-            self.rt_mut().http_acl_handle = Some(handle);
+            if let Some(cm) = ca_material.as_ref() {
+                ca_cert_pem = Some(cm.cert_pem.clone());
+                ca_key_pem = Some(cm.key_pem.clone());
+            }
         }
 
         // Seccomp COW: create the branch before fork so the child's Landlock
@@ -2051,6 +2073,66 @@ impl Sandbox {
             Some(unsafe { OwnedFd::from_raw_fd(raw) })
         };
 
+        // ---- DNS gateway (after the notif-fd read) ----
+        //
+        // Wildcard-domain rules are served by a per-sandbox DNS gateway on
+        // `<gateway>:53`: a loopback address (`127.0.1.x`, since resolv.conf
+        // cannot express a port). The gateway answers wildcard-suffix A
+        // queries with synthetic IPs and forwards the rest upstream so
+        // normal DNS keeps working; /etc/resolv.conf is virtualized to point
+        // at it.
+        let wildcard_suffixes: Vec<(String, crate::seccomp::notif::PortAllow)> =
+            resolved_net_allow
+                .tcp
+                .wildcard_domains
+                .iter()
+                .chain(resolved_net_allow.udp.wildcard_domains.iter())
+                .cloned()
+                .collect();
+        let need_gateway = !wildcard_suffixes.is_empty();
+        let mut gateway_synthetic_dns: Option<crate::network::dns_synth::SyntheticDns> = None;
+        let virtual_resolv_conf = if need_gateway {
+            use crate::network::dns_gateway::{run_dns_gateway, worker_upstream_resolver};
+
+            let gateway_ip = crate::network::dns_synth::allocate_gateway_addr().ok_or_else(|| {
+                    SandboxRuntimeError::Child(
+                        "per-sandbox DNS gateway pool exhausted (127.0.1.0/24)".into(),
+                    )
+                })?;
+            let dns = crate::network::dns_synth::SyntheticDns::new();
+            gateway_synthetic_dns = Some(dns.clone());
+            let gateway_addr = std::net::SocketAddr::from((gateway_ip, 53));
+            let upstream = worker_upstream_resolver();
+            let dns_sock = tokio::net::UdpSocket::bind(gateway_addr)
+                .await
+                .map_err(|e| SandboxRuntimeError::Child(format!("bind DNS gateway: {}", e)))?;
+            let gateway_handle =
+                tokio::spawn(run_dns_gateway(dns_sock, wildcard_suffixes, dns, upstream));
+            self.rt_mut().dns_gateway_handle = Some(gateway_handle);
+            self.rt_mut().dns_gateway_addr = Some(gateway_ip);
+            Some(format!(
+                "nameserver {}\noptions ndots:0 timeout:1 attempts:1\n",
+                gateway_ip
+            ))
+        } else {
+            None
+        };
+        // The HTTP ACL proxy is spawned now; it binds loopback and the
+        // sandbox's on-behalf connections (shared worker netns) reach it.
+        if http_acl_active {
+            let handle = crate::transparent_proxy::spawn_transparent_proxy(
+                self.http_allow.clone(),
+                self.http_deny.clone(),
+                std::sync::Arc::clone(&self.inject),
+                ca_cert_pem.as_deref(),
+                ca_key_pem.as_deref(),
+                self.http_log_fn.clone(),
+                self.host_mask.as_deref(),
+            )
+            .await
+            .map_err(SandboxRuntimeError::Io)?;
+            self.rt_mut().http_acl_handle = Some(handle);
+        }
         if let Some(notif_fd) = notif_fd {
             // Set up the per-sandbox runtime dir and control socket.  Must
             // happen before the notif supervisor is spawned so the socket
@@ -2140,6 +2222,7 @@ impl Sandbox {
                 virtual_hostname: Some(rt_name),
                 has_http_acl: resolved.features.http_acl,
                 virtual_etc_hosts,
+                virtual_resolv_conf,
                 ca_inject_paths: self.http_inject_ca.clone(),
                 ca_inject_pem: ca_inject_pem.clone(),
             };
@@ -2181,6 +2264,7 @@ impl Sandbox {
                             per_ip,
                             cidrs: resolved.cidrs.clone(),
                             any_ip_ports: resolved.any_ip_ports.clone(),
+                            wildcard_domains: resolved.wildcard_domains.clone(),
                         }
                     }
                 };
@@ -2191,6 +2275,13 @@ impl Sandbox {
             net_state.http_acl_addr = self.rt().http_acl_handle.as_ref().map(|h| h.addr);
             net_state.http_acl_ports = self.http_ports.iter().copied().collect();
             net_state.http_acl_orig_dest = self.rt().http_acl_handle.as_ref().map(|h| h.orig_dest.clone());
+            net_state.synthetic_dns =
+                gateway_synthetic_dns
+                    .unwrap_or_else(crate::network::dns_synth::SyntheticDns::new);
+            net_state.dns_gateway_addr = self
+                .rt()
+                .dns_gateway_addr
+                .map(|ip| std::net::SocketAddr::from((ip, 53)));
             net_state.bind_deny_ports = self.net_deny_bind.iter().copied().collect();
             if let Some(cb) = self.rt_mut().on_bind.take() {
                 net_state.port_map.on_bind = Some(cb);
@@ -2274,6 +2365,7 @@ impl Sandbox {
             let chroot_state = Arc::new(tokio::sync::Mutex::new(chroot_state));
             let processes = Arc::new(crate::seccomp::state::ProcessIndex::new());
 
+            let netlink_state = Arc::new(crate::netlink::NetlinkState::new());
             let ctx = Arc::new(SupervisorCtx {
                 resource: Arc::clone(&res_state),
                 cow: Arc::clone(&cow_state),
@@ -2282,7 +2374,7 @@ impl Sandbox {
                 time_random: Arc::clone(&time_random_state),
                 policy_fn: Arc::clone(&policy_fn_state),
                 chroot: Arc::clone(&chroot_state),
-                netlink: Arc::new(crate::netlink::NetlinkState::new()),
+                netlink: netlink_state,
                 processes: Arc::clone(&processes),
                 policy: Arc::new(notif_policy),
                 child_pidfd: child_pidfd_raw,
@@ -2501,6 +2593,8 @@ impl Drop for Sandbox {
             if let Some(h) = rt.throttle_handle.take() { h.abort(); }
             if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
             if let Some(h) = rt.control_handle.take() { h.abort(); }
+
+            abort_dns_gateway(rt);
 
             // Nobody is left to collect these; aborting closes the read ends.
             // A drain that already finished holds only bytes, dropped with the

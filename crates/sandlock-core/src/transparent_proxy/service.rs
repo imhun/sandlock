@@ -34,6 +34,11 @@ pub(crate) struct AclService {
     pub(crate) allow: Arc<Vec<HttpRule>>,
     pub(crate) deny: Arc<Vec<HttpRule>>,
     pub(crate) inject: Arc<Vec<InjectRule>>,
+    /// When set, every forwarded request's wire `Host` header is rewritten to
+    /// this mask (`${PORT}` is replaced with the destination port). The child
+    /// keeps addressing the real destination; only the upstream sees the
+    /// masked host.
+    pub(crate) host_mask: Option<String>,
     pub(crate) orig_dest: OrigDestMap,
     pub(crate) forwarder: Forwarder,
     dns_cache: Arc<Mutex<HashMap<String, DnsEntry>>>,
@@ -52,6 +57,31 @@ pub(crate) struct AclService {
 /// contract is unit-tested without capturing the supervisor's stderr.
 fn first_cleartext_warn(scheme: &str, seen: &AtomicBool) -> bool {
     scheme == "http" && !seen.swap(true, Ordering::Relaxed)
+}
+
+/// Compute the masked authority for an outbound request.
+///
+/// ``${PORT}`` (if present) is replaced with the request's destination port —
+/// the explicit port when the original authority carries one, otherwise the
+/// scheme default (80 for http, 443 for https). The result must parse as a
+/// hyper [`Authority`]; `Err(())` means the mask is invalid and the caller
+/// must fail the request rather than forward an unparseable host.
+fn masked_authority(
+    authority: &hyper::http::uri::Authority,
+    scheme: &str,
+    mask: &str,
+) -> Result<hyper::http::uri::Authority, ()> {
+    use hyper::http::uri::Authority;
+
+    let port = authority.port_u16().unwrap_or_else(|| {
+        if scheme == "https" {
+            443
+        } else {
+            80
+        }
+    });
+    let masked = mask.replace("${PORT}", &port.to_string());
+    masked.parse::<Authority>().map_err(|_| ())
 }
 
 /// The single upstream authority for a request, or `Err` if it is missing,
@@ -99,11 +129,13 @@ impl AclService {
         orig_dest: OrigDestMap,
         forwarder: Forwarder,
         log_fn: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
+        host_mask: Option<String>,
     ) -> Self {
         Self {
             allow: Arc::new(allow),
             deny: Arc::new(deny),
             inject,
+            host_mask,
             orig_dest,
             forwarder,
             dns_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -219,6 +251,27 @@ impl AclService {
 
         let (mut parts, body) = req.into_parts();
         parts.uri = uri;
+        // Mask the wire Host header: compute the masked authority up front so
+        // an invalid mask fails the request (fail closed) rather than being
+        // silently forwarded unmasked. The URI keeps the real authority
+        // because it also drives the upstream connection (hyper-util keeps an
+        // explicitly-set Host header, so only the wire value changes).
+        if let Some(mask) = &self.host_mask {
+            let masked = match masked_authority(&authority, scheme, mask) {
+                Ok(a) => a,
+                Err(()) => {
+                    return text_response(
+                        StatusCode::BAD_GATEWAY,
+                        "Blocked by sandlock: invalid host mask",
+                    );
+                }
+            };
+            if let Ok(v) = hyper::header::HeaderValue::from_str(masked.as_str()) {
+                parts.headers.insert("host", v);
+            } else {
+                return text_response(StatusCode::BAD_GATEWAY, "invalid host mask");
+            }
+        }
 
         // ACL passed: attach a credential if a rule matches. First match wins.
         // The secret is rendered into the outbound request only here — never on
@@ -289,7 +342,7 @@ fn text_response(status: StatusCode, msg: &str) -> Response<BoxBody<Bytes, BoxEr
 
 #[cfg(test)]
 mod tests {
-    use super::{first_cleartext_warn, request_authority};
+    use super::{first_cleartext_warn, masked_authority, request_authority};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
@@ -332,5 +385,56 @@ mod tests {
 
         // A request with no host at all is rejected (fail closed).
         assert!(authority_of("/v1", None).is_err());
+    }
+
+    fn authority(s: &str) -> hyper::http::uri::Authority {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn masked_authority_substitutes_port() {
+        assert_eq!(
+            masked_authority(&authority("127.0.0.1:8080"), "http", "localhost:${PORT}")
+                .unwrap()
+                .as_str(),
+            "localhost:8080"
+        );
+        // Explicit ports win; otherwise the scheme default is used.
+        assert_eq!(
+            masked_authority(&authority("example.com:443"), "https", "api.internal:${PORT}")
+                .unwrap()
+                .as_str(),
+            "api.internal:443"
+        );
+        assert_eq!(
+            masked_authority(&authority("example.com"), "https", "api.internal:${PORT}")
+                .unwrap()
+                .as_str(),
+            "api.internal:443"
+        );
+        assert_eq!(
+            masked_authority(&authority("example.com"), "http", "api.internal:${PORT}")
+                .unwrap()
+                .as_str(),
+            "api.internal:80"
+        );
+    }
+
+    #[test]
+    fn masked_authority_without_port_token() {
+        assert_eq!(
+            masked_authority(&authority("example.com:8443"), "https", "gateway.internal")
+                .unwrap()
+                .as_str(),
+            "gateway.internal"
+        );
+    }
+
+    #[test]
+    fn masked_authority_rejects_invalid_masks() {
+        // Space / scheme / empty are not valid authorities → Err (fail closed).
+        assert!(masked_authority(&authority("example.com"), "https", "bad host").is_err());
+        assert!(masked_authority(&authority("example.com"), "https", "http://x.com").is_err());
+        assert!(masked_authority(&authority("example.com"), "https", "").is_err());
     }
 }

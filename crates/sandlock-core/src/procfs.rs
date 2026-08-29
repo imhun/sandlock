@@ -633,11 +633,56 @@ pub(crate) fn handle_etc_hosts_open(
     chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
     processes: &ProcessIndex,
 ) -> Option<NotifAction> {
+    handle_virtual_file_open(
+        notif,
+        std::path::Path::new("/etc/hosts"),
+        etc_hosts_content,
+        notif_fd,
+        chroot_root,
+        chroot_mounts,
+        processes,
+    )
+}
+
+/// Intercept any `open`/`openat`/`openat2` of `/etc/resolv.conf` and return
+/// a memfd pointing at the sandbox's DNS gateway. Only active in per-sandbox
+/// netns mode, so wildcard-domain lookups reach the supervisor's gateway
+/// instead of the host resolver.
+pub(crate) fn handle_resolv_conf_open(
+    notif: &SeccompNotif,
+    resolv_conf_content: &str,
+    notif_fd: RawFd,
+    chroot_root: Option<&std::path::Path>,
+    chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
+    processes: &ProcessIndex,
+) -> Option<NotifAction> {
+    handle_virtual_file_open(
+        notif,
+        std::path::Path::new("/etc/resolv.conf"),
+        resolv_conf_content,
+        notif_fd,
+        chroot_root,
+        chroot_mounts,
+        processes,
+    )
+}
+
+/// Shared implementation: if the open target resolves to `virtual_path`,
+/// return a memfd with `content`; otherwise fall through.
+fn handle_virtual_file_open(
+    notif: &SeccompNotif,
+    virtual_path: &std::path::Path,
+    content: &str,
+    notif_fd: RawFd,
+    chroot_root: Option<&std::path::Path>,
+    chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
+    processes: &ProcessIndex,
+) -> Option<NotifAction> {
     let resolved = resolve_open_target(notif, notif_fd, chroot_root, chroot_mounts, processes)?;
-    if resolved != std::path::Path::new("/etc/hosts") {
+    if resolved != virtual_path {
         return None;
     }
-    Some(inject_memfd(etc_hosts_content.as_bytes()))
+    Some(inject_memfd(content.as_bytes()))
 }
 
 /// Resolve the path argument of an open-family syscall (`open`, `openat`,

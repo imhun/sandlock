@@ -475,6 +475,38 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
+    // /etc/resolv.conf virtualization: the sandbox gets a memfd pointing at
+    // its loopback DNS gateway so wildcard-domain lookups hit the
+    // supervisor's gateway. Only active when the gateway exists; registered
+    // before chroot so the memfd wins over the image's file.
+    // ------------------------------------------------------------------
+    if let Some(resolv_conf) = policy.virtual_resolv_conf.clone() {
+        for nr in open_family_syscalls() {
+            let resolv_conf = resolv_conf.clone();
+            let policy_hosts = Arc::clone(policy);
+            let processes_for_open = Arc::clone(&ctx.processes);
+            table.register(nr, move |cx: &HandlerCtx| {
+                let notif = cx.notif;
+                let notif_fd = cx.notif_fd;
+                let resolv_conf = resolv_conf.clone();
+                let policy = Arc::clone(&policy_hosts);
+                let processes = Arc::clone(&processes_for_open);
+                async move {
+                    if let Some(action) = crate::procfs::handle_resolv_conf_open(
+                        &notif, &resolv_conf, notif_fd,
+                        policy.chroot_root.as_deref(), &policy.chroot_mounts,
+                        &processes,
+                    ) {
+                        action
+                    } else {
+                        NotifAction::Continue
+                    }
+                }
+            });
+        }
+    }
+
+    // ------------------------------------------------------------------
     // CA injection: splice the active MITM CA into user-declared trust
     // bundles. Registered before chroot/COW so the substituted memfd wins
     // over a real open of the bundle file. Only active when MITM is on and
@@ -1150,6 +1182,7 @@ mod handler_tests {
                 virtual_hostname: None,
                 has_http_acl: false,
                 virtual_etc_hosts: String::new(),
+                virtual_resolv_conf: None,
                 ca_inject_paths: Vec::new(),
                 ca_inject_pem: None,
             }),

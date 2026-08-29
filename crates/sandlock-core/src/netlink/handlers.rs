@@ -131,7 +131,7 @@ pub async fn handle_socket(
     // same process (glibc compares incoming nlmsg_pid against the value
     // it read back from getsockname — they must agree).
     let tgid = tgid_of(notif.pid as i32);
-    proxy::spawn_responder(responder_fd, tgid as u32);
+    proxy::spawn_responder(responder_fd, tgid as u32, Arc::clone(state));
 
     // Record the (tgid, fd) once the kernel's ADDFD ioctl returns the
     // child-side fd number.  Doing it from the on-success callback
