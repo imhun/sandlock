@@ -91,6 +91,7 @@ _b_net_allow = _builder_fn("sandlock_sandbox_builder_net_allow", ctypes.c_char_p
 _b_net_deny = _builder_fn("sandlock_sandbox_builder_net_deny", ctypes.c_char_p)
 _b_net_allow_bind = _builder_fn("sandlock_sandbox_builder_net_allow_bind", ctypes.c_char_p)
 _b_net_deny_bind = _builder_fn("sandlock_sandbox_builder_net_deny_bind", ctypes.c_char_p)
+_b_netns = _builder_fn("sandlock_sandbox_builder_netns", ctypes.c_bool)
 _b_port_remap = _builder_fn("sandlock_sandbox_builder_port_remap", ctypes.c_bool)
 _b_http_allow = _builder_fn("sandlock_sandbox_builder_http_allow", ctypes.c_char_p)
 _b_http_deny = _builder_fn("sandlock_sandbox_builder_http_deny", ctypes.c_char_p)
@@ -1025,7 +1026,7 @@ class _NativePolicy:
         "max_memory", "max_disk", "max_processes", "max_cpu", "num_cpus",
         "cpu_cores", "gpu_devices",
         "net_allow", "net_deny", "net_allow_bind", "net_deny_bind",
-        "port_remap",
+        "port_remap", "netns",
         "http_allow", "http_deny", "http_ports", "http_ca", "http_key",
         "uid",
         "random_seed", "time_start", "clean_env", "env",
@@ -1115,6 +1116,8 @@ class _NativePolicy:
             b = _b_net_allow_bind(b, _encode(str(spec)))
         for spec in (policy.net_deny_bind or []):
             b = _b_net_deny_bind(b, _encode(str(spec)))
+        if policy.netns:
+            b = _b_netns(b, True)
 
         for rule in (policy.http_allow or []):
             b = _b_http_allow(b, _encode(str(rule)))

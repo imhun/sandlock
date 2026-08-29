@@ -208,6 +208,12 @@ class Sandbox:
     outbound. HTTP rules with concrete hosts auto-add a matching TCP entry
     on :attr:`http_ports`. See README "Network Model" for details."""
 
+    netns: bool = field(default=False)
+    """Run the sandbox in its own network namespace (veth pair + gateway
+    DNS). Isolates the sandbox's loopback from the host and is required for
+    wildcard-domain rules (``*.example.com``) to resolve inside the sandbox.
+    Requires ``CAP_NET_ADMIN`` + ``CAP_SYS_ADMIN`` in the supervisor."""
+
     net_deny: Sequence[str] = field(default_factory=list)
     """Outbound endpoint denylist: default-allow networking, block these
     targets. The inverse of :attr:`net_allow` and **mutually exclusive**

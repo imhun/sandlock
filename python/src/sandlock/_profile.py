@@ -94,6 +94,7 @@ _SECTIONS: dict[str, dict[str, tuple[str | None, type]]] = {
         "allow":      ("net_allow",  list),
         "deny":       ("net_deny",   list),
         "port_remap": ("port_remap", bool),
+        "netns":      ("netns",      bool),
     },
     "http": {
         "ports": ("http_ports", list),

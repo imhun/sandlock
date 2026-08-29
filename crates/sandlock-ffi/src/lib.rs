@@ -831,6 +831,20 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_no_coredump(
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_netns(
+    b: *mut SandboxBuilder,
+    v: bool,
+) -> *mut SandboxBuilder {
+    if b.is_null() {
+        return b;
+    }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.netns(v)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_deterministic_dirs(
     b: *mut SandboxBuilder,
     v: bool,
