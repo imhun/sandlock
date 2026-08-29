@@ -20,7 +20,8 @@ Rust CLI). Each section maps to a subset of ``Sandbox`` fields:
                     cannot express a read-only mount at all)
     [network]     → net_allow_bind (allow_bind), net_deny_bind (deny_bind), net_allow (allow), net_deny (deny), port_remap
     [http]        → http_ports (ports), http_allow (allow),
-                    http_deny (deny)
+                    http_deny (deny), http_inject (inject), host_mask
+                    (host_mask)
     [syscalls]    → extra_allow_syscalls (extra_allow),
                     extra_deny_syscalls (extra_deny)
     [limits]      → max_memory (memory), max_processes (processes),
@@ -97,9 +98,11 @@ _SECTIONS: dict[str, dict[str, tuple[str | None, type]]] = {
         "netns":      ("netns",      bool),
     },
     "http": {
-        "ports": ("http_ports", list),
-        "allow": ("http_allow", list),
-        "deny":  ("http_deny",  list),
+        "ports":     ("http_ports", list),
+        "allow":     ("http_allow", list),
+        "deny":      ("http_deny",  list),
+        "inject":    ("http_inject", list),
+        "host_mask": ("host_mask",  str),
     },
     "syscalls": {
         "extra_allow": ("extra_allow_syscalls", list),

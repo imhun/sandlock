@@ -528,6 +528,21 @@ sandlock_builder_t *sandlock_sandbox_builder_http_deny(sandlock_builder_t *b, co
 
 /**
  * # Safety
+ * `b`, `name`, and `source` must be valid pointers.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_credential(sandlock_builder_t *b,
+                                                        const char *name,
+                                                        const char *source);
+
+/**
+ * # Safety
+ * `b` and `rule` must be valid pointers.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_http_auth(sandlock_builder_t *b,
+                                                       const char *rule);
+
+/**
+ * # Safety
  * `b` must be a valid pointer.
  */
 sandlock_builder_t *sandlock_sandbox_builder_http_port(sandlock_builder_t *b, uint16_t port);
@@ -556,6 +571,12 @@ sandlock_builder_t *sandlock_sandbox_builder_http_inject_ca(sandlock_builder_t *
  * `b` and `path` must be valid pointers.
  */
 sandlock_builder_t *sandlock_sandbox_builder_http_ca_out(sandlock_builder_t *b, const char *path);
+
+/**
+ * # Safety
+ * `b` and `mask` must be valid pointers.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_host_mask(sandlock_builder_t *b, const char *mask);
 
 /**
  * # Safety

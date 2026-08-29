@@ -565,6 +565,74 @@ fn spawn_capturing_http_server() -> (
     (port, handle, captured)
 }
 
+/// Like [`spawn_capturing_http_server`], but captures the `Host` header
+/// instead of `Authorization` — used by the host-mask test.
+fn spawn_host_capturing_http_server() -> (
+    u16,
+    thread::JoinHandle<()>,
+    std::sync::Arc<std::sync::Mutex<Option<String>>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let cap = captured.clone();
+    let handle = thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                if line.to_lowercase().starts_with("host:") {
+                    *cap.lock().unwrap() =
+                        Some(line.split_once(':').unwrap().1.trim().to_string());
+                }
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+            }
+            let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (port, handle, captured)
+}
+
+/// maskRequestHost semantics: the proxy rewrites only the wire `Host` header —
+/// the child keeps addressing the real destination and the upstream sees the
+/// masked host with `${PORT}` replaced.
+#[tokio::test]
+async fn test_host_mask_rewrites_upstream_host() {
+    let out = temp_file("host-mask");
+    let (port, srv, captured) = spawn_host_capturing_http_server();
+
+    let mut policy = base_policy()
+        .http_allow("GET 127.0.0.1/*")
+        .http_port(port)
+        .host_mask("internal.test:${PORT}")
+        .build()
+        .unwrap();
+
+    let script = http_script(&format!("http://127.0.0.1:{}/data", port), &out);
+    let result = policy.run_interactive(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "exit={:?}", result.code());
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(content.starts_with("OK:200"), "child request should succeed, got: {}", content);
+
+    srv.join().unwrap();
+    let got = captured.lock().unwrap().clone();
+    let _ = std::fs::remove_file(&out);
+
+    assert_eq!(
+        got.as_deref(),
+        Some(format!("internal.test:{port}").as_str()),
+        "upstream must see the masked Host (got {got:?})"
+    );
+}
+
 /// A credential declared in the supervisor is injected into the outbound request
 /// inside the proxy — the child never carries it in env/argv/headers — and
 /// reaches the upstream, after the ACL check.

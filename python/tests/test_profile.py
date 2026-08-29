@@ -120,11 +120,27 @@ class TestPolicyFromDict:
                 "ports": [80, 443],
                 "allow": ["GET api.internal/v1/*"],
                 "deny": ["* */admin/*"],
+                "inject": [{
+                    "matcher": "GET api.internal/v1/*",
+                    "auth": "bearer",
+                    "secret": "env:API_KEY",
+                    "name": "key",
+                    "on_existing": "replace",
+                }],
+                "host_mask": "localhost:${PORT}",
             },
         })
         assert list(p.http_ports) == [80, 443]
         assert list(p.http_allow) == ["GET api.internal/v1/*"]
         assert list(p.http_deny) == ["* */admin/*"]
+        assert list(p.http_inject) == [{
+            "matcher": "GET api.internal/v1/*",
+            "auth": "bearer",
+            "secret": "env:API_KEY",
+            "name": "key",
+            "on_existing": "replace",
+        }]
+        assert p.host_mask == "localhost:${PORT}"
 
     def test_syscalls_section(self):
         p = policy_from_dict({

@@ -162,6 +162,7 @@ impl TryFrom<&Sandbox> for Confinement {
         if sandbox.http_key.is_some() { unsupported.push("http_key"); }
         if !sandbox.http_inject_ca.is_empty() { unsupported.push("http_inject_ca"); }
         if sandbox.http_ca_out.is_some() { unsupported.push("http_ca_out"); }
+        if sandbox.host_mask.is_some() { unsupported.push("host_mask"); }
         if sandbox.max_memory.is_some() { unsupported.push("max_memory"); }
         if sandbox.max_processes != 64 { unsupported.push("max_processes"); }
         if sandbox.max_open_files.is_some() { unsupported.push("max_open_files"); }
@@ -483,6 +484,14 @@ pub struct Sandbox {
     /// Path to write the active MITM CA public cert (PEM) for external trust
     /// wiring (e.g. NODE_EXTRA_CA_CERTS). Never writes the private key.
     pub http_ca_out: Option<PathBuf>,
+    /// Mask the outbound `Host`/authority for every request the HTTP ACL proxy
+    /// forwards. The token ``${PORT}`` (if present) is replaced with the
+    /// request's destination port, so ``localhost:${PORT}`` maps a request to
+    /// ``127.0.0.1:8080`` onto ``Host: localhost:8080``. Matches the official
+    /// ``maskRequestHost`` semantics: the upstream sees the masked host while
+    /// the sandboxed child keeps addressing the real destination.
+    #[serde(default)]
+    pub host_mask: Option<String>,
     /// Optional observation callback for HTTP learn mode. When set the proxy is
     /// spawned even without ACL rules; every request is logged via this closure.
     #[serde(skip)]
@@ -647,6 +656,7 @@ impl Clone for Sandbox {
             http_key: self.http_key.clone(),
             http_inject_ca: self.http_inject_ca.clone(),
             http_ca_out: self.http_ca_out.clone(),
+            host_mask: self.host_mask.clone(),
             http_log_fn: self.http_log_fn.clone(),
             max_memory: self.max_memory,
             max_processes: self.max_processes,
@@ -2230,6 +2240,7 @@ impl Sandbox {
                 ca_key_pem.as_deref(),
                 self.http_log_fn.clone(),
                 proxy_bind_ip,
+                self.host_mask.as_deref(),
             )
             .await
             .map_err(SandboxRuntimeError::Io)?;

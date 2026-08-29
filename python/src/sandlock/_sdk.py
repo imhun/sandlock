@@ -71,6 +71,102 @@ def _builder_fn(name, *extra_args):
     fn.argtypes = [_c_builder_p] + list(extra_args)
     return fn
 
+
+_SECRET_PREFIXES = ("env:", "file:", "fd:")
+
+
+def _serialize_http_inject(rule, index: int) -> tuple[str, str, str]:
+    """Validate one ``http_inject`` dict and serialize it to the native
+    ``(name, source)`` credential + ``METHOD HOST/PATH AUTHSPEC NAME`` rule.
+
+    Returns ``(name, secret_source, http_auth_rule)``; raises ``ValueError``
+    with a precise message for any malformed entry.
+    """
+    if not isinstance(rule, dict):
+        raise ValueError(
+            f"http_inject[{index}] must be a dict, got {type(rule).__name__}"
+        )
+    unknown = set(rule) - {"matcher", "auth", "secret", "name", "on_existing"}
+    if unknown:
+        raise ValueError(
+            f"http_inject[{index}] unknown field(s): {sorted(unknown)}"
+        )
+
+    matcher = rule.get("matcher")
+    if not isinstance(matcher, str) or not matcher.strip():
+        raise ValueError(
+            f"http_inject[{index}].matcher must be a non-empty string "
+            f'("HOST", "HOST/PATH", or "METHOD HOST/PATH")'
+        )
+    matcher = " ".join(matcher.split())
+    tokens = matcher.split()
+    if len(tokens) == 1:
+        # Bare host (optionally with path): default method `*`.
+        host_path = tokens[0]
+        matcher = f"* {host_path}" if "/" in host_path else f"* {host_path}/*"
+    elif len(tokens) == 2:
+        pass  # already "METHOD HOST/PATH"
+    else:
+        raise ValueError(
+            f"http_inject[{index}].matcher must be "
+            f'"HOST", "HOST/PATH", or "METHOD HOST/PATH", got {matcher!r}'
+        )
+
+    auth = rule.get("auth")
+    if not isinstance(auth, str) or not auth.strip():
+        raise ValueError(f"http_inject[{index}].auth must be a non-empty string")
+    auth = auth.strip()
+    if auth == "bearer":
+        pass
+    elif auth.startswith(("basic:", "header:", "apikey:", "query:")):
+        _, _, arg = auth.partition(":")
+        if not arg:
+            raise ValueError(
+                f"http_inject[{index}].auth {auth!r} requires a non-empty argument"
+            )
+    else:
+        raise ValueError(
+            f"http_inject[{index}].auth must be one of "
+            '"bearer", "basic:<user>", "header:<name>", "apikey:<name>", '
+            f'"query:<param>", got {auth!r}'
+        )
+
+    secret = rule.get("secret")
+    if not isinstance(secret, str):
+        raise ValueError(f"http_inject[{index}].secret must be a string")
+    secret = secret.strip()
+    if secret.startswith("literal:"):
+        raise ValueError(
+            f"http_inject[{index}].secret 'literal:' is rejected (it leaks via "
+            "ps / shell history); use env:VAR, file:/path, or fd:N"
+        )
+    kind, _, val = secret.partition(":")
+    if kind not in ("env", "file", "fd") or not val:
+        raise ValueError(
+            f"http_inject[{index}].secret must be env:VAR, file:/path, or "
+            f"fd:N, got {secret!r}"
+        )
+
+    name = rule.get("name")
+    if name is None:
+        name = f"inject{index}"
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"http_inject[{index}].name must be a non-empty string")
+    name = name.strip()
+
+    on_existing = rule.get("on_existing", "replace")
+    if on_existing not in ("replace", "add-only"):
+        raise ValueError(
+            f"http_inject[{index}].on_existing must be "
+            f"'replace' or 'add-only', got {on_existing!r}"
+        )
+
+    rule_str = f"{matcher} {auth} {name}"
+    if on_existing == "add-only":
+        rule_str = f"{rule_str} add-only"
+    return name, secret, rule_str
+
+
 _b_fs_read = _builder_fn("sandlock_sandbox_builder_fs_read", ctypes.c_char_p)
 _b_fs_write = _builder_fn("sandlock_sandbox_builder_fs_write", ctypes.c_char_p)
 _b_fs_deny = _builder_fn("sandlock_sandbox_builder_fs_deny", ctypes.c_char_p)
@@ -95,11 +191,16 @@ _b_netns = _builder_fn("sandlock_sandbox_builder_netns", ctypes.c_bool)
 _b_port_remap = _builder_fn("sandlock_sandbox_builder_port_remap", ctypes.c_bool)
 _b_http_allow = _builder_fn("sandlock_sandbox_builder_http_allow", ctypes.c_char_p)
 _b_http_deny = _builder_fn("sandlock_sandbox_builder_http_deny", ctypes.c_char_p)
+_b_credential = _builder_fn(
+    "sandlock_sandbox_builder_credential", ctypes.c_char_p, ctypes.c_char_p
+)
+_b_http_auth = _builder_fn("sandlock_sandbox_builder_http_auth", ctypes.c_char_p)
 _b_http_port = _builder_fn("sandlock_sandbox_builder_http_port", ctypes.c_uint16)
 _b_http_ca = _builder_fn("sandlock_sandbox_builder_http_ca", ctypes.c_char_p)
 _b_http_key = _builder_fn("sandlock_sandbox_builder_http_key", ctypes.c_char_p)
 _b_http_inject_ca = _builder_fn("sandlock_sandbox_builder_http_inject_ca", ctypes.c_char_p)
 _b_http_ca_out = _builder_fn("sandlock_sandbox_builder_http_ca_out", ctypes.c_char_p)
+_b_host_mask = _builder_fn("sandlock_sandbox_builder_host_mask", ctypes.c_char_p)
 _b_user = _builder_fn("sandlock_sandbox_builder_user", ctypes.c_uint32, ctypes.c_uint32)
 _b_random_seed = _builder_fn("sandlock_sandbox_builder_random_seed", ctypes.c_uint64)
 _b_clean_env = _builder_fn("sandlock_sandbox_builder_clean_env", ctypes.c_bool)
@@ -1028,7 +1129,7 @@ class _NativePolicy:
         "net_allow", "net_deny", "net_allow_bind", "net_deny_bind",
         "port_remap", "netns",
         "http_allow", "http_deny", "http_ports", "http_ca", "http_key",
-        "uid",
+        "http_inject_ca", "http_ca_out", "http_inject", "host_mask", "uid",
         "random_seed", "time_start", "clean_env", "env",
         "extra_deny_syscalls", "extra_allow_syscalls", "max_open_files",
         "no_randomize_memory", "no_huge_pages", "no_coredump", "deterministic_dirs",
@@ -1133,6 +1234,12 @@ class _NativePolicy:
             b = _b_http_inject_ca(b, _encode(str(path)))
         if policy.http_ca_out:
             b = _b_http_ca_out(b, _encode(str(policy.http_ca_out)))
+        for index, rule in enumerate(policy.http_inject or []):
+            name, secret, auth_rule = _serialize_http_inject(rule, index)
+            b = _b_credential(b, _encode(name), _encode(secret))
+            b = _b_http_auth(b, _encode(auth_rule))
+        if policy.host_mask:
+            b = _b_host_mask(b, _encode(str(policy.host_mask)))
 
         if policy.port_remap:
             b = _b_port_remap(b, True)
