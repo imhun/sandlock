@@ -423,6 +423,7 @@ pub fn format_net_rule(rule: &crate::sandbox::NetRule) -> String {
     let target = match &rule.target {
         NetTarget::AnyIp => "*".to_string(),
         NetTarget::Host(h) => h.clone(),
+        NetTarget::HostWildcard(s) => format!("*.{}", s),
         NetTarget::Cidr(c) => {
             // Bracket IPv6 only when a port suffix will follow, because a
             // bare addr:port is itself a valid IPv6 address.

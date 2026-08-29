@@ -37,6 +37,38 @@ pub(crate) fn destination_verdict(
     }
 }
 
+/// Verdict for one validated IP destination that may carry a hostname
+/// (from a synthetic DNS mapping). Wildcard-domain rules (`*.suffix`) are
+/// matched against the hostname first; anything else falls through to the
+/// ordinary IP verdict, so a hostname can never borrow a synthetic
+/// address to bypass literal rules. Pure: no I/O, no locks.
+pub(crate) fn destination_verdict_with_host(
+    effective: &NetworkPolicy,
+    ip: IpAddr,
+    port: Option<u16>,
+    hostname: Option<&str>,
+) -> Result<(), i32> {
+    if let Some(host) = hostname {
+        if let NetworkPolicy::AllowList { wildcard_domains, .. } = effective {
+            for (suffix, allowed) in wildcard_domains {
+                if super::dns_synth::wildcard_suffix_matches(host, suffix) {
+                    let port_ok = match (port, allowed) {
+                        (Some(_), crate::seccomp::notif::PortAllow::Any) => true,
+                        (Some(p), crate::seccomp::notif::PortAllow::Specific(ps)) => {
+                            ps.contains(&p)
+                        }
+                        (None, _) => true,
+                    };
+                    if port_ok {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+    destination_verdict(effective, ip, port)
+}
+
 /// Resolve the effective per-protocol policy for `pid` and apply
 /// [`destination_verdict`]. Shared by the sendto and sendmsg handlers;
 /// connect keeps its own `ns` borrow alive for HTTP-ACL and port-remap
@@ -200,6 +232,7 @@ mod tests {
             per_ip,
             cidrs: Vec::new(),
             any_ip_ports: HashSet::new(),
+            wildcard_domains: Vec::new(),
         }
     }
 
@@ -227,6 +260,92 @@ mod tests {
         let p = allowlist_for("10.0.0.1", 443);
         let allowed: IpAddr = "10.0.0.1".parse().unwrap();
         assert_eq!(destination_verdict(&p, allowed, None), Err(ECONNREFUSED));
+    }
+
+    // --- destination_verdict_with_host (wildcard domains, Block A R3/R4) ---
+
+    fn wildcard_allowlist(ports: &[u16]) -> NetworkPolicy {
+        NetworkPolicy::AllowList {
+            per_ip: HashMap::new(),
+            cidrs: Vec::new(),
+            any_ip_ports: HashSet::new(),
+            wildcard_domains: vec![(
+                "example.com".to_string(),
+                PortAllow::Specific(ports.iter().copied().collect()),
+            )],
+        }
+    }
+
+    #[test]
+    fn verdict_with_host_matches_wildcard_suffix_and_port() {
+        let p = wildcard_allowlist(&[443]);
+        let synth: IpAddr = "127.0.0.2".parse().unwrap();
+        assert_eq!(
+            destination_verdict_with_host(&p, synth, Some(443), Some("api.example.com")),
+            Ok(())
+        );
+        assert_eq!(
+            destination_verdict_with_host(&p, synth, Some(8443), Some("api.example.com")),
+            Err(ECONNREFUSED)
+        );
+    }
+
+    #[test]
+    fn verdict_with_host_wildcard_any_port_allows_any_port() {
+        let p = NetworkPolicy::AllowList {
+            per_ip: HashMap::new(),
+            cidrs: Vec::new(),
+            any_ip_ports: HashSet::new(),
+            wildcard_domains: vec![("example.com".to_string(), PortAllow::Any)],
+        };
+        let synth: IpAddr = "127.0.0.2".parse().unwrap();
+        assert_eq!(
+            destination_verdict_with_host(&p, synth, Some(22), Some("db.example.com")),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn verdict_with_host_rejects_bare_and_partial_suffixes() {
+        let p = wildcard_allowlist(&[443]);
+        let synth: IpAddr = "127.0.0.2".parse().unwrap();
+        // Bare domain must not match `*.example.com`; the synthetic IP has
+        // no literal rule, so the verdict falls through and refuses.
+        assert_eq!(
+            destination_verdict_with_host(&p, synth, Some(443), Some("example.com")),
+            Err(ECONNREFUSED)
+        );
+        // A name that merely ends in the suffix must not match either.
+        assert_eq!(
+            destination_verdict_with_host(&p, synth, Some(443), Some("badexample.com")),
+            Err(ECONNREFUSED)
+        );
+    }
+
+    #[test]
+    fn verdict_with_host_unknown_synthetic_destination_is_refused() {
+        // R4: with no hostname context the synthetic address cannot borrow a
+        // wildcard rule — the IP-level verdict (empty allowlist) refuses.
+        let p = wildcard_allowlist(&[443]);
+        let synth: IpAddr = "127.0.0.2".parse().unwrap();
+        assert_eq!(
+            destination_verdict_with_host(&p, synth, Some(443), None),
+            Err(ECONNREFUSED)
+        );
+    }
+
+    #[test]
+    fn verdict_with_host_without_hostname_matches_ip_rules() {
+        let p = allowlist_for("10.0.0.1", 443);
+        let allowed: IpAddr = "10.0.0.1".parse().unwrap();
+        assert_eq!(
+            destination_verdict_with_host(&p, allowed, Some(443), None),
+            Ok(())
+        );
+        assert_eq!(
+            destination_verdict_with_host(&p, allowed, Some(80), Some("ignored.example.com")),
+            Err(ECONNREFUSED)
+        );
     }
 
     fn named(p: &str) -> DestShape {

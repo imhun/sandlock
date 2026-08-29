@@ -2181,6 +2181,7 @@ impl Sandbox {
                             per_ip,
                             cidrs: resolved.cidrs.clone(),
                             any_ip_ports: resolved.any_ip_ports.clone(),
+                            wildcard_domains: resolved.wildcard_domains.clone(),
                         }
                     }
                 };

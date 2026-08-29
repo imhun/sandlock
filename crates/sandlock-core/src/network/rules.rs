@@ -109,6 +109,12 @@ pub enum NetTarget {
     Cidr(IpCidr),
     /// A hostname, resolved to IPs at sandbox start (allow-only).
     Host(String),
+    /// A domain-suffix wildcard (`*.example.com`), stored with the `*.`
+    /// prefix stripped (i.e. `example.com`). Not DNS-resolved at sandbox
+    /// start: the sandbox's DNS path hands wildcard subdomains a synthetic
+    /// IP and the on-behalf connect path reverse-looks the hostname and
+    /// matches it against this suffix at connect time. TCP/UDP only.
+    HostWildcard(String),
 }
 
 /// A single `--net-allow` / `--net-deny` rule. Both flags share this
@@ -197,9 +203,16 @@ impl NetRule {
                     label, spec
                 )));
             }
+            let target = parse_target(rest, label, allow_hosts)?;
+            if matches!(target, NetTarget::HostWildcard(_)) {
+                return Err(SandboxError::Invalid(format!(
+                    "{}: icmp rule cannot target a wildcard domain, got `{}`",
+                    label, spec
+                )));
+            }
             return Ok(vec![NetRule {
                 protocol: Protocol::Icmp,
-                target: parse_target(rest, label, allow_hosts)?,
+                target,
                 ports: Vec::new(),
                 all_ports: true,
             }]);
@@ -263,6 +276,35 @@ impl NetRule {
 fn parse_target(s: &str, label: &str, allow_hosts: bool) -> Result<NetTarget, SandboxError> {
     match s {
         "" | "*" => Ok(NetTarget::AnyIp),
+        // A `*.suffix` wildcard domain. Must come before the `/` CIDR
+        // branch so a malformed wildcard gets a wildcard-specific error.
+        _ if s.starts_with("*.") => {
+            if !allow_hosts {
+                return Err(SandboxError::Invalid(format!(
+                    "{}: `{}` is not an IP or CIDR (hostnames are not allowed; \
+                     use --http-deny for domains)",
+                    label, s
+                )));
+            }
+            let suffix = &s[2..];
+            // The suffix must be a plausible DNS name: non-empty, at least
+            // one dot, no empty labels, and no other rule metacharacters.
+            let valid = !suffix.is_empty()
+                && !suffix.starts_with('.')
+                && !suffix.ends_with('.')
+                && suffix.contains('.')
+                && !suffix.split('.').any(|label| label.is_empty())
+                && !suffix
+                    .chars()
+                    .any(|c| matches!(c, '*' | '/' | ':' | ' ' | '\t'));
+            if !valid {
+                return Err(SandboxError::Invalid(format!(
+                    "{}: invalid wildcard domain `{}` (expected `*.example.com`)",
+                    label, s
+                )));
+            }
+            Ok(NetTarget::HostWildcard(suffix.to_string()))
+        }
         // A `/` signals CIDR intent: parse strictly so a bad prefix is a
         // clear error rather than being misread as a hostname.
         _ if s.contains('/') => Ok(NetTarget::Cidr(
@@ -272,6 +314,12 @@ fn parse_target(s: &str, label: &str, allow_hosts: bool) -> Result<NetTarget, Sa
             if let Ok(cidr) = IpCidr::parse(s) {
                 Ok(NetTarget::Cidr(cidr))
             } else if allow_hosts {
+                if s.contains('*') {
+                    return Err(SandboxError::Invalid(format!(
+                        "{}: invalid hostname `{}` (wildcard domains must be `*.example.com`)",
+                        label, s
+                    )));
+                }
                 Ok(NetTarget::Host(s.to_string()))
             } else {
                 Err(SandboxError::Invalid(format!(
@@ -376,6 +424,11 @@ pub struct ResolvedNetAllow {
     pub cidrs: Vec<(IpCidr, crate::seccomp::notif::PortAllow)>,
     /// Ports permitted to any IP (the `:port` form).
     pub any_ip_ports: HashSet<u16>,
+    /// Domain-suffix wildcard rules (`*.example.com`), matched at connect
+    /// time against the destination hostname carried by a synthetic IP
+    /// (see `network::dns_synth`). Never DNS-resolved at sandbox start:
+    /// produces no per-IP entries and no `/etc/hosts` lines.
+    pub wildcard_domains: Vec<(String, crate::seccomp::notif::PortAllow)>,
     /// Any-host any-port wildcard (`:*` / `*:*`, or `icmp://*`). When
     /// true, the per-protocol policy becomes `Unrestricted` and the
     /// on-behalf check is bypassed for that protocol.
@@ -445,6 +498,7 @@ pub async fn resolve_net_allow(
         let mut per_ip_all_ports: HashSet<IpAddr> = HashSet::new();
         let mut cidrs: Vec<(IpCidr, PortAllow)> = Vec::new();
         let mut any_ip_ports: HashSet<u16> = HashSet::new();
+        let mut wildcard_domains: Vec<(String, PortAllow)> = Vec::new();
         let mut any_ip_all_ports = false;
 
         for rule in rules.iter().filter(|r| r.protocol == target) {
@@ -483,6 +537,14 @@ pub async fn resolve_net_allow(
                         }
                     }
                 }
+                NetTarget::HostWildcard(suffix) => {
+                    let pa = if rule.all_ports || target == Protocol::Icmp {
+                        PortAllow::Any
+                    } else {
+                        PortAllow::Specific(rule.ports.iter().copied().collect())
+                    };
+                    wildcard_domains.push((suffix.clone(), pa));
+                }
             }
         }
 
@@ -491,6 +553,7 @@ pub async fn resolve_net_allow(
             per_ip_all_ports,
             cidrs,
             any_ip_ports,
+            wildcard_domains,
             any_ip_all_ports,
         }
     };
@@ -544,6 +607,7 @@ pub fn resolve_net_deny(rules: &[NetDeny]) -> ResolvedNetDenySet {
                 // `--net-deny` rejects hostnames at parse time, so a deny
                 // rule never carries a `Host` target.
                 NetTarget::Host(_) => unreachable!("net-deny rejects hostnames"),
+                NetTarget::HostWildcard(_) => unreachable!("net-deny rejects hostnames"),
             }
         }
 
@@ -815,6 +879,105 @@ mod tests {
         let r = allow_pair(":*,*");
         assert!(r.all_ports);
         assert!(r.ports.is_empty());
+    }
+
+    // --- Wildcard-domain rules (Block A / R1) ---
+
+    #[test]
+    fn netallow_parse_wildcard_domain_port() {
+        let r = allow_pair("*.example.com:443");
+        assert!(matches!(&r.target, NetTarget::HostWildcard(s) if s == "example.com"));
+        assert_eq!(r.ports, vec![443]);
+        assert!(!r.all_ports);
+    }
+
+    #[test]
+    fn netallow_parse_wildcard_domain_any_port() {
+        let r = allow_pair("*.example.com:*");
+        assert!(matches!(&r.target, NetTarget::HostWildcard(s) if s == "example.com"));
+        assert!(r.ports.is_empty());
+        assert!(r.all_ports);
+    }
+
+    #[test]
+    fn netallow_parse_wildcard_domain_multi_label() {
+        let r = allow_one("tcp://*.a.b.example.com:443");
+        assert!(matches!(&r.target, NetTarget::HostWildcard(s) if s == "a.b.example.com"));
+        assert_eq!(r.ports, vec![443]);
+    }
+
+    #[test]
+    fn netallow_parse_wildcard_domain_schemeless_expands_pair() {
+        let r = allow_pair("*.example.com");
+        assert!(matches!(&r.target, NetTarget::HostWildcard(s) if s == "example.com"));
+        assert!(r.all_ports);
+    }
+
+    #[test]
+    fn netallow_parse_wildcard_domain_rejects_bad_shapes() {
+        // `**` / `*.*` carry a second `*`; `*.` and `*..` have an empty
+        // suffix; `*.com` is a TLD not a suffix; a path or port-0 suffix
+        // is not a valid rule.
+        for bad in [
+            "**",
+            "*.",
+            "*..",
+            "*.com",
+            "*.*.example.com",
+            "*.example.com/path",
+            "*.example.com:0",
+        ] {
+            assert!(
+                NetRule::parse_allow(bad).is_err(),
+                "`{bad}` should be rejected as a wildcard-domain rule"
+            );
+        }
+    }
+
+    #[test]
+    fn netdeny_rejects_wildcard_domain() {
+        // `--net-deny` keeps the E2B semantics: no domain targets, literal
+        // or wildcard.
+        assert!(NetRule::parse_deny("*.example.com:443").is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_net_allow_wildcard_domain_no_dns() {
+        // Wildcard rules are matched at connect time against the
+        // destination hostname, so resolution at sandbox start must not
+        // pin any IP: no per-IP entries, no /etc/hosts lines.
+        let rules = NetRule::parse_allow("*.example.com:443").unwrap();
+        let resolved = resolve_net_allow(&rules).await.unwrap();
+        assert!(resolved.tcp.per_ip.is_empty());
+        assert!(resolved.udp.per_ip.is_empty());
+        assert!(resolved.tcp.cidrs.is_empty());
+        assert!(resolved.udp.cidrs.is_empty());
+        assert!(resolved.concrete_host_entries.is_empty());
+        // Both TCP and UDP carry the suffix rule with the specific port.
+        for proto in [&resolved.tcp, &resolved.udp] {
+            assert_eq!(proto.wildcard_domains.len(), 1, "suffix rule missing");
+            let (suffix, pa) = &proto.wildcard_domains[0];
+            assert_eq!(suffix, "example.com");
+            match pa {
+                crate::seccomp::notif::PortAllow::Specific(s) => {
+                    assert_eq!(s.len(), 1);
+                    assert!(s.contains(&443));
+                }
+                _ => panic!("expected a specific-port wildcard rule"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_net_allow_wildcard_domain_any_port() {
+        let rules = NetRule::parse_allow("tcp://*.example.com:*").unwrap();
+        let resolved = resolve_net_allow(&rules).await.unwrap();
+        assert_eq!(resolved.tcp.wildcard_domains.len(), 1);
+        assert!(matches!(
+            resolved.tcp.wildcard_domains[0].1,
+            crate::seccomp::notif::PortAllow::Any
+        ));
+        assert!(resolved.udp.wildcard_domains.is_empty());
     }
 
     // --- Protocol scheme prefix tests ---

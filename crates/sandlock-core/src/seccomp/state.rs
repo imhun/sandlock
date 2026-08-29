@@ -468,6 +468,10 @@ pub struct NetworkState {
     pub http_acl_ports: HashSet<u16>,
     /// Shared map for recording original destination IPs on proxy redirect.
     pub http_acl_orig_dest: Option<crate::transparent_proxy::OrigDestMap>,
+    /// Hostname ↔ synthetic-IP mapping for wildcard-domain rules. Populated
+    /// by the sandbox's DNS path; the connect handler reverse-looks a
+    /// synthetic destination here before matching wildcard rules.
+    pub synthetic_dns: crate::network::dns_synth::SyntheticDns,
 }
 
 impl NetworkState {
@@ -482,6 +486,7 @@ impl NetworkState {
             http_acl_addr: None,
             http_acl_ports: HashSet::new(),
             http_acl_orig_dest: None,
+            synthetic_dns: crate::network::dns_synth::SyntheticDns::new(),
         }
     }
 
@@ -506,6 +511,7 @@ impl NetworkState {
                 per_ip,
                 cidrs: Vec::new(),
                 any_ip_ports: HashSet::new(),
+                wildcard_domains: Vec::new(),
             }
         };
         if let Ok(overrides) = self.pid_ip_overrides.read() {
