@@ -6,13 +6,9 @@
 // structurally incapable of re-reading child state after validation.
 
 use std::net::IpAddr;
-use std::sync::Arc;
 
-use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::NetworkPolicy;
 use crate::sys::structs::ECONNREFUSED;
-
-use super::Protocol;
 
 /// Verdict for one validated IP destination against the effective policy.
 /// Pure: no I/O, no locks.
@@ -67,32 +63,6 @@ pub(crate) fn destination_verdict_with_host(
         }
     }
     destination_verdict(effective, ip, port)
-}
-
-/// Resolve the effective per-protocol policy for `pid` and apply
-/// [`destination_verdict`]. Shared by the sendto and sendmsg handlers;
-/// connect keeps its own `ns` borrow alive for HTTP-ACL and port-remap
-/// reads, so it calls [`destination_verdict`] directly.
-pub(crate) async fn check_ip_destination(
-    ctx: &Arc<SupervisorCtx>,
-    pid: u32,
-    protocol: Protocol,
-    ip: IpAddr,
-    port: Option<u16>,
-) -> Result<(), i32> {
-    let ns = ctx.network.lock().await;
-    let live_policy = {
-        let pfs = ctx.policy_fn.lock().await;
-        pfs.live_policy.clone()
-    };
-    // The sandbox's own DNS gateway must be reachable regardless of the
-    // allowlist (DNS is how wildcard rules get a synthetic destination).
-    if ns.is_netns_dns_dest(ip, port) {
-        return Ok(());
-    }
-    let effective = ns.effective_network_policy(pid, protocol, live_policy.as_ref());
-    drop(ns);
-    destination_verdict(&effective, ip, port)
 }
 
 /// True if `real` (an already-canonical path) is at or under any of `prefixes`,

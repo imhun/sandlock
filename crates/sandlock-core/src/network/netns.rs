@@ -24,8 +24,6 @@ use std::os::fd::RawFd;
 /// Default pool for per-sandbox veth subnets: `10.200.0.0/16`, carved into
 /// `/30` pairs (sandbox address = base + 4n, gateway = base + 4n + 1).
 pub const DEFAULT_POOL_BASE: Ipv4Addr = Ipv4Addr::new(10, 200, 0, 0);
-/// The reserved pool prefix length; allocations never escape it.
-pub const POOL_PREFIX_LEN: u8 = 16;
 /// `/30` prefix for each sandbox's veth link.
 pub const VETH_PREFIX_LEN: u8 = 30;
 

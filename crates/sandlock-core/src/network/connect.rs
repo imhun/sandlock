@@ -313,7 +313,7 @@ fn plan_connect_target(
 /// a wildcard rule grants the *name*, never the network ranges it resolves
 /// to, so DNS rebinding cannot turn `*.example.com` into a reachable
 /// `127.0.0.1` / RFC1918 target (SSRF guard).
-async fn resolve_wildcard_destination(
+pub(super) async fn resolve_wildcard_destination(
     addr_bytes: &[u8],
     effective: &NetworkPolicy,
     port: Option<u16>,
@@ -355,7 +355,7 @@ async fn resolve_wildcard_destination(
 
 /// True when `ip` is a private/reserved/loopback/link-local address that a
 /// wildcard-resolved destination must never reach.
-fn is_private_or_reserved(ip: IpAddr) -> bool {
+pub(super) fn is_private_or_reserved(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let n = u32::from(v4);
@@ -384,7 +384,7 @@ fn is_private_or_reserved(ip: IpAddr) -> bool {
 /// Rebuild a sockaddr with the same family and port as `addr_bytes` but a
 /// different destination IP. `None` when the family cannot carry `ip`
 /// (e.g. a v4 address on a plain AF_INET6 sockaddr).
-fn rewrite_sockaddr_ip(addr_bytes: &[u8], ip: IpAddr) -> Option<Vec<u8>> {
+pub(super) fn rewrite_sockaddr_ip(addr_bytes: &[u8], ip: IpAddr) -> Option<Vec<u8>> {
     let port = parse_port_from_sockaddr(addr_bytes)?;
     if sockaddr_is_ipv6(addr_bytes) {
         let mut sa6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
