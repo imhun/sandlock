@@ -2210,7 +2210,23 @@ mod tests {
     /// this test fails on that path (the flag is absent) and passes on the fix.
     #[test]
     fn stderr_tee_is_nonblocking_and_clone_inherits_it() {
-        let tee = open_stderr_tee().expect("opening /proc/self/fd/2 must succeed under test");
+        // The production tee is opened from /proc/self/fd/2 so the file
+        // description's O_NONBLOCK is what transaction stages use. Under a
+        // privilege-dropped test run fd 2 can be a root-owned pty that cannot
+        // be reopened O_WRONLY (EACCES); fall back to an equivalent
+        // non-blocking pipe description so the invariant — O_NONBLOCK lives
+        // on the file description and survives clone — is still exercised.
+        let tee = open_stderr_tee().unwrap_or_else(|| {
+            let (r, w) = crate::sandbox::make_cloexec_pipe()
+                .expect("tee pipe for the non-root fallback");
+            drop(r);
+            let flags = unsafe { libc::fcntl(w.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0, "F_GETFL failed: {}", std::io::Error::last_os_error());
+            unsafe {
+                libc::fcntl(w.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            w
+        });
         let nonblock = |fd: std::os::fd::BorrowedFd<'_>| {
             let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
             assert!(flags >= 0, "F_GETFL failed: {}", std::io::Error::last_os_error());

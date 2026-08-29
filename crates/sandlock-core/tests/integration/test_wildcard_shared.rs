@@ -5,10 +5,10 @@
 
 use sandlock_core::Sandbox;
 use std::io::Write;
-use std::net::{Ipv4Addr, TcpListener};
-use std::sync::Mutex;
+use std::net::Ipv4Addr;
+use std::net::TcpListener;
 
-static HOST_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+use crate::net_fixture::WorkerLocalHost;
 
 fn base_policy() -> sandlock_core::SandboxBuilder {
     Sandbox::builder()
@@ -32,62 +32,6 @@ fn is_synthetic(ip: &str) -> bool {
     };
     let n = u32::from(ip);
     (0x0afa_0002..=0x0afa_fffe).contains(&n)
-}
-
-/// Register `host -> 198.18.0.x` (benchmarking range, allowed by the SSRF
-/// guard) on the worker's loopback and /etc/hosts, so the supervisor's
-/// dial-time resolution is deterministic. Drop removes exactly this entry.
-struct WorkerLocalHost {
-    ip: Ipv4Addr,
-    host: String,
-}
-
-impl WorkerLocalHost {
-    fn setup(host: &str) -> Self {
-        let _g = HOST_FIXTURE_LOCK.lock().unwrap();
-        let mut ip = Ipv4Addr::new(198, 18, 0, 99);
-        loop {
-            let ip_str = format!("{}/32", ip);
-            let ok = std::process::Command::new("ip")
-                .args(["addr", "add", ip_str.as_str(), "dev", "lo"])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if ok {
-                break;
-            }
-            let o = ip.octets();
-            assert!(o[3] < 254, "no free 198.18.0.x address for {host}");
-            ip = Ipv4Addr::new(198, 18, 0, o[3] + 1);
-        }
-        let hosts = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
-        if !hosts.lines().any(|l| l.trim().ends_with(host)) {
-            let mut h = hosts;
-            h.push_str(&format!("{} {}\n", ip, host));
-            let _ = std::fs::write("/etc/hosts", h);
-        }
-        WorkerLocalHost {
-            ip,
-            host: host.to_string(),
-        }
-    }
-}
-
-impl Drop for WorkerLocalHost {
-    fn drop(&mut self) {
-        let _g = HOST_FIXTURE_LOCK.lock().unwrap();
-        if let Ok(hosts) = std::fs::read_to_string("/etc/hosts") {
-            let filtered: Vec<&str> = hosts
-                .lines()
-                .filter(|l| !l.trim().ends_with(self.host.as_str()))
-                .collect();
-            let _ = std::fs::write("/etc/hosts", filtered.join("\n") + "\n");
-        }
-        let ip_str = format!("{}/32", self.ip);
-        let _ = std::process::Command::new("ip")
-            .args(["addr", "del", ip_str.as_str(), "dev", "lo"])
-            .status();
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -132,7 +76,7 @@ async fn test_shared_netns_wildcard_connect() {
 
 async fn test_shared_netns_wildcard_connect_inner() {
     let _host = WorkerLocalHost::setup("conn.example.com");
-    let listener = TcpListener::bind((_host.ip, 0)).unwrap();
+    let listener = TcpListener::bind((_host.addr(), 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().unwrap();
