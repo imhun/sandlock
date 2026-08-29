@@ -12,7 +12,8 @@
 
 use sandlock_core::Sandbox;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{Ipv4Addr, TcpListener};
+use std::sync::Mutex;
 
 fn base_policy() -> sandlock_core::SandboxBuilder {
     Sandbox::builder()
@@ -39,41 +40,71 @@ fn stdout_of(result: &sandlock_core::result::RunResult) -> String {
     String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default()).into_owned()
 }
 
-/// Worker-side fixture: map `host` to 198.18.0.99 (a benchmarking-range
-/// address the SSRF guard deliberately allows) and put that address on the
-/// worker's loopback so local servers can bind it. Returns a guard whose
-/// Drop restores `/etc/hosts` and removes the address.
+/// Serializes the shared host-netns fixtures (loopback addresses and
+/// `/etc/hosts`) so concurrently-running netns tests cannot clobber each
+/// other's entries.
+static HOST_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Worker-side fixture: map `host` to a per-instance `198.18.0.x` address
+/// (benchmarking range, deliberately allowed by the SSRF guard), put it on
+/// the worker's loopback so a local server can bind it, and register the
+/// mapping in `/etc/hosts`. Drop removes exactly this instance's address and
+/// hosts line, so tests stay concurrency-safe.
 struct WorkerLocalHost {
-    hosts_backup: Vec<u8>,
-    added: bool,
+    ip: Ipv4Addr,
+    host: String,
 }
 
 impl WorkerLocalHost {
     fn setup(host: &str) -> Self {
-        let _ = std::process::Command::new("ip")
-            .args(["addr", "add", "198.18.0.99/32", "dev", "lo"])
-            .status();
-        let hosts_backup = std::fs::read("/etc/hosts").unwrap_or_default();
-        let hosts = String::from_utf8_lossy(&hosts_backup).into_owned();
-        let added = if hosts.contains(host) {
-            false
-        } else {
+        let _g = HOST_FIXTURE_LOCK.lock().unwrap();
+        // Allocate the first free address from 198.18.0.99 upward.
+        let mut ip = Ipv4Addr::new(198, 18, 0, 99);
+        loop {
+            let ip_str = format!("{}/32", ip);
+            let ok = std::process::Command::new("ip")
+                .args(["addr", "add", ip_str.as_str(), "dev", "lo"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                break;
+            }
+            let o = ip.octets();
+            assert!(o[3] < 254, "no free 198.18.0.x address for {host}");
+            ip = Ipv4Addr::new(198, 18, 0, o[3] + 1);
+        }
+        let hosts = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+        if !hosts.lines().any(|l| l.trim().ends_with(host)) {
             let mut h = hosts;
-            h.push_str(&format!("198.18.0.99 {}\n", host));
+            h.push_str(&format!("{} {}\n", ip, host));
             let _ = std::fs::write("/etc/hosts", h);
-            true
-        };
-        WorkerLocalHost { hosts_backup, added }
+        }
+        WorkerLocalHost {
+            ip,
+            host: host.to_string(),
+        }
+    }
+
+    fn addr(&self) -> Ipv4Addr {
+        self.ip
     }
 }
 
 impl Drop for WorkerLocalHost {
     fn drop(&mut self) {
-        if self.added {
-            let _ = std::fs::write("/etc/hosts", &self.hosts_backup);
+        let _g = HOST_FIXTURE_LOCK.lock().unwrap();
+        // Remove only this instance's hosts line.
+        if let Ok(hosts) = std::fs::read_to_string("/etc/hosts") {
+            let filtered: Vec<&str> = hosts
+                .lines()
+                .filter(|l| !l.trim().ends_with(self.host.as_str()))
+                .collect();
+            let _ = std::fs::write("/etc/hosts", filtered.join("\n") + "\n");
         }
+        let ip_str = format!("{}/32", self.ip);
         let _ = std::process::Command::new("ip")
-            .args(["addr", "del", "198.18.0.99/32", "dev", "lo"])
+            .args(["addr", "del", ip_str.as_str(), "dev", "lo"])
             .status();
     }
 }
@@ -169,7 +200,7 @@ async fn test_netns_wildcard_connect_reaches_real_destination_inner() {
     // resolution, SSRF guard, sockaddr rewrite and veth path are still all
     // exercised.
     let _host = WorkerLocalHost::setup("conn.example.com");
-    let listener = TcpListener::bind("198.18.0.99:0").unwrap();
+    let listener = TcpListener::bind((_host.addr(), 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().unwrap();
@@ -209,7 +240,7 @@ async fn test_netns_wildcard_udp_reaches_real_destination() {
 
 async fn test_netns_wildcard_udp_reaches_real_destination_inner() {
     let _host = WorkerLocalHost::setup("udp.example.com");
-    let udp = std::net::UdpSocket::bind("198.18.0.99:0").unwrap();
+    let udp = std::net::UdpSocket::bind((_host.addr(), 0)).unwrap();
     let port = udp.local_addr().unwrap().port();
     let server = tokio::spawn(async move {
         let mut buf = [0u8; 64];
@@ -260,7 +291,7 @@ async fn test_netns_http_acl_proxy_redirect_inner() {
     // resolver; 198.18.0.99 is placed on the worker's loopback and is
     // deliberately allowed by the SSRF guard.
     let _host = WorkerLocalHost::setup("http.test");
-    let listener = TcpListener::bind("198.18.0.99:0").unwrap();
+    let listener = TcpListener::bind((_host.addr(), 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().unwrap();
@@ -276,12 +307,13 @@ async fn test_netns_http_acl_proxy_redirect_inner() {
     let mut policy = base_policy()
         .netns(true)
         .http_port(port)
-        .http_allow("GET 198.18.0.99/*")
+        .http_allow(&format!("GET {}/*", _host.addr()))
         .build()
         .unwrap();
     let script = format!(
         "import urllib.request\n\
-         print(urllib.request.urlopen('http://198.18.0.99:{port}/hello', timeout=10).read().decode())\n",
+         print(urllib.request.urlopen('http://{addr}:{port}/hello', timeout=10).read().decode())\n",
+        addr = _host.addr(),
         port = port
     );
     let result = policy.run(&["python3", "-c", &script]).await.unwrap();
