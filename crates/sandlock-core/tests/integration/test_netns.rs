@@ -12,8 +12,10 @@
 
 use sandlock_core::Sandbox;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, TcpListener};
-use std::sync::Mutex;
+use std::net::Ipv4Addr;
+use std::net::TcpListener;
+
+use crate::net_fixture::{WorkerLocalHost, net_admin_available};
 
 fn base_policy() -> sandlock_core::SandboxBuilder {
     Sandbox::builder()
@@ -40,77 +42,12 @@ fn stdout_of(result: &sandlock_core::result::RunResult) -> String {
     String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default()).into_owned()
 }
 
-/// Serializes the shared host-netns fixtures (loopback addresses and
-/// `/etc/hosts`) so concurrently-running netns tests cannot clobber each
-/// other's entries.
-static HOST_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
-
-/// Worker-side fixture: map `host` to a per-instance `198.18.0.x` address
-/// (benchmarking range, deliberately allowed by the SSRF guard), put it on
-/// the worker's loopback so a local server can bind it, and register the
-/// mapping in `/etc/hosts`. Drop removes exactly this instance's address and
-/// hosts line, so tests stay concurrency-safe.
-struct WorkerLocalHost {
-    ip: Ipv4Addr,
-    host: String,
-}
-
-impl WorkerLocalHost {
-    fn setup(host: &str) -> Self {
-        let _g = HOST_FIXTURE_LOCK.lock().unwrap();
-        // Allocate the first free address from 198.18.0.99 upward.
-        let mut ip = Ipv4Addr::new(198, 18, 0, 99);
-        loop {
-            let ip_str = format!("{}/32", ip);
-            let ok = std::process::Command::new("ip")
-                .args(["addr", "add", ip_str.as_str(), "dev", "lo"])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if ok {
-                break;
-            }
-            let o = ip.octets();
-            assert!(o[3] < 254, "no free 198.18.0.x address for {host}");
-            ip = Ipv4Addr::new(198, 18, 0, o[3] + 1);
-        }
-        let hosts = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
-        if !hosts.lines().any(|l| l.trim().ends_with(host)) {
-            let mut h = hosts;
-            h.push_str(&format!("{} {}\n", ip, host));
-            let _ = std::fs::write("/etc/hosts", h);
-        }
-        WorkerLocalHost {
-            ip,
-            host: host.to_string(),
-        }
-    }
-
-    fn addr(&self) -> Ipv4Addr {
-        self.ip
-    }
-}
-
-impl Drop for WorkerLocalHost {
-    fn drop(&mut self) {
-        let _g = HOST_FIXTURE_LOCK.lock().unwrap();
-        // Remove only this instance's hosts line.
-        if let Ok(hosts) = std::fs::read_to_string("/etc/hosts") {
-            let filtered: Vec<&str> = hosts
-                .lines()
-                .filter(|l| !l.trim().ends_with(self.host.as_str()))
-                .collect();
-            let _ = std::fs::write("/etc/hosts", filtered.join("\n") + "\n");
-        }
-        let ip_str = format!("{}/32", self.ip);
-        let _ = std::process::Command::new("ip")
-            .args(["addr", "del", ip_str.as_str(), "dev", "lo"])
-            .status();
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_netns_isolates_host_loopback() {
+    if !net_admin_available() {
+        eprintln!("skipping test_netns_isolates_host_loopback: requires CAP_NET_ADMIN (privileged container)");
+        return;
+    }
     tokio::time::timeout(
         std::time::Duration::from_secs(30),
         test_netns_isolates_host_loopback_inner(),
@@ -156,6 +93,10 @@ async fn test_netns_isolates_host_loopback_inner() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_netns_wildcard_dns_returns_synthetic_ip() {
+    if !net_admin_available() {
+        eprintln!("skipping test_netns_wildcard_dns_returns_synthetic_ip: requires CAP_NET_ADMIN (privileged container)");
+        return;
+    }
     tokio::time::timeout(
         std::time::Duration::from_secs(30),
         test_netns_wildcard_dns_returns_synthetic_ip_inner(),
@@ -186,6 +127,10 @@ async fn test_netns_wildcard_dns_returns_synthetic_ip_inner() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_netns_wildcard_connect_reaches_real_destination() {
+    if !net_admin_available() {
+        eprintln!("skipping test_netns_wildcard_connect_reaches_real_destination: requires CAP_NET_ADMIN (privileged container)");
+        return;
+    }
     tokio::time::timeout(
         std::time::Duration::from_secs(30),
         test_netns_wildcard_connect_reaches_real_destination_inner(),
@@ -230,6 +175,10 @@ async fn test_netns_wildcard_connect_reaches_real_destination_inner() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_netns_wildcard_udp_reaches_real_destination() {
+    if !net_admin_available() {
+        eprintln!("skipping test_netns_wildcard_udp_reaches_real_destination: requires CAP_NET_ADMIN (privileged container)");
+        return;
+    }
     tokio::time::timeout(
         std::time::Duration::from_secs(30),
         test_netns_wildcard_udp_reaches_real_destination_inner(),
@@ -278,6 +227,10 @@ async fn test_netns_wildcard_udp_reaches_real_destination_inner() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_netns_http_acl_proxy_redirect() {
+    if !net_admin_available() {
+        eprintln!("skipping test_netns_http_acl_proxy_redirect: requires CAP_NET_ADMIN (privileged container)");
+        return;
+    }
     tokio::time::timeout(
         std::time::Duration::from_secs(30),
         test_netns_http_acl_proxy_redirect_inner(),

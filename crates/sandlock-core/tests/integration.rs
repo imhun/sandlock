@@ -46,6 +46,9 @@ mod test_egress;
 #[path = "integration/test_wildcard_shared.rs"]
 mod test_wildcard_shared;
 
+#[path = "integration/net_fixture.rs"]
+mod net_fixture;
+
 #[path = "integration/test_netlink_virt.rs"]
 mod test_netlink_virt;
 

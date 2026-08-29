@@ -7,8 +7,10 @@
 
 use sandlock_core::Sandbox;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Mutex;
+
+use crate::net_fixture::WorkerLocalHost;
 
 fn base_policy() -> sandlock_core::SandboxBuilder {
     Sandbox::builder()
@@ -24,71 +26,6 @@ fn base_policy() -> sandlock_core::SandboxBuilder {
 
 fn stdout_of(result: &sandlock_core::result::RunResult) -> String {
     String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default()).into_owned()
-}
-
-/// Serializes the shared host-netns fixtures (loopback addresses and
-/// `/etc/hosts`) so concurrently-running tests cannot clobber each other.
-static HOST_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
-
-/// Worker-side fixture: map `host` to a per-instance `198.18.0.x` address
-/// (benchmarking range, allowed by the SSRF guard) and register it in
-/// `/etc/hosts` so the SOCKS5 forwarder can resolve the ATYP=domain target
-/// remotely. Drop removes exactly this instance's entries.
-struct WorkerLocalHost {
-    ip: Ipv4Addr,
-    host: String,
-}
-
-impl WorkerLocalHost {
-    fn setup(host: &str) -> Self {
-        let _g = HOST_FIXTURE_LOCK.lock().unwrap();
-        let mut ip = Ipv4Addr::new(198, 18, 0, 99);
-        loop {
-            let ip_str = format!("{}/32", ip);
-            let ok = std::process::Command::new("ip")
-                .args(["addr", "add", ip_str.as_str(), "dev", "lo"])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if ok {
-                break;
-            }
-            let o = ip.octets();
-            assert!(o[3] < 254, "no free 198.18.0.x address for {host}");
-            ip = Ipv4Addr::new(198, 18, 0, o[3] + 1);
-        }
-        let hosts = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
-        if !hosts.lines().any(|l| l.trim().ends_with(host)) {
-            let mut h = hosts;
-            h.push_str(&format!("{} {}\n", ip, host));
-            let _ = std::fs::write("/etc/hosts", h);
-        }
-        WorkerLocalHost {
-            ip,
-            host: host.to_string(),
-        }
-    }
-
-    fn addr(&self) -> Ipv4Addr {
-        self.ip
-    }
-}
-
-impl Drop for WorkerLocalHost {
-    fn drop(&mut self) {
-        let _g = HOST_FIXTURE_LOCK.lock().unwrap();
-        if let Ok(hosts) = std::fs::read_to_string("/etc/hosts") {
-            let filtered: Vec<&str> = hosts
-                .lines()
-                .filter(|l| !l.trim().ends_with(self.host.as_str()))
-                .collect();
-            let _ = std::fs::write("/etc/hosts", filtered.join("\n") + "\n");
-        }
-        let ip_str = format!("{}/32", self.ip);
-        let _ = std::process::Command::new("ip")
-            .args(["addr", "del", ip_str.as_str(), "dev", "lo"])
-            .status();
-    }
 }
 
 /// What the SOCKS5 forwarder saw on its CONNECT request.
