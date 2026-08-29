@@ -82,6 +82,7 @@ class TestSandboxFields:
         p = Sandbox()
         assert p.http_inject == []
         assert p.host_mask is None
+        assert p.egress_proxy is None
 
     def test_accepts_inject_and_host_mask(self):
         p = Sandbox(
@@ -97,3 +98,13 @@ class TestSandboxFields:
         )
         assert p.host_mask == "localhost:${PORT}"
         assert p.http_inject[0]["auth"] == "bearer"
+
+    def test_accepts_egress_proxy(self):
+        p = Sandbox(
+            egress_proxy={
+                "address": "proxy.example.com:1080",
+                "username": "user",
+                "password": "pass",
+            }
+        )
+        assert p.egress_proxy["address"] == "proxy.example.com:1080"

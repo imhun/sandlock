@@ -163,6 +163,7 @@ impl TryFrom<&Sandbox> for Confinement {
         if !sandbox.http_inject_ca.is_empty() { unsupported.push("http_inject_ca"); }
         if sandbox.http_ca_out.is_some() { unsupported.push("http_ca_out"); }
         if sandbox.host_mask.is_some() { unsupported.push("host_mask"); }
+        if sandbox.egress_proxy.is_some() { unsupported.push("egress_proxy"); }
         if sandbox.max_memory.is_some() { unsupported.push("max_memory"); }
         if sandbox.max_processes != 64 { unsupported.push("max_processes"); }
         if sandbox.max_open_files.is_some() { unsupported.push("max_open_files"); }
@@ -481,6 +482,12 @@ pub struct Sandbox {
     /// the sandboxed child keeps addressing the real destination.
     #[serde(default)]
     pub host_mask: Option<String>,
+    /// SOCKS5 egress proxy for all outbound TCP (after allow/deny filtering).
+    /// UDP/ICMP are not tunneled. The proxy endpoint is dialed by the
+    /// supervisor and is not reachable directly from the sandbox. Contains
+    /// the optional RFC 1929 password, so it is never serialized.
+    #[serde(skip)]
+    pub egress_proxy: Option<crate::network::egress::EgressProxyConfig>,
     /// Optional observation callback for HTTP learn mode. When set the proxy is
     /// spawned even without ACL rules; every request is logged via this closure.
     #[serde(skip)]
@@ -645,6 +652,7 @@ impl Clone for Sandbox {
             http_inject_ca: self.http_inject_ca.clone(),
             http_ca_out: self.http_ca_out.clone(),
             host_mask: self.host_mask.clone(),
+            egress_proxy: self.egress_proxy.clone(),
             http_log_fn: self.http_log_fn.clone(),
             max_memory: self.max_memory,
             max_processes: self.max_processes,
@@ -2282,6 +2290,14 @@ impl Sandbox {
                 .rt()
                 .dns_gateway_addr
                 .map(|ip| std::net::SocketAddr::from((ip, 53)));
+            net_state.egress_proxy = match &self.egress_proxy {
+                Some(cfg) => Some(crate::network::egress::resolve_egress_proxy(
+                    &cfg.address,
+                    cfg.username.as_deref(),
+                    cfg.password.as_deref(),
+                )?),
+                None => None,
+            };
             net_state.bind_deny_ports = self.net_deny_bind.iter().copied().collect();
             if let Some(cb) = self.rt_mut().on_bind.take() {
                 net_state.port_map.on_bind = Some(cb);

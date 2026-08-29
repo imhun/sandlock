@@ -37,6 +37,9 @@ mod test_transaction;
 #[path = "integration/test_network.rs"]
 mod test_network;
 
+#[path = "integration/test_egress.rs"]
+mod test_egress;
+
 #[path = "integration/test_wildcard_shared.rs"]
 mod test_wildcard_shared;
 
