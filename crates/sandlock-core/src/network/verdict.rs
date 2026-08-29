@@ -85,6 +85,11 @@ pub(crate) async fn check_ip_destination(
         let pfs = ctx.policy_fn.lock().await;
         pfs.live_policy.clone()
     };
+    // The sandbox's own DNS gateway must be reachable regardless of the
+    // allowlist (DNS is how wildcard rules get a synthetic destination).
+    if ns.is_netns_dns_dest(ip, port) {
+        return Ok(());
+    }
     let effective = ns.effective_network_policy(pid, protocol, live_policy.as_ref());
     drop(ns);
     destination_verdict(&effective, ip, port)

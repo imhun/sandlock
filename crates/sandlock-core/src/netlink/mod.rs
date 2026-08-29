@@ -5,6 +5,7 @@
 //! `handlers.rs` for seccomp-notify integration.
 
 pub mod handlers;
+pub(crate) mod ops;
 pub mod proto;
 pub mod proxy;
 pub mod state;

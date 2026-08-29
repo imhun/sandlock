@@ -53,6 +53,7 @@ pub(crate) async fn spawn_transparent_proxy(
     ca_cert_pem: Option<&str>,
     ca_key_pem: Option<&str>,
     log_fn: Option<Arc<dyn Fn(&str, &str, &str) + Send + Sync>>,
+    bind_ip: std::net::IpAddr,
 ) -> std::io::Result<HttpAclProxyHandle> {
     // rustls 0.22 builder() uses the ring provider directly; no provider install needed.
     let orig_dest: OrigDestMap =
@@ -65,7 +66,10 @@ pub(crate) async fn spawn_transparent_proxy(
         _ => None,
     };
 
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    // In per-sandbox netns mode the proxy must bind the veth gateway address
+    // (the sandbox's on-behalf connections route inside the sandbox netns and
+    // can only reach the worker through the veth); otherwise host loopback.
+    let listener = TcpListener::bind(std::net::SocketAddr::new(bind_ip, 0)).await?;
     let addr = listener.local_addr()?;
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
 
@@ -183,9 +187,17 @@ mod tests {
             .expect("resolve_ca ok")
             .expect("ephemeral CA generated");
         let allow = vec![crate::http::HttpRule::parse("GET allowed.test/*").expect("rule parses")];
-        let handle = super::spawn_transparent_proxy(allow, vec![], Arc::new(vec![]), Some(&ca.cert_pem), Some(&ca.key_pem), None)
-            .await
-            .expect("proxy spawns");
+        let handle = super::spawn_transparent_proxy(
+            allow,
+            vec![],
+            Arc::new(vec![]),
+            Some(&ca.cert_pem),
+            Some(&ca.key_pem),
+            None,
+            std::net::Ipv4Addr::LOCALHOST.into(),
+        )
+        .await
+        .expect("proxy spawns");
         let addr = handle.addr;
 
         // rustls client that trusts only the generated CA.

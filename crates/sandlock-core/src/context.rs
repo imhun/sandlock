@@ -31,13 +31,18 @@ pub struct PipePair {
     pub ready_r: OwnedFd,
     /// Parent writes the "supervisor ready" signal to the child.
     pub ready_w: OwnedFd,
+    /// Parent reads the child's "netns ready" marker (per-sandbox netns).
+    pub netns_r: OwnedFd,
+    /// Child writes the "netns ready" marker to the parent.
+    pub netns_w: OwnedFd,
 }
 
 impl PipePair {
-    /// Create two pipe pairs using `pipe2(O_CLOEXEC)`.
+    /// Create three pipe pairs using `pipe2(O_CLOEXEC)`.
     pub fn new() -> io::Result<Self> {
         let mut notif_fds = [0i32; 2];
         let mut ready_fds = [0i32; 2];
+        let mut netns_fds = [0i32; 2];
 
         // SAFETY: pipe2 with valid pointers and O_CLOEXEC
         let ret = unsafe { libc::pipe2(notif_fds.as_mut_ptr(), libc::O_CLOEXEC) };
@@ -55,12 +60,25 @@ impl PipePair {
             return Err(io::Error::last_os_error());
         }
 
+        let ret = unsafe { libc::pipe2(netns_fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        if ret < 0 {
+            unsafe {
+                libc::close(notif_fds[0]);
+                libc::close(notif_fds[1]);
+                libc::close(ready_fds[0]);
+                libc::close(ready_fds[1]);
+            }
+            return Err(io::Error::last_os_error());
+        }
+
         // SAFETY: pipe2 returned valid fds
         Ok(PipePair {
             notif_r: unsafe { OwnedFd::from_raw_fd(notif_fds[0]) },
             notif_w: unsafe { OwnedFd::from_raw_fd(notif_fds[1]) },
             ready_r: unsafe { OwnedFd::from_raw_fd(ready_fds[0]) },
             ready_w: unsafe { OwnedFd::from_raw_fd(ready_fds[1]) },
+            netns_r: unsafe { OwnedFd::from_raw_fd(netns_fds[0]) },
+            netns_w: unsafe { OwnedFd::from_raw_fd(netns_fds[1]) },
         })
     }
 }
@@ -390,6 +408,51 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     // Capture real uid/gid before any unshare (after unshare they become 65534)
     let real_uid = unsafe { libc::getuid() };
     let real_gid = unsafe { libc::getgid() };
+
+    // 5a. Network namespace isolation (per-sandbox netns).
+    //
+    // Must run *before* the user-namespace remap so the child still holds
+    // CAP_NET_ADMIN in the fresh namespace (and can configure its own end
+    // regardless of any later userns remap). The child unshares the netns,
+    // brings loopback up, signals the parent, then waits for the parent to
+    // allocate the /30 and create the veth pair. The parent streams the two
+    // assigned addresses back over the ready pipe; the child configures its
+    // own end (address + default route) here, before Landlock/seccomp make
+    // netlink configuration impossible.
+    if sandbox.netns {
+        if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
+            fail!("unshare(CLONE_NEWNET)");
+        }
+        if let Err(e) = crate::network::netns::child_bring_up_loopback() {
+            fail!(format!("bring up loopback in sandbox netns: {}", e));
+        }
+        if let Err(e) = write_u32_fd(pipes.netns_w.as_raw_fd(), 1) {
+            fail!(format!("write netns-ready: {}", e));
+        }
+        let sandbox_ip = match read_u32_fd(pipes.ready_r.as_raw_fd()) {
+            Ok(v) => v,
+            Err(e) => fail!(format!("read sandbox IP from parent: {}", e)),
+        };
+        let gateway_ip = match read_u32_fd(pipes.ready_r.as_raw_fd()) {
+            Ok(v) => v,
+            Err(e) => fail!(format!("read gateway IP from parent: {}", e)),
+        };
+        let names = crate::network::netns::veth_names(std::process::id());
+        let sandbox_ifindex = match crate::network::netns::child_configure_sandbox_end(
+            &names.sandbox,
+            std::net::Ipv4Addr::from(sandbox_ip),
+            std::net::Ipv4Addr::from(gateway_ip),
+            30,
+        ) {
+            Ok(idx) => idx,
+            Err(e) => fail!(format!("configure sandbox veth end: {}", e)),
+        };
+        // Report the sandbox-end ifindex back to the parent for the
+        // synthesized netlink view.
+        if let Err(e) = write_u32_fd(pipes.netns_w.as_raw_fd(), sandbox_ifindex as u32) {
+            fail!(format!("write sandbox ifindex: {}", e));
+        }
+    }
 
     // 5b. User namespace for --user (run-as uid/gid) mapping.
     //

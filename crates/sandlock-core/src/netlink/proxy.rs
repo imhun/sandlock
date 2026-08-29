@@ -15,11 +15,12 @@
 //! handle are needed.
 
 use std::os::unix::io::{AsRawFd, OwnedFd};
+use std::sync::Arc;
 
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 
-use crate::netlink::{proto, synth};
+use crate::netlink::{proto, state::NetlinkState, synth};
 
 const RECV_BUF: usize = 8192;
 
@@ -32,15 +33,19 @@ const RECV_BUF: usize = 8192;
 /// Must be called from within the supervisor's tokio runtime (all
 /// seccomp-notify handlers satisfy this). The supervisor-side fd must
 /// be non-blocking; see `handle_socket` for the `F_SETFL` call.
-pub fn spawn_responder(fd: OwnedFd, reply_pid: u32) {
+pub fn spawn_responder(fd: OwnedFd, reply_pid: u32, state: Arc<NetlinkState>) {
     tokio::spawn(async move {
-        if let Err(e) = responder_loop(fd, reply_pid).await {
+        if let Err(e) = responder_loop(fd, reply_pid, state).await {
             eprintln!("sandlock netlink responder error: {e}");
         }
     });
 }
 
-async fn responder_loop(fd: OwnedFd, reply_pid: u32) -> std::io::Result<()> {
+async fn responder_loop(
+    fd: OwnedFd,
+    reply_pid: u32,
+    state: Arc<NetlinkState>,
+) -> std::io::Result<()> {
     let async_fd = AsyncFd::with_interest(fd, Interest::READABLE)?;
     let mut buf = vec![0u8; RECV_BUF];
 
@@ -76,7 +81,7 @@ async fn responder_loop(fd: OwnedFd, reply_pid: u32) -> std::io::Result<()> {
         // looking for NLMSG_DONE, so keeping everything in one send
         // is simpler and matches the common kernel behavior for
         // small dumps.
-        let reply: Vec<u8> = synth::synthesize_reply(&req, reply_pid)
+        let reply: Vec<u8> = synth::synthesize_reply(&req, reply_pid, state.veth().as_ref())
             .into_iter()
             .flatten()
             .collect();

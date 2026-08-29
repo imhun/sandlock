@@ -472,6 +472,11 @@ pub struct NetworkState {
     /// by the sandbox's DNS path; the connect handler reverse-looks a
     /// synthetic destination here before matching wildcard rules.
     pub synthetic_dns: crate::network::dns_synth::SyntheticDns,
+    /// The sandbox's DNS gateway endpoint (`gateway:53`) in per-sandbox
+    /// netns mode. The send/connect verdicts exempt exactly this endpoint so
+    /// the sandbox can resolve names through its own gateway without opening
+    /// the rest of loopback.
+    pub netns_dns_addr: Option<std::net::SocketAddr>,
 }
 
 impl NetworkState {
@@ -487,6 +492,17 @@ impl NetworkState {
             http_acl_ports: HashSet::new(),
             http_acl_orig_dest: None,
             synthetic_dns: crate::network::dns_synth::SyntheticDns::new(),
+            netns_dns_addr: None,
+        }
+    }
+
+    /// True when `(ip, port)` is this sandbox's own DNS gateway endpoint,
+    /// which must be reachable regardless of the network allowlist so the
+    /// sandbox can resolve names through the gateway.
+    pub fn is_netns_dns_dest(&self, ip: std::net::IpAddr, port: Option<u16>) -> bool {
+        match self.netns_dns_addr {
+            Some(a) => a.ip() == ip && port == Some(a.port()),
+            None => false,
         }
     }
 

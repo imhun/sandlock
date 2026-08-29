@@ -799,6 +799,11 @@ pub struct NotifPolicy {
     /// host's on-disk `/etc/hosts` never leaks in. The content is the
     /// loopback base plus any concrete hostnames resolved from `net_allow`.
     pub virtual_etc_hosts: String,
+    /// Synthetic `/etc/resolv.conf` served to the sandbox, `Some` only in
+    /// per-sandbox netns mode: `openat("/etc/resolv.conf")` returns a memfd
+    /// pointing at the sandbox's DNS gateway so wildcard-domain lookups hit
+    /// the supervisor's gateway instead of the host's resolver.
+    pub virtual_resolv_conf: Option<String>,
     /// User-declared trust-bundle paths to splice the MITM CA into.
     pub ca_inject_paths: Vec<std::path::PathBuf>,
     /// Active MITM CA public cert (PEM bytes) to inject. `Some` only when

@@ -56,6 +56,15 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "net-deny-bind", value_name = "PORTS"))]
     pub net_deny_bind: Vec<String>,
 
+    /// Run this sandbox in its own network namespace: `unshare(CLONE_NEWNET)`
+    /// in the child (before any user-namespace remap), a veth pair configured
+    /// by the supervisor, and a per-sandbox DNS gateway. Isolates the
+    /// sandbox's loopback from the worker and is required for wildcard-domain
+    /// rules to resolve inside the sandbox. Requires `CAP_NET_ADMIN` +
+    /// `CAP_SYS_ADMIN` in the supervisor.
+    #[cfg_attr(feature = "cli", arg(long = "netns"))]
+    pub netns: bool,
+
     #[cfg_attr(feature = "cli", arg(long = "http-allow", value_name = "RULE"))]
     pub http_allow: Vec<String>,
 
@@ -265,6 +274,7 @@ impl Default for SandboxBuilder {
             net_deny: Vec::new(),
             net_allow_bind: Vec::new(),
             net_deny_bind: Vec::new(),
+            netns: false,
             http_allow: Vec::new(),
             http_deny: Vec::new(),
             credentials: Vec::new(),
@@ -329,6 +339,7 @@ impl Clone for SandboxBuilder {
             net_deny: self.net_deny.clone(),
             net_allow_bind: self.net_allow_bind.clone(),
             net_deny_bind: self.net_deny_bind.clone(),
+            netns: self.netns,
             http_allow: self.http_allow.clone(),
             http_deny: self.http_deny.clone(),
             credentials: self.credentials.clone(),
@@ -464,6 +475,13 @@ impl SandboxBuilder {
     /// Add a `--net-deny` rule. See the field docs for accepted forms.
     pub fn net_deny(mut self, spec: impl Into<String>) -> Self {
         self.net_deny.push(spec.into());
+        self
+    }
+
+    /// Run this sandbox in its own network namespace (veth pair + gateway
+    /// DNS). See the field docs for the capability requirements.
+    pub fn netns(mut self, enable: bool) -> Self {
+        self.netns = enable;
         self
     }
 
@@ -1019,6 +1037,7 @@ impl SandboxBuilder {
             net_deny,
             net_allow_bind,
             net_deny_bind,
+            netns: self.netns,
             http_allow,
             http_deny,
             inject,
