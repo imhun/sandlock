@@ -365,4 +365,114 @@ mod tests {
             "upstream request missing masked host: {raw}"
         );
     }
+
+    /// Hermetic proof that every matching credential rule is applied: two
+    /// header rules on the same matcher both reach the upstream (E2B
+    /// ``transform.headers`` with multiple entries), not just the first match.
+    #[tokio::test]
+    async fn http_injects_multiple_credentials_per_request() {
+        use crate::credential::{AuthShape, InjectRule, OnExistingHeader, SecretString};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.expect("upstream binds");
+        let upstream_addr = upstream.local_addr().expect("upstream addr");
+        let seen: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_cap = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let (mut sock, _) = upstream.accept().await.expect("upstream accepts");
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut tmp).await.expect("upstream reads");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            *seen_cap.lock().unwrap() = buf;
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .expect("upstream responds");
+        });
+
+        let inject = vec![
+            InjectRule {
+                name: "api-key".to_string(),
+                matcher: crate::http::HttpRule::parse("* 127.0.0.1/*").expect("rule parses"),
+                auth: AuthShape::Header {
+                    name: "x-api-key".to_string(),
+                },
+                secret: Arc::new(SecretString::new(b"sk-secret".to_vec())),
+                on_existing: OnExistingHeader::Replace,
+            },
+            InjectRule {
+                name: "token".to_string(),
+                matcher: crate::http::HttpRule::parse("* 127.0.0.1/*").expect("rule parses"),
+                auth: AuthShape::Header {
+                    name: "x-token".to_string(),
+                },
+                secret: Arc::new(SecretString::new(b"sk-token".to_vec())),
+                on_existing: OnExistingHeader::Replace,
+            },
+        ];
+        let handle = super::spawn_transparent_proxy(
+            vec![crate::http::HttpRule::parse("* 127.0.0.1/*").expect("allow parses")],
+            vec![],
+            Arc::new(inject),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("proxy spawns");
+
+        let mut conn = TcpStream::connect(handle.addr).await.expect("tcp connect");
+        let host_line = format!("Host: {upstream_addr}");
+        conn.write_all(
+            format!("GET / HTTP/1.1\r\n{host_line}\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .expect("write request");
+
+        let mut resp = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut chunk = [0u8; 4096];
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let n = tokio::time::timeout(remaining, conn.read(&mut chunk))
+                .await
+                .expect("response within timeout")
+                .expect("read response");
+            if n == 0 {
+                break;
+            }
+            resp.extend_from_slice(&chunk[..n]);
+            if let Some(header_end) = resp.windows(4).position(|w| w == b"\r\n\r\n") {
+                if resp.len() >= header_end + 4 + 2 {
+                    break;
+                }
+            }
+        }
+        let resp = String::from_utf8_lossy(&resp);
+        assert!(resp.starts_with("HTTP/1.1 200"), "expected 200, got: {resp}");
+
+        let raw = seen.lock().unwrap().clone();
+        let raw = String::from_utf8_lossy(&raw);
+        let raw_lower = raw.to_ascii_lowercase();
+        assert!(
+            raw_lower.contains("x-api-key: sk-secret"),
+            "missing first injected header: {raw}"
+        );
+        assert!(
+            raw_lower.contains("x-token: sk-token"),
+            "missing second injected header (first-match-wins regression): {raw}"
+        );
+    }
 }

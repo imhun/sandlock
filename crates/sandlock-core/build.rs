@@ -81,19 +81,29 @@ fn main() {
     } else {
         "-Wl,-Ttext-segment=0x30000000000"
     };
+    // x86_64 only: newer binutils (e.g. RHEL gcc-toolset, used by the pypa
+    // manylinux builder) lay out .bss beyond the 32-bit signed reach of the
+    // default small code model at the 3 TiB text segment, failing with
+    // "relocation truncated to fit: R_X86_64_32S". The large model keeps the
+    // freestanding stub toolchain-agnostic. riscv64 has no large model and its
+    // default (medany) is already fine.
+    let mut stub_args: Vec<&str> = vec![
+        "-static",
+        "-nostdlib",
+        "-no-pie",
+        "-O2",
+        "-ffreestanding",
+        "-fno-tree-loop-distribute-patterns",
+        text_segment,
+    ];
+    if !is_riscv64 {
+        stub_args.push("-mcmodel=large");
+    }
     if !build_static(
         &stub_src,
         &stub_bin,
         ccs,
-        &[
-            "-static",
-            "-nostdlib",
-            "-no-pie",
-            "-O2",
-            "-ffreestanding",
-            "-fno-tree-loop-distribute-patterns",
-            text_segment,
-        ],
+        &stub_args,
     ) {
         if stub_failure_is_fatal {
             panic!("{fail_msg}");

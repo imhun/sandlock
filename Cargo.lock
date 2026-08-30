@@ -1368,7 +1368,7 @@ dependencies = [
 
 [[package]]
 name = "sandlock-cli"
-version = "0.8.6"
+version = "0.9.0-beta"
 dependencies = [
  "anyhow",
  "clap",
@@ -1384,7 +1384,7 @@ dependencies = [
 
 [[package]]
 name = "sandlock-core"
-version = "0.8.6"
+version = "0.9.0-beta"
 dependencies = [
  "bincode",
  "bollard",
@@ -1419,7 +1419,7 @@ dependencies = [
 
 [[package]]
 name = "sandlock-ffi"
-version = "0.8.6"
+version = "0.9.0-beta"
 dependencies = [
  "libc",
  "sandlock-core",
@@ -1429,7 +1429,7 @@ dependencies = [
 
 [[package]]
 name = "sandlock-oci"
-version = "0.8.6"
+version = "0.9.0-beta"
 dependencies = [
  "anyhow",
  "clap",

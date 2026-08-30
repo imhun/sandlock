@@ -273,9 +273,13 @@ impl AclService {
             }
         }
 
-        // ACL passed: attach a credential if a rule matches. First match wins.
-        // The secret is rendered into the outbound request only here — never on
-        // the deny path above — and only its name is recorded, never the value.
+        // ACL passed: attach a credential for every matching rule. Multiple
+        // rules may target the same host (e.g. several `transform.headers`
+        // entries), so each one is applied in order — a later rule wins for a
+        // header name it shares with an earlier one, and AddOnly still keeps
+        // a caller-supplied value. The secret is rendered into the outbound
+        // request only here — never on the deny path above — and only its
+        // name is recorded, never the value.
         for r in self.inject.iter() {
             if r.matches(&method, &host, &path) {
                 match r.apply(&mut parts) {
@@ -318,9 +322,6 @@ impl AclService {
                         }
                     }
                 }
-                // First match wins whether it injected or deliberately kept the
-                // caller's value.
-                break;
             }
         }
 
