@@ -105,6 +105,17 @@ pub(super) async fn connect_on_behalf(
         } else {
             None
         };
+        // S2.3: the resolver's UDP connect() to the sandbox's own DNS gateway
+        // must be left to the kernel in the sandbox's netns. Under
+        // `net_isolation` the gateway socket is bound inside the sandbox
+        // netns, so a supervisor-side connect/inject (host netns) could never
+        // reach it; and the gateway endpoint is policy-exempt either way (its
+        // datagram path is exempted in the send handler). Letting the kernel
+        // connect the child's own socket also matches the shared-netns mode
+        // exactly — loopback, no packets sent on a UDP connect.
+        if dns_exempt && protocol == crate::network::Protocol::Udp {
+            return NotifAction::Continue;
+        }
         // The sandbox's own DNS gateway must stay reachable even when the
         // allowlist would otherwise deny it.
         if !dns_exempt {

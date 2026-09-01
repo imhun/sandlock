@@ -19,12 +19,22 @@
 
 use sandlock_core::Sandbox;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 
+use crate::net_fixture::WorkerLocalHost;
+
 fn temp_file(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("sandlock-test-netisol-{}-{}", name, std::process::id()))
+}
+
+fn is_synthetic(ip: &str) -> bool {
+    let Ok(ip) = ip.parse::<Ipv4Addr>() else {
+        return false;
+    };
+    let n = u32::from(ip);
+    (0x0afa_0002..=0x0afa_fffe).contains(&n)
 }
 
 fn base_policy() -> sandlock_core::SandboxBuilder {
@@ -725,32 +735,156 @@ async fn test_net_isolation_without_fd_inject_host_unreachable() {
     );
 }
 
-/// The wildcard-domain DNS gateway binds a 127.0.1.x address in the SHARED
-/// netns; from a netns-isolated sandbox that loopback address is the
-/// sandbox's own lo with nothing listening, so wildcard rules cannot work
-/// (until the in-netns DNS gateway lands, S2.3). The combination must fail
-/// fast at spawn, never silently run a broken DNS path.
+// ============================================================
+// S2.3: in-netns DNS gateway — wildcard DNS under net_isolation
+// ============================================================
+
+/// S2.3: under `net_isolation` the wildcard DNS gateway binds inside the
+/// sandbox's own netns (bound from the sandbox's userns, so
+/// `ip_unprivileged_port_start` is not involved). A wildcard subdomain must
+/// resolve to a synthetic IP through that gateway, while the bare apex
+/// domain must NOT be synthesized (wildcard rules grant subdomains only —
+/// the apex resolves through the gateway's upstream forwarder instead).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_net_isolation_wildcard_dns_restricted() {
-    let policy = base_policy()
+async fn test_net_isolation_wildcard_dns_resolves_subdomain_and_refuses_bare() {
+    let mut policy = base_policy()
         .net_isolation(true)
         .net_allow("*.example.com:443")
         .build()
         .unwrap();
-    let err = policy
-        .clone()
-        .run_interactive(&["python3", "-c", "pass"])
-        .await
-        .unwrap_err()
-        .to_string();
-    assert_eq!(
-        err,
-        "process error: child process error: net_isolation sandboxes cannot use \
-         wildcard-domain DNS rules: the shared-netns 127.0.1.x gateway is unreachable \
-         from a per-sandbox netns (only loopback); wildcard DNS under net_isolation is \
-         restricted until the in-netns DNS gateway lands (S2.3)",
-        "net_isolation + wildcard rules must fail closed"
+    let script = "import socket\n\
+                  try:\n\
+                  \x20 ip = socket.gethostbyname('api.example.com')\n\
+                  \x20 print(f'IP:{ip}')\n\
+                  except socket.gaierror as e:\n\
+                  \x20 print(f'ERR:{e.errno}')\n\
+                  try:\n\
+                  \x20 ip = socket.gethostbyname('example.com')\n\
+                  \x20 print(f'BARE:{ip}')\n\
+                  except socket.gaierror as e:\n\
+                  \x20 print(f'BARE_ERR:{e.errno}')\n";
+    let result = policy.run(&["python3", "-c", script]).await.unwrap();
+    let out = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default()).into_owned();
+    let err = String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()).into_owned();
+    assert!(
+        result.success(),
+        "netns wildcard DNS sandbox failed: exit={:?} out={out} err={err}",
+        result.code()
     );
+    let mut lines = out.lines();
+    let ip_line = lines.next().expect("missing first result line");
+    let ip = ip_line
+        .strip_prefix("IP:")
+        .expect("first line must be IP:<addr>, got: {out}");
+    assert!(
+        is_synthetic(ip),
+        "wildcard subdomain must resolve to a synthetic IP, got: {out}"
+    );
+    let bare_line = lines.next().expect("missing bare-apex result line");
+    let bare_ip = bare_line
+        .strip_prefix("BARE:")
+        .expect("bare apex line must be BARE:<addr>, got: {out}");
+    assert!(
+        !is_synthetic(bare_ip),
+        "bare apex domain must not be synthesized by the wildcard rule, got: {out}"
+    );
+    assert_eq!(lines.next(), None, "unexpected extra output: {out}");
+}
+
+/// S2.3 + S2.1: a netns-isolated sandbox with `fd_inject_connect` resolves a
+/// wildcard subdomain through its in-netns gateway (synthetic IP), connects
+/// to the synthetic address, and reaches the real destination through the
+/// injected connected fd — deterministic 4-byte echo, exact assertion. The
+/// bare apex domain must be refused at connect time (the wildcard rule
+/// grants subdomains only; the supervisor verdict denies before any
+/// host-side connect, ECONNREFUSED). The client uses the raw
+/// `connect()`/send/recv form like the S2.1 fd-injection tests: CPython's
+/// `socket.connect()` requires an exact 0 return, while the ADDFD|SEND
+/// injection semantics return the injected fd number (positive) — a known
+/// wrapper incompatibility, not a data-plane failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_net_isolation_wildcard_connect_with_fd_inject() {
+    let _host = WorkerLocalHost::setup("conn.example.com");
+    let listener = TcpListener::bind((_host.addr(), 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(b"PONG").unwrap();
+    });
+
+    let mut policy = base_policy()
+        .net_isolation(true)
+        .fd_inject_connect(true)
+        .net_allow(format!("*.example.com:{}", port))
+        .build()
+        .unwrap();
+    let script = format!(
+        concat!(
+            "import ctypes, errno, select, socket, struct\n",
+            "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+            "libc.connect.restype = ctypes.c_int\n",
+            "ip = socket.gethostbyname('conn.example.com')\n",
+            "print(f'IP:{{ip}}')\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.settimeout(5)\n",
+            "fd = s.fileno()\n",
+            "addr = struct.pack('<H', socket.AF_INET) + struct.pack('!H', {port}) + socket.inet_aton(ip) + b'\\x00' * 8\n",
+            "buf = ctypes.create_string_buffer(addr)\n",
+            "ctypes.set_errno(0)\n",
+            "ret = libc.connect(fd, buf, len(addr))\n",
+            "if ret < 0:\n",
+            "  err = ctypes.get_errno()\n",
+            "  if err != errno.EINPROGRESS:\n",
+            "    print(f'CONNECT_ERR:{{err}}')\n",
+            "    raise SystemExit(0)\n",
+            "  select.select([], [s], [], 5)\n",
+            "  soerr = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)\n",
+            "  if soerr != 0:\n",
+            "    print(f'CONNECT_ERR:{{soerr}}')\n",
+            "    raise SystemExit(0)\n",
+            "s.settimeout(5)\n",
+            "s.sendall(b'ping')\n",
+            "data = s.recv(4)\n",
+            "s.close()\n",
+            "print(f'ECHO:{{data.decode()}}')\n",
+            "try:\n",
+            "  b = socket.create_connection(('example.com', {port}), timeout=5)\n",
+            "  b.close()\n",
+            "  print('BARE_ALLOWED')\n",
+            "except OSError as e:\n",
+            "  print(f'BARE_ERR:{{e.errno}}')\n",
+        ),
+        port = port
+    );
+    let result = policy.run(&["python3", "-c", &script]).await.unwrap();
+    let out = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default()).into_owned();
+    let err = String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()).into_owned();
+    assert!(
+        result.success(),
+        "netns wildcard connect sandbox failed: exit={:?} out={out} err={err}",
+        result.code()
+    );
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 3, "unexpected output: {out} err={err}");
+    let ip = lines[0]
+        .strip_prefix("IP:")
+        .expect("first line must be IP:<addr>, got: {out}");
+    assert!(
+        is_synthetic(ip),
+        "wildcard subdomain must resolve to a synthetic IP, got: {out}"
+    );
+    assert_eq!(
+        lines[1], "ECHO:PONG",
+        "wildcard connect over in-netns DNS must echo PONG, got: out={out} err={err}"
+    );
+    assert_eq!(
+        lines[2], "BARE_ERR:111",
+        "bare apex domain connect must be refused with ECONNREFUSED, got: out={out} err={err}"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(30), server)
+        .await
+        .expect("connect server task timed out")
+        .unwrap();
 }
 
 // ============================================================

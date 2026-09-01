@@ -590,8 +590,9 @@ pub struct Sandbox {
     /// sandbox spawns in its own netns (`unshare(CLONE_NEWNET)` after the
     /// user namespace), containing only loopback brought up from inside the
     /// sandbox's userns. Defaults to `false` (shared network namespace).
-    /// Independent of `fd_inject_connect`; wildcard-domain DNS is restricted
-    /// under `net_isolation` until the in-netns DNS gateway (S2.3).
+    /// Independent of `fd_inject_connect`. With wildcard-domain rules the
+    /// DNS gateway binds inside the sandbox's own netns (S2.3), so the host
+    /// `ip_unprivileged_port_start` sysctl is not needed for netns sandboxes.
     #[serde(default)]
     pub net_isolation: bool,
 
@@ -1795,7 +1796,7 @@ impl Sandbox {
 
     async fn do_create_stdio(&mut self, cmd: &[&str], stdio: StdioSpec) -> Result<(), crate::error::SandlockError> {
         use std::ffi::CString;
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
         use crate::error::SandboxRuntimeError;
         use crate::context::{PipePair, read_u32_fd};
         use crate::network;
@@ -1867,26 +1868,46 @@ impl Sandbox {
         let resolved_net_allow = network::resolve_net_allow(&self.net_allow)
             .await
             .map_err(SandboxRuntimeError::Io)?;
-        // S2.2: wildcard-domain DNS is restricted under per-sandbox netns
-        // isolation. The wildcard gateway binds a 127.0.1.x loopback address
-        // in the SHARED netns; from a netns-isolated sandbox that address is
-        // its own loopback with nothing listening, so wildcard lookups cannot
-        // work (the in-netns DNS gateway is S2.3). Fail closed at spawn
-        // instead of silently running a broken DNS path; the default
-        // shared-netns path is unaffected (`net_isolation` defaults false).
-        if self.net_isolation
-            && (!resolved_net_allow.tcp.wildcard_domains.is_empty()
-                || !resolved_net_allow.udp.wildcard_domains.is_empty())
-        {
-            return Err(SandboxRuntimeError::Child(
-                "net_isolation sandboxes cannot use wildcard-domain DNS rules: the shared-netns \
-                 127.0.1.x gateway is unreachable from a per-sandbox netns (only loopback); \
-                 wildcard DNS under net_isolation is restricted until the in-netns DNS gateway \
-                 lands (S2.3)"
-                    .into(),
-            )
-            .into());
-        }
+        // Wildcard-domain rules are served by a per-sandbox DNS gateway on
+        // `<gateway>:53` (resolv.conf cannot express a port, so each sandbox
+        // gets its own 127.0.1.x loopback address). Under `net_isolation`
+        // (S2.3) the gateway binds INSIDE the sandbox netns: the address is
+        // allocated here, handed to the child through the dns pipe before
+        // forking, and the child binds `<addr>:53` in its own netns — it is
+        // root inside its user namespace, so CAP_NET_BIND_SERVICE applies and
+        // the host `ip_unprivileged_port_start` sysctl is not involved — then
+        // reports the socket back for the supervisor to serve (see the
+        // gateway section below). The default shared-netns path is unchanged
+        // (`net_isolation` defaults false): the parent binds the gateway in
+        // the shared netns as before.
+        let wildcard_suffixes: Vec<(String, crate::seccomp::notif::PortAllow)> =
+            resolved_net_allow
+                .tcp
+                .wildcard_domains
+                .iter()
+                .chain(resolved_net_allow.udp.wildcard_domains.iter())
+                .cloned()
+                .collect();
+        let need_gateway = !wildcard_suffixes.is_empty();
+        let netns_gateway_ip: Option<std::net::Ipv4Addr> = if self.net_isolation {
+            let ip = if need_gateway {
+                Some(crate::network::dns_synth::allocate_gateway_addr().ok_or_else(|| {
+                    SandboxRuntimeError::Child(
+                        "per-sandbox DNS gateway pool exhausted (127.0.1.0/24)".into(),
+                    )
+                })?)
+            } else {
+                None
+            };
+            // 0.0.0.0 signals "no wildcard gateway requested" to the child.
+            let encoded = ip.map(u32::from).unwrap_or(0);
+            crate::context::write_u32_fd(pipes.dns_w.as_raw_fd(), encoded).map_err(|e| {
+                SandboxRuntimeError::Child(format!("write DNS gateway address to child: {}", e))
+            })?;
+            ip
+        } else {
+            None
+        };
         // In chroot/image mode, seed the synthetic /etc/hosts from the
         // rootfs's own file so entries baked into the image (private
         // registries, internal hostnames, etc.) survive virtualization.
@@ -2222,6 +2243,8 @@ impl Sandbox {
                     unsafe { libc::close(pipes.ready_w.as_raw_fd()) };
                     unsafe { libc::close(pipes.leader_pid_r.as_raw_fd()) };
                     unsafe { libc::close(pipes.leader_pid_w.as_raw_fd()) };
+                    unsafe { libc::close(pipes.dns_r.as_raw_fd()) };
+                    unsafe { libc::close(pipes.dns_w.as_raw_fd()) };
                     if let Some((r, w)) = stdin_p.as_ref() {
                         unsafe { libc::close(r.as_raw_fd()) };
                         unsafe { libc::close(w.as_raw_fd()) };
@@ -2341,6 +2364,9 @@ impl Sandbox {
         // The intermediate holds the only other write end of the leader-pid
         // pipe; the parent never writes to it.
         drop(pipes.leader_pid_w);
+        // The gateway address was written to the dns pipe before forking; the
+        // parent only reads the child's fd number back on `dns_r`.
+        drop(pipes.dns_w);
 
         // Privileged `--user` remap: wait for the child to unshare its user
         // namespace, write the `0 -> host_uid` maps, then release it. Must
@@ -2488,31 +2514,59 @@ impl Sandbox {
         // queries with synthetic IPs and forwards the rest upstream so
         // normal DNS keeps working; /etc/resolv.conf is virtualized to point
         // at it.
-        let wildcard_suffixes: Vec<(String, crate::seccomp::notif::PortAllow)> =
-            resolved_net_allow
-                .tcp
-                .wildcard_domains
-                .iter()
-                .chain(resolved_net_allow.udp.wildcard_domains.iter())
-                .cloned()
-                .collect();
-        let need_gateway = !wildcard_suffixes.is_empty();
         let mut gateway_synthetic_dns: Option<crate::network::dns_synth::SyntheticDns> = None;
         let virtual_resolv_conf = if need_gateway {
             use crate::network::dns_gateway::{run_dns_gateway, worker_upstream_resolver};
 
-            let gateway_ip = crate::network::dns_synth::allocate_gateway_addr().ok_or_else(|| {
-                    SandboxRuntimeError::Child(
-                        "per-sandbox DNS gateway pool exhausted (127.0.1.0/24)".into(),
-                    )
+            // S2.3 netns mode: the child bound the gateway inside the
+            // sandbox's own netns and reported the socket's fd number; dup
+            // it here and wrap it in a tokio UDP socket. Shared-netns mode
+            // (default) keeps binding the gateway supervisor-side as before.
+            let (gateway_ip, dns_sock) = if let Some(gateway_ip) = netns_gateway_ip {
+                let dns_fd_num = read_u32_fd(pipes.dns_r.as_raw_fd()).map_err(|e| {
+                    SandboxRuntimeError::Child(format!("read DNS gateway fd from child: {}", e))
                 })?;
+                let raw = dup_child_fd(
+                    pidfd.as_ref(),
+                    self.rt().leader_pid,
+                    dns_fd_num as i32,
+                    pid,
+                    "DNS gateway",
+                )
+                .map_err(SandboxRuntimeError::Child)?;
+                let std_sock =
+                    unsafe { std::net::UdpSocket::from_raw_fd(raw.into_raw_fd()) };
+                std_sock
+                    .set_nonblocking(true)
+                    .map_err(|e| {
+                        SandboxRuntimeError::Child(format!(
+                            "set nonblocking on in-netns DNS gateway: {}",
+                            e
+                        ))
+                    })?;
+                let dns_sock = tokio::net::UdpSocket::from_std(std_sock).map_err(|e| {
+                    SandboxRuntimeError::Child(format!(
+                        "wrap in-netns DNS gateway socket: {}",
+                        e
+                    ))
+                })?;
+                (gateway_ip, dns_sock)
+            } else {
+                let gateway_ip =
+                    crate::network::dns_synth::allocate_gateway_addr().ok_or_else(|| {
+                        SandboxRuntimeError::Child(
+                            "per-sandbox DNS gateway pool exhausted (127.0.1.0/24)".into(),
+                        )
+                    })?;
+                let gateway_addr = std::net::SocketAddr::from((gateway_ip, 53));
+                let dns_sock = tokio::net::UdpSocket::bind(gateway_addr)
+                    .await
+                    .map_err(|e| SandboxRuntimeError::Child(format!("bind DNS gateway: {}", e)))?;
+                (gateway_ip, dns_sock)
+            };
             let dns = crate::network::dns_synth::SyntheticDns::new();
             gateway_synthetic_dns = Some(dns.clone());
-            let gateway_addr = std::net::SocketAddr::from((gateway_ip, 53));
             let upstream = worker_upstream_resolver();
-            let dns_sock = tokio::net::UdpSocket::bind(gateway_addr)
-                .await
-                .map_err(|e| SandboxRuntimeError::Child(format!("bind DNS gateway: {}", e)))?;
             let gateway_handle =
                 tokio::spawn(run_dns_gateway(dns_sock, wildcard_suffixes, dns, upstream));
             self.rt_mut().dns_gateway_handle = Some(gateway_handle);
@@ -3171,6 +3225,43 @@ unsafe fn relocate_high(src: i32) -> i32 {
     } else {
         src
     }
+}
+
+/// Open a child-side fd by number, using the same acquisition routes as the
+/// seccomp notif fd: `pidfd_getfd` for pid-ns leaders / direct children, and
+/// `/proc/<pid>/fd/<n>` otherwise. The child keeps the fd open (it is blocked
+/// on the ready pipe) until this dup lands, so the two handles share the same
+/// open file description — a socket created in the sandbox's netns stays bound
+/// to that netns even though the supervisor serves it from the host netns.
+fn dup_child_fd(
+    pidfd: Option<&std::os::fd::OwnedFd>,
+    leader_pid: Option<i32>,
+    fd_num: i32,
+    child_pid: i32,
+    what: &str,
+) -> Result<std::os::fd::OwnedFd, String> {
+    use std::os::fd::FromRawFd;
+    if let Some(leader_pid) = leader_pid {
+        let lpfd = crate::sys::syscall::pidfd_open(leader_pid as u32, 0)
+            .map_err(|e| format!("pidfd_open(leader): {}", e))?;
+        return crate::sys::syscall::pidfd_getfd(&lpfd, fd_num, 0)
+            .map_err(|e| format!("pidfd_getfd({}): {}", what, e));
+    }
+    if let Some(pfd) = pidfd {
+        return crate::sys::syscall::pidfd_getfd(pfd, fd_num, 0)
+            .map_err(|e| format!("pidfd_getfd({}): {}", what, e));
+    }
+    let path = format!("/proc/{}/fd/{}", child_pid, fd_num);
+    let cpath = std::ffi::CString::new(path).unwrap();
+    let raw = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
+    if raw < 0 {
+        return Err(format!(
+            "open {} fd from /proc: {}",
+            what,
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
 }
 
 /// Wire one of the child's std fds (`target` = 0/1/2) according to `mode`, in

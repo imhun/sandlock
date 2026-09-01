@@ -42,14 +42,23 @@ pub struct PipePair {
     pub leader_pid_r: OwnedFd,
     /// Intermediate process writes the leader's host pid to the parent.
     pub leader_pid_w: OwnedFd,
+    /// Parent reads the in-netns DNS gateway socket fd number (net_isolation
+    /// + wildcard rules only). The parent writes the allocated gateway
+    /// address to `dns_w` before forking; the child binds it in the sandbox
+    /// netns and writes the socket's fd number back. One writer at a time on
+    /// each direction, so the two messages never interleave.
+    pub dns_r: OwnedFd,
+    /// Parent writes the DNS gateway address, child writes the socket fd.
+    pub dns_w: OwnedFd,
 }
 
 impl PipePair {
-    /// Create three pipe pairs using `pipe2(O_CLOEXEC)`.
+    /// Create four pipe pairs using `pipe2(O_CLOEXEC)`.
     pub fn new() -> io::Result<Self> {
         let mut notif_fds = [0i32; 2];
         let mut ready_fds = [0i32; 2];
         let mut leader_pid_fds = [0i32; 2];
+        let mut dns_fds = [0i32; 2];
 
         // SAFETY: pipe2 with valid pointers and O_CLOEXEC
         let ret = unsafe { libc::pipe2(notif_fds.as_mut_ptr(), libc::O_CLOEXEC) };
@@ -78,6 +87,19 @@ impl PipePair {
             return Err(io::Error::last_os_error());
         }
 
+        let ret = unsafe { libc::pipe2(dns_fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        if ret < 0 {
+            unsafe {
+                libc::close(notif_fds[0]);
+                libc::close(notif_fds[1]);
+                libc::close(ready_fds[0]);
+                libc::close(ready_fds[1]);
+                libc::close(leader_pid_fds[0]);
+                libc::close(leader_pid_fds[1]);
+            }
+            return Err(io::Error::last_os_error());
+        }
+
         // SAFETY: pipe2 returned valid fds
         Ok(PipePair {
             notif_r: unsafe { OwnedFd::from_raw_fd(notif_fds[0]) },
@@ -86,6 +108,8 @@ impl PipePair {
             ready_w: unsafe { OwnedFd::from_raw_fd(ready_fds[1]) },
             leader_pid_r: unsafe { OwnedFd::from_raw_fd(leader_pid_fds[0]) },
             leader_pid_w: unsafe { OwnedFd::from_raw_fd(leader_pid_fds[1]) },
+            dns_r: unsafe { OwnedFd::from_raw_fd(dns_fds[0]) },
+            dns_w: unsafe { OwnedFd::from_raw_fd(dns_fds[1]) },
         })
     }
 }
@@ -665,16 +689,67 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     // privilege in the parent namespace. The fresh netns contains only
     // loopback; bring lo up from inside the userns. Must run before
     // Landlock/seccomp: the interface ioctls are only needed at setup and the
-    // netns switch must precede any network confinement. Supervisor-mediated
-    // services that live in the shared netns (the 127.0.1.x wildcard DNS
-    // gateway) are unreachable from here by design — see the net_isolation
-    // wildcard-DNS restriction in `do_create_stdio`.
+    // netns switch must precede any network confinement. The wildcard DNS
+    // gateway for net_isolation sandboxes is bound in this netns right below
+    // (S2.3), so the sandbox never depends on shared-netns supervisor
+    // services.
     if sandbox.net_isolation {
         if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
             fail!("unshare(CLONE_NEWNET)");
         }
         if let Err(e) = bring_loopback_up() {
             fail!(format!("bring loopback up in netns: {}", e));
+        }
+
+        // 5c. In-netns wildcard DNS gateway (S2.3): when the parent allocated
+        // a gateway address for this sandbox it wrote it to the dns pipe
+        // before forking (0.0.0.0 means "no wildcard gateway requested").
+        // Bind a UDP socket at `<addr>:53` in the sandbox's OWN netns — we
+        // are root inside our user namespace, so CAP_NET_BIND_SERVICE covers
+        // port 53 and the host `ip_unprivileged_port_start` sysctl is
+        // irrelevant — then report the socket's fd number to the parent,
+        // which dups it and runs the gateway task supervisor-side. The
+        // socket stays bound to this netns for its whole lifetime, so the
+        // supervisor answers queries without entering the namespace. Must
+        // run before Landlock/seccomp: socket()/bind() happen unconfined and
+        // only the fd number crosses the confinement boundary. We keep the
+        // fd open until the parent dups it (we block on the ready pipe
+        // below); `close_fds_above` drops our copy at exec.
+        match read_u32_fd(pipes.dns_r.as_raw_fd()) {
+            Ok(0) => {}
+            Ok(ip_bits) => {
+                let addr = std::net::Ipv4Addr::from(ip_bits);
+                let sock = unsafe {
+                    libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0)
+                };
+                if sock < 0 {
+                    fail!("socket(AF_INET, SOCK_DGRAM) for in-netns DNS gateway");
+                }
+                let sa = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as libc::sa_family_t,
+                    sin_port: 53u16.to_be(),
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from_ne_bytes(addr.octets()),
+                    },
+                    sin_zero: [0; 8],
+                };
+                if unsafe {
+                    libc::bind(
+                        sock,
+                        &sa as *const libc::sockaddr_in as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    )
+                } < 0
+                {
+                    unsafe { libc::close(sock) };
+                    fail!("bind in-netns DNS gateway");
+                }
+                if write_u32_fd(pipes.dns_w.as_raw_fd(), sock as u32).is_err() {
+                    unsafe { libc::close(sock) };
+                    fail!("write in-netns DNS gateway fd");
+                }
+            }
+            Err(e) => fail!(format!("read DNS gateway address: {}", e)),
         }
     }
 
