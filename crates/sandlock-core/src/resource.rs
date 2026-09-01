@@ -957,6 +957,7 @@ mod tests {
             time_offset: 0,
             num_cpus: None,
             port_remap: false,
+            fd_inject_connect: false,
             cow_enabled: false,
             chroot_root: None,
             chroot_readable: Vec::new(),

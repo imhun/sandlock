@@ -215,6 +215,15 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "port-remap"))]
     pub port_remap: bool,
 
+    /// S2.1: when true, an IP `connect()` is executed on a fresh
+    /// supervisor-side socket and the connected fd is injected into the
+    /// sandbox via `SECCOMP_ADDFD_FLAG_SETFD|SEND`, so the trapped syscall
+    /// returns the child-side fd number instead of 0. Defaults to `false`
+    /// (legacy dup-based on-behalf connect). CLI surface intentionally not
+    /// exposed yet — the flag lands with the per-sandbox netns work (S2.2).
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub fd_inject_connect: bool,
+
     /// Skip the seccomp user-notification supervisor. The CLI exposes
     /// its own `--no-supervisor` flag on `RunArgs` (which short-circuits
     /// to a direct exec); this field is the API-level counterpart used
@@ -337,6 +346,7 @@ impl Default for SandboxBuilder {
             cpu_cores: None,
             num_cpus: None,
             port_remap: false,
+            fd_inject_connect: false,
             no_supervisor: false,
             pid_ns: false,
             control_socket: true,
@@ -407,6 +417,7 @@ impl Clone for SandboxBuilder {
             cpu_cores: self.cpu_cores.clone(),
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
+            fd_inject_connect: self.fd_inject_connect,
             no_supervisor: self.no_supervisor,
             pid_ns: self.pid_ns,
             control_socket: self.control_socket,
@@ -803,6 +814,15 @@ impl SandboxBuilder {
         self
     }
 
+    /// Enable the connect fd-injection path (S2.1): the supervisor performs
+    /// the connect on a fresh host-side socket and injects the connected fd
+    /// into the sandbox, so the trapped `connect()` returns the child-side
+    /// fd number. Defaults to `false` (legacy on-behalf connect).
+    pub fn fd_inject_connect(mut self, v: bool) -> Self {
+        self.fd_inject_connect = v;
+        self
+    }
+
     /// Skip the seccomp user-notification supervisor. The sandbox keeps
     /// Landlock and the kernel-level deny filter but loses every
     /// supervisor-mediated feature (IP allowlist, resource limits, COW,
@@ -1163,6 +1183,7 @@ impl SandboxBuilder {
             cpu_cores: self.cpu_cores,
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
+            fd_inject_connect: self.fd_inject_connect,
             no_supervisor: self.no_supervisor,
             pid_ns: self.pid_ns,
             control_socket: self.control_socket,

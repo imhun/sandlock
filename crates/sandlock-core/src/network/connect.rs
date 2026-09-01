@@ -4,7 +4,7 @@
 // on the dup'd socket. Named AF_UNIX connects are delegated to `unix`.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use crate::seccomp::ctx::SupervisorCtx;
@@ -147,16 +147,44 @@ pub(super) async fn connect_on_behalf(
                     };
                     let port = dest_port.unwrap_or(0);
                     let is_v6 = sockaddr_is_ipv6(&addr_bytes);
-                    return match crate::network::egress::socks5_connect(
-                        dup_fd.as_raw_fd(),
-                        &eg,
-                        &dest,
-                        port,
-                        is_v6,
-                    ) {
-                        Ok(()) => NotifAction::ReturnValue(0),
-                        Err(_) => NotifAction::Errno(ECONNREFUSED),
-                    };
+                    if ctx.policy.fd_inject_connect {
+                        // Injection path: tunnel the fresh host-side socket
+                        // through the proxy and inject it into the sandbox.
+                        if let Some(host) = new_host_socket(dup_fd.as_raw_fd()) {
+                            let result = crate::network::egress::socks5_connect(
+                                host.as_raw_fd(),
+                                &eg,
+                                &dest,
+                                port,
+                                is_v6,
+                            );
+                            return match result {
+                                Ok(()) => {
+                                    mirror_child_fd_flags(
+                                        host.as_raw_fd(),
+                                        dup_fd.as_raw_fd(),
+                                    );
+                                    inject_connected_fd(host, sockfd)
+                                }
+                                Err(_) => NotifAction::Errno(ECONNREFUSED),
+                            };
+                        }
+                        // A fresh socket could not be created (e.g. a
+                        // privileged protocol an unprivileged supervisor
+                        // cannot mint): fall through to the legacy
+                        // dup-based path below.
+                    } else {
+                        return match crate::network::egress::socks5_connect(
+                            dup_fd.as_raw_fd(),
+                            &eg,
+                            &dest,
+                            port,
+                            is_v6,
+                        ) {
+                            Ok(()) => NotifAction::ReturnValue(0),
+                            Err(_) => NotifAction::Errno(ECONNREFUSED),
+                        };
+                    }
                 }
             }
         }
@@ -199,8 +227,44 @@ pub(super) async fn connect_on_behalf(
         // Execute. Record the original destination *before* connect to prevent
         // a TOCTOU race: the proxy may receive the request before we write the
         // mapping if we did it after connect(). The IP comes from `addr_bytes`
-        // (our immune copy). The dup from the SO_PROTOCOL probe above is
-        // reused rather than pidfd_getfd-ing a second time.
+        // (our immune copy).
+        if ctx.policy.fd_inject_connect {
+            if let Some(host) = new_host_socket(dup_fd.as_raw_fd()) {
+                // Injection path: connect the fresh host-side socket to the
+                // planned target, then inject it at the child's socket fd so
+                // the sandbox's connect() returns the fd number.
+                if plan.record_orig_dest {
+                    if let Some(ref map) = orig_dest_map {
+                        // The local-address probe must bind in the socket's
+                        // own family, which for a v4-mapped destination is
+                        // AF_INET6 even though the canonical `ip` is V4.
+                        record_orig_dest(
+                            map,
+                            host.as_raw_fd(),
+                            sockaddr_is_ipv6(&addr_bytes),
+                            resolved_ip.unwrap_or(ip),
+                        );
+                    }
+                }
+                let ret = unsafe {
+                    libc::connect(
+                        host.as_raw_fd(),
+                        plan.addr.as_ptr() as *const libc::sockaddr,
+                        plan.addr.len() as libc::socklen_t,
+                    )
+                };
+                return if ret == 0 {
+                    mirror_child_fd_flags(host.as_raw_fd(), dup_fd.as_raw_fd());
+                    inject_connected_fd(host, sockfd)
+                } else {
+                    NotifAction::Errno(unsafe { *libc::__errno_location() })
+                };
+            }
+            // Fall back to the legacy dup-based path when the host socket
+            // cannot be reproduced (keeps the sandbox functional in the
+            // shared-netns mode; per-sandbox netns (S2.2) will make
+            // injection mandatory and this fallback unreachable).
+        }
         if plan.record_orig_dest {
             if let Some(ref map) = orig_dest_map {
                 // The local-address probe must bind in the socket's own
@@ -554,6 +618,74 @@ fn connect_dup(fd: RawFd, addr: &[u8]) -> NotifAction {
         NotifAction::ReturnValue(0)
     } else {
         NotifAction::Errno(unsafe { *libc::__errno_location() })
+    }
+}
+
+/// Create a fresh supervisor-side socket matching the child's socket
+/// (SO_DOMAIN / SO_TYPE / SO_PROTOCOL) so it can be connected in the host
+/// netns and injected into the sandbox.
+///
+/// Returns `None` when the child's socket parameters cannot be reproduced —
+/// e.g. `socket(2)` fails for an ICMP ping socket an unprivileged supervisor
+/// cannot mint — in which case callers fall back to the legacy dup-based
+/// on-behalf connect.
+fn new_host_socket(dup_fd: RawFd) -> Option<OwnedFd> {
+    let mut domain: libc::c_int = 0;
+    let mut sock_type: libc::c_int = 0;
+    let mut protocol: libc::c_int = 0;
+    let get = |opt: libc::c_int, out: &mut libc::c_int| unsafe {
+        let mut len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        libc::getsockopt(
+            dup_fd,
+            libc::SOL_SOCKET,
+            opt,
+            out as *mut _ as *mut libc::c_void,
+            &mut len,
+        ) == 0
+    };
+    if !get(libc::SO_DOMAIN, &mut domain)
+        || !get(libc::SO_TYPE, &mut sock_type)
+        || !get(libc::SO_PROTOCOL, &mut protocol)
+    {
+        return None;
+    }
+    let fd = unsafe { libc::socket(domain, sock_type, protocol) };
+    if fd < 0 {
+        return None;
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    Some(owned)
+}
+
+/// Mirror the child socket's fd semantics onto the host socket before
+/// injection: `O_NONBLOCK` (file status flags) and `FD_CLOEXEC` (fd flags).
+/// The injected fd must preserve the child's blocking mode and close-on-exec
+/// behavior, otherwise read/write semantics or exec hygiene silently change.
+fn mirror_child_fd_flags(host_fd: RawFd, dup_fd: RawFd) {
+    let fl = unsafe { libc::fcntl(dup_fd, libc::F_GETFL) };
+    if fl >= 0 {
+        let status = fl & (libc::O_NONBLOCK | libc::O_ASYNC);
+        if status != 0 {
+            unsafe {
+                libc::fcntl(host_fd, libc::F_SETFL, status);
+            }
+        }
+    }
+    let fd = unsafe { libc::fcntl(dup_fd, libc::F_GETFD) };
+    if fd >= 0 && (fd & libc::FD_CLOEXEC) != 0 {
+        unsafe {
+            libc::fcntl(host_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+    }
+}
+
+/// Build the action that atomically replaces the child's socket fd with the
+/// connected supervisor-side socket (`SETFD|SEND`): the child's `connect()`
+/// returns the fd number and the data plane is the injected fd.
+fn inject_connected_fd(host: OwnedFd, sockfd: i32) -> NotifAction {
+    NotifAction::InjectFdSendAt {
+        srcfd: host,
+        targetfd: sockfd,
     }
 }
 

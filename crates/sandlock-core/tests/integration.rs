@@ -37,6 +37,9 @@ mod test_transaction;
 #[path = "integration/test_network.rs"]
 mod test_network;
 
+#[path = "integration/test_net_isolate.rs"]
+mod test_net_isolate;
+
 #[path = "integration/test_egress.rs"]
 mod test_egress;
 

@@ -206,6 +206,7 @@ impl TryFrom<&Sandbox> for Confinement {
         if sandbox.cpu_cores.is_some() { unsupported.push("cpu_cores"); }
         if sandbox.num_cpus.is_some() { unsupported.push("num_cpus"); }
         if sandbox.port_remap { unsupported.push("port_remap"); }
+        if sandbox.fd_inject_connect { unsupported.push("fd_inject_connect"); }
         if sandbox.user.is_some() { unsupported.push("user"); }
         if sandbox.policy_fn.is_some() { unsupported.push("policy_fn"); }
 
@@ -578,6 +579,12 @@ pub struct Sandbox {
     pub num_cpus: Option<u32>,
     pub port_remap: bool,
 
+    /// Connect fd-injection path (S2.1): supervisor-side connect + fd
+    /// injection into the sandbox. Defaults to `false`; only meaningful
+    /// under the seccomp-notif supervisor (not the Confinement path).
+    #[serde(default)]
+    pub fd_inject_connect: bool,
+
     /// Skip the seccomp user-notification supervisor. The sandbox runs
     /// with Landlock + a kernel-only deny filter, with none of the
     /// supervisor-mediated features (IP allowlist, resource limits,
@@ -719,6 +726,7 @@ impl Clone for Sandbox {
             cpu_cores: self.cpu_cores.clone(),
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
+            fd_inject_connect: self.fd_inject_connect,
             no_supervisor: self.no_supervisor,
             pid_ns: self.pid_ns,
             control_socket: self.control_socket,
@@ -2568,6 +2576,7 @@ impl Sandbox {
                 time_offset: time_offset_val,
                 num_cpus: self.num_cpus,
                 port_remap: resolved.features.port_remap,
+                fd_inject_connect: resolved.features.fd_inject_connect,
                 cow_enabled: resolved.features.cow,
                 chroot_root: chroot_root.clone(),
                 chroot_readable: self.fs_readable.clone(),

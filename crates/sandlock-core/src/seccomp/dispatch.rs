@@ -1199,6 +1199,7 @@ mod handler_tests {
                 num_cpus: None,
                 argv_safety_required: false,
                 port_remap: false,
+                fd_inject_connect: false,
                 cow_enabled: false,
                 chroot_root: None,
                 chroot_readable: Vec::new(),
