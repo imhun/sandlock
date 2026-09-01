@@ -180,7 +180,7 @@ fn close_fds_above(min_fd: RawFd, keep: &[RawFd]) {
 /// child running as the overflow uid (65534) with no indication. Ubuntu
 /// 24.04's default AppArmor restriction on unprivileged user namespaces
 /// produces exactly that: unshare succeeds, the map write fails.
-fn write_id_maps(
+pub(crate) fn write_id_maps(
     real_uid: u32,
     real_gid: u32,
     target_uid: u32,
@@ -242,6 +242,13 @@ pub(crate) struct ChildSpawnArgs<'a> {
     /// piped run taking the foreground demotes the embedding process to a
     /// background job, and its next tty read stops it with SIGTTIN.
     pub foreground: bool,
+    /// The child runs as the first process of a fresh PID namespace
+    /// (`Sandbox::pid_ns`): the user namespace (and any uid/gid mapping)
+    /// was already created by the intermediate process before the final
+    /// fork, so `confine_child` must not unshare another one, and the
+    /// parent-death check compares against `getppid() == 0` (the real
+    /// parent lives outside the namespace).
+    pub pid_ns: bool,
 }
 
 /// Set the calling thread/process name (`/proc/<pid>/comm`, shown by `ps`). The
@@ -289,6 +296,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         extra_syscalls,
         parent_pid,
         foreground,
+        pid_ns,
     } = args;
     // Helper: abort child on error. Includes the OS error automatically.
     macro_rules! fail {
@@ -387,26 +395,33 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         }
     }
 
-    // Capture real uid/gid before any unshare (after unshare they become 65534)
-    let real_uid = unsafe { libc::getuid() };
-    let real_gid = unsafe { libc::getgid() };
-
     // 5. User namespace for --user (run-as uid/gid) mapping.
     //
-    // Skip entirely when the requested identity already matches the current
-    // uid/gid: there's no point unsharing a user namespace to map an identity
-    // the process already has, and skipping avoids imposing an
+    // Skipped entirely when the sandbox runs in its own PID namespace:
+    // the intermediate process created the user namespace (required for
+    // unprivileged CLONE_NEWPID) and wrote the mapping before the final
+    // fork, so this child already has its target identity.
+    //
+    // Otherwise skip when the requested identity already matches the
+    // current uid/gid: there's no point unsharing a user namespace to map
+    // an identity the process already has, and skipping avoids imposing an
     // unprivileged-userns requirement on callers that don't need a remap.
-    if let Some(run_as) = sandbox.user {
-        if run_as.uid != real_uid || run_as.gid != real_gid {
-            if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
-                fail!("unshare(CLONE_NEWUSER)");
-            }
-            if write_id_maps(real_uid, real_gid, run_as.uid, run_as.gid).is_err() {
-                fail!(
-                    "uid_map/gid_map write (is unprivileged userns restricted? \
-                     e.g. kernel.apparmor_restrict_unprivileged_userns=1)"
-                );
+    if !pid_ns {
+        // Capture real uid/gid before any unshare (after unshare they become 65534)
+        let real_uid = unsafe { libc::getuid() };
+        let real_gid = unsafe { libc::getgid() };
+
+        if let Some(run_as) = sandbox.user {
+            if run_as.uid != real_uid || run_as.gid != real_gid {
+                if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+                    fail!("unshare(CLONE_NEWUSER)");
+                }
+                if write_id_maps(real_uid, real_gid, run_as.uid, run_as.gid).is_err() {
+                    fail!(
+                        "uid_map/gid_map write (is unprivileged userns restricted? \
+                         e.g. kernel.apparmor_restrict_unprivileged_userns=1)"
+                    );
+                }
             }
         }
     }

@@ -18,8 +18,8 @@
 //     supervisor approving a syscall based on user-controlled string
 //     contents, so the seccomp_unotify TOCTOU class doesn't apply.
 
-use std::collections::HashSet;
-use std::os::unix::io::RawFd;
+use std::collections::{HashMap, HashSet};
+use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -27,6 +27,132 @@ use tokio::sync::Mutex;
 use crate::seccomp::notif::{content_memfd, read_child_cstr, write_child_mem, NotifAction, NotifPolicy};
 use crate::seccomp::state::{NetworkState, ProcessIndex};
 use crate::sys::structs::{SeccompNotif, EACCES};
+
+// ============================================================
+// PID namespace translation (CLONE_NEWPID)
+// ============================================================
+
+/// Maps the PID namespace of one sandbox (`Sandbox::pid_ns`) to the host
+/// PID namespace the supervisor lives in.
+///
+/// This map is *not* used to translate `SeccompNotif.pid`: the kernel fills
+/// that field with the pid relative to the reader's namespace
+/// (`task_pid_vnr`), and the supervisor reads notifications from the host
+/// namespace, so notifications already carry host pids. The map exists for
+/// the sandbox's own `/proc` view: the shared host `/proc` mount lists host
+/// pids, but inside the sandbox's namespace the same processes must appear
+/// as their namespace pids (1, 2, …). It translates ns pid ↔ host pid for
+/// that renumbering and for `/proc/<ns_pid>/…` opens.
+///
+/// The leader's host pid is known at spawn time (the intermediate process
+/// relays it through the spawn pipe; its ns pid is always 1). Every other
+/// process is discovered by scanning `/proc` for tasks whose PID namespace
+/// inode matches the sandbox's and reading the last `NSpid:` entry (the pid
+/// in the task's own namespace). Entries are re-verified against
+/// `/proc/<host>/status` + the namespace inode on every use, so a recycled
+/// host pid can never be mistaken for a live sandbox process.
+pub(crate) struct PidNsMap {
+    /// The sandbox's PID namespace identity: `readlink /proc/<leader>/ns/pid`
+    /// (e.g. `pid:[4026532444]`). Only processes in this namespace can be
+    /// translated.
+    ns_inode: Option<String>,
+    /// ns pid (as reported by seccomp notifications) → host pid.
+    map: HashMap<u32, i32>,
+}
+
+impl PidNsMap {
+    /// Create the map for a sandbox whose leader (ns pid 1) has host pid
+    /// `leader_host_pid`.
+    pub(crate) fn new(leader_host_pid: i32) -> Self {
+        let ns_inode = std::fs::read_link(format!("/proc/{}/ns/pid", leader_host_pid))
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
+        let mut map = HashMap::new();
+        map.insert(1, leader_host_pid);
+        Self { ns_inode, map }
+    }
+
+    /// Translate a sandbox-namespace pid to its host pid, scanning `/proc`
+    /// for a fresh entry when the cache misses. Returns `None` when the pid
+    /// cannot be resolved to a live process of this sandbox's namespace.
+    pub(crate) fn host_pid(&mut self, ns_pid: u32) -> Option<i32> {
+        if let Some(&host) = self.map.get(&ns_pid) {
+            if self.verify(host, ns_pid) {
+                return Some(host);
+            }
+        }
+        self.refresh();
+        self.map.get(&ns_pid).copied().filter(|&host| self.verify(host, ns_pid))
+    }
+
+    /// The sandbox-namespace pid of a tracked host pid, if known.
+    pub(crate) fn ns_pid_of(&self, host_pid: i32) -> Option<u32> {
+        self.map.iter().find_map(|(&ns, &host)| (host == host_pid).then_some(ns))
+    }
+
+    /// Highest sandbox-namespace pid currently known, for `/proc/loadavg`.
+    pub(crate) fn max_ns_pid(&self) -> Option<i32> {
+        self.map.keys().copied().map(|p| p as i32).max()
+    }
+
+    /// Rebuild the map from a full `/proc` scan. Every process whose PID
+    /// namespace inode matches the sandbox's is added under its own-namespace
+    /// pid (the last `NSpid:` entry). The leader's entry (ns pid 1) is
+    /// always re-seeded — its ns pid is fixed by construction.
+    fn refresh(&mut self) {
+        let mut fresh = HashMap::new();
+        if self.ns_inode.is_some() {
+            if let Ok(dir) = std::fs::read_dir("/proc") {
+                for entry in dir.flatten() {
+                    let Ok(host) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                        continue;
+                    };
+                    if host <= 0 {
+                        continue;
+                    }
+                    if !self.in_sandbox_ns(host) {
+                        continue;
+                    }
+                    if let Some(ns) = self.ns_pid_of_host(host) {
+                        fresh.insert(ns, host);
+                    }
+                }
+            }
+        }
+        if let Some(&host) = self.map.get(&1) {
+            fresh.insert(1, host);
+        }
+        self.map = fresh;
+    }
+
+    /// True when `host` lives in the sandbox's PID namespace.
+    fn in_sandbox_ns(&self, host: i32) -> bool {
+        match self.ns_inode {
+            Some(ref inode) => std::fs::read_link(format!("/proc/{}/ns/pid", host))
+                .map(|p| p.to_string_lossy() == inode.as_str())
+                .unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// The pid of `host` inside its own (innermost) PID namespace: the last
+    /// field of the `NSpid:` line in `/proc/<host>/status`.
+    fn ns_pid_of_host(&self, host: i32) -> Option<u32> {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", host)).ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("NSpid:") {
+                return rest.split_whitespace().last()?.parse().ok();
+            }
+        }
+        None
+    }
+
+    /// Re-check a cached (ns_pid, host_pid) pair against live `/proc` state
+    /// so a recycled host pid (or an exited process) is never used.
+    fn verify(&self, host: i32, ns_pid: u32) -> bool {
+        self.in_sandbox_ns(host) && self.ns_pid_of_host(host) == Some(ns_pid)
+    }
+}
 
 // ============================================================
 // Sensitive path detection
@@ -437,7 +563,46 @@ pub(crate) async fn handle_proc_open(
     // already hide non-sandbox PIDs, but without this check a process
     // could still open /proc/{ppid}/cmdline (or any guessed PID) directly.
     if let Some(pid) = extract_proc_pid(path) {
-        if !processes.contains(pid) {
+        // With a PID namespace the numeric pid in the path is the
+        // *sandbox-namespace* pid (the shared host /proc mount lists host
+        // pids, but the sandbox only ever learns ns pids from its filtered
+        // directory listings). Translate to the host pid before deciding,
+        // and service the open on the supervisor's behalf against the host
+        // path — the kernel would otherwise resolve `/proc/<ns_pid>`
+        // against an unrelated host process.
+        if let Some(ref map) = policy.pid_ns {
+            // PID-namespace sandbox: the numeric pid is a *sandbox-
+            // namespace* pid. Resolve it to the host pid and require it to
+            // belong to this sandbox's namespace; the shared host /proc
+            // mount would otherwise resolve `/proc/<ns_pid>` against an
+            // unrelated host process, so the open is serviced on the
+            // supervisor's behalf against the host path.
+            let mut map = map.write().expect("pid-ns map lock poisoned");
+            let Some(host_pid) = map.host_pid(pid as u32).map(|h| h as i32) else {
+                return NotifAction::Errno(EACCES);
+            };
+            let prefix = format!("/proc/{}", pid);
+            let rest = path.strip_prefix(&prefix).unwrap_or("");
+            let host_path = format!("/proc/{}{}", host_pid, rest);
+            let c_path = match std::ffi::CString::new(host_path) {
+                Ok(c) => c,
+                Err(_) => return NotifAction::Errno(libc::EINVAL),
+            };
+            // /proc entries cannot be created; drop creation flags so a
+            // bogus O_CREAT does not change the supervisor's open.
+            let raw_flags = crate::seccomp::notif::decode_open_args(notif, notif_fd)
+                .map(|a| (a.flags & !(libc::O_CREAT as u64 | libc::O_EXCL as u64 | libc::O_TRUNC as u64)) as i32)
+                .unwrap_or(libc::O_RDONLY);
+            let fd = unsafe { libc::open(c_path.as_ptr(), raw_flags, 0) };
+            if fd < 0 {
+                let err = std::io::Error::last_os_error();
+                return NotifAction::Errno(err.raw_os_error().unwrap_or(libc::EIO));
+            }
+            let newfd_flags = (raw_flags as u32) & (libc::O_CLOEXEC as u32);
+            // SAFETY: fd is a fresh open file description owned by the supervisor.
+            let owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
+            return NotifAction::InjectFdSend { srcfd: owned, newfd_flags };
+        } else if !processes.contains(pid) {
             return NotifAction::Errno(EACCES);
         }
     }
@@ -468,7 +633,10 @@ pub(crate) async fn handle_proc_open(
     // Virtualize /proc/loadavg when proc virtualization is active.
     if path == "/proc/loadavg" {
         let total = processes.len() as u32;
-        let last_pid = processes.max_pid().unwrap_or(0);
+        let last_pid = match policy.pid_ns {
+            Some(ref map) => map.read().expect("pid-ns map lock poisoned").max_ns_pid().unwrap_or(0),
+            None => processes.max_pid().unwrap_or(0),
+        };
         let rs = resource.lock().await;
         let running = rs.proc_count;
         let content = generate_loadavg(&rs.load_avg, running, total, last_pid);
@@ -993,6 +1161,68 @@ fn build_filtered_dirents(sandbox_pids: &HashSet<i32>) -> Vec<Vec<u8>> {
     entries
 }
 
+/// Like [`build_filtered_dirents`], but for a PID-namespace sandbox: the
+/// entries are renamed to the pid each process has *inside* the sandbox's
+/// namespace (`/proc` there shows 1, 2, … — never host pids). Membership is
+/// decided by the namespace map (which covers every process of the sandbox's
+/// PID namespace, whether or not the supervisor has registered it yet), not
+/// by the supervisor's tracking set.
+fn build_filtered_dirents_ns(map: &PidNsMap) -> Vec<Vec<u8>> {
+    let mut entries = Vec::new();
+    let mut d_off: i64 = 0;
+
+    let dir = match std::fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return entries,
+    };
+
+    for entry in dir {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Keep only the sandbox's own processes, renamed to their ns pid.
+        if let Ok(host_pid) = name_str.parse::<i32>() {
+            let Some(ns_pid) = map.ns_pid_of(host_pid) else {
+                // Not a process of this sandbox's PID namespace: hide it.
+                continue;
+            };
+            d_off += 1;
+            let d_type = match entry.file_type() {
+                Ok(ft) if ft.is_dir() => DT_DIR,
+                Ok(ft) if ft.is_symlink() => DT_LNK,
+                _ => DT_REG,
+            };
+            let d_ino = {
+                use std::os::linux::fs::MetadataExt;
+                entry.metadata().map(|m| m.st_ino()).unwrap_or(0)
+            };
+            if let Some(rec) = build_dirent64(d_ino, d_off, d_type, &ns_pid.to_string()) {
+                entries.push(rec);
+            }
+            continue;
+        }
+
+        d_off += 1;
+        let d_type = match entry.file_type() {
+            Ok(ft) if ft.is_dir() => DT_DIR,
+            Ok(ft) if ft.is_symlink() => DT_LNK,
+            _ => DT_REG,
+        };
+        let d_ino = {
+            use std::os::linux::fs::MetadataExt;
+            entry.metadata().map(|m| m.st_ino()).unwrap_or(0)
+        };
+        if let Some(rec) = build_dirent64(d_ino, d_off, d_type, &name_str) {
+            entries.push(rec);
+        }
+    }
+    entries
+}
+
 // ============================================================
 // handle_getdents — PID filtering
 // ============================================================
@@ -1004,7 +1234,7 @@ fn build_filtered_dirents(sandbox_pids: &HashSet<i32>) -> Vec<Vec<u8>> {
 pub(crate) async fn handle_getdents(
     notif: &SeccompNotif,
     processes: &Arc<ProcessIndex>,
-    _policy: &NotifPolicy,
+    policy: &NotifPolicy,
     notif_fd: RawFd,
 ) -> NotifAction {
     let pid = notif.pid; // u32
@@ -1035,7 +1265,20 @@ pub(crate) async fn handle_getdents(
         // any longer than needed — pids_snapshot only takes the
         // ProcessIndex read lock briefly.
         let snapshot = processes.pids_snapshot();
-        let entries = build_filtered_dirents(&snapshot);
+        let entries = match policy.pid_ns {
+            // PID-namespace sandbox: list the sandbox's own processes under
+            // their namespace pids (1, 2, …) so /proc matches what the
+            // kernel's pid namespace would show.
+            Some(ref map) => {
+                let mut map = map.write().expect("pid-ns map lock poisoned");
+                // Refresh so processes created since the last scan (and any
+                // not yet registered with the supervisor) appear; the
+                // getdents cache makes this once per directory fd.
+                map.refresh();
+                build_filtered_dirents_ns(&map)
+            }
+            None => build_filtered_dirents(&snapshot),
+        };
         perproc.procfs_dir_cache.insert(cache_key.clone(), entries);
     }
 
@@ -1084,6 +1327,59 @@ pub(crate) async fn handle_getdents(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Kernel-behavior probe backing `Sandbox::pid_ns`: after
+    /// `unshare(CLONE_NEWUSER)` (required for unprivileged PID namespace
+    /// creation) + `unshare(CLONE_NEWPID)` + a final fork, the first
+    /// process of the new namespace cannot `kill(pid, 0)` a process from
+    /// the host namespace — the probe must fail with ESRCH. The integration
+    /// suite relies on exactly this property for cross-sandbox signal
+    /// isolation; this lib test pins it without the full sandbox stack.
+    #[test]
+    fn pid_ns_kill_host_pid_is_esrch() {
+        let host_pid = std::process::id() as i32;
+        let a = unsafe { libc::fork() };
+        assert!(a >= 0, "fork failed");
+        if a == 0 {
+            if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+                unsafe { libc::_exit(10) };
+            }
+            if unsafe { libc::unshare(crate::sys::structs::CLONE_NEWPID as libc::c_int) } != 0 {
+                unsafe { libc::_exit(11) };
+            }
+            let b = unsafe { libc::fork() };
+            if b < 0 {
+                unsafe { libc::_exit(12) };
+            }
+            if b == 0 {
+                let r = unsafe { libc::kill(host_pid, 0) };
+                let errno = if r == 0 {
+                    0
+                } else {
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+                };
+                unsafe { libc::_exit(errno) }; // exit code = errno; ESRCH == 3
+            }
+            let mut st = 0;
+            unsafe { libc::waitpid(b, &mut st, 0) };
+            if libc::WIFEXITED(st) {
+                unsafe { libc::_exit(libc::WEXITSTATUS(st)) };
+            }
+            unsafe { libc::_exit(13) };
+        }
+        let mut st = 0;
+        unsafe { libc::waitpid(a, &mut st, 0) };
+        assert!(
+            libc::WIFEXITED(st),
+            "intermediate exited abnormally: status {:#x}",
+            st
+        );
+        assert_eq!(
+            libc::WEXITSTATUS(st),
+            3,
+            "kill(host_pid, 0) must be ESRCH inside a fresh PID namespace"
+        );
+    }
 
     #[test]
     fn test_is_sensitive_proc() {

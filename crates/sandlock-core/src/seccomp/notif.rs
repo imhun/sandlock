@@ -809,6 +809,14 @@ pub struct NotifPolicy {
     /// Active MITM CA public cert (PEM bytes) to inject. `Some` only when
     /// HTTPS MITM is active (BYO or generated).
     pub ca_inject_pem: Option<std::sync::Arc<Vec<u8>>>,
+    /// PID namespace translation for `Sandbox::pid_ns` sandboxes, used to
+    /// render the sandbox's `/proc` view (renumbered to namespace pids).
+    /// `None` when the sandbox shares the supervisor's PID namespace (the
+    /// default). Note: `SeccompNotif.pid` is *not* routed through this map —
+    /// the kernel reports it as the pid in the *reader's* namespace
+    /// (`task_pid_vnr`), and the supervisor reads notifications from the
+    /// host namespace, so it is already a host pid.
+    pub(crate) pid_ns: Option<std::sync::Arc<std::sync::RwLock<crate::procfs::PidNsMap>>>,
 }
 
 impl NotifPolicy {

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -270,6 +271,12 @@ struct Runtime {
     name: String,
     state: RuntimeState,
     child_pid: Option<i32>,
+    /// Host PID of the sandbox's first process in its PID namespace (ns
+    /// pid 1). `Some` only when `Sandbox::pid_ns` is enabled; the process
+    /// group leader, and the pid `Sandbox::pid()` reports. The direct
+    /// child (`child_pid`) is then the intermediate process that created
+    /// the namespace, waits for the leader, and relays its exit status.
+    leader_pid: Option<i32>,
     pidfd: Option<std::os::fd::OwnedFd>,
     notif_handle: Option<JoinHandle<()>>,
     policy_fn_worker: Option<crate::policy_fn::PolicyFnWorker>,
@@ -562,6 +569,14 @@ pub struct Sandbox {
     /// allows one `SECCOMP_FILTER_FLAG_NEW_LISTENER` per task.
     pub no_supervisor: bool,
 
+    /// Run the sandboxed workload in a private PID namespace
+    /// (`CLONE_NEWPID`): the sandbox's first process is PID 1 inside its
+    /// own namespace, foreign PIDs are invisible (`kill(pid, 0)` on host /
+    /// other-sandbox processes returns `ESRCH`), and `/proc` is filtered
+    /// and renumbered to the sandbox's own processes. Defaults to `false`.
+    #[serde(default)]
+    pub pid_ns: bool,
+
     /// Enable the per-sandbox control socket for introspection (`sandlock ps`,
     /// `sandlock inspect`, etc.). Defaults to `true`. Set to `false` to skip
     /// the runtime dir, pid file, and control-socket tokio task entirely.
@@ -688,6 +703,7 @@ impl Clone for Sandbox {
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
             no_supervisor: self.no_supervisor,
+            pid_ns: self.pid_ns,
             control_socket: self.control_socket,
             user: self.user,
             policy_fn: self.policy_fn.clone(),
@@ -797,7 +813,17 @@ impl Sandbox {
 
     /// Return the child PID if spawned.
     pub fn pid(&self) -> Option<i32> {
-        self.runtime.as_ref().and_then(|r| r.child_pid)
+        self.group_pid()
+    }
+
+    /// Host PID of the process group to signal when freezing or killing
+    /// the sandbox. With a PID namespace the group leader is the sandbox's
+    /// first process (ns pid 1, host pid `leader_pid`); without one it is
+    /// the direct child. The direct child itself is only waited/reaped.
+    fn group_pid(&self) -> Option<i32> {
+        self.runtime
+            .as_ref()
+            .and_then(|rt| rt.leader_pid.or(rt.child_pid))
     }
 
     /// Return whether the child is currently running or paused.
@@ -810,9 +836,7 @@ impl Sandbox {
     /// Send SIGSTOP to the child's process group.
     pub fn pause(&mut self) -> Result<(), crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
-        let pid = self.runtime.as_ref()
-            .and_then(|rt| rt.child_pid)
-            .ok_or(SandboxRuntimeError::NotRunning)?;
+        let pid = self.group_pid().ok_or(SandboxRuntimeError::NotRunning)?;
         let ret = unsafe { libc::killpg(pid, libc::SIGSTOP) };
         if ret < 0 {
             return Err(SandboxRuntimeError::Io(std::io::Error::last_os_error()).into());
@@ -824,9 +848,7 @@ impl Sandbox {
     /// Send SIGCONT to the child's process group.
     pub fn resume(&mut self) -> Result<(), crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
-        let pid = self.runtime.as_ref()
-            .and_then(|rt| rt.child_pid)
-            .ok_or(SandboxRuntimeError::NotRunning)?;
+        let pid = self.group_pid().ok_or(SandboxRuntimeError::NotRunning)?;
         let ret = unsafe { libc::killpg(pid, libc::SIGCONT) };
         if ret < 0 {
             return Err(SandboxRuntimeError::Io(std::io::Error::last_os_error()).into());
@@ -838,9 +860,7 @@ impl Sandbox {
     /// Send SIGKILL to the child's process group.
     pub fn kill(&mut self) -> Result<(), crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
-        let pid = self.runtime.as_ref()
-            .and_then(|rt| rt.child_pid)
-            .ok_or(SandboxRuntimeError::NotRunning)?;
+        let pid = self.group_pid().ok_or(SandboxRuntimeError::NotRunning)?;
         let ret = unsafe { libc::killpg(pid, libc::SIGKILL) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();
@@ -960,7 +980,11 @@ impl Sandbox {
         self.rt_mut().state = RuntimeState::Stopped(exit_status.clone());
 
         if self.rt().tty_foreground_taken {
-            sandbox_restore_tty_foreground(pid);
+            // The foreground process group is the sandbox leader's (ns pid
+            // 1); with a PID namespace that is `leader_pid`, not the direct
+            // child we waited on.
+            let fg_pid = self.rt().leader_pid.unwrap_or(pid);
+            sandbox_restore_tty_foreground(fg_pid);
             self.rt_mut().tty_foreground_taken = false;
         }
 
@@ -1279,7 +1303,8 @@ impl Sandbox {
     pub(crate) async fn freeze(&self) -> Result<(), crate::error::SandlockError> {
         use crate::error::{SandboxRuntimeError, SandlockError};
         let rt = self.runtime.as_ref().ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
-        let pid = rt.child_pid.ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
+        let pid = rt.leader_pid.or(rt.child_pid)
+            .ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         if let Some(ref resource) = rt.supervisor_resource {
             let mut rs = resource.lock().await;
             rs.hold_forks = true;
@@ -1292,7 +1317,8 @@ impl Sandbox {
     pub(crate) async fn thaw(&self) -> Result<(), crate::error::SandlockError> {
         use crate::error::{SandboxRuntimeError, SandlockError};
         let rt = self.runtime.as_ref().ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
-        let pid = rt.child_pid.ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
+        let pid = rt.leader_pid.or(rt.child_pid)
+            .ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         if let Some(ref resource) = rt.supervisor_resource {
             let mut rs = resource.lock().await;
             rs.hold_forks = false;
@@ -1306,7 +1332,7 @@ impl Sandbox {
     pub async fn checkpoint(&self) -> Result<crate::checkpoint::Checkpoint, crate::error::SandlockError> {
         use crate::error::{SandboxRuntimeError, SandlockError};
         let pid = self.runtime.as_ref()
-            .and_then(|rt| rt.child_pid)
+            .and_then(|rt| rt.leader_pid.or(rt.child_pid))
             .ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         self.checkpoint_pid(pid).await
     }
@@ -1551,6 +1577,7 @@ impl Sandbox {
                     crate::result::ExitStatus::Killed
                 }),
                 child_pid: Some(clone_pid),
+                leader_pid: None,
                 pidfd: None,
                 notif_handle: None,
                 policy_fn_worker: None,
@@ -1654,6 +1681,7 @@ impl Sandbox {
             name,
             state: RuntimeState::Created,
             child_pid: None,
+            leader_pid: None,
             pidfd: None,
             notif_handle: None,
             policy_fn_worker: None,
@@ -1925,6 +1953,111 @@ impl Sandbox {
 
         if pid == 0 {
             // ===== CHILD PROCESS =====
+            if self.pid_ns {
+                // === Intermediate process: create the PID namespace ===
+                //
+                // An unprivileged process cannot create a PID namespace
+                // directly (that needs CAP_SYS_ADMIN in the current user
+                // namespace). The unprivileged route is: unshare a user
+                // namespace first (granting full caps inside it), write the
+                // uid/gid mapping, then unshare CLONE_NEWPID and fork the
+                // final child. The intermediate process stays alive as the
+                // final child's parent: it relays the leader's host pid to
+                // the supervisor, waits for the leader, and exits with its
+                // status, so the supervisor only ever waits/reaps its own
+                // direct child.
+                unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+                if unsafe { libc::getppid() } != parent_pid {
+                    unsafe { libc::_exit(127) };
+                }
+
+                let real_uid = unsafe { libc::getuid() };
+                let real_gid = unsafe { libc::getgid() };
+                if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "sandlock child: unshare(CLONE_NEWUSER) for pid namespace: {}",
+                        std::io::Error::last_os_error(),
+                    );
+                    unsafe { libc::_exit(127) };
+                }
+                let (map_uid, map_gid) = match self.user {
+                    Some(run_as) if run_as.uid != real_uid || run_as.gid != real_gid => {
+                        (run_as.uid, run_as.gid)
+                    }
+                    _ => (real_uid, real_gid),
+                };
+                if crate::context::write_id_maps(real_uid, real_gid, map_uid, map_gid).is_err() {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "sandlock child: uid_map/gid_map write for pid namespace: {}",
+                        std::io::Error::last_os_error(),
+                    );
+                    unsafe { libc::_exit(127) };
+                }
+                if unsafe { libc::unshare(crate::sys::structs::CLONE_NEWPID as libc::c_int) } != 0 {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "sandlock child: unshare(CLONE_NEWPID): {}",
+                        std::io::Error::last_os_error(),
+                    );
+                    unsafe { libc::_exit(127) };
+                }
+                let leader = unsafe { libc::fork() };
+                if leader < 0 {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "sandlock child: final fork for pid namespace: {}",
+                        std::io::Error::last_os_error(),
+                    );
+                    unsafe { libc::_exit(127) };
+                }
+                if leader > 0 {
+                    // === Intermediate relay ===
+                    // Report the leader's host pid (the sandbox leader is
+                    // pid 1 inside the new namespace), then wait for the
+                    // leader and relay its exit status. Close every pipe
+                    // end we inherited but the leader no longer needs so
+                    // the parent sees EOF once the leader exits, and a
+                    // piped stdin EOF reaches the leader when the parent
+                    // drops its write end.
+                    if crate::context::write_u32_fd(pipes.notif_w.as_raw_fd(), leader as u32).is_err() {
+                        unsafe { libc::_exit(127) };
+                    }
+                    unsafe { libc::close(pipes.notif_w.as_raw_fd()) };
+                    unsafe { libc::close(pipes.notif_r.as_raw_fd()) };
+                    unsafe { libc::close(pipes.ready_r.as_raw_fd()) };
+                    unsafe { libc::close(pipes.ready_w.as_raw_fd()) };
+                    if let Some((r, w)) = stdin_p.as_ref() {
+                        unsafe { libc::close(r.as_raw_fd()) };
+                        unsafe { libc::close(w.as_raw_fd()) };
+                    }
+                    if let Some((r, w)) = stdout_p.as_ref() {
+                        unsafe { libc::close(r.as_raw_fd()) };
+                        unsafe { libc::close(w.as_raw_fd()) };
+                    }
+                    if let Some((r, w)) = stderr_p.as_ref() {
+                        unsafe { libc::close(r.as_raw_fd()) };
+                        unsafe { libc::close(w.as_raw_fd()) };
+                    }
+                    for &(_target, source_fd) in &self.rt().extra_fds {
+                        unsafe { libc::close(source_fd) };
+                    }
+                    let mut status: i32 = 0;
+                    unsafe { libc::waitpid(leader, &mut status, 0) };
+                    let code = if libc::WIFEXITED(status) {
+                        libc::WEXITSTATUS(status)
+                    } else if libc::WIFSIGNALED(status) {
+                        128 + libc::WTERMSIG(status)
+                    } else {
+                        1
+                    };
+                    unsafe { libc::_exit(code) };
+                }
+                // leader == 0: fall through into the normal confined-child
+                // path below; this process is pid 1 in the new namespace.
+            }
+
             let io_overrides = self.rt().io_overrides;
             if let Some((stdin_fd, stdout_fd, stderr_fd)) = io_overrides {
                 if let Some(fd) = stdin_fd { unsafe { libc::dup2(fd, 0) }; }
@@ -1987,6 +2120,11 @@ impl Sandbox {
                 Some(run) => context::ChildEntry::InProcess { name: c_cmd[0].as_c_str(), run },
                 None => context::ChildEntry::Exec(&c_cmd),
             };
+            // In a PID namespace the confined process's real parent (the
+            // intermediate) lives outside the namespace, so the kernel
+            // reports `getppid()` as 0 there; pass 0 as the expected
+            // parent so the death-check stays vacuous-but-true.
+            let child_parent_pid = if self.pid_ns { 0 } else { parent_pid };
             context::confine_child(context::ChildSpawnArgs {
                 sandbox: self,
                 entry,
@@ -1995,8 +2133,9 @@ impl Sandbox {
                 keep_fds: &gather_keep_fds,
                 sandbox_name: Some(sandbox_name.as_str()),
                 extra_syscalls: &extra_syscalls,
-                parent_pid,
+                parent_pid: child_parent_pid,
                 foreground,
+                pid_ns: self.pid_ns,
             });
         }
 
@@ -2012,6 +2151,16 @@ impl Sandbox {
         self.rt_mut().tty_foreground_taken = tty_foreground_taken;
         // State remains `Created` until `do_start` writes ready_w to release
         // the child to execve.
+
+        // With a PID namespace, the intermediate child writes the sandbox
+        // leader's host pid to the notif pipe before the leader writes the
+        // seccomp notif fd number, so read it first.
+        if self.pid_ns {
+            let leader_pid = read_u32_fd(pipes.notif_r.as_raw_fd())
+                .map_err(|e| SandboxRuntimeError::Child(format!("read leader pid from child: {}", e)))?
+                as i32;
+            self.rt_mut().leader_pid = Some(leader_pid);
+        }
 
         let pidfd = match syscall::pidfd_open(pid as u32, 0) {
             Ok(fd) => Some(fd),
@@ -2072,6 +2221,14 @@ impl Sandbox {
 
         let notif_fd = if is_nested_mode {
             None
+        } else if let Some(leader_pid) = self.rt().leader_pid {
+            // PID-namespace sandbox: the seccomp listener lives in the
+            // sandbox leader (ns pid 1), not in the intermediate child the
+            // supervisor forked, so dup the notif fd from the leader.
+            let lpfd = syscall::pidfd_open(leader_pid as u32, 0)
+                .map_err(|e| SandboxRuntimeError::Child(format!("pidfd_open(leader): {}", e)))?;
+            Some(syscall::pidfd_getfd(&lpfd, notif_fd_num as i32, 0)
+                .map_err(|e| SandboxRuntimeError::Child(format!("pidfd_getfd: {}", e)))?)
         } else if let Some(ref pfd) = pidfd {
             Some(syscall::pidfd_getfd(pfd, notif_fd_num as i32, 0)
                 .map_err(|e| SandboxRuntimeError::Child(format!("pidfd_getfd: {}", e)))?)
@@ -2237,6 +2394,11 @@ impl Sandbox {
                 virtual_resolv_conf,
                 ca_inject_paths: self.http_inject_ca.clone(),
                 ca_inject_pem: ca_inject_pem.clone(),
+                pid_ns: self.rt().leader_pid.map(|leader_pid| {
+                    std::sync::Arc::new(std::sync::RwLock::new(
+                        crate::procfs::PidNsMap::new(leader_pid),
+                    ))
+                }),
             };
 
             use rand::SeedableRng;
@@ -2471,8 +2633,8 @@ impl Sandbox {
 
         if let Some(cpu_pct) = self.max_cpu {
             if cpu_pct < 100 {
-                let child_pid = pid;
-                self.rt_mut().throttle_handle = Some(tokio::spawn(sandbox_throttle_cpu(child_pid, cpu_pct)));
+                let group_pid = self.rt().leader_pid.unwrap_or(pid);
+                self.rt_mut().throttle_handle = Some(tokio::spawn(sandbox_throttle_cpu(group_pid, cpu_pct)));
             }
         }
 
@@ -2604,12 +2766,17 @@ impl Drop for Sandbox {
         if let Some(ref mut rt) = self.runtime {
             if let Some(pid) = rt.child_pid {
                 if matches!(rt.state, RuntimeState::Created | RuntimeState::Running | RuntimeState::Paused) {
-                    unsafe { libc::killpg(pid, libc::SIGKILL) };
+                    // Signal the sandbox leader's process group (ns pid 1
+                    // with a PID namespace); the direct child then exits on
+                    // its own (it waits for the leader) and is reaped below.
+                    let group = rt.leader_pid.unwrap_or(pid);
+                    unsafe { libc::killpg(group, libc::SIGKILL) };
                     let mut status: i32 = 0;
                     unsafe { libc::waitpid(pid, &mut status, 0) };
                 }
                 if rt.tty_foreground_taken {
-                    sandbox_restore_tty_foreground(pid);
+                    let fg_pid = rt.leader_pid.unwrap_or(pid);
+                    sandbox_restore_tty_foreground(fg_pid);
                     rt.tty_foreground_taken = false;
                 }
             }

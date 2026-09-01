@@ -87,3 +87,6 @@ mod test_popen;
 
 #[path = "integration/test_tty.rs"]
 mod test_tty;
+
+#[path = "integration/test_pid_ns.rs"]
+mod test_pid_ns;

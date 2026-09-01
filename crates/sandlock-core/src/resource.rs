@@ -968,6 +968,7 @@ mod tests {
             virtual_resolv_conf: None,
             ca_inject_paths: Vec::new(),
             ca_inject_pem: None,
+            pid_ns: None,
         }
     }
 

@@ -224,6 +224,16 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", clap(skip))]
     pub no_supervisor: bool,
 
+    /// Run the sandboxed workload in a private PID namespace
+    /// (`CLONE_NEWPID`). The sandbox's first process becomes PID 1 inside
+    /// its own namespace; host and other-sandbox PIDs are not visible, so
+    /// `kill(pid, 0)` probes of foreign processes fail with `ESRCH` and
+    /// `/proc` is filtered to the sandbox's own processes (renumbered by
+    /// namespace PID). Defaults to `false` — existing sandboxes keep the
+    /// shared PID namespace behavior.
+    #[cfg_attr(feature = "cli", arg(long = "pid-ns"))]
+    pub pid_ns: bool,
+
     /// Enable the per-sandbox control socket for introspection. Defaults to
     /// `true`. When `false`, no runtime dir, pid file, or control-socket task
     /// is created — `sandlock ps` and `sandlock inspect` will not see this
@@ -328,6 +338,7 @@ impl Default for SandboxBuilder {
             num_cpus: None,
             port_remap: false,
             no_supervisor: false,
+            pid_ns: false,
             control_socket: true,
             user: None,
             protection_policy: ProtectionPolicy::default(),
@@ -397,6 +408,7 @@ impl Clone for SandboxBuilder {
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
             no_supervisor: self.no_supervisor,
+            pid_ns: self.pid_ns,
             control_socket: self.control_socket,
             user: self.user,
             protection_policy: self.protection_policy.clone(),
@@ -804,6 +816,13 @@ impl SandboxBuilder {
         self
     }
 
+    /// Run the sandboxed workload in its own PID namespace. See the
+    /// [`SandboxBuilder::pid_ns`] field docs for the isolation guarantees.
+    pub fn pid_ns(mut self, v: bool) -> Self {
+        self.pid_ns = v;
+        self
+    }
+
     /// Enable or disable the per-sandbox control socket. Defaults to `true`.
     /// When `false`, no runtime dir, pid file, or control-socket task is
     /// created — `sandlock ps` and `sandlock inspect` will not see this
@@ -1132,6 +1151,7 @@ impl SandboxBuilder {
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
             no_supervisor: self.no_supervisor,
+            pid_ns: self.pid_ns,
             control_socket: self.control_socket,
             user: self.user,
             policy_fn: self.policy_fn,
