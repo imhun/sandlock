@@ -171,6 +171,7 @@ impl TryFrom<&Sandbox> for Confinement {
         if !sandbox.net_deny.is_empty() { unsupported.push("net_deny"); }
         if !sandbox.net_allow_bind.is_default() { unsupported.push("net_allow_bind"); }
         if !sandbox.net_deny_bind.is_empty() { unsupported.push("net_deny_bind"); }
+        if !sandbox.net_bind_map.is_empty() { unsupported.push("net_bind_map"); }
         if sandbox.allows_sysv_ipc() { unsupported.push("extra_allow_syscalls=[\"sysv_ipc\"]"); }
         if !sandbox.http_allow.is_empty() { unsupported.push("http_allow"); }
         if !sandbox.http_deny.is_empty() { unsupported.push("http_deny"); }
@@ -474,6 +475,14 @@ pub struct Sandbox {
     /// denylist, enforced on the on-behalf `bind()` path). Mutually
     /// exclusive with `net_allow_bind`.
     pub net_deny_bind: Vec<u16>,
+    /// S2.5 inbound port mapping: `(host_port, sandbox_port)` pairs. When the
+    /// sandbox listens on `sandbox_port` inside its own netns
+    /// (`net_isolation` required), the supervisor listens on the host loopback
+    /// at `host_port` (>= 50005) and serves the sandbox's `accept()` from that
+    /// host listener by injecting the accepted connection fd (MCP-server path:
+    /// external gateway -> host mapped port -> sandbox listener).
+    #[serde(default)]
+    pub net_bind_map: Vec<(u16, u16)>,
     // HTTP ACL
     pub http_allow: Vec<HttpRule>,
     pub http_deny: Vec<HttpRule>,
@@ -695,6 +704,7 @@ impl Clone for Sandbox {
             net_deny: self.net_deny.clone(),
             net_allow_bind: self.net_allow_bind.clone(),
             net_deny_bind: self.net_deny_bind.clone(),
+            net_bind_map: self.net_bind_map.clone(),
             http_allow: self.http_allow.clone(),
             http_deny: self.http_deny.clone(),
             inject: self.inject.clone(),
@@ -774,6 +784,28 @@ impl Sandbox {
     /// Currently a no-op; retained as an extension point and for API
     /// stability. Idempotent: calling repeatedly is safe.
     pub fn validate(&self) -> Result<(), SandboxError> {
+        // S2.5 inbound port mapping needs the per-sandbox loopback netns so
+        // the supervisor can own the host mapped port, and the seccomp
+        // supervisor to intercept listen/accept/close. Without either, the
+        // mapping would be silently ignored — refuse instead of running with a
+        // quietly weaker configuration.
+        if !self.net_bind_map.is_empty() {
+            if !self.net_isolation {
+                return Err(SandboxError::Invalid(
+                    "net_bind_map (inbound port mapping) requires net_isolation(true): \
+                     the sandbox must live in its own loopback-only netns so the \
+                     supervisor can own the host mapped port"
+                        .into(),
+                ));
+            }
+            if self.no_supervisor {
+                return Err(SandboxError::Invalid(
+                    "net_bind_map (inbound port mapping) requires the seccomp \
+                     supervisor and is incompatible with no_supervisor=true"
+                        .into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -2677,6 +2709,7 @@ impl Sandbox {
                 port_remap: resolved.features.port_remap,
                 fd_inject_connect: resolved.features.fd_inject_connect,
                 net_isolation: resolved.features.net_isolation,
+                inbound_port_map: resolved.features.inbound_port_map,
                 cow_enabled: resolved.features.cow,
                 chroot_root: chroot_root.clone(),
                 chroot_readable: self.fs_readable.clone(),
@@ -2762,6 +2795,11 @@ impl Sandbox {
                 None => None,
             };
             net_state.bind_deny_ports = self.net_deny_bind.iter().copied().collect();
+            net_state.inbound_map = self
+                .net_bind_map
+                .iter()
+                .map(|&(host_port, sandbox_port)| (sandbox_port, host_port))
+                .collect();
             if let Some(cb) = self.rt_mut().on_bind.take() {
                 net_state.port_map.on_bind = Some(cb);
             }

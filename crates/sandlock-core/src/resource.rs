@@ -959,6 +959,7 @@ mod tests {
             port_remap: false,
             fd_inject_connect: false,
             net_isolation: false,
+            inbound_port_map: false,
             cow_enabled: false,
             chroot_root: None,
             chroot_readable: Vec::new(),

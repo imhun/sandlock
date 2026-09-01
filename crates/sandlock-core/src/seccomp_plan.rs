@@ -371,6 +371,13 @@ const PORT_REMAP_SYSCALLS: &[i64] = &[
     libc::SYS_getsockname,
 ];
 
+/// S2.5 inbound port mapping: `listen` triggers host-listener creation for a
+/// mapped sandbox port, and `accept4` (plus legacy `accept` where the ABI has
+/// it) is served from that host listener with the accepted fd injected into
+/// the sandbox. `close` is already on the notif list via the netlink block,
+/// so the close handler chain can drop the mapping when the listener closes.
+const INBOUND_MAPPING_SYSCALLS: &[i64] = &[libc::SYS_listen, libc::SYS_accept4];
+
 /// Determine which syscalls need `SECCOMP_RET_USER_NOTIF`.
 pub(crate) fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> {
     let resolved = ResolvedSandbox::from_sandbox(policy, sandbox_name, &[]);
@@ -462,6 +469,12 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
     // Port remapping
     if features.port_remap {
         nrs.extend(PORT_REMAP_SYSCALLS);
+    }
+
+    // Inbound port mapping (S2.5)
+    if features.inbound_port_map {
+        nrs.extend(INBOUND_MAPPING_SYSCALLS);
+        nrs.push_optional(arch::sys_accept());
     }
 
     // PID-namespace sandbox: numeric /proc/<n>/… stat-family paths must

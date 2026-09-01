@@ -818,6 +818,12 @@ pub struct NotifPolicy {
     /// netns and can never reach the planned destination, so the injection
     /// path fails closed instead of silently attempting it.
     pub net_isolation: bool,
+    /// S2.5: inbound port mapping is configured (`net_bind_map` non-empty).
+    /// When set, `listen`/`accept`/`accept4`/`close` are trapped so the
+    /// supervisor can serve a host-side listener on the mapped host port and
+    /// inject accepted connection fds into the sandbox. Requires
+    /// `net_isolation` (build-time validated).
+    pub inbound_port_map: bool,
     pub cow_enabled: bool,
     pub chroot_root: Option<std::path::PathBuf>,
     /// Virtual paths allowed for reading under chroot (original user-specified paths).
@@ -2222,16 +2228,24 @@ const DEFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// On timeout, fail closed with `EIO` so the trapped child gets a definite
 /// response instead of parking forever; `finalize_deferred` still guards a
 /// future that resolves to a nested `Defer`.
-async fn run_deferred_within(deferred: Deferred, limit: std::time::Duration) -> NotifAction {
-    match tokio::time::timeout(limit, deferred.run()).await {
-        Ok(action) => finalize_deferred(action),
-        Err(_) => {
-            eprintln!(
-                "sandlock: deferred handler exceeded {:?}; failing syscall with EIO",
-                limit
-            );
-            NotifAction::Errno(libc::EIO)
-        }
+async fn run_deferred_within(deferred: Deferred, limit: Option<std::time::Duration>) -> NotifAction {
+    let run = deferred.run();
+    match limit {
+        Some(limit) => match tokio::time::timeout(limit, run).await {
+            Ok(action) => finalize_deferred(action),
+            Err(_) => {
+                eprintln!(
+                    "sandlock: deferred handler exceeded {:?}; failing syscall with EIO",
+                    limit
+                );
+                NotifAction::Errno(libc::EIO)
+            }
+        },
+        // Unbounded deferral: used only for the S2.5 inbound accept, whose
+        // future self-terminates when a connection arrives, the mapping is
+        // dropped, or the child's notification id becomes invalid — so it
+        // cannot park forever.
+        None => finalize_deferred(run.await),
     }
 }
 
@@ -2245,10 +2259,11 @@ fn spawn_deferred(
     id: u64,
     deferred: Deferred,
     permit: tokio::sync::OwnedSemaphorePermit,
+    limit: Option<std::time::Duration>,
 ) {
     tokio::spawn(async move {
         let _permit = permit; // released when the worker finishes
-        let action = run_deferred_within(deferred, DEFER_TIMEOUT).await;
+        let action = run_deferred_within(deferred, limit).await;
         let _ = send_response(fd, id, action);
     });
 }
@@ -2424,8 +2439,18 @@ async fn handle_notification(
             let _ = send_response(fd, notif.id, NotifAction::Errno(libc::EPERM));
             return;
         }
+        // The S2.5 inbound accept defers unboundedly: its future
+        // self-terminates when a connection arrives, the mapping is dropped
+        // (receiver closed), or the child's notification id becomes invalid —
+        // so it cannot park forever. Every other deferred handler keeps the
+        // 30s `DEFER_TIMEOUT` safety cap.
+        let limit = if nr == libc::SYS_accept4 || Some(nr) == arch::sys_accept() {
+            None
+        } else {
+            Some(DEFER_TIMEOUT)
+        };
         match Arc::clone(defer_sem).try_acquire_owned() {
-            Ok(permit) => spawn_deferred(fd, notif.id, deferred, permit),
+            Ok(permit) => spawn_deferred(fd, notif.id, deferred, permit, limit),
             // Too many deferrals in flight: fail fast with EAGAIN rather than
             // blocking the loop or letting unbounded workers accrete.
             Err(_) => {
@@ -2993,7 +3018,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             NotifAction::ReturnValue(7)
         });
-        let action = run_deferred_within(slow, std::time::Duration::from_secs(1)).await;
+        let action = run_deferred_within(slow, Some(std::time::Duration::from_secs(1))).await;
         assert!(matches!(action, NotifAction::Errno(e) if e == libc::EIO));
     }
 
@@ -3001,7 +3026,20 @@ mod tests {
     async fn deferred_within_limit_passes_through() {
         // A future that resolves within the limit returns its terminal action.
         let fast = Deferred::new(async { NotifAction::ReturnValue(7) });
-        let action = run_deferred_within(fast, std::time::Duration::from_secs(1)).await;
+        let action = run_deferred_within(fast, Some(std::time::Duration::from_secs(1))).await;
+        assert!(matches!(action, NotifAction::ReturnValue(7)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deferred_unbounded_runs_past_the_default_cap() {
+        // The S2.5 inbound accept defers unboundedly (`None`): its future
+        // self-terminates on connection arrival / mapping drop / child death,
+        // so it must not be cut short by the 30s `DEFER_TIMEOUT` cap.
+        let slow = Deferred::new(async {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            NotifAction::ReturnValue(7)
+        });
+        let action = run_deferred_within(slow, None).await;
         assert!(matches!(action, NotifAction::ReturnValue(7)));
     }
 

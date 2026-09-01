@@ -483,6 +483,15 @@ pub struct NetworkState {
     /// is dialed by the supervisor and is never added to the sandbox's
     /// allowlist, so the sandbox cannot reach the proxy directly.
     pub egress_proxy: Option<crate::network::egress::EgressProxy>,
+    /// S2.5 configured inbound port mapping: `sandbox_port -> host_port`
+    /// (from `net_bind_map(host_port, sandbox_port)`). The host listener for
+    /// a mapped sandbox port is created when the sandbox `listen()`s on it.
+    pub inbound_map: HashMap<u16, u16>,
+    /// S2.5 live host-side inbound listeners, keyed by the sandbox listening
+    /// socket's inode (stable across fork/dup of the listening fd). Dropping
+    /// an entry — the `close` handler, or NetworkState teardown with the
+    /// sandbox — closes the host listener.
+    pub inbound: HashMap<u64, crate::network::inbound::InboundListener>,
 }
 
 impl NetworkState {
@@ -500,6 +509,8 @@ impl NetworkState {
             synthetic_dns: crate::network::dns_synth::SyntheticDns::new(),
             dns_gateway_addr: None,
             egress_proxy: None,
+            inbound_map: HashMap::new(),
+            inbound: HashMap::new(),
         }
     }
 

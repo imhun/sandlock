@@ -56,6 +56,15 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "net-deny-bind", value_name = "PORTS"))]
     pub net_deny_bind: Vec<String>,
 
+    /// S2.5 inbound port mapping: `(host_port, sandbox_port)` pairs. When the
+    /// sandbox listens on `sandbox_port` inside its own netns (`net_isolation`
+    /// required), the supervisor listens on the host loopback at `host_port`
+    /// (>= 50005) and serves the sandbox's `accept()` from that host listener
+    /// by injecting the accepted connection fd. This is the MCP-server path:
+    /// an external gateway connects to `host_port` to reach a server that
+    /// listens inside the loopback-only sandbox netns.
+    pub net_bind_map: Vec<(u16, u16)>,
+
     #[cfg_attr(feature = "cli", arg(long = "http-allow", value_name = "RULE"))]
     pub http_allow: Vec<String>,
 
@@ -319,6 +328,7 @@ impl Default for SandboxBuilder {
             net_deny: Vec::new(),
             net_allow_bind: Vec::new(),
             net_deny_bind: Vec::new(),
+            net_bind_map: Vec::new(),
             http_allow: Vec::new(),
             http_deny: Vec::new(),
             credentials: Vec::new(),
@@ -391,6 +401,7 @@ impl Clone for SandboxBuilder {
             net_deny: self.net_deny.clone(),
             net_allow_bind: self.net_allow_bind.clone(),
             net_deny_bind: self.net_deny_bind.clone(),
+            net_bind_map: self.net_bind_map.clone(),
             http_allow: self.http_allow.clone(),
             http_deny: self.http_deny.clone(),
             credentials: self.credentials.clone(),
@@ -567,6 +578,20 @@ impl SandboxBuilder {
     /// inverse of [`net_allow_bind`](Self::net_allow_bind).
     pub fn net_deny_bind(mut self, spec: impl Into<String>) -> Self {
         self.net_deny_bind.push(spec.into());
+        self
+    }
+
+    /// Add an inbound port mapping: the sandbox's `listen()` on
+    /// `sandbox_port` (inside its `net_isolation` netns) is served from the
+    /// supervisor's host-loopback listener on `host_port`; external
+    /// connections to `host_port` are accepted by the supervisor and the
+    /// connected fd is injected as the sandbox's `accept()` result.
+    ///
+    /// `host_port` must be >= 50005 (the reserved inbound mapping range) and
+    /// unique per sandbox; `sandbox_port` must be unique per sandbox.
+    /// Requires `net_isolation(true)` and the seccomp supervisor.
+    pub fn net_bind_map(mut self, host_port: u16, sandbox_port: u16) -> Self {
+        self.net_bind_map.push((host_port, sandbox_port));
         self
     }
 
@@ -1142,6 +1167,32 @@ impl SandboxBuilder {
             ));
         }
 
+        // S2.5 inbound port mapping: host ports live in the reserved 50005+
+        // range and must be unique per sandbox; sandbox ports must be unique
+        // too (one host listener per mapped sandbox port). The
+        // net_isolation / supervisor requirements are cross-section checks in
+        // `Sandbox::validate`.
+        let mut seen_host = std::collections::HashSet::new();
+        let mut seen_sandbox = std::collections::HashSet::new();
+        for &(host_port, sandbox_port) in &self.net_bind_map {
+            if host_port < 50005 {
+                return Err(SandboxError::Invalid(format!(
+                    "net_bind_map: host port {host_port} is below the reserved \
+                     inbound mapping range (50005+); pick a host_port >= 50005"
+                )));
+            }
+            if !seen_host.insert(host_port) {
+                return Err(SandboxError::Invalid(format!(
+                    "net_bind_map: duplicate host port {host_port}"
+                )));
+            }
+            if !seen_sandbox.insert(sandbox_port) {
+                return Err(SandboxError::Invalid(format!(
+                    "net_bind_map: duplicate sandbox port {sandbox_port}"
+                )));
+            }
+        }
+
         crate::http::extend_net_allow_for_http(
             &mut net_allow,
             &http_allow,
@@ -1160,6 +1211,7 @@ impl SandboxBuilder {
             net_deny,
             net_allow_bind,
             net_deny_bind,
+            net_bind_map: self.net_bind_map.clone(),
             http_allow,
             http_deny,
             inject,

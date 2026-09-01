@@ -287,6 +287,70 @@ fn builder_net_deny_bind_rejects_wildcard() {
 }
 
 #[test]
+fn builder_net_bind_map_requires_net_isolation() {
+    let err = Sandbox::builder()
+        .net_bind_map(50005, 8000)
+        .build()
+        .unwrap_err();
+    assert!(err.to_string().contains("net_isolation"));
+}
+
+#[test]
+fn builder_net_bind_map_rejects_low_host_port() {
+    // The design reserves the 50005+ host range for inbound mapping.
+    let err = Sandbox::builder()
+        .net_isolation(true)
+        .net_bind_map(50004, 8000)
+        .build()
+        .unwrap_err();
+    assert!(err.to_string().contains("50005"));
+}
+
+#[test]
+fn builder_net_bind_map_rejects_duplicate_host_port() {
+    let err = Sandbox::builder()
+        .net_isolation(true)
+        .net_bind_map(50005, 8000)
+        .net_bind_map(50005, 9000)
+        .build()
+        .unwrap_err();
+    assert!(err.to_string().contains("50005"));
+}
+
+#[test]
+fn builder_net_bind_map_rejects_duplicate_sandbox_port() {
+    let err = Sandbox::builder()
+        .net_isolation(true)
+        .net_bind_map(50005, 8000)
+        .net_bind_map(50006, 8000)
+        .build()
+        .unwrap_err();
+    assert!(err.to_string().contains("8000"));
+}
+
+#[test]
+fn builder_net_bind_map_requires_supervisor() {
+    let err = Sandbox::builder()
+        .net_isolation(true)
+        .no_supervisor(true)
+        .net_bind_map(50005, 8000)
+        .build()
+        .unwrap_err();
+    assert!(err.to_string().contains("supervisor"));
+}
+
+#[test]
+fn builder_net_bind_map_roundtrips() {
+    let policy = Sandbox::builder()
+        .net_isolation(true)
+        .net_bind_map(50005, 8000)
+        .net_bind_map(50006, 9000)
+        .build()
+        .unwrap();
+    assert_eq!(policy.net_bind_map, vec![(50005, 8000), (50006, 9000)]);
+}
+
+#[test]
 fn builder_net_allow_bind_wildcard_exclusive_with_deny_bind() {
     assert!(Sandbox::builder()
         .net_allow_bind("*")

@@ -18,15 +18,38 @@
 //! future shared/pooled netns refactor cannot silently pass).
 
 use sandlock_core::Sandbox;
-use std::io::{Read, Write};
-use std::net::{Ipv4Addr, TcpListener, UdpSocket};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crate::net_fixture::WorkerLocalHost;
 
 fn temp_file(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("sandlock-test-netisol-{}-{}", name, std::process::id()))
+}
+
+/// Allocate a free ephemeral TCP port on the host loopback.
+fn alloc_ephemeral_port() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    l.local_addr().unwrap().port()
+}
+
+/// Allocate a free host-side TCP port at or above `min` (the inbound mapping
+/// range starts at 50005 per the S2.5 design). The kernel hands out `:0`
+/// ephemeral ports sequentially from `ip_local_port_range` (32768 here), so
+/// probing `:0` never reaches the mapping range; probe explicit candidate
+/// ports instead. The probe listener is released before the sandbox binds the
+/// port — a small window, acceptable because the suite runs serialized
+/// (`--test-threads=1`) in a dedicated container.
+fn alloc_host_port_in_range(min: u16) -> u16 {
+    for p in min..=65535 {
+        if let Ok(_l) = TcpListener::bind(("127.0.0.1", p)) {
+            return p;
+        }
+    }
+    panic!("no free loopback TCP port >= {min}");
 }
 
 fn is_synthetic(ip: &str) -> bool {
@@ -1500,4 +1523,556 @@ async fn test_net_isolation_connected_udp_without_fd_inject_not_reachable() {
          got: {content}"
     );
     drop(sock);
+}
+
+// ============================================================
+// S2.5: inbound port mapping (net_bind_map under net_isolation)
+// ============================================================
+//
+// With `net_bind_map(host_port, sandbox_port)` the supervisor listens on the
+// host loopback at `host_port` (>= 50005), and the sandbox's `accept()` on
+// the mapped listener is served from that host listener: the accepted
+// connection fd is injected into the sandbox and `accept()` returns it.
+// This is the MCP-server path: an external gateway connects to the host
+// mapped port and reaches the server listening inside the loopback-only
+// sandbox netns.
+
+/// MCP-style fixed request/response payloads (exact round-trip contract).
+const MCP_REQ: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
+const MCP_RESP: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"pong\"}";
+
+/// In-process inbound server probe: bind+listen on the mapped sandbox port,
+/// serve exactly one external MCP round-trip (fixed request -> fixed
+/// response), report the outcome on fd 3, and exit. The external client is
+/// driven by the test process; the accept blocks until it connects.
+fn inbound_mcp_server_probe() {
+    let mut out = unsafe { std::fs::File::from_raw_fd(3) };
+    let mut line = String::new();
+    let sandbox_port =
+        match std::env::var("INBOUND_SANDBOX_PORT").ok().and_then(|v| v.parse::<u16>().ok()) {
+            Some(p) => p,
+            None => {
+                let _ = out.write_all(b"no_port\n");
+                let _ = out.flush();
+                unsafe { libc::_exit(0) };
+            }
+        };
+    match TcpListener::bind(("127.0.0.1", sandbox_port)) {
+        Ok(listener) => {
+            let handle = std::thread::spawn(move || {
+                if let Ok((mut conn, _)) = listener.accept() {
+                    let mut buf = [0u8; MCP_REQ.len()];
+                    if conn.read_exact(&mut buf).is_ok() && &buf == MCP_REQ {
+                        let _ = conn.write_all(MCP_RESP);
+                    }
+                }
+            });
+            match handle.join() {
+                Ok(()) => line.push_str("external=mcp-echo-ok\n"),
+                Err(_) => line.push_str("external=accept_thread_panicked\n"),
+            }
+        }
+        Err(e) => line.push_str(&format!(
+            "external=bind_errno={}\n",
+            e.raw_os_error().unwrap_or(-1)
+        )),
+    }
+    let _ = out.write_all(line.as_bytes());
+    let _ = out.flush();
+    unsafe { libc::_exit(0) };
+}
+
+/// In-process probe proving the sandbox's own listener on the *mapped* port
+/// still accepts sandbox-internal loopback connections (the accept handler
+/// polls both the host listener and the sandbox's own accept queue).
+fn inbound_internal_probe() {
+    let mut out = unsafe { std::fs::File::from_raw_fd(3) };
+    let mut line = String::new();
+    let sandbox_port =
+        match std::env::var("INBOUND_SANDBOX_PORT").ok().and_then(|v| v.parse::<u16>().ok()) {
+            Some(p) => p,
+            None => {
+                let _ = out.write_all(b"no_port\n");
+                let _ = out.flush();
+                unsafe { libc::_exit(0) };
+            }
+        };
+    match TcpListener::bind(("127.0.0.1", sandbox_port)) {
+        Ok(listener) => {
+            let handle = std::thread::spawn(move || {
+                if let Ok((mut conn, _)) = listener.accept() {
+                    let mut buf = [0u8; 4];
+                    if conn.read_exact(&mut buf).is_ok() {
+                        let _ = conn.write_all(&buf);
+                    }
+                }
+            });
+            match std::net::TcpStream::connect(("127.0.0.1", sandbox_port)) {
+                Ok(mut stream) => {
+                    let mut buf = [0u8; 4];
+                    let sent = stream.write_all(b"ping").is_ok();
+                    let recvd = stream.read_exact(&mut buf).is_ok();
+                    line.push_str(&format!(
+                        "internal={}\n",
+                        if sent && recvd && &buf == b"ping" { "ok" } else { "bad" }
+                    ));
+                }
+                Err(e) => line.push_str(&format!(
+                    "internal=connect_errno={}\n",
+                    e.raw_os_error().unwrap_or(-1)
+                )),
+            }
+            match handle.join() {
+                Ok(()) => {}
+                Err(_) => line.push_str("internal=accept_thread_panicked\n"),
+            }
+        }
+        Err(e) => line.push_str(&format!(
+            "internal=bind_errno={}\n",
+            e.raw_os_error().unwrap_or(-1)
+        )),
+    }
+    let _ = out.write_all(line.as_bytes());
+    let _ = out.flush();
+    unsafe { libc::_exit(0) };
+}
+
+/// In-process probe for lifecycle: bind+listen on the mapped port, report
+/// `listening` on fd 3, then park forever so the test can observe the host
+/// listener while the sandbox lives and after it is dropped.
+fn inbound_park_probe() {
+    let mut out = unsafe { std::fs::File::from_raw_fd(3) };
+    let sandbox_port =
+        match std::env::var("INBOUND_SANDBOX_PORT").ok().and_then(|v| v.parse::<u16>().ok()) {
+            Some(p) => p,
+            None => {
+                let _ = out.write_all(b"no_port\n");
+                let _ = out.flush();
+                unsafe { libc::_exit(0) };
+            }
+        };
+    match TcpListener::bind(("127.0.0.1", sandbox_port)) {
+        Ok(_listener) => {
+            let _ = out.write_all(b"listening\n");
+            let _ = out.flush();
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        }
+        Err(e) => {
+            let _ = out.write_all(
+                format!("bind_errno={}\n", e.raw_os_error().unwrap_or(-1)).as_bytes(),
+            );
+            let _ = out.flush();
+            unsafe { libc::_exit(0) };
+        }
+    }
+}
+
+/// In-process probe for the S2.1 + S2.5 coordination: with both
+/// `fd_inject_connect` and `net_bind_map` active, the sandbox can still
+/// connect OUT to a host loopback echo server (injected fd) AND serve an
+/// inbound MCP connection through the host mapped port.
+fn inbound_plus_egress_probe() {
+    let mut out = unsafe { std::fs::File::from_raw_fd(3) };
+    let mut line = String::new();
+    let sandbox_port =
+        match std::env::var("INBOUND_SANDBOX_PORT").ok().and_then(|v| v.parse::<u16>().ok()) {
+            Some(p) => p,
+            None => {
+                let _ = out.write_all(b"no_port\n");
+                let _ = out.flush();
+                unsafe { libc::_exit(0) };
+            }
+        };
+    let egress_port =
+        match std::env::var("INBOUND_EGRESS_PORT").ok().and_then(|v| v.parse::<u16>().ok()) {
+            Some(p) => p,
+            None => {
+                let _ = out.write_all(b"no_egress_port\n");
+                let _ = out.flush();
+                unsafe { libc::_exit(0) };
+            }
+        };
+
+    // Outbound first: fd-injected connect to the host echo server must work
+    // while the inbound mapping is active (the two paths share the seccomp
+    // dispatch table without conflict).
+    match std::net::TcpStream::connect(("127.0.0.1", egress_port)) {
+        Ok(mut stream) => {
+            let mut buf = [0u8; 4];
+            let sent = stream.write_all(b"ping").is_ok();
+            let recvd = stream.read_exact(&mut buf).is_ok();
+            line.push_str(&format!(
+                "egress={}\n",
+                if sent && recvd && &buf == b"ping" { "ok" } else { "bad" }
+            ));
+        }
+        Err(e) => line.push_str(&format!(
+            "egress=connect_errno={}\n",
+            e.raw_os_error().unwrap_or(-1)
+        )),
+    }
+
+    // Inbound second: the mapped host port serves the MCP round-trip.
+    match TcpListener::bind(("127.0.0.1", sandbox_port)) {
+        Ok(listener) => {
+            let handle = std::thread::spawn(move || {
+                if let Ok((mut conn, _)) = listener.accept() {
+                    let mut buf = [0u8; MCP_REQ.len()];
+                    if conn.read_exact(&mut buf).is_ok() && &buf == MCP_REQ {
+                        let _ = conn.write_all(MCP_RESP);
+                    }
+                }
+            });
+            match handle.join() {
+                Ok(()) => line.push_str("external=mcp-echo-ok\n"),
+                Err(_) => line.push_str("external=accept_thread_panicked\n"),
+            }
+        }
+        Err(e) => line.push_str(&format!(
+            "external=bind_errno={}\n",
+            e.raw_os_error().unwrap_or(-1)
+        )),
+    }
+
+    let _ = out.write_all(line.as_bytes());
+    let _ = out.flush();
+    unsafe { libc::_exit(0) };
+}
+
+/// Build and start a sandbox running `entry` in-process with a result pipe on
+/// fd 3, configured with `net_bind_map(host_port, sandbox_port)`. Returns
+/// (full probe output, sandbox). The pipe is read to EOF, so `entry` must
+/// exit for this helper to return.
+async fn run_inbound_sandbox(
+    entry: fn(),
+    name: &str,
+    net_isolation: bool,
+    host_port: u16,
+    sandbox_port: u16,
+) -> (String, Sandbox) {
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
+    let (r, w) = (fds[0], fds[1]);
+    let mut sb = base_policy()
+        .net_isolation(net_isolation)
+        .net_bind_map(host_port, sandbox_port)
+        .net_allow(format!("127.0.0.1:{}", sandbox_port))
+        .net_allow_bind_port(sandbox_port)
+        .env_var("INBOUND_SANDBOX_PORT", &sandbox_port.to_string())
+        .build()
+        .unwrap();
+    sb.create_with_in_child_main(name, vec![(3, w)], entry)
+        .await
+        .unwrap();
+    unsafe { libc::close(w) };
+    sb.start().unwrap();
+    let buf = tokio::task::spawn_blocking(move || {
+        let mut buf = String::new();
+        let mut f = unsafe { std::fs::File::from_raw_fd(r) };
+        f.read_to_string(&mut buf).unwrap();
+        buf
+    })
+    .await
+    .unwrap();
+    (buf, sb)
+}
+
+/// `run_inbound_sandbox` with `fd_inject_connect` on and an extra egress port
+/// env var, for the S2.1 + S2.5 coordination test.
+async fn run_inbound_sandbox_with_egress(
+    entry: fn(),
+    name: &str,
+    host_port: u16,
+    sandbox_port: u16,
+    egress_port: u16,
+) -> (String, Sandbox) {
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
+    let (r, w) = (fds[0], fds[1]);
+    let mut sb = base_policy()
+        .net_isolation(true)
+        .fd_inject_connect(true)
+        .net_bind_map(host_port, sandbox_port)
+        .net_allow(format!("127.0.0.1:{}", sandbox_port))
+        .net_allow(format!("127.0.0.1:{}", egress_port))
+        .net_allow_bind_port(sandbox_port)
+        .env_var("INBOUND_SANDBOX_PORT", &sandbox_port.to_string())
+        .env_var("INBOUND_EGRESS_PORT", &egress_port.to_string())
+        .build()
+        .unwrap();
+    sb.create_with_in_child_main(name, vec![(3, w)], entry)
+        .await
+        .unwrap();
+    unsafe { libc::close(w) };
+    sb.start().unwrap();
+    let buf = tokio::task::spawn_blocking(move || {
+        let mut buf = String::new();
+        let mut f = unsafe { std::fs::File::from_raw_fd(r) };
+        f.read_to_string(&mut buf).unwrap();
+        buf
+    })
+    .await
+    .unwrap();
+    (buf, sb)
+}
+
+/// Build and start a sandbox running `entry` with a *streaming* result pipe on
+/// fd 3: each probe line is delivered as it is written, so a probe that parks
+/// can still report readiness. Returns (line receiver, sandbox).
+async fn start_inbound_sandbox_stream(
+    entry: fn(),
+    name: &str,
+    host_port: u16,
+    sandbox_port: u16,
+) -> (tokio::sync::mpsc::UnboundedReceiver<String>, Sandbox) {
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
+    let (r, w) = (fds[0], fds[1]);
+    let mut sb = base_policy()
+        .net_isolation(true)
+        .net_bind_map(host_port, sandbox_port)
+        .net_allow(format!("127.0.0.1:{}", sandbox_port))
+        .net_allow_bind_port(sandbox_port)
+        .env_var("INBOUND_SANDBOX_PORT", &sandbox_port.to_string())
+        .build()
+        .unwrap();
+    sb.create_with_in_child_main(name, vec![(3, w)], entry)
+        .await
+        .unwrap();
+    unsafe { libc::close(w) };
+    sb.start().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::task::spawn_blocking(move || {
+        let mut reader = BufReader::new(unsafe { std::fs::File::from_raw_fd(r) });
+        let mut line = String::new();
+        while let Ok(n) = reader.read_line(&mut line) {
+            if n == 0 {
+                break;
+            }
+            let l = line.trim_end().to_string();
+            line.clear();
+            if tx.send(l).is_err() {
+                break;
+            }
+        }
+    });
+    (rx, sb)
+}
+
+/// External TCP client retrying until the host mapped listener appears, then
+/// exchanging one MCP request/response. Runs on a blocking thread so the
+/// sandbox's accept can be served concurrently by the supervisor.
+fn mcp_client(host_port: u16) -> std::io::Result<Vec<u8>> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let outcome: std::io::Result<Vec<u8>> = (|| {
+            let mut s = TcpStream::connect(("127.0.0.1", host_port))?;
+            let mut resp = [0u8; MCP_RESP.len()];
+            s.write_all(MCP_REQ)?;
+            s.read_exact(&mut resp)?;
+            if &resp != MCP_RESP {
+                return Err(std::io::Error::other("bad MCP exchange"));
+            }
+            Ok(resp.to_vec())
+        })();
+        if let Ok(resp) = outcome {
+            return Ok(resp);
+        }
+        if Instant::now() >= deadline {
+            return Err(outcome.unwrap_err());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// External connect result helper: `Some(errno)` when refused, `None` on
+/// success (used to assert the unmapped/unmapped-after-teardown contract).
+fn connect_errno(port: u16) -> Option<i32> {
+    match TcpStream::connect(("127.0.0.1", port)) {
+        Ok(_) => None,
+        Err(e) => Some(e.raw_os_error().unwrap_or(-1)),
+    }
+}
+
+/// MCP scenario: a server listening inside a `net_isolation` sandbox on
+/// `sandbox_port` is reachable from the host via the mapped `host_port`, and
+/// one request/response round-trip completes over the injected fd.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_net_isolation_inbound_mapping_mcp_roundtrip() {
+    let sandbox_port = alloc_ephemeral_port();
+    let host_port = alloc_host_port_in_range(50005);
+
+    let client = tokio::task::spawn_blocking(move || mcp_client(host_port));
+    let run = run_inbound_sandbox(
+        inbound_mcp_server_probe,
+        "inbound-mcp",
+        true,
+        host_port,
+        sandbox_port,
+    );
+    let (output, mut sb) = match tokio::time::timeout(Duration::from_secs(40), run).await {
+        Ok(v) => v,
+        Err(_) => panic!(
+            "sandbox did not serve the external MCP connection within 40s \
+             (host_port={host_port} sandbox_port={sandbox_port})"
+        ),
+    };
+
+    let resp = client.await.unwrap().expect("external MCP client must reach the sandbox");
+    assert_eq!(resp, MCP_RESP.to_vec(), "MCP response must be exact");
+
+    let result = sb.wait().await.unwrap();
+    assert!(
+        result.success(),
+        "sandbox failed: {:?}\nprobe output:\n{}",
+        result.exit_status,
+        output
+    );
+    assert_eq!(
+        output,
+        "external=mcp-echo-ok\n",
+        "probe must report a served external round-trip, got:\n{}",
+        output
+    );
+}
+
+/// The sandbox's own loopback listener on a *mapped* port must keep accepting
+/// sandbox-internal connections: the accept handler polls both the host
+/// listener and the sandbox's own accept queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_net_isolation_inbound_mapping_internal_loopback_still_works() {
+    let sandbox_port = alloc_ephemeral_port();
+    let host_port = alloc_host_port_in_range(50005);
+
+    let (output, mut sb) = run_inbound_sandbox(
+        inbound_internal_probe,
+        "inbound-internal",
+        true,
+        host_port,
+        sandbox_port,
+    )
+    .await;
+    let result = sb.wait().await.unwrap();
+    assert!(
+        result.success(),
+        "sandbox failed: {:?}\nprobe output:\n{}",
+        result.exit_status,
+        output
+    );
+    assert_eq!(
+        output,
+        "internal=ok\n",
+        "mapped sandbox port must still serve sandbox-internal loopback, got:\n{}",
+        output
+    );
+}
+
+/// Lifecycle: the host mapped listener exists while the sandbox lives, the
+/// unmapped sandbox port is refused from the host (nothing listens on the
+/// host for it), and dropping the sandbox closes the host mapped listener
+/// (subsequent connects are refused).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_net_isolation_inbound_mapping_lifecycle_and_unmapped_refused() {
+    let sandbox_port = alloc_ephemeral_port();
+    let host_port = alloc_host_port_in_range(50005);
+
+    let (mut lines, sb) =
+        start_inbound_sandbox_stream(inbound_park_probe, "inbound-park", host_port, sandbox_port)
+            .await;
+    let ready = tokio::time::timeout(Duration::from_secs(20), lines.recv())
+        .await
+        .expect("sandbox must report listening within 20s")
+        .expect("probe pipe closed before reporting readiness");
+    assert_eq!(ready, "listening", "probe readiness line");
+
+    // While the sandbox lives, the host mapped listener accepts connections.
+    let mut mapped_live = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if connect_errno(host_port).is_none() {
+            mapped_live = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(mapped_live, "host mapped port must accept while the sandbox lives");
+
+    // The unmapped sandbox port must be refused from the host: nothing on the
+    // host listens there, only the sandbox's own netns listener.
+    let mut unmapped_refused = false;
+    for _ in 0..10 {
+        if connect_errno(sandbox_port) == Some(libc::ECONNREFUSED) {
+            unmapped_refused = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        unmapped_refused,
+        "host connect to the unmapped sandbox port must be refused (errno 111)"
+    );
+
+    // Dropping the sandbox kills the child and tears down the supervisor, so
+    // the host mapped listener must close: eventually every connect is refused.
+    drop(sb);
+    let mut teardown_refused = false;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if connect_errno(host_port) == Some(libc::ECONNREFUSED) {
+            teardown_refused = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        teardown_refused,
+        "host mapped port must be refused after the sandbox is dropped"
+    );
+}
+
+/// S2.1 + S2.5 coordination: the same sandbox can use outbound fd injection
+/// (connect OUT to a host echo server via an injected fd) and inbound port
+/// mapping (serve an external MCP connection through the host mapped port)
+/// at the same time, with no dispatch-table conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_net_isolation_inbound_mapping_coexists_with_outbound_fd_injection() {
+    let sandbox_port = alloc_ephemeral_port();
+    let host_port = alloc_host_port_in_range(50005);
+    let (egress_port, srv) = spawn_echo_server();
+
+    let client = tokio::task::spawn_blocking(move || mcp_client(host_port));
+    let run = run_inbound_sandbox_with_egress(
+        inbound_plus_egress_probe,
+        "inbound-plus-egress",
+        host_port,
+        sandbox_port,
+        egress_port,
+    );
+    let (output, mut sb) = match tokio::time::timeout(Duration::from_secs(40), run).await {
+        Ok(v) => v,
+        Err(_) => panic!(
+            "sandbox did not finish within 40s \
+             (host_port={host_port} sandbox_port={sandbox_port} egress_port={egress_port})"
+        ),
+    };
+
+    let resp = client.await.unwrap().expect("external MCP client must reach the sandbox");
+    assert_eq!(resp, MCP_RESP.to_vec(), "MCP response must be exact");
+
+    let result = sb.wait().await.unwrap();
+    assert!(
+        result.success(),
+        "sandbox failed: {:?}\nprobe output:\n{}",
+        result.exit_status,
+        output
+    );
+    srv.join().unwrap();
+    assert_eq!(
+        output,
+        "egress=ok\nexternal=mcp-echo-ok\n",
+        "outbound fd injection and inbound mapping must coexist, got:\n{}",
+        output
+    );
 }

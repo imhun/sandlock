@@ -69,6 +69,7 @@ legacy_syscall!(sys_mknod, "mknod");
 legacy_syscall!(sys_rename, "rename");
 legacy_syscall!(sys_symlink, "symlink");
 legacy_syscall!(sys_link, "link");
+legacy_syscall!(sys_accept, "accept");
 legacy_syscall!(sys_chmod, "chmod");
 legacy_syscall!(sys_chown, "chown");
 legacy_syscall!(sys_lchown, "lchown");
