@@ -12,12 +12,15 @@
 //! With the `net_isolation` switch on (default off), the sandbox spawns in
 //! its own network namespace containing only loopback, brought up from
 //! inside the sandbox's user namespace (no privilege in the parent
-//! namespace). The default shared-netns path is unchanged.
+//! namespace). The default shared-netns path is unchanged. Each spawn gets
+//! its own fresh netns: a dual-sandbox test below locks the contract that
+//! two concurrent netns sandboxes are mutually invisible (and that a
+//! future shared/pooled netns refactor cannot silently pass).
 
 use sandlock_core::Sandbox;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::os::unix::io::FromRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 
 fn temp_file(name: &str) -> PathBuf {
@@ -747,5 +750,326 @@ async fn test_net_isolation_wildcard_dns_restricted() {
          from a per-sandbox netns (only loopback); wildcard DNS under net_isolation is \
          restricted until the in-netns DNS gateway lands (S2.3)",
         "net_isolation + wildcard rules must fail closed"
+    );
+}
+
+// ============================================================
+// S2.2 dual-sandbox: two concurrent netns sandboxes are mutually
+// invisible (cross-sandbox netns isolation contract)
+// ============================================================
+
+/// The sandbox's network-namespace identifier as seen from inside it:
+/// the target of `/proc/self/ns/net`, e.g. `net:[4026532000]`. Two
+/// concurrently live sandboxes with independent netns have different
+/// inodes; a shared or pooled netns would hand out the same one, so
+/// comparing the two probes' identifiers directly locks the per-spawn
+/// `unshare(CLONE_NEWNET)` contract (not just the host-invisibility
+/// behavior, which a synthetic-view change could mask).
+fn read_netns_inode() -> String {
+    match std::fs::read_link("/proc/self/ns/net") {
+        Ok(target) => target.to_string_lossy().into_owned(),
+        Err(e) => format!("errno={}", e.raw_os_error().unwrap_or(-1)),
+    }
+}
+
+/// Pair probe A (netns sandbox A): binds a TCP listener on its own
+/// loopback at `LOOPBACK_PORT` (allowed via `net_allow_bind_port`), signals
+/// B on fd 4 (`ready`, listener is bound), then polls the listener and the
+/// fd 5 `done` pipe. If a connection ever arrives, B reached A's netns
+/// (regression); under correct per-sandbox isolation only `done` arrives.
+/// Also reports its netns inode for the cross-sandbox identifier check.
+/// Result goes to fd 3.
+fn netns_pair_probe_a() {
+    let mut out = unsafe { std::fs::File::from_raw_fd(3) };
+    let mut sync_to_b = unsafe { std::fs::File::from_raw_fd(4) };
+    let sync_from_b = unsafe { std::fs::File::from_raw_fd(5) };
+    let mut line = String::new();
+    line.push_str(&format!("netns_inode={}\n", read_netns_inode()));
+
+    let loopback_port = match std::env::var("LOOPBACK_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+    {
+        Some(p) => p,
+        None => {
+            let _ = out.write_all(b"a_bind=no_port\n");
+            let _ = out.flush();
+            unsafe { libc::_exit(0) };
+        }
+    };
+    let listener = match TcpListener::bind(("127.0.0.1", loopback_port)) {
+        Ok(l) => l,
+        Err(e) => {
+            line.push_str(&format!("a_bind=errno={}\n", e.raw_os_error().unwrap_or(-1)));
+            // Signal B anyway so it never hangs waiting for readiness.
+            let _ = sync_to_b.write_all(b"ready");
+            let _ = out.write_all(line.as_bytes());
+            let _ = out.flush();
+            unsafe { libc::_exit(0) };
+        }
+    };
+    line.push_str("a_bind=ok\n");
+    let _ = sync_to_b.write_all(b"ready");
+    let _ = sync_to_b.flush();
+
+    // Wait for either an incoming connection (regression: B reached A's
+    // netns) or B's `done` signal. The done pipe normally arrives in
+    // milliseconds; 10s is only a safety bound so a broken sync can never
+    // hang the suite.
+    let listener_fd = listener.as_raw_fd();
+    let done_fd = sync_from_b.as_raw_fd();
+    let mut fds = [
+        libc::pollfd {
+            fd: listener_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: done_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, 10_000) };
+    if rc < 0 {
+        line.push_str(&format!(
+            "a_poll=errno={}\n",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        ));
+    } else if rc == 0 {
+        line.push_str("a_poll=timeout\n");
+    } else if fds[0].revents & libc::POLLIN != 0 {
+        // A connection arrived on A's listener: B reached this netns.
+        let _ = listener.accept();
+        line.push_str("a_accept=conn\n");
+    } else {
+        line.push_str("a_accept=none\n");
+    }
+
+    let _ = out.write_all(line.as_bytes());
+    let _ = out.flush();
+    unsafe { libc::_exit(0) };
+}
+
+/// Pair probe B (netns sandbox B): waits on fd 4 for A's `ready` (listener
+/// bound), reports its own netns inode, then connects to A's listener at
+/// `127.0.0.1:PEER_PORT` (allowed via `net_allow`, so a failure can only be
+/// a netns-level ECONNREFUSED, never a policy denial). Signals `done` on fd
+/// 5 and writes the result to fd 3.
+fn netns_pair_probe_b() {
+    let mut out = unsafe { std::fs::File::from_raw_fd(3) };
+    let mut sync_from_a = unsafe { std::fs::File::from_raw_fd(4) };
+    let mut sync_to_a = unsafe { std::fs::File::from_raw_fd(5) };
+    let mut line = String::new();
+
+    // Block until A's listener is bound (10s safety bound; normally instant).
+    let ready_fd = sync_from_a.as_raw_fd();
+    let mut fds = [libc::pollfd {
+        fd: ready_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), 1, 10_000) };
+    if rc <= 0 || fds[0].revents & libc::POLLIN == 0 {
+        line.push_str("b_ready=timeout\n");
+        let _ = out.write_all(line.as_bytes());
+        let _ = out.flush();
+        unsafe { libc::_exit(0) };
+    }
+    let mut ready = [0u8; 5];
+    let _ = sync_from_a.read_exact(&mut ready);
+    line.push_str(&format!("netns_inode={}\n", read_netns_inode()));
+
+    let peer_port = match std::env::var("PEER_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+    {
+        Some(p) => p,
+        None => {
+            line.push_str("b_connect=no_port\n");
+            let _ = sync_to_a.write_all(b"done");
+            let _ = out.write_all(line.as_bytes());
+            let _ = out.flush();
+            unsafe { libc::_exit(0) };
+        }
+    };
+    match std::net::TcpStream::connect(("127.0.0.1", peer_port)) {
+        Ok(_) => line.push_str("b_connect=reachable\n"),
+        Err(e) => line.push_str(&format!(
+            "b_connect=errno={}\n",
+            e.raw_os_error().unwrap_or(-1)
+        )),
+    }
+    let _ = sync_to_a.write_all(b"done");
+    let _ = sync_to_a.flush();
+    let _ = out.write_all(line.as_bytes());
+    let _ = out.flush();
+    unsafe { libc::_exit(0) };
+}
+
+/// Two concurrent `net_isolation` sandboxes must be mutually invisible:
+/// sandbox A listens on 127.0.0.1:P inside its own netns, sandbox B's
+/// connect to 127.0.0.1:P must fail with ECONNREFUSED (B's loopback is its
+/// own lo, nothing is listening), and A must never accept a connection.
+/// Additionally the two `/proc/self/ns/net` inodes must differ, proving
+/// each spawn got its own netns rather than a shared/pooled one. The sync
+/// pipes make the ordering deterministic: B only connects after A's
+/// listener is bound, and A only exits after B finished its attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_net_isolation_two_sandboxes_mutually_invisible() {
+    // Pick a free port on the host loopback, then close it so A can bind it
+    // inside its own netns (each netns has its own loopback, so no clash).
+    let loopback_port = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+
+    // Per-sandbox result pipes (fd 3) and the cross-sandbox sync pipes:
+    // A->B `ready` and B->A `done`.
+    let mut a_out = [0i32; 2];
+    let mut b_out = [0i32; 2];
+    let mut ready = [0i32; 2];
+    let mut done = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(a_out.as_mut_ptr()) }, 0, "a result pipe failed");
+    assert_eq!(unsafe { libc::pipe(b_out.as_mut_ptr()) }, 0, "b result pipe failed");
+    assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0, "ready pipe failed");
+    assert_eq!(unsafe { libc::pipe(done.as_mut_ptr()) }, 0, "done pipe failed");
+
+    // Sandbox A: fd 3 = result, fd 4 = ready write end, fd 5 = done read end.
+    let mut a = base_policy()
+        .net_isolation(true)
+        .net_allow_bind_port(loopback_port)
+        .env_var("LOOPBACK_PORT", &loopback_port.to_string())
+        .build()
+        .unwrap();
+    a.create_with_in_child_main(
+        "netns-pair-a",
+        vec![(3, a_out[1]), (4, ready[1]), (5, done[0])],
+        netns_pair_probe_a,
+    )
+    .await
+    .unwrap();
+
+    // Sandbox B: fd 3 = result, fd 4 = ready read end, fd 5 = done write end.
+    let mut b = base_policy()
+        .net_isolation(true)
+        .net_allow(format!("127.0.0.1:{}", loopback_port))
+        .env_var("PEER_PORT", &loopback_port.to_string())
+        .build()
+        .unwrap();
+    b.create_with_in_child_main(
+        "netns-pair-b",
+        vec![(3, b_out[1]), (4, ready[0]), (5, done[1])],
+        netns_pair_probe_b,
+    )
+    .await
+    .unwrap();
+
+    // Close the parent-side copies; the children hold their own dups.
+    unsafe { libc::close(a_out[1]) };
+    unsafe { libc::close(b_out[1]) };
+    unsafe { libc::close(ready[0]) };
+    unsafe { libc::close(ready[1]) };
+    unsafe { libc::close(done[0]) };
+    unsafe { libc::close(done[1]) };
+
+    a.start().unwrap();
+    b.start().unwrap();
+
+    // Read B first (it exits right after its connect attempt), then A
+    // (it exits as soon as B's `done` arrives). Blocking pipe reads must
+    // run off the tokio executor that pumps the seccomp supervisors.
+    let out_b = tokio::task::spawn_blocking(move || {
+        let mut buf = String::new();
+        let mut f = unsafe { std::fs::File::from_raw_fd(b_out[0]) };
+        f.read_to_string(&mut buf).unwrap();
+        buf
+    })
+    .await
+    .unwrap();
+    let out_a = tokio::task::spawn_blocking(move || {
+        let mut buf = String::new();
+        let mut f = unsafe { std::fs::File::from_raw_fd(a_out[0]) };
+        f.read_to_string(&mut buf).unwrap();
+        buf
+    })
+    .await
+    .unwrap();
+
+    let result_b = b.wait().await.unwrap();
+    assert!(
+        result_b.success(),
+        "sandbox B failed: {:?}\nprobe B output:\n{}",
+        result_b.exit_status,
+        out_b
+    );
+    let result_a = a.wait().await.unwrap();
+    assert!(
+        result_a.success(),
+        "sandbox A failed: {:?}\nprobe A output:\n{}",
+        result_a.exit_status,
+        out_a
+    );
+
+    let mut a_inode = None;
+    let mut a_bind = None;
+    let mut a_accept = None;
+    let mut b_inode = None;
+    let mut b_connect = None;
+    for l in out_a.lines() {
+        if let Some(v) = l.strip_prefix("netns_inode=") {
+            a_inode = Some(v);
+        } else if let Some(v) = l.strip_prefix("a_bind=") {
+            a_bind = Some(v);
+        } else if let Some(v) = l.strip_prefix("a_accept=") {
+            a_accept = Some(v);
+        }
+    }
+    for l in out_b.lines() {
+        if let Some(v) = l.strip_prefix("netns_inode=") {
+            b_inode = Some(v);
+        } else if let Some(v) = l.strip_prefix("b_connect=") {
+            b_connect = Some(v);
+        }
+    }
+
+    assert_eq!(
+        a_bind, Some("ok"),
+        "sandbox A must bind its listener:\n{}",
+        out_a
+    );
+    assert_eq!(
+        a_accept, Some("none"),
+        "sandbox B must never reach sandbox A's listener (a_accept=none expected):\nA:\n{}\nB:\n{}",
+        out_a, out_b
+    );
+    assert_eq!(
+        b_connect, Some("errno=111"),
+        "sandbox B must fail to reach sandbox A's 127.0.0.1 listener with ECONNREFUSED:\nB:\n{}\nA:\n{}",
+        out_b, out_a
+    );
+
+    // Both inodes must parse as `net:[<inode>]` and differ: two concurrently
+    // live sandboxes share a netns iff they got the same one (pooling/sharing
+    // would equalize them).
+    let inode_a = a_inode
+        .expect("netns_inode line missing from A")
+        .strip_prefix("net:[")
+        .and_then(|s| s.strip_suffix(']'))
+        .expect("A netns inode must be net:[...]")
+        .parse::<u64>()
+        .expect("A netns inode must be numeric");
+    let inode_b = b_inode
+        .expect("netns_inode line missing from B")
+        .strip_prefix("net:[")
+        .and_then(|s| s.strip_suffix(']'))
+        .expect("B netns inode must be net:[...]")
+        .parse::<u64>()
+        .expect("B netns inode must be numeric");
+    assert_ne!(
+        inode_a, inode_b,
+        "concurrent net_isolation sandboxes must have distinct netns \
+         identifiers (per-spawn unshare), got A={} B={}",
+        inode_a, inode_b
     );
 }
