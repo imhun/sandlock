@@ -72,22 +72,59 @@ fn pin_child_unix_target(
 
 /// Resolve a named unix socket `sun_path` to its real, symlink-followed inode
 /// in the child's root view (see [`pin_child_unix_target`]) and verify that
-/// inode is under an fs-write grant. On success returns the pinned `O_PATH` fd;
-/// on failure returns the deny/refuse `NotifAction`.
+/// inode is under an fs-write grant AND that the sandbox child's own host
+/// identity would pass the kernel's DAC write check on the socket inode. On
+/// success returns the pinned `O_PATH` fd; on failure returns the
+/// deny/refuse `NotifAction`.
 fn resolve_named_unix_target(
     child_pid: u32,
     sun_path: &std::path::Path,
     writable: &[std::path::PathBuf],
+    host_uid: u32,
+    host_gid: u32,
+    host_groups: &[u32],
 ) -> Result<OwnedFd, NotifAction> {
     let pinned = pin_child_unix_target(child_pid, sun_path)?;
 
     // Canonical path of the pinned inode in our mount namespace.
     let real = std::fs::read_link(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
         .map_err(|_| NotifAction::Errno(libc::EACCES))?;
-    if real_path_under_any(&real, writable) {
-        Ok(pinned)
-    } else {
+    if !real_path_under_any(&real, writable) {
         Err(NotifAction::Errno(libc::EACCES))
+    } else if !child_dac_write_allowed(&pinned, host_uid, host_gid, host_groups) {
+        // The on-behalf connect/send below executes with the supervisor's
+        // (root) credentials, which would bypass the socket inode's owner
+        // check — reproduce the check the kernel would apply to the CHILD's
+        // host identity, so a 0700 socket owned by another sandbox's uid
+        // stays unreachable (per-sandbox `RunAs` host-uid isolation).
+        Err(NotifAction::Errno(libc::EACCES))
+    } else {
+        Ok(pinned)
+    }
+}
+
+/// Reproduce the kernel's DAC write-permission check on the pinned socket
+/// inode as the *sandbox child* would experience it: owner/group/other mode
+/// bits compared against the child's host uid/gid and supplementary groups.
+/// The named-unix on-behalf path executes in the supervisor, whose root
+/// credentials would otherwise let a socket owned by a different sandbox's
+/// host uid pass the check. POSIX ACLs are not modelled (sockets rarely carry
+/// them; a refusal here is the safe direction). The child's single-entry
+/// userns grants no DAC-override for ids it cannot map, so a plain mode-bit
+/// check matches the kernel for every reachable mapping.
+fn child_dac_write_allowed(pinned: &OwnedFd, uid: u32, gid: u32, groups: &[u32]) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let meta = match std::fs::metadata(format!("/proc/self/fd/{}", pinned.as_raw_fd())) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let mode = meta.mode() & 0o777;
+    if meta.uid() == uid {
+        mode & 0o200 != 0
+    } else if meta.gid() == gid || groups.contains(&meta.gid()) {
+        mode & 0o020 != 0
+    } else {
+        mode & 0o002 != 0
     }
 }
 
@@ -126,8 +163,18 @@ pub(super) fn connect_named_unix_on_behalf(
     sockfd: i32,
     sun_path: &std::path::Path,
     writable: &[std::path::PathBuf],
+    host_uid: u32,
+    host_gid: u32,
+    host_groups: &[u32],
 ) -> NotifAction {
-    let pinned = match resolve_named_unix_target(child_pid, sun_path, writable) {
+    let pinned = match resolve_named_unix_target(
+        child_pid,
+        sun_path,
+        writable,
+        host_uid,
+        host_gid,
+        host_groups,
+    ) {
         Ok(fd) => fd,
         Err(action) => return action,
     };
@@ -165,8 +212,18 @@ pub(super) fn sendto_named_unix_on_behalf(
     flags: i32,
     sun_path: &std::path::Path,
     writable: &[std::path::PathBuf],
+    host_uid: u32,
+    host_gid: u32,
+    host_groups: &[u32],
 ) -> NotifAction {
-    let pinned = match resolve_named_unix_target(notif.pid, sun_path, writable) {
+    let pinned = match resolve_named_unix_target(
+        notif.pid,
+        sun_path,
+        writable,
+        host_uid,
+        host_gid,
+        host_groups,
+    ) {
         Ok(fd) => fd,
         Err(action) => return action,
     };
@@ -294,6 +351,9 @@ pub(super) fn unix_sendmsg_gate(
         flags,
         &path,
         &ctx.policy.chroot_writable,
+        ctx.policy.host_uid,
+        ctx.policy.host_gid,
+        &ctx.policy.host_groups,
     ))
 }
 
@@ -308,8 +368,21 @@ fn sendmsg_named_unix_on_behalf(
     flags: i32,
     sun_path: &std::path::Path,
     writable: &[std::path::PathBuf],
+    host_uid: u32,
+    host_gid: u32,
+    host_groups: &[u32],
 ) -> NotifAction {
-    match send_named_unix_msghdr(notif, notif_fd, sockfd, msghdr_ptr, sun_path, writable) {
+    match send_named_unix_msghdr(
+        notif,
+        notif_fd,
+        sockfd,
+        msghdr_ptr,
+        sun_path,
+        writable,
+        host_uid,
+        host_gid,
+        host_groups,
+    ) {
         Ok((dup_fd, m)) => {
             let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
             resolve_send(dup_fd, m, flags, blocking)
@@ -331,8 +404,18 @@ fn send_named_unix_msghdr(
     msghdr_ptr: u64,
     sun_path: &std::path::Path,
     writable: &[std::path::PathBuf],
+    host_uid: u32,
+    host_gid: u32,
+    host_groups: &[u32],
 ) -> Result<(OwnedFd, MaterializedMsg), i32> {
-    let pinned = match resolve_named_unix_target(notif.pid, sun_path, writable) {
+    let pinned = match resolve_named_unix_target(
+        notif.pid,
+        sun_path,
+        writable,
+        host_uid,
+        host_gid,
+        host_groups,
+    ) {
         Ok(fd) => fd,
         Err(NotifAction::Errno(e)) => return Err(e),
         Err(_) => return Err(libc::EACCES),
@@ -386,6 +469,9 @@ pub(super) fn sendmmsg_named_unix_on_behalf(
     vlen: usize,
     flags: i32,
     writable: &[std::path::PathBuf],
+    host_uid: u32,
+    host_gid: u32,
+    host_groups: &[u32],
 ) -> NotifAction {
     let mut sent: usize = 0;
     let mut first_errno: Option<i32> = None;
@@ -397,7 +483,17 @@ pub(super) fn sendmmsg_named_unix_on_behalf(
             // stop here and report a short send rather than passing it through.
             None => break,
         };
-        let (dup_fd, m) = match send_named_unix_msghdr(notif, notif_fd, sockfd, entry_ptr, &path, writable) {
+        let (dup_fd, m) = match send_named_unix_msghdr(
+            notif,
+            notif_fd,
+            sockfd,
+            entry_ptr,
+            &path,
+            writable,
+            host_uid,
+            host_gid,
+            host_groups,
+        ) {
             Ok(pair) => pair,
             Err(errno) => {
                 first_errno = Some(errno);

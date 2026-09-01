@@ -764,6 +764,19 @@ pub struct NotifPolicy {
     /// connect, so the seccomp layer closes the escape; abstract sockets are
     /// handled by `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` instead.
     pub has_unix_fs_gate: bool,
+    /// Host (parent-namespace) identity the sandbox process runs as, after
+    /// the single-entry userns mapping: `host_uid`/`host_gid` are the ids the
+    /// kernel would compare against a file's owner/group, and `host_groups`
+    /// the supplementary groups the sandbox still has (empty for the
+    /// privileged `RunAs` remap, where the child clears them; inherited from
+    /// the supervisor otherwise). The named-unix on-behalf connect/send runs
+    /// with the supervisor's credentials, so the supervisor reproduces the
+    /// kernel's DAC write check against *this* identity — otherwise every
+    /// sandbox (different `RunAs` host uids included) would connect to a
+    /// 0700 socket as if it were the root supervisor.
+    pub host_uid: u32,
+    pub host_gid: u32,
+    pub host_groups: Vec<u32>,
     pub has_random_seed: bool,
     pub has_time_start: bool,
     /// Argv-safety gate: the supervisor must freeze every task that

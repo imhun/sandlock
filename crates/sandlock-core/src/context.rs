@@ -140,6 +140,58 @@ pub(crate) fn read_u32_fd(fd: RawFd) -> io::Result<u32> {
     Ok(u32::from_le_bytes(buf))
 }
 
+/// Write a single byte (blocking) to a raw fd.
+pub(crate) fn write_byte_fd(fd: RawFd, b: u8) -> io::Result<()> {
+    let buf = [b];
+    let mut written = 0usize;
+    while written < buf.len() {
+        let ret = unsafe {
+            libc::write(
+                fd,
+                buf[written..].as_ptr() as *const libc::c_void,
+                buf.len() - written,
+            )
+        };
+        if ret < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(io::Error::last_os_error());
+        }
+        written += ret as usize;
+    }
+    Ok(())
+}
+
+/// Read a single byte (blocking) from a raw fd.
+pub(crate) fn read_byte_fd(fd: RawFd) -> io::Result<u8> {
+    let mut buf = [0u8; 1];
+    let mut total = 0usize;
+    while total < buf.len() {
+        let ret = unsafe {
+            libc::read(
+                fd,
+                buf[total..].as_mut_ptr() as *mut libc::c_void,
+                buf.len() - total,
+            )
+        };
+        if ret < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(io::Error::last_os_error());
+        }
+        if ret == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "pipe closed before 1 byte read",
+            ));
+        }
+        total += ret as usize;
+    }
+    Ok(buf[0])
+}
+
 #[cfg(test)]
 use crate::seccomp::syscall::syscall_name_to_nr;
 
@@ -217,6 +269,45 @@ pub(crate) fn write_id_maps(
     Ok(())
 }
 
+/// Write the uid/gid maps of a *child* that has unshared a fresh user
+/// namespace, mapping inside-id 0 to the requested host identity
+/// (`RunAs` = host uid/gid; inside the namespace the sandbox sees uid 0).
+///
+/// This runs in the parent (supervisor), not the child: unshare(CLONE_NEWUSER)
+/// strips every capability the caller had in the *parent* namespace, so a
+/// child can only ever map its own euid — the single-entry map `0 -> uid`
+/// with an arbitrary host uid requires the parent to hold CAP_SETUID /
+/// CAP_SETGID in the parent namespace (root).  The child is synchronized via
+/// the map-ready / map-done pipes: it signals after unsharing, the parent
+/// writes the maps, then releases the child to `setresuid(0)` inside the
+/// namespace (which re-points its host identity at the mapped uid).
+pub(crate) fn write_privileged_id_maps(
+    child_pid: libc::pid_t,
+    run_as: crate::sandbox::RunAs,
+) -> std::io::Result<()> {
+    std::fs::write(format!("/proc/{child_pid}/uid_map"), format!("0 {} 1\n", run_as.uid))?;
+    std::fs::write(format!("/proc/{child_pid}/gid_map"), format!("0 {} 1\n", run_as.gid))?;
+    Ok(())
+}
+
+/// Current supplementary group ids of this process (host gids). The sandbox
+/// child inherits them across fork (and keeps them in the unprivileged
+/// single-entry userns, where `setgroups` is denied), so they are part of the
+/// identity the kernel's DAC checks use for the sandbox's file/socket access.
+pub(crate) fn current_supplementary_groups() -> Vec<u32> {
+    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    let mut groups = vec![0 as libc::gid_t; n as usize];
+    let got = unsafe { libc::getgroups(n, groups.as_mut_ptr()) };
+    if got <= 0 {
+        return Vec::new();
+    }
+    groups.truncate(got as usize);
+    groups.into_iter().map(|g| g as u32).collect()
+}
+
 // ============================================================
 // Child-side confinement (never returns)
 // ============================================================
@@ -274,6 +365,17 @@ pub(crate) struct ChildSpawnArgs<'a> {
     /// parent-death check compares against `getppid() == 0` (the real
     /// parent lives outside the namespace).
     pub pid_ns: bool,
+    /// Child-side write end of the "user namespace created" pipe. `Some`
+    /// only when the supervisor is privileged and `RunAs` differs from its
+    /// own identity: the child unshares a user namespace, signals the
+    /// parent, and waits for the parent to write the `0 -> host_uid` maps
+    /// (a child alone cannot map an arbitrary host uid — unshare strips its
+    /// parent-namespace capabilities, leaving only a self-euid mapping).
+    pub map_ready_w: Option<OwnedFd>,
+    /// Child-side read end of the "maps written" pipe (parent -> child).
+    /// Paired with `map_ready_w`; the byte received is the release signal
+    /// after the parent wrote the privileged maps.
+    pub map_done_r: Option<OwnedFd>,
 }
 
 /// Set the calling thread/process name (`/proc/<pid>/comm`, shown by `ps`). The
@@ -322,6 +424,8 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         parent_pid,
         foreground,
         pid_ns,
+        map_ready_w,
+        map_done_r,
     } = args;
     // Helper: abort child on error. Includes the OS error automatically.
     macro_rules! fail {
@@ -441,11 +545,41 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
                 if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
                     fail!("unshare(CLONE_NEWUSER)");
                 }
-                if write_id_maps(real_uid, real_gid, run_as.uid, run_as.gid).is_err() {
-                    fail!(
-                        "uid_map/gid_map write (is unprivileged userns restricted? \
-                         e.g. kernel.apparmor_restrict_unprivileged_userns=1)"
-                    );
+                if let (Some(ready_w), Some(done_r)) = (map_ready_w, map_done_r) {
+                    // Privileged path: the parent writes the `0 -> run_as`
+                    // maps (only it still has CAP_SETUID in the parent
+                    // namespace), then we re-point our host identity at the
+                    // mapped uid/gid from inside the namespace. `RunAs` is
+                    // the *host* uid; inside we see uid 0.
+                    if write_byte_fd(ready_w.as_raw_fd(), b'R').is_err() {
+                        fail!("user-namespace map ready signal");
+                    }
+                    if read_byte_fd(done_r.as_raw_fd()).is_err() {
+                        fail!(
+                            "parent uid_map/gid_map write (is unprivileged userns restricted? \
+                             e.g. kernel.apparmor_restrict_unprivileged_userns=1)"
+                        );
+                    }
+                    if unsafe { libc::setresgid(0, 0, 0) } != 0 {
+                        fail!("setresgid(0) to activate mapped host gid");
+                    }
+                    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+                        fail!("setgroups to drop supplementary groups");
+                    }
+                    if unsafe { libc::setresuid(0, 0, 0) } != 0 {
+                        fail!("setresuid(0) to activate mapped host uid");
+                    }
+                } else {
+                    // Unprivileged fallback (single-entry map can only cover
+                    // the caller's own euid): the requested uid is visible
+                    // inside the namespace and the host uid stays the
+                    // caller's — the historical contract.
+                    if write_id_maps(real_uid, real_gid, run_as.uid, run_as.gid).is_err() {
+                        fail!(
+                            "uid_map/gid_map write (is unprivileged userns restricted? \
+                             e.g. kernel.apparmor_restrict_unprivileged_userns=1)"
+                        );
+                    }
                 }
             }
         }

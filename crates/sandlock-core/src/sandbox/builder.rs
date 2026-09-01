@@ -841,7 +841,16 @@ impl SandboxBuilder {
     }
 
     /// Run the sandboxed process as `uid`/`gid` via a single-entry user
-    /// namespace map (no host privilege required).
+    /// namespace map.
+    ///
+    /// With a **privileged** supervisor (root in its user namespace) the
+    /// requested ids are the sandbox's HOST identity: the parent writes the
+    /// map `0 -> uid`, the process appears as uid 0 inside the namespace, and
+    /// distinct `uid`s across sandboxes give kernel-enforced file and
+    /// unix-socket isolation.  With an **unprivileged** supervisor the
+    /// single-entry map can only cover the caller's own euid, so the requested
+    /// ids are visible inside the namespace and the host identity stays the
+    /// caller's (historical behavior, no host privilege required).
     ///
     /// If `uid`/`gid` already match the process's real uid/gid at launch, no
     /// user namespace is created — the process already has that identity, so

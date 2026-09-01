@@ -81,10 +81,22 @@ impl ByteSize {
 /// Identity to run the sandboxed process as.
 ///
 /// Applied via a single-entry user-namespace map (`unshare(CLONE_NEWUSER)` +
-/// `uid_map`/`gid_map`), so it requires no host privilege.  Because an
-/// unprivileged user namespace can only map a single id and must deny
-/// `setgroups`, exactly one uid and one gid are representable (no supplementary
-/// groups, no id ranges).
+/// `uid_map`/`gid_map`).  The interpretation depends on the supervisor:
+///
+/// * **Privileged supervisor** (root in its user namespace): `uid`/`gid` are
+///   the **host** identity — the parent writes the map `0 -> uid` (and
+///   `0 -> gid`) and the sandbox process runs as uid 0 *inside* the namespace
+///   while the host sees the requested `uid`/`gid`.  Two sandboxes with
+///   different `RunAs` ids therefore get kernel-enforced file and unix-socket
+///   isolation (0700 + distinct host uid), even against a shared volume.
+/// * **Unprivileged supervisor**: a single-entry userns can only map the
+///   caller's own euid, so the requested `uid`/`gid` are visible *inside* the
+///   namespace and the host identity stays the caller's (the historical
+///   contract).  Cross-sandbox host-uid isolation is then impossible by
+///   kernel design.
+///
+/// Either way exactly one uid and one gid are representable (no
+/// supplementary groups on the privileged path, no id ranges).
 ///
 /// Parsed from `UID:GID`; both ids are required (no implicit default).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1946,6 +1958,51 @@ impl Sandbox {
         let foreground = stdio.all_inherit();
         let tty_foreground_taken = foreground && unsafe { libc::isatty(0) } == 1;
 
+        // User-namespace map handshake pipes (privileged `--user` remap only).
+        //
+        // A `--user` remap to a *different* host identity requires the parent
+        // to write the child's uid/gid maps: `unshare(CLONE_NEWUSER)` strips
+        // the child's capabilities in the parent user namespace, so a child
+        // can only ever map its own euid — the single-entry map `0 -> host_uid`
+        // needs the parent to hold CAP_SETUID/CAP_SETGID there (root).  The
+        // pipes exist exactly when `RunAs` differs from our own identity and
+        // we are privileged; the unprivileged path keeps the historical
+        // child self-map (requested uid visible inside, host uid = caller's).
+        let real_uid = unsafe { libc::getuid() };
+        let real_gid = unsafe { libc::getgid() };
+        let privileged_userns = unsafe { libc::geteuid() } == 0;
+        let userns_remap =
+            matches!(self.user, Some(run_as) if run_as.uid != real_uid || run_as.gid != real_gid);
+        let map_pipes = if privileged_userns && userns_remap {
+            // (ready: child writes / parent reads, done: parent writes /
+            // child reads). `make_cloexec_pipe` returns (read, write).
+            let ready = make_cloexec_pipe().map_err(SandboxRuntimeError::Io)?;
+            let done = make_cloexec_pipe().map_err(SandboxRuntimeError::Io)?;
+            Some((ready, done))
+        } else {
+            None
+        };
+
+        // The sandbox's effective HOST identity after the userns mapping —
+        // the ids the kernel's DAC checks compare against file/socket
+        // owners. On the privileged remap path these are the `RunAs` ids and
+        // the child cleared its supplementary groups; otherwise they are the
+        // supervisor's own ids (and groups), which the child inherits. The
+        // named-unix on-behalf gate reproduces the child's permission check
+        // with this identity, because the supervisor performs those syscalls
+        // with root credentials that would otherwise bypass every per-uid
+        // socket boundary.
+        let (host_uid, host_gid, host_groups) = match self.user {
+            Some(run_as) if userns_remap && privileged_userns => {
+                (run_as.uid, run_as.gid, Vec::new())
+            }
+            _ => (
+                real_uid,
+                real_gid,
+                crate::context::current_supplementary_groups(),
+            ),
+        };
+
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             return Err(SandboxRuntimeError::Fork(std::io::Error::last_os_error()).into());
@@ -1953,6 +2010,19 @@ impl Sandbox {
 
         if pid == 0 {
             // ===== CHILD PROCESS =====
+            // Keep the child-side handshake ends; drop the parent-side ends
+            // of the post-fork copies.
+            let (mut map_ready_w, mut map_done_r) = match map_pipes {
+                Some((ready, done)) => {
+                    let ready_w = ready.1;
+                    let done_r = done.0;
+                    drop(ready.0);
+                    drop(done.1);
+                    (Some(ready_w), Some(done_r))
+                }
+                None => (None, None),
+            };
+
             if self.pid_ns {
                 // === Intermediate process: create the PID namespace ===
                 //
@@ -1960,12 +2030,13 @@ impl Sandbox {
                 // directly (that needs CAP_SYS_ADMIN in the current user
                 // namespace). The unprivileged route is: unshare a user
                 // namespace first (granting full caps inside it), write the
-                // uid/gid mapping, then unshare CLONE_NEWPID and fork the
-                // final child. The intermediate process stays alive as the
-                // final child's parent: it relays the leader's host pid to
-                // the supervisor, waits for the leader, and exits with its
-                // status, so the supervisor only ever waits/reaps its own
-                // direct child.
+                // uid/gid mapping (parent-written when the supervisor is
+                // privileged, self-written otherwise), then unshare
+                // CLONE_NEWPID and fork the final child. The intermediate
+                // process stays alive as the final child's parent: it relays
+                // the leader's host pid to the supervisor, waits for the
+                // leader, and exits with its status, so the supervisor only
+                // ever waits/reaps its own direct child.
                 unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
                 if unsafe { libc::getppid() } != parent_pid {
                     unsafe { libc::_exit(127) };
@@ -1987,7 +2058,42 @@ impl Sandbox {
                     }
                     _ => (real_uid, real_gid),
                 };
-                if crate::context::write_id_maps(real_uid, real_gid, map_uid, map_gid).is_err() {
+                if map_ready_w.is_some() {
+                    // Privileged: hand the namespace to the parent, which
+                    // writes `0 -> RunAs` maps, then activate the mapped host
+                    // identity from inside the namespace.
+                    let ready_w = map_ready_w.take().expect("handshake ready pipe");
+                    let done_r = map_done_r.take().expect("handshake done pipe");
+                    if crate::context::write_byte_fd(ready_w.as_raw_fd(), b'R').is_err() {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "sandlock child: user-namespace map ready signal: {}",
+                            std::io::Error::last_os_error(),
+                        );
+                        unsafe { libc::_exit(127) };
+                    }
+                    if crate::context::read_byte_fd(done_r.as_raw_fd()).is_err() {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "sandlock child: parent uid_map/gid_map write for pid namespace: {}",
+                            std::io::Error::last_os_error(),
+                        );
+                        unsafe { libc::_exit(127) };
+                    }
+                    if unsafe { libc::setresgid(0, 0, 0) } != 0
+                        || unsafe { libc::setgroups(0, std::ptr::null()) } != 0
+                        || unsafe { libc::setresuid(0, 0, 0) } != 0
+                    {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "sandlock child: activate mapped host identity for pid namespace: {}",
+                            std::io::Error::last_os_error(),
+                        );
+                        unsafe { libc::_exit(127) };
+                    }
+                } else if crate::context::write_id_maps(real_uid, real_gid, map_uid, map_gid)
+                    .is_err()
+                {
                     let _ = writeln!(
                         std::io::stderr(),
                         "sandlock child: uid_map/gid_map write for pid namespace: {}",
@@ -2144,6 +2250,8 @@ impl Sandbox {
                 parent_pid: child_parent_pid,
                 foreground,
                 pid_ns: self.pid_ns,
+                map_ready_w,
+                map_done_r,
             });
         }
 
@@ -2153,6 +2261,35 @@ impl Sandbox {
         // The intermediate holds the only other write end of the leader-pid
         // pipe; the parent never writes to it.
         drop(pipes.leader_pid_w);
+
+        // Privileged `--user` remap: wait for the child to unshare its user
+        // namespace, write the `0 -> host_uid` maps, then release it. Must
+        // complete before the notif-fd read below — the child blocks on the
+        // map-done pipe until the maps are written. On failure the child is
+        // SIGKILL'd directly (the pid-ns intermediate has not setpgid'd yet,
+        // so killpg could hit the supervisor's own group) and the error is
+        // returned; Drop then only reaps the already-dead child.
+        if let Some((ready, done)) = map_pipes {
+            let ready_r = ready.0;
+            let done_w = done.1;
+            drop(ready.1);
+            drop(done.0);
+            let run_as = self.user.expect("map pipes imply a RunAs remap");
+            let map_result = crate::context::read_byte_fd(ready_r.as_raw_fd())
+                .and_then(|_| crate::context::write_privileged_id_maps(pid, run_as))
+                .and_then(|_| crate::context::write_byte_fd(done_w.as_raw_fd(), b'P'));
+            drop(ready_r);
+            drop(done_w);
+            if let Err(e) = map_result {
+                eprintln!("sandlock: user-namespace map write for child {pid}: {e}");
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                return Err(SandboxRuntimeError::Child(format!(
+                    "uid_map/gid_map write for sandbox child (is unprivileged userns \
+                     restricted? e.g. kernel.apparmor_restrict_unprivileged_userns=1): {e}"
+                ))
+                .into());
+            }
+        }
 
         self.rt_mut()._stdin_write = stdin_p.map(|(_r, w)| w);
         self.rt_mut()._stdout_read = stdout_p.map(|(r, _w)| r);
@@ -2387,6 +2524,9 @@ impl Sandbox {
                 has_net_destination_policy: resolved.features.network_destination_policy,
                 has_bind_denylist: resolved.features.bind_denylist,
                 has_unix_fs_gate: resolved.features.unix_fs_gate,
+                host_uid,
+                host_gid,
+                host_groups,
                 has_random_seed: resolved.features.random_seed,
                 has_time_start: resolved.features.time_start,
                 argv_safety_required: resolved.features.argv_safety_required,

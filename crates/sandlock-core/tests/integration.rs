@@ -58,6 +58,9 @@ mod test_fork;
 #[path = "integration/test_user_mapping.rs"]
 mod test_user_mapping;
 
+#[path = "integration/test_uid_isolation.rs"]
+mod test_uid_isolation;
+
 #[path = "integration/test_chroot.rs"]
 mod test_chroot;
 

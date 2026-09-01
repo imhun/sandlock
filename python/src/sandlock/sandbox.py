@@ -406,15 +406,22 @@ class Sandbox:
 
 
     uid: int | None = None
-    """Map to the given UID inside a user namespace.  For example,
-    ``uid=0`` gives fake root, ``uid=1000`` maps to UID 1000.
-    The child has no real host privileges regardless of the mapped UID.
-    Only effective when user namespaces are available."""
+    """Host UID the sandbox process runs as, applied via a single-entry user
+    namespace map.
+
+    With a privileged (root) supervisor the requested UID is the sandbox's
+    *host* identity: the process is UID 0 inside the namespace (fake root)
+    while the host sees the requested UID, so distinct ``uid`` values across
+    sandboxes give kernel-enforced file and unix-socket isolation.
+    With an unprivileged supervisor the single-entry map can only cover the
+    caller's own euid: the requested UID is visible inside the namespace and
+    the host identity stays the caller's.  The child has no real host
+    privileges regardless of the mapped UID."""
 
     gid: int | None = None
-    """Map to the given GID inside the user namespace.  Must be set together
-    with ``uid`` (both or neither).  An unprivileged user namespace maps a
-    single id, so supplementary groups are not available."""
+    """Host GID paired with ``uid`` (set both or neither).  A single-entry
+    user namespace maps exactly one gid; supplementary groups are not
+    available on the privileged path."""
 
     # Seccomp user notification (filesystem virtualization)
     notif_policy: NotifPolicy | None = None

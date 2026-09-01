@@ -189,6 +189,9 @@ pub(super) async fn sendto_on_behalf(
                         flags,
                         &path,
                         &ctx.policy.chroot_writable,
+                        ctx.policy.host_uid,
+                        ctx.policy.host_gid,
+                        &ctx.policy.host_groups,
                     )
                 }
             }
@@ -549,6 +552,9 @@ pub(super) async fn sendmmsg_on_behalf(
                     vlen,
                     flags,
                     &ctx.policy.chroot_writable,
+                    ctx.policy.host_uid,
+                    ctx.policy.host_gid,
+                    &ctx.policy.host_groups,
                 );
             }
         }

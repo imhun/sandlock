@@ -120,6 +120,13 @@ async fn test_uid_zero_echo() {
 }
 
 /// Test that --user 1000:1000 maps to the expected UID inside the namespace.
+///
+/// Semantics depend on the supervisor's privilege (task S1.2):
+/// * privileged (root): `RunAs` is the HOST identity — inside the namespace
+///   the process is uid 0 (single-entry map `0 -> host_uid`);
+/// * unprivileged: the single-entry map can only cover the caller's own euid,
+///   so the requested uid is visible inside and the host uid stays the
+///   caller's (the historical contract).
 #[tokio::test]
 async fn test_uid_custom() {
     if !userns_available() {
@@ -141,7 +148,21 @@ async fn test_uid_custom() {
     let result = policy.clone().run(&["id", "-u"]).await.unwrap();
     assert!(result.success(), "id -u failed: {:?}", result.exit_status);
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default());
-    assert_eq!(stdout.trim(), "1000", "Expected uid 1000, got: {:?}", stdout.trim());
+    if unsafe { libc::geteuid() } == 0 {
+        assert_eq!(
+            stdout.trim(),
+            "0",
+            "privileged: inside uid must be 0 (host identity 1000), got: {:?}",
+            stdout.trim()
+        );
+    } else {
+        assert_eq!(
+            stdout.trim(),
+            "1000",
+            "unprivileged: inside uid must be 1000, got: {:?}",
+            stdout.trim()
+        );
+    }
 }
 
 /// Requesting the identity the process already has must NOT create a user

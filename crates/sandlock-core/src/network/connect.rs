@@ -247,6 +247,9 @@ pub(super) async fn connect_on_behalf(
                         sockfd,
                         &path,
                         &ctx.policy.chroot_writable,
+                        ctx.policy.host_uid,
+                        ctx.policy.host_gid,
+                        &ctx.policy.host_groups,
                     )
                 }
             }
