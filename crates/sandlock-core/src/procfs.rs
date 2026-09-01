@@ -97,8 +97,11 @@ impl PidNsMap {
 
     /// Rebuild the map from a full `/proc` scan. Every process whose PID
     /// namespace inode matches the sandbox's is added under its own-namespace
-    /// pid (the last `NSpid:` entry). The leader's entry (ns pid 1) is
-    /// always re-seeded — its ns pid is fixed by construction.
+    /// pid (the last `NSpid:` entry), and every thread of a sandbox process
+    /// is added under its namespace tid so `/proc/<ns_tid>/…` opens resolve
+    /// too (a multi-threaded workload addresses threads by number). The
+    /// leader's entry (ns pid 1) is always re-seeded — its ns pid is fixed
+    /// by construction.
     fn refresh(&mut self) {
         let mut fresh = HashMap::new();
         if self.ns_inode.is_some() {
@@ -115,6 +118,25 @@ impl PidNsMap {
                     }
                     if let Some(ns) = self.ns_pid_of_host(host) {
                         fresh.insert(ns, host);
+                    }
+                    // Threads of a sandbox process: the sandbox sees their
+                    // namespace tids as `/proc/<ns_tid>/…` and can open them
+                    // by number, so the map must resolve those as well.
+                    if let Ok(task_dir) = std::fs::read_dir(format!("/proc/{}/task", host)) {
+                        for task in task_dir.flatten() {
+                            let Ok(tid) = task.file_name().to_string_lossy().parse::<i32>() else {
+                                continue;
+                            };
+                            if tid <= 0 || tid == host {
+                                continue;
+                            }
+                            if !self.in_sandbox_ns(tid) {
+                                continue;
+                            }
+                            if let Some(ns) = self.ns_pid_of_host(tid) {
+                                fresh.insert(ns, tid);
+                            }
+                        }
                     }
                 }
             }
@@ -169,6 +191,43 @@ const SENSITIVE_PATHS: &[&str] = &[
     "/sys/class/net",
     "/sys/firmware",
     "/sys/kernel/security",
+];
+
+/// Single-component metadata files under `/proc/<pid>/` that a
+/// PID-namespace sandbox may open *on its behalf* (the supervisor opens
+/// the translated host path and injects the fd).
+///
+/// Every entry is a plain, read-only procfs file. Deliberately excluded:
+/// magic links (`root`, `cwd`, `exe`, `fd/N`, `map_files/…`, `net/…`),
+/// memory exposure (`mem`, `environ`, `smaps`, `pagemap`, …), symlinked
+/// aliases that resolve through `/proc/self` (`mounts`, `mountinfo`,
+/// `mountstats`), and everything that needs a path component of its own.
+/// An on-behalf open with the supervisor's credentials would otherwise
+/// bypass the sandbox's own Landlock deny list and ptrace restrictions,
+/// so the safe surface is exactly these read-only task-metadata files.
+const ON_BEHALF_READABLE_METADATA: &[&str] = &[
+    "status",
+    "stat",
+    "statm",
+    "cmdline",
+    "comm",
+    "limits",
+    "cgroup",
+    "cpuset",
+    "sched",
+    "schedstat",
+    "io",
+    "oom_score",
+    "oom_score_adj",
+    "oom_adj",
+    "loginuid",
+    "sessionid",
+    "uid_map",
+    "gid_map",
+    "projid_map",
+    "setgroups",
+    "coredump_filter",
+    "timerslack_ns",
 ];
 
 /// Returns true for paths that should be denied access.
@@ -573,33 +632,62 @@ pub(crate) async fn handle_proc_open(
         if let Some(ref map) = policy.pid_ns {
             // PID-namespace sandbox: the numeric pid is a *sandbox-
             // namespace* pid. Resolve it to the host pid and require it to
-            // belong to this sandbox's namespace; the shared host /proc
-            // mount would otherwise resolve `/proc/<ns_pid>` against an
-            // unrelated host process, so the open is serviced on the
-            // supervisor's behalf against the host path.
+            // belong to this sandbox's namespace.
+            //
+            // The open is then serviced on the supervisor's behalf against
+            // the host path — but only for a strict whitelist of read-only
+            // task-metadata files, and never with a write intent. Opening
+            // `/proc/<pid>/root|mem|fd/N|...` with the supervisor's
+            // credentials would bypass the sandbox's own Landlock deny list
+            // and ptrace restrictions (e.g. `open("/proc/1/root/etc/passwd")`
+            // would hand the child a fd to the host `/etc/passwd` the
+            // sandbox is denied, and `open("/proc/1/mem")` would re-grant
+            // what the process_vm_*/ptrace deny list takes away). Magic-link
+            // and multi-component paths (the lexical folding above collapses
+            // `.`/`..` but never resolves symlinks) are refused, and
+            // O_WRONLY/O_RDWR requests are denied outright — the injected fd
+            // is always opened O_RDONLY, so no write-capable descriptor ever
+            // crosses the supervisor boundary.
+            let open_args = crate::seccomp::notif::decode_open_args(notif, notif_fd);
+            let raw_flags = open_args.map(|a| a.flags as i64).unwrap_or(libc::O_RDONLY as i64);
+            const WRITE_INTENT: i64 = (libc::O_WRONLY
+                | libc::O_RDWR
+                | libc::O_APPEND
+                | libc::O_TRUNC
+                | libc::O_CREAT
+                | libc::O_EXCL
+                | libc::O_TMPFILE) as i64;
+            if (raw_flags & WRITE_INTENT) != 0 {
+                return NotifAction::Errno(EACCES);
+            }
+
             let mut map = map.write().expect("pid-ns map lock poisoned");
             let Some(host_pid) = map.host_pid(pid as u32).map(|h| h as i32) else {
                 return NotifAction::Errno(EACCES);
             };
             let prefix = format!("/proc/{}", pid);
             let rest = path.strip_prefix(&prefix).unwrap_or("");
+            // `strip_prefix` leaves the leading `/` ("/proc/1/status" →
+            // "/status"); the whitelist holds bare component names.
+            let component = rest.strip_prefix('/').unwrap_or(rest);
+            if rest.is_empty() || !ON_BEHALF_READABLE_METADATA.contains(&component) {
+                return NotifAction::Errno(EACCES);
+            }
             let host_path = format!("/proc/{}{}", host_pid, rest);
             let c_path = match std::ffi::CString::new(host_path) {
                 Ok(c) => c,
                 Err(_) => return NotifAction::Errno(libc::EINVAL),
             };
-            // /proc entries cannot be created; drop creation flags so a
-            // bogus O_CREAT does not change the supervisor's open.
-            let raw_flags = crate::seccomp::notif::decode_open_args(notif, notif_fd)
-                .map(|a| (a.flags & !(libc::O_CREAT as u64 | libc::O_EXCL as u64 | libc::O_TRUNC as u64)) as i32)
-                .unwrap_or(libc::O_RDONLY);
-            let fd = unsafe { libc::open(c_path.as_ptr(), raw_flags, 0) };
+            // Open strictly read-only: the caller's write flags are stripped
+            // here (write-intent requests were already refused above), and
+            // O_CLOEXEC is the only flag carried into the injected fd.
+            let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY, 0) };
             if fd < 0 {
                 let err = std::io::Error::last_os_error();
                 return NotifAction::Errno(err.raw_os_error().unwrap_or(libc::EIO));
             }
             let newfd_flags = (raw_flags as u32) & (libc::O_CLOEXEC as u32);
-            // SAFETY: fd is a fresh open file description owned by the supervisor.
+            // SAFETY: fd is a fresh O_RDONLY open owned by the supervisor.
             let owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
             return NotifAction::InjectFdSend { srcfd: owned, newfd_flags };
         } else if !processes.contains(pid) {
@@ -681,6 +769,80 @@ pub(crate) async fn handle_proc_open(
         return inject_memfd(&content);
     }
 
+    NotifAction::Continue
+}
+
+// ============================================================
+// PID-namespace stat-family gate
+// ============================================================
+
+/// Gate the stat family (`newfstatat`/`statx`/`access`/`readlink` and
+/// their legacy variants) for PID-namespace sandboxes.
+///
+/// In a PID-namespace sandbox a numeric `/proc/<n>/…` path must be read as
+/// a *sandbox-namespace* pid, but the shared host `/proc` mount would
+/// resolve `/proc/<n>/…` against host pid `n` — a direct cross-namespace
+/// metadata leak (host pids 1..N all exist, so every number the sandbox can
+/// guess maps to a real host process). The open and getdents64 families are
+/// virtualized (translated / renumbered); the stat family is denied
+/// outright so the kernel never resolves a sandbox-ns pid against the host
+/// table. `open()` remains the supported way to read task metadata (it is
+/// translated to the host pid and serves only the whitelisted read-only
+/// files above).
+///
+/// Registered only for pid_ns sandboxes; the syscalls are added to the BPF
+/// notif list by [`crate::seccomp_plan::pid_ns_procfs_stat_syscalls`].
+pub(crate) async fn handle_proc_stat_family(
+    notif: &SeccompNotif,
+    processes: &Arc<ProcessIndex>,
+    policy: &NotifPolicy,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let nr = notif.data.nr as i64;
+    let (dirfd, path_ptr): (i64, u64) = if nr == libc::SYS_newfstatat
+        || nr == libc::SYS_statx
+        || nr == libc::SYS_faccessat
+        || nr == crate::arch::SYS_FACCESSAT2
+        || nr == libc::SYS_readlinkat
+    {
+        // All *at variants share the (dirfd, path) argument slots.
+        (notif.data.args[0] as i64, notif.data.args[1])
+    } else if Some(nr) == crate::arch::sys_stat()
+        || Some(nr) == crate::arch::sys_lstat()
+        || Some(nr) == crate::arch::sys_access()
+        || Some(nr) == crate::arch::sys_readlink()
+    {
+        // Legacy syscalls take the path as the first argument.
+        (libc::AT_FDCWD as i64, notif.data.args[0])
+    } else {
+        return NotifAction::Continue;
+    };
+
+    let path = match read_path(notif, path_ptr, notif_fd) {
+        // Empty path (e.g. `fstatat(fd, "", AT_EMPTY_PATH)`) stats the fd
+        // itself, not a path: let the kernel handle it.
+        Some(p) if !p.is_empty() => p,
+        _ => return NotifAction::Continue,
+    };
+    let resolved = match resolve_to_normalized_absolute(
+        notif.pid,
+        dirfd,
+        &path,
+        policy.chroot_root.as_deref(),
+        &policy.chroot_mounts,
+        processes,
+    ) {
+        Some(p) => p,
+        None => return NotifAction::Continue,
+    };
+    let path = match resolved.to_str() {
+        Some(p) => p,
+        None => return NotifAction::Continue,
+    };
+
+    if extract_proc_pid(path).is_some() {
+        return NotifAction::Errno(EACCES);
+    }
     NotifAction::Continue
 }
 

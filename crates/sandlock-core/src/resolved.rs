@@ -48,6 +48,7 @@ pub(crate) struct SandboxFeatures {
     pub(crate) sysv_ipc_allowed: bool,
     pub(crate) net_allow_present: bool,
     pub(crate) net_deny: bool,
+    pub(crate) pid_ns: bool,
 }
 
 impl SandboxFeatures {
@@ -86,6 +87,7 @@ impl SandboxFeatures {
             sysv_ipc_allowed: sandbox.allows_sysv_ipc(),
             net_allow_present: !sandbox.net_allow.is_empty(),
             net_deny: !sandbox.net_deny.is_empty(),
+            pid_ns: sandbox.pid_ns,
         }
     }
 }

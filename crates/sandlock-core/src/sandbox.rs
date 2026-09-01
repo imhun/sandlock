@@ -2015,19 +2015,27 @@ impl Sandbox {
                 if leader > 0 {
                     // === Intermediate relay ===
                     // Report the leader's host pid (the sandbox leader is
-                    // pid 1 inside the new namespace), then wait for the
-                    // leader and relay its exit status. Close every pipe
-                    // end we inherited but the leader no longer needs so
-                    // the parent sees EOF once the leader exits, and a
-                    // piped stdin EOF reaches the leader when the parent
-                    // drops its write end.
-                    if crate::context::write_u32_fd(pipes.notif_w.as_raw_fd(), leader as u32).is_err() {
+                    // pid 1 inside the new namespace) over the *dedicated*
+                    // leader-pid pipe, then wait for the leader and relay
+                    // its exit status. The leader pid must not share the
+                    // notif pipe with the leader's own notif-fd write: two
+                    // writers on one pipe have no ordering guarantee, and
+                    // the parent would read the two 4-byte values swapped
+                    // if the leader wrote first. One writer per pipe keeps
+                    // each message unambiguous. Close every pipe end we
+                    // inherited but the leader no longer needs so the
+                    // parent sees EOF once the leader exits, and a piped
+                    // stdin EOF reaches the leader when the parent drops
+                    // its write end.
+                    if crate::context::write_u32_fd(pipes.leader_pid_w.as_raw_fd(), leader as u32).is_err() {
                         unsafe { libc::_exit(127) };
                     }
                     unsafe { libc::close(pipes.notif_w.as_raw_fd()) };
                     unsafe { libc::close(pipes.notif_r.as_raw_fd()) };
                     unsafe { libc::close(pipes.ready_r.as_raw_fd()) };
                     unsafe { libc::close(pipes.ready_w.as_raw_fd()) };
+                    unsafe { libc::close(pipes.leader_pid_r.as_raw_fd()) };
+                    unsafe { libc::close(pipes.leader_pid_w.as_raw_fd()) };
                     if let Some((r, w)) = stdin_p.as_ref() {
                         unsafe { libc::close(r.as_raw_fd()) };
                         unsafe { libc::close(w.as_raw_fd()) };
@@ -2142,6 +2150,9 @@ impl Sandbox {
         // ===== PARENT PROCESS =====
         drop(pipes.notif_w);
         drop(pipes.ready_r);
+        // The intermediate holds the only other write end of the leader-pid
+        // pipe; the parent never writes to it.
+        drop(pipes.leader_pid_w);
 
         self.rt_mut()._stdin_write = stdin_p.map(|(_r, w)| w);
         self.rt_mut()._stdout_read = stdout_p.map(|(r, _w)| r);
@@ -2152,11 +2163,16 @@ impl Sandbox {
         // State remains `Created` until `do_start` writes ready_w to release
         // the child to execve.
 
-        // With a PID namespace, the intermediate child writes the sandbox
-        // leader's host pid to the notif pipe before the leader writes the
-        // seccomp notif fd number, so read it first.
+        // Read the seccomp notif fd number first: the leader writes it only
+        // after its confinement (including setpgid) is installed, so an
+        // error return from anything after this point is safe for Drop's
+        // killpg+waitpid reaping. Only then read the leader's host pid from
+        // its dedicated pipe (already buffered by the intermediate).
+        let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
+            .map_err(|e| SandboxRuntimeError::Child(format!("read notif fd from child: {}", e)))?;
+
         if self.pid_ns {
-            let leader_pid = read_u32_fd(pipes.notif_r.as_raw_fd())
+            let leader_pid = read_u32_fd(pipes.leader_pid_r.as_raw_fd())
                 .map_err(|e| SandboxRuntimeError::Child(format!("read leader pid from child: {}", e)))?
                 as i32;
             self.rt_mut().leader_pid = Some(leader_pid);
@@ -2166,9 +2182,6 @@ impl Sandbox {
             Ok(fd) => Some(fd),
             Err(_) => None,
         };
-
-        let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
-            .map_err(|e| SandboxRuntimeError::Child(format!("read notif fd from child: {}", e)))?;
 
         // Even for --no-supervisor sandboxes, write a pid file so sandlock ps
         // can discover and list them.  The control socket is only created when

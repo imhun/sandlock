@@ -569,6 +569,31 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
+    // PID-namespace stat-family gate. Registered with the /proc handlers
+    // (before chroot/COW) so a numeric `/proc/<ns_pid>/…` path is denied
+    // with EACCES before any later handler — or the kernel — can resolve
+    // it against host pid n. Only active for pid_ns sandboxes; the BPF
+    // notif list is extended by `pid_ns_procfs_stat_syscalls` at the same
+    // time.
+    // ------------------------------------------------------------------
+    if policy.pid_ns.is_some() {
+        for nr in crate::seccomp_plan::pid_ns_procfs_stat_syscalls() {
+            let policy_for_stat = Arc::clone(policy);
+            let __sup = Arc::clone(ctx);
+            table.register(nr, move |cx: &HandlerCtx| {
+                let notif = cx.notif;
+                let sup = Arc::clone(&__sup);
+                let notif_fd = cx.notif_fd;
+                let policy = Arc::clone(&policy_for_stat);
+                async move {
+                    let processes = Arc::clone(&sup.processes);
+                    crate::procfs::handle_proc_stat_family(&notif, &processes, &policy, notif_fd).await
+                }
+            });
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Chroot path interception (before COW)
     // ------------------------------------------------------------------
     if policy.chroot_root.is_some() {

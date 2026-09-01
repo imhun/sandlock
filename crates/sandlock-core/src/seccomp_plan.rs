@@ -113,6 +113,37 @@ fn procfs_hosts_notif_syscalls() -> Vec<i64> {
     v
 }
 
+/// Syscalls gated by the PID-namespace `/proc` stat-family denial.
+///
+/// In a PID-namespace sandbox the shared host `/proc` mount resolves a
+/// numeric `/proc/<n>/…` path against host pid `n`, but the sandbox only
+/// knows namespace pids (1, 2, …) — a direct collision leaks host process
+/// metadata. The open and getdents families are virtualized (translated /
+/// renumbered); the stat family is denied outright (EACCES) by
+/// `procfs::handle_proc_stat_family`, so its syscalls must be on the notif
+/// list whenever `pid_ns` is enabled, or the kernel would `RET_ALLOW` them
+/// past the handler.
+pub(crate) fn pid_ns_procfs_stat_syscalls() -> Vec<i64> {
+    let mut v = vec![
+        libc::SYS_newfstatat,
+        libc::SYS_statx,
+        libc::SYS_faccessat,
+        arch::SYS_FACCESSAT2,
+        libc::SYS_readlinkat,
+    ];
+    v.extend(
+        [
+            arch::sys_stat(),
+            arch::sys_lstat(),
+            arch::sys_access(),
+            arch::sys_readlink(),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    v
+}
+
 // Netlink virtualization (always on):
 //   socket, bind, getsockname -- swap in a unix socketpair for AF_NETLINK
 //   recvfrom, recvmsg         -- zero msg_name so glibc accepts the reply
@@ -431,6 +462,12 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
     // Port remapping
     if features.port_remap {
         nrs.extend(PORT_REMAP_SYSCALLS);
+    }
+
+    // PID-namespace sandbox: numeric /proc/<n>/… stat-family paths must
+    // never reach the kernel (host pid collision); gate them.
+    if features.pid_ns {
+        nrs.extend(&pid_ns_procfs_stat_syscalls());
     }
 
     nrs.finish()

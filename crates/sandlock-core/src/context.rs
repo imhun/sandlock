@@ -31,13 +31,25 @@ pub struct PipePair {
     pub ready_r: OwnedFd,
     /// Parent writes the "supervisor ready" signal to the child.
     pub ready_w: OwnedFd,
+    /// Parent reads the sandbox leader's host pid (pid-ns mode only).
+    ///
+    /// This is a *separate* pipe from the notif pipe on purpose: in pid-ns
+    /// mode the intermediate process writes the leader's host pid while the
+    /// leader itself writes the notif fd number, and two writers on one pipe
+    /// have no inter-writer ordering guarantee (the leader can win the race
+    /// and the parent would read the fd number as the pid). One writer per
+    /// pipe makes each 4-byte write unambiguous.
+    pub leader_pid_r: OwnedFd,
+    /// Intermediate process writes the leader's host pid to the parent.
+    pub leader_pid_w: OwnedFd,
 }
 
 impl PipePair {
-    /// Create two pipe pairs using `pipe2(O_CLOEXEC)`.
+    /// Create three pipe pairs using `pipe2(O_CLOEXEC)`.
     pub fn new() -> io::Result<Self> {
         let mut notif_fds = [0i32; 2];
         let mut ready_fds = [0i32; 2];
+        let mut leader_pid_fds = [0i32; 2];
 
         // SAFETY: pipe2 with valid pointers and O_CLOEXEC
         let ret = unsafe { libc::pipe2(notif_fds.as_mut_ptr(), libc::O_CLOEXEC) };
@@ -55,12 +67,25 @@ impl PipePair {
             return Err(io::Error::last_os_error());
         }
 
+        let ret = unsafe { libc::pipe2(leader_pid_fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        if ret < 0 {
+            unsafe {
+                libc::close(notif_fds[0]);
+                libc::close(notif_fds[1]);
+                libc::close(ready_fds[0]);
+                libc::close(ready_fds[1]);
+            }
+            return Err(io::Error::last_os_error());
+        }
+
         // SAFETY: pipe2 returned valid fds
         Ok(PipePair {
             notif_r: unsafe { OwnedFd::from_raw_fd(notif_fds[0]) },
             notif_w: unsafe { OwnedFd::from_raw_fd(notif_fds[1]) },
             ready_r: unsafe { OwnedFd::from_raw_fd(ready_fds[0]) },
             ready_w: unsafe { OwnedFd::from_raw_fd(ready_fds[1]) },
+            leader_pid_r: unsafe { OwnedFd::from_raw_fd(leader_pid_fds[0]) },
+            leader_pid_w: unsafe { OwnedFd::from_raw_fd(leader_pid_fds[1]) },
         })
     }
 }

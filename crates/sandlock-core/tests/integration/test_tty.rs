@@ -169,3 +169,49 @@ fn interactive_run_hands_tty_foreground_to_child_while_alive() {
          13=child never got the tty foreground, 14=tty foreground not returned after reap)"
     );
 }
+
+/// The same handover must work for a PID-namespace sandbox, where the
+/// foreground process group is the *leader* (ns pid 1, host pid
+/// `leader_pid`) rather than the direct child the supervisor waits on.
+#[test]
+fn pid_ns_interactive_hands_tty_foreground_to_leader_and_back() {
+    let code = run_in_pty_session(|| {
+        block_on(async {
+            let mut policy = Sandbox::builder()
+                .pid_ns(true)
+                .fs_read("/usr")
+                .fs_read("/lib")
+                .fs_read_if_exists("/lib64")
+                .fs_read("/bin")
+                .fs_read("/etc")
+                .fs_read("/proc")
+                .build()
+                .unwrap();
+            if policy.spawn_interactive(&["sleep", "30"]).await.is_err() {
+                return EXIT_RUN_FAILED;
+            }
+            let leader = match policy.pid() {
+                Some(p) => p,
+                None => return EXIT_RUN_FAILED,
+            };
+            if unsafe { libc::tcgetpgrp(0) } != leader {
+                return EXIT_FOREGROUND_NOT_TAKEN;
+            }
+            if policy.kill().is_err() {
+                return EXIT_RUN_FAILED;
+            }
+            if policy.wait().await.is_err() {
+                return EXIT_RUN_FAILED;
+            }
+            if unsafe { libc::tcgetpgrp(0) != libc::getpgrp() } {
+                return EXIT_FOREGROUND_NOT_RESTORED;
+            }
+            EXIT_OK
+        })
+    });
+    assert_eq!(
+        code, EXIT_OK,
+        "helper exit {code} (10=no tty foreground at start, 11=spawn/kill/wait failed, \
+         13=pid-ns leader never got the tty foreground, 14=tty foreground not returned after reap)"
+    );
+}

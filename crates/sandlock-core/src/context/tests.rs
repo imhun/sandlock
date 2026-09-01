@@ -8,15 +8,19 @@ fn test_pipe_pair_creation() {
     assert!(pipes.notif_w.as_raw_fd() >= 0);
     assert!(pipes.ready_r.as_raw_fd() >= 0);
     assert!(pipes.ready_w.as_raw_fd() >= 0);
-    // All four fds should be distinct
+    assert!(pipes.leader_pid_r.as_raw_fd() >= 0);
+    assert!(pipes.leader_pid_w.as_raw_fd() >= 0);
+    // All six fds should be distinct
     let fds = [
         pipes.notif_r.as_raw_fd(),
         pipes.notif_w.as_raw_fd(),
         pipes.ready_r.as_raw_fd(),
         pipes.ready_w.as_raw_fd(),
+        pipes.leader_pid_r.as_raw_fd(),
+        pipes.leader_pid_w.as_raw_fd(),
     ];
-    for i in 0..4 {
-        for j in (i + 1)..4 {
+    for i in 0..fds.len() {
+        for j in (i + 1)..fds.len() {
             assert_ne!(fds[i], fds[j]);
         }
     }
@@ -162,6 +166,26 @@ fn test_notif_syscalls_faccessat2() {
     assert!(nrs.contains(&(libc::SYS_faccessat as u32)));
     assert!(nrs.contains(&(arch::SYS_FACCESSAT2 as u32)),
             "COW notif filter must include SYS_faccessat2 (439)");
+}
+
+/// pid_ns must put the stat family on the notif list (the numeric
+/// /proc/<ns_pid>/… deny gate needs the notifications to exist), and the
+/// default (pid_ns=false) sandbox must NOT intercept the stat family.
+#[test]
+fn test_notif_syscalls_pid_ns_adds_stat_family_gate() {
+    let policy = Sandbox::builder().pid_ns(true).build().unwrap();
+    let nrs = notif_syscalls(&policy, None);
+    assert!(nrs.contains(&(libc::SYS_newfstatat as u32)));
+    assert!(nrs.contains(&(libc::SYS_statx as u32)));
+    assert!(nrs.contains(&(libc::SYS_faccessat as u32)));
+    assert!(nrs.contains(&(arch::SYS_FACCESSAT2 as u32)));
+    assert!(nrs.contains(&(libc::SYS_readlinkat as u32)));
+
+    let policy = Sandbox::builder().build().unwrap();
+    let nrs = notif_syscalls(&policy, None);
+    assert!(!nrs.contains(&(libc::SYS_newfstatat as u32)));
+    assert!(!nrs.contains(&(libc::SYS_statx as u32)));
+    assert!(!nrs.contains(&(libc::SYS_readlinkat as u32)));
 }
 
 #[test]
