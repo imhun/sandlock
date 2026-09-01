@@ -351,6 +351,44 @@ class Sandbox:
     real port.  Inbound traffic to the virtual port is proxied to the
     real port automatically.  No network namespaces or root required."""
 
+    pid_ns: bool = False
+    """Run the sandboxed workload in a private PID namespace
+    (``CLONE_NEWPID``): the sandbox's first process is PID 1 inside its own
+    namespace, foreign PIDs are invisible (``kill(pid, 0)`` on host /
+    other-sandbox processes returns ``ESRCH``), and ``/proc`` is filtered
+    and renumbered to the sandbox's own processes.  Defaults to ``False``
+    (shared host PID namespace)."""
+
+    net_isolation: bool = False
+    """Run the sandbox in its own network namespace (``CLONE_NEWNET`` after
+    the user namespace): only loopback, brought up from inside the sandbox's
+    user namespace.  Defaults to ``False`` (shared network namespace).
+    Independent of :attr:`fd_inject_connect`; with wildcard-domain rules the
+    DNS gateway binds inside the sandbox's own netns.  Requires a user
+    namespace — under a non-root supervisor a ``RunAs`` ``uid`` different
+    from the supervisor identity cannot be mapped and fails closed at spawn
+    (see :attr:`uid`)."""
+
+    fd_inject_connect: bool = False
+    """Enable the connect fd-injection path: the supervisor performs the
+    connect on a fresh host-side socket and injects the connected fd into
+    the sandbox, so the trapped ``connect()`` returns the child-side fd
+    number.  Defaults to ``False`` (legacy on-behalf connect)."""
+
+    port_mappings: Mapping[int, int] | None = None
+    """Inbound port mappings ``{host_port: sandbox_port}`` for
+    :attr:`net_isolation` sandboxes: the sandbox's ``listen()`` on
+    ``sandbox_port`` (inside its own netns) is served from the supervisor's
+    host-loopback listener on ``host_port``; external connections to
+    ``host_port`` are accepted by the supervisor and the connected fd is
+    injected as the sandbox's ``accept()`` result.
+
+    ``host_port`` must be >= 50005 (the reserved inbound mapping range) and
+    unique per sandbox; ``sandbox_port`` must be unique per sandbox.
+    Requires ``net_isolation=True`` and the seccomp supervisor — a mapping
+    without either fails closed at build time.  ``None`` or empty = no
+    inbound mappings."""
+
     # Deterministic execution
     random_seed: int | None = None
     """Seed for deterministic randomness. When set, getrandom() returns
@@ -501,6 +539,44 @@ class Sandbox:
                 raise ValueError("sandbox name must not contain '/'")
             if self.name in (".", ".."):
                 raise ValueError("sandbox name must not be '.' or '..'")
+        # Validate inbound port mappings (S2.5): host ports live in the
+        # reserved 50005+ range and must be unique per sandbox; sandbox
+        # ports must be unique too (one host listener per mapped port).
+        if self.port_mappings:
+            if not isinstance(self.port_mappings, Mapping):
+                raise ValueError(
+                    "port_mappings must be a dict {host_port: sandbox_port}, "
+                    f"got {type(self.port_mappings).__name__}"
+                )
+            seen_host: set[int] = set()
+            seen_sandbox: set[int] = set()
+            for host_port, sandbox_port in self.port_mappings.items():
+                if not isinstance(host_port, int) or not isinstance(sandbox_port, int):
+                    raise ValueError(
+                        "port_mappings keys and values must be ints, got "
+                        f"{host_port!r} -> {sandbox_port!r}"
+                    )
+                if not 50005 <= host_port <= 65535:
+                    raise ValueError(
+                        f"port_mappings host port {host_port} is below the "
+                        "reserved inbound mapping range (50005+); pick a "
+                        "host_port >= 50005"
+                    )
+                if not 1 <= sandbox_port <= 65535:
+                    raise ValueError(
+                        f"port_mappings sandbox port {sandbox_port} is out "
+                        "of range (1-65535)"
+                    )
+                if host_port in seen_host:
+                    raise ValueError(
+                        f"port_mappings duplicate host port {host_port}"
+                    )
+                if sandbox_port in seen_sandbox:
+                    raise ValueError(
+                        f"port_mappings duplicate sandbox port {sandbox_port}"
+                    )
+                seen_host.add(host_port)
+                seen_sandbox.add(sandbox_port)
         # Runtime state — not dataclass fields, not serialized
         self._native = None   # _NativePolicy created lazily on first use
         self._handle = None   # live sandbox handle during start()/run()

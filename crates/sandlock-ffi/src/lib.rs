@@ -521,6 +521,88 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_port_remap(
     Box::into_raw(Box::new(builder.port_remap(v)))
 }
 
+/// Run the sandboxed workload in a private PID namespace (`CLONE_NEWPID`):
+/// the sandbox's first process is PID 1 inside its own namespace, foreign
+/// PIDs are invisible (`kill(pid, 0)` on host / other-sandbox processes
+/// returns `ESRCH`), and `/proc` is filtered and renumbered to the sandbox's
+/// own processes. Defaults to `false`.
+///
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_pid_ns(
+    b: *mut SandboxBuilder,
+    v: bool,
+) -> *mut SandboxBuilder {
+    if b.is_null() {
+        return b;
+    }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.pid_ns(v)))
+}
+
+/// Run the sandbox in its own network namespace (`CLONE_NEWNET` after the
+/// user namespace): only loopback, brought up from inside the sandbox's
+/// userns. Defaults to `false` (shared network namespace). Independent of
+/// `fd_inject_connect`; with wildcard-domain rules the DNS gateway binds
+/// inside the sandbox's own netns.
+///
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_net_isolation(
+    b: *mut SandboxBuilder,
+    v: bool,
+) -> *mut SandboxBuilder {
+    if b.is_null() {
+        return b;
+    }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.net_isolation(v)))
+}
+
+/// Enable the connect fd-injection path: the supervisor performs the connect
+/// on a fresh host-side socket and injects the connected fd into the sandbox,
+/// so the trapped `connect()` returns the child-side fd number. Defaults to
+/// `false` (legacy on-behalf connect).
+///
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_fd_inject_connect(
+    b: *mut SandboxBuilder,
+    v: bool,
+) -> *mut SandboxBuilder {
+    if b.is_null() {
+        return b;
+    }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.fd_inject_connect(v)))
+}
+
+/// Add an inbound port mapping: the sandbox's `listen()` on `sandbox_port`
+/// (inside its `net_isolation` netns) is served from the supervisor's
+/// host-loopback listener on `host_port` (>= 50005, the reserved inbound
+/// mapping range); external connections to `host_port` are accepted by the
+/// supervisor and the connected fd is injected as the sandbox's `accept()`
+/// result. Requires `net_isolation(true)` and the seccomp supervisor
+/// (build-time fail-closed).
+///
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_net_bind_map(
+    b: *mut SandboxBuilder,
+    host_port: u16,
+    sandbox_port: u16,
+) -> *mut SandboxBuilder {
+    if b.is_null() {
+        return b;
+    }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.net_bind_map(host_port, sandbox_port)))
+}
+
 // Protocol gating (UDP, kernel ping socket) is expressed via
 // `net_allow` rule schemes (`udp://`, `icmp://`) rather than separate
 // FFI booleans. There is no `allow_udp` / `allow_icmp` setter.

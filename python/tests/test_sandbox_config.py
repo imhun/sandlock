@@ -68,6 +68,62 @@ class TestEnsureNative:
         assert rebuilt is sb._native
 
 
+class TestIsolationFields:
+    """S1.1/S2 FFI exposure: ``pid_ns`` / ``net_isolation`` /
+    ``fd_inject_connect`` / ``port_mappings`` round-trip through the native
+    builder with fail-closed validation."""
+
+    def test_defaults_off(self):
+        p = Sandbox()
+        assert p.pid_ns is False
+        assert p.net_isolation is False
+        assert p.fd_inject_connect is False
+        assert p.port_mappings is None
+
+    def test_empty_port_mappings_treated_as_off(self):
+        assert Sandbox(port_mappings={}).port_mappings == {}
+        assert Sandbox(port_mappings=None).port_mappings is None
+
+    def test_fields_roundtrip_to_native_build(self):
+        p = Sandbox(
+            pid_ns=True,
+            net_isolation=True,
+            fd_inject_connect=True,
+            port_mappings={50005: 8080},
+        )
+        native = p._ensure_native()
+        assert native.ptr
+
+    def test_port_mappings_without_net_isolation_fails_closed(self):
+        p = Sandbox(port_mappings={50005: 8080})
+        with pytest.raises(RuntimeError, match="net_isolation"):
+            p._ensure_native()
+
+    def test_host_port_below_50005_rejected(self):
+        with pytest.raises(ValueError, match="50005"):
+            Sandbox(port_mappings={50004: 8080})
+
+    def test_host_port_out_of_u16_range_rejected(self):
+        with pytest.raises(ValueError, match="50005"):
+            Sandbox(port_mappings={70000: 8080})
+
+    def test_sandbox_port_zero_rejected(self):
+        with pytest.raises(ValueError, match="range"):
+            Sandbox(port_mappings={50005: 0})
+
+    def test_duplicate_sandbox_port_rejected(self):
+        with pytest.raises(ValueError, match="duplicate sandbox port"):
+            Sandbox(port_mappings={50005: 8080, 50006: 8080})
+
+    def test_non_int_mapping_rejected(self):
+        with pytest.raises(ValueError, match="must be ints"):
+            Sandbox(port_mappings={50005: "8080"})
+
+    def test_non_mapping_rejected(self):
+        with pytest.raises(ValueError, match="must be a dict"):
+            Sandbox(port_mappings=[(50005, 8080)])
+
+
 class TestPolicy:
     def test_defaults(self):
         p = Sandbox()
@@ -255,4 +311,3 @@ class TestNetDeny:
     def test_specs_preserved_as_strings(self):
         p = Sandbox(net_deny=["10.0.0.0/8", "169.254.169.254:80", "udp://*"])
         assert list(p.net_deny) == ["10.0.0.0/8", "169.254.169.254:80", "udp://*"]
-
