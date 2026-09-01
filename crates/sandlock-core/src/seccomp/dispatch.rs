@@ -729,7 +729,7 @@ pub(crate) fn build_dispatch_table(
             let sup = Arc::clone(&__sup);
             async move {
                 let state = Arc::clone(&sup.netlink);
-                crate::netlink::handlers::handle_socket(&notif, &state).await
+                crate::netlink::handlers::handle_socket(&notif, &state, sup.policy.net_isolation).await
             }
         });
         let __sup = Arc::clone(ctx);
@@ -1200,6 +1200,7 @@ mod handler_tests {
                 argv_safety_required: false,
                 port_remap: false,
                 fd_inject_connect: false,
+                net_isolation: false,
                 cow_enabled: false,
                 chroot_root: None,
                 chroot_readable: Vec::new(),

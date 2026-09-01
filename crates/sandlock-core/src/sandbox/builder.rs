@@ -224,6 +224,19 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", clap(skip))]
     pub fd_inject_connect: bool,
 
+    /// S2.2: when true, the sandbox spawns in its own network namespace
+    /// (`unshare(CLONE_NEWNET)` after the user namespace): it contains only
+    /// loopback, brought up from inside the sandbox's userns (the owner of
+    /// the new netns has CAP_NET_ADMIN there — no privilege in the parent
+    /// namespace). Host/other-sandbox netns are invisible. Defaults to
+    /// `false` — existing sandboxes keep the shared network namespace.
+    /// The switch is independent of `fd_inject_connect`; with `net_isolation`
+    /// on, outbound connects require the fd-injection path (the shared-netns
+    /// dup fallback cannot reach the host from the sandbox netns), and
+    /// wildcard-domain DNS is restricted until the in-netns gateway (S2.3).
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub net_isolation: bool,
+
     /// Skip the seccomp user-notification supervisor. The CLI exposes
     /// its own `--no-supervisor` flag on `RunArgs` (which short-circuits
     /// to a direct exec); this field is the API-level counterpart used
@@ -347,6 +360,7 @@ impl Default for SandboxBuilder {
             num_cpus: None,
             port_remap: false,
             fd_inject_connect: false,
+            net_isolation: false,
             no_supervisor: false,
             pid_ns: false,
             control_socket: true,
@@ -418,6 +432,7 @@ impl Clone for SandboxBuilder {
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
             fd_inject_connect: self.fd_inject_connect,
+            net_isolation: self.net_isolation,
             no_supervisor: self.no_supervisor,
             pid_ns: self.pid_ns,
             control_socket: self.control_socket,
@@ -823,6 +838,16 @@ impl SandboxBuilder {
         self
     }
 
+    /// Run the sandbox in its own network namespace (`CLONE_NEWNET` after
+    /// the user namespace): only loopback, brought up from inside the
+    /// sandbox's userns. See the [`SandboxBuilder::net_isolation`] field
+    /// docs for the isolation guarantees and the `fd_inject_connect` /
+    /// wildcard-DNS interaction. Defaults to `false`.
+    pub fn net_isolation(mut self, v: bool) -> Self {
+        self.net_isolation = v;
+        self
+    }
+
     /// Skip the seccomp user-notification supervisor. The sandbox keeps
     /// Landlock and the kernel-level deny filter but loses every
     /// supervisor-mediated feature (IP allowlist, resource limits, COW,
@@ -1184,6 +1209,7 @@ impl SandboxBuilder {
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
             fd_inject_connect: self.fd_inject_connect,
+            net_isolation: self.net_isolation,
             no_supervisor: self.no_supervisor,
             pid_ns: self.pid_ns,
             control_socket: self.control_socket,
@@ -1313,6 +1339,37 @@ mod tests {
             .max_open_files(64)
             .build()
             .expect("a non-zero cap must build");
+    }
+
+    #[test]
+    fn net_isolation_defaults_false_and_setter_applies() {
+        // Default off: existing sandboxes keep the shared network namespace.
+        let built = super::SandboxBuilder::default().build().unwrap();
+        assert!(!built.net_isolation, "net_isolation must default to false");
+
+        // Setter turns it on.
+        let built = super::SandboxBuilder::default()
+            .net_isolation(true)
+            .build()
+            .unwrap();
+        assert!(built.net_isolation, "net_isolation(true) must be honored");
+
+        // Independent of fd_inject_connect: either switch alone must be
+        // expressible (the combination semantics are enforced at runtime).
+        let built = super::SandboxBuilder::default()
+            .net_isolation(true)
+            .fd_inject_connect(false)
+            .build()
+            .unwrap();
+        assert!(built.net_isolation);
+        assert!(!built.fd_inject_connect);
+        let built = super::SandboxBuilder::default()
+            .net_isolation(false)
+            .fd_inject_connect(true)
+            .build()
+            .unwrap();
+        assert!(!built.net_isolation);
+        assert!(built.fd_inject_connect);
     }
 
     #[test]

@@ -79,6 +79,7 @@ fn read_struct<T: Copy>(
 pub async fn handle_socket(
     notif: &SeccompNotif,
     state: &Arc<NetlinkState>,
+    net_isolation: bool,
 ) -> NotifAction {
     let domain   = notif.data.args[0];
     let protocol = notif.data.args[2];
@@ -131,7 +132,12 @@ pub async fn handle_socket(
     // same process (glibc compares incoming nlmsg_pid against the value
     // it read back from getsockname — they must agree).
     let tgid = tgid_of(notif.pid as i32);
-    proxy::spawn_responder(responder_fd, tgid as u32, Arc::clone(state));
+    // Per-sandbox netns isolation (S2.2): the real netns contains only
+    // loopback (brought up by the child), so the responder synthesizes the
+    // loopback-only view instead of the shared-netns lo + virtual-eth0
+    // view — `ip addr` / AI_ADDRCONFIG see exactly what the kernel would
+    // show for the sandbox's own netns.
+    proxy::spawn_responder(responder_fd, tgid as u32, Arc::clone(state), net_isolation);
 
     // Record the (tgid, fd) once the kernel's ADDFD ioctl returns the
     // child-side fd number.  Doing it from the on-success callback

@@ -1,4 +1,5 @@
-//! fd-injection connect path (S2.1, per-sandbox network isolation plan 1).
+//! fd-injection connect path (S2.1) and per-sandbox netns isolation (S2.2,
+//! per-sandbox network isolation plan 1).
 //!
 //! With the `fd_inject_connect` switch on, the supervisor performs the
 //! connect on a fresh host-side socket and injects it into the sandbox via
@@ -7,10 +8,16 @@
 //! With the switch off (default) the legacy dup-based on-behalf connect
 //! returns 0. Policy decisions (allow verdict, synthetic-IP refusal) run
 //! before the host connect in both modes.
+//!
+//! With the `net_isolation` switch on (default off), the sandbox spawns in
+//! its own network namespace containing only loopback, brought up from
+//! inside the sandbox's user namespace (no privilege in the parent
+//! namespace). The default shared-netns path is unchanged.
 
 use sandlock_core::Sandbox;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::os::unix::io::FromRawFd;
 use std::path::PathBuf;
 
 fn temp_file(name: &str) -> PathBuf {
@@ -339,5 +346,406 @@ async fn test_fd_inject_connect_rejected_with_no_supervisor() {
         "process error: child process error: fd_inject_connect requires the seccomp \
          supervisor and is incompatible with no_supervisor=true",
         "no_supervisor + fd_inject_connect must fail closed"
+    );
+}
+
+// ============================================================
+// S2.2: per-sandbox netns isolation (net_isolation)
+// ============================================================
+
+/// In-process probe for the netns isolation behavior. Writes exact result
+/// lines to fd 3 and exits:
+///
+/// - `ifnames=...`: sorted interface-name list seen from inside the sandbox
+///   (via glibc `if_nameindex`, which is netlink-backed).
+/// - `lo_echo=ok`: a 127.0.0.1 TCP echo round-trip inside the sandbox
+///   succeeded. This is the ping-equivalent: a down `lo` makes the
+///   connect/bind fail, so `ok` proves loopback is up AND usable.
+/// - `host_echo=errno=N` / `host_echo=reachable`: the outcome of connecting
+///   to the test's host-side echo server on 127.0.0.1 (`HOST_ECHO_PORT`).
+///
+/// The in-sandbox listener binds a caller-chosen port (`LOOPBACK_PORT`)
+/// that the policy allows via `net_allow` + `net_allow_bind_port` — Landlock
+/// handles TCP bind/connect by default, so an unlisted port is denied
+/// regardless of the network namespace.
+fn netns_probe() {
+    let mut out = unsafe { std::fs::File::from_raw_fd(3) };
+    let mut line = String::new();
+
+    // Interface enumeration: exactly what `ip addr` / glibc sees. In the
+    // netns-isolated sandbox the real netns view is passed through, so this
+    // must be exactly ["lo"]; in the default shared-netns sandbox the
+    // virtualized view is the fixed ["eth0", "lo"] pair.
+    let mut names: Vec<String> = Vec::new();
+    let head = unsafe { libc::if_nameindex() };
+    if head.is_null() {
+        line.push_str(&format!(
+            "ifnames_errno={}\n",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        ));
+    } else {
+        let mut p = head;
+        while !unsafe { (*p).if_name }.is_null() {
+            let name = unsafe { std::ffi::CStr::from_ptr((*p).if_name) }
+                .to_string_lossy()
+                .into_owned();
+            names.push(name);
+            p = unsafe { p.add(1) };
+        }
+        unsafe { libc::if_freenameindex(head) };
+        names.sort_unstable();
+        line.push_str(&format!("ifnames={:?}\n", names));
+    }
+
+    // Loopback data plane inside the sandbox: bind+listen on the allowed
+    // 127.0.0.1:LOOPBACK_PORT,
+    // connect from the same process, deterministic 4-byte echo. Requires lo
+    // to be UP (a down loopback fails the connect with ENETUNREACH).
+    let loopback_port = match std::env::var("LOOPBACK_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+    {
+        Some(p) => p,
+        None => {
+            let _ = out.write_all(b"lo_echo=no_port\n");
+            let _ = out.flush();
+            unsafe { libc::_exit(0) };
+        }
+    };
+    match TcpListener::bind(("127.0.0.1", loopback_port)) {
+        Ok(listener) => {
+            let handle = std::thread::spawn(move || {
+                if let Ok((mut conn, _)) = listener.accept() {
+                    let mut buf = [0u8; 4];
+                    if conn.read_exact(&mut buf).is_ok() {
+                        let _ = conn.write_all(&buf);
+                    }
+                }
+            });
+            match std::net::TcpStream::connect(("127.0.0.1", loopback_port)) {
+                Ok(mut stream) => {
+                    let mut buf = [0u8; 4];
+                    let sent = stream.write_all(b"ping").is_ok();
+                    let recvd = stream.read_exact(&mut buf).is_ok();
+                    line.push_str(&format!(
+                        "lo_echo={}\n",
+                        if sent && recvd && &buf == b"ping" { "ok" } else { "bad" }
+                    ));
+                }
+                Err(e) => line.push_str(&format!(
+                    "lo_echo=connect_errno={}\n",
+                    e.raw_os_error().unwrap_or(-1)
+                )),
+            }
+            handle.join().unwrap();
+        }
+        Err(e) => line.push_str(&format!(
+            "lo_echo=bind_errno={}\n",
+            e.raw_os_error().unwrap_or(-1)
+        )),
+    }
+
+    // Host visibility: the test's echo server lives on the HOST loopback.
+    // A netns-isolated sandbox's 127.0.0.1 is its own lo, so the connect must
+    // fail; the default shared-netns sandbox must reach it.
+    match std::env::var("HOST_ECHO_PORT").ok().and_then(|v| v.parse::<u16>().ok()) {
+        Some(port) => match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(_) => line.push_str("host_echo=reachable\n"),
+            Err(e) => line.push_str(&format!(
+                "host_echo=errno={}\n",
+                e.raw_os_error().unwrap_or(-1)
+            )),
+        },
+        None => line.push_str("host_echo=no_port\n"),
+    }
+
+    let _ = out.write_all(line.as_bytes());
+    let _ = out.flush();
+    unsafe { libc::_exit(0) };
+}
+
+/// Build a sandbox running `entry` in-process with a result pipe on fd 3,
+/// start it, and read everything the probe wrote. Returns (output, sandbox).
+async fn run_netns_probe(
+    entry: fn(),
+    name: &str,
+    env: &[(&str, &str)],
+    net_isolation: bool,
+    loopback_port: u16,
+    host_echo_port: u16,
+) -> (String, Sandbox) {
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
+    let (r, w) = (fds[0], fds[1]);
+    let mut b = base_policy()
+        .net_isolation(net_isolation)
+        .net_allow(format!("127.0.0.1:{}", loopback_port))
+        .net_allow(format!("127.0.0.1:{}", host_echo_port))
+        .net_allow_bind_port(loopback_port)
+        .env_var("LOOPBACK_PORT", &loopback_port.to_string());
+    for (k, v) in env {
+        b = b.env_var(*k, *v);
+    }
+    let mut sb = b.build().unwrap();
+    sb.create_with_in_child_main(name, vec![(3, w)], entry)
+        .await
+        .unwrap();
+    unsafe { libc::close(w) };
+    sb.start().unwrap();
+    let buf = tokio::task::spawn_blocking(move || {
+        let mut buf = String::new();
+        let mut f = unsafe { std::fs::File::from_raw_fd(r) };
+        f.read_to_string(&mut buf).unwrap();
+        buf
+    })
+    .await
+    .unwrap();
+    (buf, sb)
+}
+
+/// With `net_isolation` on, the sandbox runs in its own network namespace:
+/// exactly one interface (`lo`), loopback up and usable (TCP echo round-trip
+/// over 127.0.0.1), and the host's loopback echo server invisible
+/// (ECONNREFUSED — the sandbox's 127.0.0.1 is its own lo, not the host's).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_net_isolation_loopback_only_lo_up_host_invisible() {
+    let (port, srv) = spawn_echo_server();
+    let loopback_port = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let (output, mut sb) = run_netns_probe(
+        netns_probe,
+        "netns-probe",
+        &[("HOST_ECHO_PORT", &port.to_string())],
+        true,
+        loopback_port,
+        port,
+    )
+    .await;
+    let result = sb.wait().await.unwrap();
+    assert!(
+        result.success(),
+        "sandbox failed: {:?}\nprobe output:\n{}",
+        result.exit_status,
+        output
+    );
+    // The echo server is intentionally never reached from the netns sandbox,
+    // so its accept thread never returns; drop the handle instead of joining.
+    drop(srv);
+
+    let mut ifnames = None;
+    let mut lo_echo = None;
+    let mut host_echo = None;
+    for l in output.lines() {
+        if let Some(v) = l.strip_prefix("ifnames=") {
+            ifnames = Some(v.to_string());
+        } else if let Some(v) = l.strip_prefix("lo_echo=") {
+            lo_echo = Some(v.to_string());
+        } else if let Some(v) = l.strip_prefix("host_echo=") {
+            host_echo = Some(v.to_string());
+        }
+    }
+    assert_eq!(
+        ifnames.as_deref(),
+        Some("[\"lo\"]"),
+        "netns-isolated sandbox must see exactly lo:\n{}",
+        output
+    );
+    assert_eq!(
+        lo_echo.as_deref(),
+        Some("ok"),
+        "loopback must be up and echo 127.0.0.1 (ping-equivalent):\n{}",
+        output
+    );
+    assert_eq!(
+        host_echo.as_deref(),
+        Some("errno=111"),
+        "host loopback echo must be unreachable from a netns-isolated sandbox:\n{}",
+        output
+    );
+}
+
+/// Default (switch off) contrast: the shared-netns path is unchanged — the
+/// sandbox still sees the virtualized interface view (lo + eth0) and reaches
+/// the host's loopback echo server (loopback is shared).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_default_shared_netns_contrast_loopback_shared() {
+    let (port, srv) = spawn_echo_server();
+    let loopback_port = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let (output, mut sb) = run_netns_probe(
+        netns_probe,
+        "shared-netns-probe",
+        &[("HOST_ECHO_PORT", &port.to_string())],
+        false,
+        loopback_port,
+        port,
+    )
+    .await;
+    let result = sb.wait().await.unwrap();
+    assert!(
+        result.success(),
+        "sandbox failed: {:?}\nprobe output:\n{}",
+        result.exit_status,
+        output
+    );
+    srv.join().unwrap();
+
+    let mut ifnames = None;
+    let mut lo_echo = None;
+    let mut host_echo = None;
+    for l in output.lines() {
+        if let Some(v) = l.strip_prefix("ifnames=") {
+            ifnames = Some(v.to_string());
+        } else if let Some(v) = l.strip_prefix("lo_echo=") {
+            lo_echo = Some(v.to_string());
+        } else if let Some(v) = l.strip_prefix("host_echo=") {
+            host_echo = Some(v.to_string());
+        }
+    }
+    assert_eq!(
+        ifnames.as_deref(),
+        Some("[\"eth0\", \"lo\"]"),
+        "default sandbox keeps the virtualized interface view:\n{}",
+        output
+    );
+    assert_eq!(
+        lo_echo.as_deref(),
+        Some("ok"),
+        "loopback must still work in the default shared-netns path:\n{}",
+        output
+    );
+    assert_eq!(
+        host_echo.as_deref(),
+        Some("reachable"),
+        "default shared-netns sandbox must reach the host loopback echo:\n{}",
+        output
+    );
+}
+
+/// `net_isolation` + `fd_inject_connect` is the full plan-1 path: the
+/// sandbox's connect is trapped, the supervisor connects on a host-side
+/// socket (host netns) and injects the connected fd, so the sandbox reaches
+/// the host echo server from inside its loopback-only netns. The trapped
+/// connect returns the injected fd number.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_net_isolation_with_fd_inject_reaches_host_echo() {
+    let out = temp_file("netns-inject-echo");
+    let (port, srv) = spawn_echo_server();
+
+    let policy = base_policy()
+        .net_isolation(true)
+        .net_allow(format!("127.0.0.1:{}", port))
+        .fd_inject_connect(true)
+        .build()
+        .unwrap();
+
+    let script = connect_script(port, &out);
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "exit={:?} stderr={:?}",
+        result.code(),
+        result.stderr
+    );
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    srv.join().unwrap();
+
+    let parts: Vec<&str> = content.split_whitespace().collect();
+    assert_eq!(parts.len(), 3, "unexpected result line: {content}");
+    let ret_val: i32 = parts[0]
+        .strip_prefix("ret=")
+        .expect("ret field")
+        .parse()
+        .unwrap();
+    let fd_val: i32 = parts[1]
+        .strip_prefix("fd=")
+        .expect("fd field")
+        .parse()
+        .unwrap();
+    assert_eq!(
+        ret_val, fd_val,
+        "connect must return the injected fd number, got: {content}"
+    );
+    assert_eq!(
+        parts[2], "echo=ping",
+        "echo over the injected fd must reach the host server: {content}"
+    );
+}
+
+/// `net_isolation` without `fd_inject_connect`: the shared-netns dup-based
+/// on-behalf path cannot borrow external connectivity (the dup'd socket lives
+/// in the sandbox's loopback-only netns), so the host echo stays unreachable
+/// (ECONNREFUSED). The combination degrades to loopback-only, never to a
+/// silent shared-netns escape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_net_isolation_without_fd_inject_host_unreachable() {
+    let out = temp_file("netns-noinject-host");
+    let (port, srv) = spawn_echo_server();
+
+    let policy = base_policy()
+        .net_isolation(true)
+        .net_allow(format!("127.0.0.1:{}", port))
+        .build()
+        .unwrap();
+
+    let script = connect_script(port, &out);
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "exit={:?} stderr={:?}",
+        result.code(),
+        result.stderr
+    );
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    // The echo server is never reached (ECONNREFUSED in the sandbox netns),
+    // so its accept thread never returns; drop the handle instead of joining.
+    drop(srv);
+    assert_eq!(
+        content, "connect_err=111",
+        "netns sandbox without fd injection must fail the host connect with ECONNREFUSED"
+    );
+}
+
+/// The wildcard-domain DNS gateway binds a 127.0.1.x address in the SHARED
+/// netns; from a netns-isolated sandbox that loopback address is the
+/// sandbox's own lo with nothing listening, so wildcard rules cannot work
+/// (until the in-netns DNS gateway lands, S2.3). The combination must fail
+/// fast at spawn, never silently run a broken DNS path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_net_isolation_wildcard_dns_restricted() {
+    let policy = base_policy()
+        .net_isolation(true)
+        .net_allow("*.example.com:443")
+        .build()
+        .unwrap();
+    let err = policy
+        .clone()
+        .run_interactive(&["python3", "-c", "pass"])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "process error: child process error: net_isolation sandboxes cannot use \
+         wildcard-domain DNS rules: the shared-netns 127.0.1.x gateway is unreachable \
+         from a per-sandbox netns (only loopback); wildcard DNS under net_isolation is \
+         restricted until the in-netns DNS gateway lands (S2.3)",
+        "net_isolation + wildcard rules must fail closed"
     );
 }

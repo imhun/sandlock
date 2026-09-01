@@ -407,6 +407,51 @@ fn effective_nofile(requested: u32, inherited: &libc::rlimit) -> libc::rlim_t {
     (requested as libc::rlim_t).min(inherited.rlim_cur).min(inherited.rlim_max)
 }
 
+/// Minimal Linux `struct ifreq` for the loopback ioctls: `ifr_name` plus the
+/// flags slot of the `ifru` union, padded to the kernel's 40-byte struct.
+/// (`libc` does not expose `ifreq` on Linux, so we carry the layout we need.)
+#[repr(C)]
+struct Ifreq {
+    ifr_name: [libc::c_char; 16],
+    ifr_flags: libc::c_short,
+    _pad: [u8; 22],
+}
+
+/// Bring the loopback interface up in the caller's current network
+/// namespace (`ioctl(SIOCSIFFLAGS)` on an AF_INET socket, preserving the
+/// kernel's existing flags). Runs in the child before confinement: it
+/// requires CAP_NET_ADMIN in the current netns, which the sandbox holds
+/// because its userns owns the fresh netns created for `net_isolation`
+/// (S2.2) — no privilege in the parent namespace.
+fn bring_loopback_up() -> Result<(), String> {
+    let sock = unsafe {
+        libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0)
+    };
+    if sock < 0 {
+        return Err(format!(
+            "socket(AF_INET, SOCK_DGRAM): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut ifr: Ifreq = unsafe { std::mem::zeroed() };
+    for (i, b) in b"lo".iter().enumerate() {
+        ifr.ifr_name[i] = *b as libc::c_char;
+    }
+    if unsafe { libc::ioctl(sock, crate::sys::structs::SIOCGIFFLAGS as libc::c_ulong, &mut ifr) } < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(sock) };
+        return Err(format!("ioctl(SIOCGIFFLAGS, lo): {}", err));
+    }
+    ifr.ifr_flags |= libc::IFF_UP as libc::c_short;
+    let rc = unsafe { libc::ioctl(sock, crate::sys::structs::SIOCSIFFLAGS as libc::c_ulong, &ifr) };
+    let err = std::io::Error::last_os_error();
+    unsafe { libc::close(sock) };
+    if rc < 0 {
+        return Err(format!("ioctl(SIOCSIFFLAGS, lo): {}", err));
+    }
+    Ok(())
+}
+
 /// Apply irreversible confinement (Landlock + seccomp), then either `execve` the
 /// command or run an in-process entrypoint, per [`ChildEntry`].
 ///
@@ -532,61 +577,104 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     // fork, so this child already has its target identity.
     //
     // Otherwise skip when the requested identity already matches the
-    // current uid/gid: there's no point unsharing a user namespace to map
-    // an identity the process already has, and skipping avoids imposing an
-    // unprivileged-userns requirement on callers that don't need a remap.
+    // current uid/gid AND no netns isolation is requested: there's no point
+    // unsharing a user namespace to map an identity the process already has,
+    // and skipping avoids imposing an unprivileged-userns requirement on
+    // callers that don't need one. `net_isolation` (S2.2) explicitly opts in:
+    // `unshare(CLONE_NEWNET)` needs CAP_SYS_ADMIN, which an unprivileged
+    // process only has inside its own user namespace (rootless-container
+    // pattern), so the userns is created even without a `RunAs` remap.
     if !pid_ns {
         // Capture real uid/gid before any unshare (after unshare they become 65534)
         let real_uid = unsafe { libc::getuid() };
         let real_gid = unsafe { libc::getgid() };
+        let userns_needed = sandbox.net_isolation
+            || matches!(sandbox.user, Some(run_as) if run_as.uid != real_uid || run_as.gid != real_gid);
 
-        if let Some(run_as) = sandbox.user {
-            if run_as.uid != real_uid || run_as.gid != real_gid {
-                if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
-                    fail!("unshare(CLONE_NEWUSER)");
+        if userns_needed {
+            if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+                fail!("unshare(CLONE_NEWUSER)");
+            }
+            match sandbox.user {
+                Some(run_as) if run_as.uid != real_uid || run_as.gid != real_gid => {
+                    if let (Some(ready_w), Some(done_r)) = (map_ready_w, map_done_r) {
+                        // Privileged path: the parent writes the `0 -> run_as`
+                        // maps (only it still has CAP_SETUID in the parent
+                        // namespace), then we re-point our host identity at the
+                        // mapped uid/gid from inside the namespace. `RunAs` is
+                        // the *host* uid; inside we see uid 0.
+                        if write_byte_fd(ready_w.as_raw_fd(), b'R').is_err() {
+                            fail!("user-namespace map ready signal");
+                        }
+                        if read_byte_fd(done_r.as_raw_fd()).is_err() {
+                            fail!(
+                                "parent uid_map/gid_map write (is unprivileged userns restricted? \
+                                 e.g. kernel.apparmor_restrict_unprivileged_userns=1)"
+                            );
+                        }
+                        if unsafe { libc::setresgid(0, 0, 0) } != 0 {
+                            fail!("setresgid(0) to activate mapped host gid");
+                        }
+                        if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+                            fail!("setgroups to drop supplementary groups");
+                        }
+                        if unsafe { libc::setresuid(0, 0, 0) } != 0 {
+                            fail!("setresuid(0) to activate mapped host uid");
+                        }
+                    } else {
+                        // Defense-in-depth only: `do_create_stdio` refuses an
+                        // unprivileged `RunAs` remap *before* forking, because a
+                        // single-entry map can only cover the caller's own euid
+                        // (no CAP_SETUID in the parent namespace) — the sandbox
+                        // would silently keep the supervisor's host uid and
+                        // per-sandbox isolation would be absent.  If this branch
+                        // is ever reached outside that path, self-map the
+                        // requested uid inside the namespace as a last resort
+                        // rather than running as the overflow uid (65534).
+                        if write_id_maps(real_uid, real_gid, run_as.uid, run_as.gid).is_err() {
+                            fail!(
+                                "uid_map/gid_map write (is unprivileged userns restricted? \
+                                 e.g. kernel.apparmor_restrict_unprivileged_userns=1)"
+                            );
+                        }
+                    }
                 }
-                if let (Some(ready_w), Some(done_r)) = (map_ready_w, map_done_r) {
-                    // Privileged path: the parent writes the `0 -> run_as`
-                    // maps (only it still has CAP_SETUID in the parent
-                    // namespace), then we re-point our host identity at the
-                    // mapped uid/gid from inside the namespace. `RunAs` is
-                    // the *host* uid; inside we see uid 0.
-                    if write_byte_fd(ready_w.as_raw_fd(), b'R').is_err() {
-                        fail!("user-namespace map ready signal");
-                    }
-                    if read_byte_fd(done_r.as_raw_fd()).is_err() {
+                _ => {
+                    // `net_isolation` without a `RunAs` remap: self-map our
+                    // own identity so the fresh user namespace grants us a
+                    // full capability set (writing a map that covers the
+                    // caller's own euid is allowed unprivileged; a child can
+                    // never map an arbitrary host uid). The capabilities are
+                    // what `unshare(CLONE_NEWNET)` and `lo up` below rely on.
+                    if write_id_maps(real_uid, real_gid, real_uid, real_gid).is_err() {
                         fail!(
-                            "parent uid_map/gid_map write (is unprivileged userns restricted? \
-                             e.g. kernel.apparmor_restrict_unprivileged_userns=1)"
-                        );
-                    }
-                    if unsafe { libc::setresgid(0, 0, 0) } != 0 {
-                        fail!("setresgid(0) to activate mapped host gid");
-                    }
-                    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
-                        fail!("setgroups to drop supplementary groups");
-                    }
-                    if unsafe { libc::setresuid(0, 0, 0) } != 0 {
-                        fail!("setresuid(0) to activate mapped host uid");
-                    }
-                } else {
-                    // Defense-in-depth only: `do_create_stdio` refuses an
-                    // unprivileged `RunAs` remap *before* forking, because a
-                    // single-entry map can only cover the caller's own euid
-                    // (no CAP_SETUID in the parent namespace) — the sandbox
-                    // would silently keep the supervisor's host uid and
-                    // per-sandbox isolation would be absent.  If this branch
-                    // is ever reached outside that path, self-map the
-                    // requested uid inside the namespace as a last resort
-                    // rather than running as the overflow uid (65534).
-                    if write_id_maps(real_uid, real_gid, run_as.uid, run_as.gid).is_err() {
-                        fail!(
-                            "uid_map/gid_map write (is unprivileged userns restricted? \
-                             e.g. kernel.apparmor_restrict_unprivileged_userns=1)"
+                            "uid_map/gid_map write for net_isolation (is unprivileged userns \
+                             restricted? e.g. kernel.apparmor_restrict_unprivileged_userns=1)"
                         );
                     }
                 }
             }
+        }
+    }
+
+    // 5b. Per-sandbox network namespace isolation (S2.2).
+    //
+    // Runs after the user namespace (created above, or by the pid-ns
+    // intermediate): unshare(CLONE_NEWNET) puts the sandbox in a fresh netns
+    // owned by its own userns, so the sandbox has CAP_NET_ADMIN there with no
+    // privilege in the parent namespace. The fresh netns contains only
+    // loopback; bring lo up from inside the userns. Must run before
+    // Landlock/seccomp: the interface ioctls are only needed at setup and the
+    // netns switch must precede any network confinement. Supervisor-mediated
+    // services that live in the shared netns (the 127.0.1.x wildcard DNS
+    // gateway) are unreachable from here by design — see the net_isolation
+    // wildcard-DNS restriction in `do_create_stdio`.
+    if sandbox.net_isolation {
+        if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
+            fail!("unshare(CLONE_NEWNET)");
+        }
+        if let Err(e) = bring_loopback_up() {
+            fail!(format!("bring loopback up in netns: {}", e));
         }
     }
 

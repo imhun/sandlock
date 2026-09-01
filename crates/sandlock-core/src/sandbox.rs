@@ -207,6 +207,7 @@ impl TryFrom<&Sandbox> for Confinement {
         if sandbox.num_cpus.is_some() { unsupported.push("num_cpus"); }
         if sandbox.port_remap { unsupported.push("port_remap"); }
         if sandbox.fd_inject_connect { unsupported.push("fd_inject_connect"); }
+        if sandbox.net_isolation { unsupported.push("net_isolation"); }
         if sandbox.user.is_some() { unsupported.push("user"); }
         if sandbox.policy_fn.is_some() { unsupported.push("policy_fn"); }
 
@@ -585,6 +586,15 @@ pub struct Sandbox {
     #[serde(default)]
     pub fd_inject_connect: bool,
 
+    /// Per-sandbox network namespace isolation (S2.2): when true, the
+    /// sandbox spawns in its own netns (`unshare(CLONE_NEWNET)` after the
+    /// user namespace), containing only loopback brought up from inside the
+    /// sandbox's userns. Defaults to `false` (shared network namespace).
+    /// Independent of `fd_inject_connect`; wildcard-domain DNS is restricted
+    /// under `net_isolation` until the in-netns DNS gateway (S2.3).
+    #[serde(default)]
+    pub net_isolation: bool,
+
     /// Skip the seccomp user-notification supervisor. The sandbox runs
     /// with Landlock + a kernel-only deny filter, with none of the
     /// supervisor-mediated features (IP allowlist, resource limits,
@@ -727,6 +737,7 @@ impl Clone for Sandbox {
             num_cpus: self.num_cpus,
             port_remap: self.port_remap,
             fd_inject_connect: self.fd_inject_connect,
+            net_isolation: self.net_isolation,
             no_supervisor: self.no_supervisor,
             pid_ns: self.pid_ns,
             control_socket: self.control_socket,
@@ -1856,6 +1867,26 @@ impl Sandbox {
         let resolved_net_allow = network::resolve_net_allow(&self.net_allow)
             .await
             .map_err(SandboxRuntimeError::Io)?;
+        // S2.2: wildcard-domain DNS is restricted under per-sandbox netns
+        // isolation. The wildcard gateway binds a 127.0.1.x loopback address
+        // in the SHARED netns; from a netns-isolated sandbox that address is
+        // its own loopback with nothing listening, so wildcard lookups cannot
+        // work (the in-netns DNS gateway is S2.3). Fail closed at spawn
+        // instead of silently running a broken DNS path; the default
+        // shared-netns path is unaffected (`net_isolation` defaults false).
+        if self.net_isolation
+            && (!resolved_net_allow.tcp.wildcard_domains.is_empty()
+                || !resolved_net_allow.udp.wildcard_domains.is_empty())
+        {
+            return Err(SandboxRuntimeError::Child(
+                "net_isolation sandboxes cannot use wildcard-domain DNS rules: the shared-netns \
+                 127.0.1.x gateway is unreachable from a per-sandbox netns (only loopback); \
+                 wildcard DNS under net_isolation is restricted until the in-netns DNS gateway \
+                 lands (S2.3)"
+                    .into(),
+            )
+            .into());
+        }
         // In chroot/image mode, seed the synthetic /etc/hosts from the
         // rootfs's own file so entries baked into the image (private
         // registries, internal hostnames, etc.) survive virtualization.
@@ -2591,6 +2622,7 @@ impl Sandbox {
                 num_cpus: self.num_cpus,
                 port_remap: resolved.features.port_remap,
                 fd_inject_connect: resolved.features.fd_inject_connect,
+                net_isolation: resolved.features.net_isolation,
                 cow_enabled: resolved.features.cow,
                 chroot_root: chroot_root.clone(),
                 chroot_readable: self.fs_readable.clone(),

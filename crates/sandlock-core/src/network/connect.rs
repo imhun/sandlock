@@ -271,10 +271,16 @@ pub(super) async fn connect_on_behalf(
                     NotifAction::Errno(unsafe { *libc::__errno_location() })
                 };
             }
-            // Fall back to the legacy dup-based path when the host socket
-            // cannot be reproduced (keeps the sandbox functional in the
-            // shared-netns mode; per-sandbox netns (S2.2) will make
-            // injection mandatory and this fallback unreachable).
+            // Shared-netns mode: fall back to the legacy dup-based path when
+            // the host socket cannot be reproduced (EMFILE/ENFILE), keeping
+            // the sandbox functional. Per-sandbox netns isolation (S2.2,
+            // `net_isolation`): the dup'd socket lives in the sandbox's
+            // loopback-only netns, so the fallback can never reach the
+            // planned destination — attempting it would only misreport the
+            // failure as a routing error. Fail closed with ECONNREFUSED.
+            if ctx.policy.net_isolation {
+                return NotifAction::Errno(ECONNREFUSED);
+            }
         }
         if plan.record_orig_dest {
             if let Some(ref map) = orig_dest_map {

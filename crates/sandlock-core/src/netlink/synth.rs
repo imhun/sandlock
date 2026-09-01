@@ -42,12 +42,13 @@ const IFA_LABEL: u16 = 3;
 pub fn synthesize_reply(
     req: &ParsedRequest,
     reply_pid: u32,
+    loopback_only: bool,
 ) -> Vec<Vec<u8>> {
     match req.nlmsg_type {
         RTM_GETLINK if req.nlmsg_flags & NLM_F_DUMP != 0 =>
-            build_link_dump(req.nlmsg_seq, reply_pid),
+            build_link_dump(req.nlmsg_seq, reply_pid, loopback_only),
         RTM_GETADDR if req.nlmsg_flags & NLM_F_DUMP != 0 =>
-            build_addr_dump(req.nlmsg_seq, reply_pid),
+            build_addr_dump(req.nlmsg_seq, reply_pid, loopback_only),
         _ => vec![build_error(req, -libc::EOPNOTSUPP)],
     }
 }
@@ -73,7 +74,7 @@ fn done_datagram(seq: u32, pid: u32) -> Vec<u8> {
     })
 }
 
-fn build_link_dump(seq: u32, pid: u32) -> Vec<Vec<u8>> {
+fn build_link_dump(seq: u32, pid: u32, loopback_only: bool) -> Vec<Vec<u8>> {
     let link = encode_one(RTM_NEWLINK, NLM_F_MULTI, seq, pid, |w| {
         let ifi = IfInfoMsg {
             ifi_family: libc::AF_UNSPEC as u8, _pad: 0,
@@ -91,6 +92,14 @@ fn build_link_dump(seq: u32, pid: u32) -> Vec<Vec<u8>> {
         w.write_attr(IFLA_BROADCAST, &[0u8; 6]);
     });
     let mut out = vec![link];
+    // Per-sandbox netns isolation (S2.2): the real netns contains only
+    // loopback, so the synthesized view must not fabricate the virtual
+    // non-loopback interface — `ip addr` / AI_ADDRCONFIG must see exactly
+    // what the kernel would show.
+    if loopback_only {
+        out.push(done_datagram(seq, pid));
+        return out;
+    }
     let extra = (VIRTUAL_IF_INDEX, "eth0", 1500u32);
     out.push(encode_one(RTM_NEWLINK, NLM_F_MULTI, seq, pid, |w| {
         let ifi = IfInfoMsg {
@@ -116,7 +125,7 @@ fn build_link_dump(seq: u32, pid: u32) -> Vec<Vec<u8>> {
     out
 }
 
-fn build_addr_dump(seq: u32, pid: u32) -> Vec<Vec<u8>> {
+fn build_addr_dump(seq: u32, pid: u32, loopback_only: bool) -> Vec<Vec<u8>> {
     let v4 = encode_one(RTM_NEWADDR, NLM_F_MULTI, seq, pid, |w| {
         let ifa = IfAddrMsg {
             ifa_family: libc::AF_INET as u8, ifa_prefixlen: 8,
@@ -146,6 +155,10 @@ fn build_addr_dump(seq: u32, pid: u32) -> Vec<Vec<u8>> {
         w.write_attr(IFA_LOCAL,   &v6addr);
     });
     let mut out = vec![v4, v6];
+    if loopback_only {
+        out.push(done_datagram(seq, pid));
+        return out;
+    }
     let (index, name, ip, prefix) =
         (VIRTUAL_IF_INDEX, "eth0", VIRTUAL_IF_IP, VIRTUAL_IF_PREFIX);
     let ip6 = Some(VIRTUAL_IF_IP6);
@@ -216,7 +229,7 @@ mod tests {
             nlmsg_type: RTM_GETLINK, nlmsg_flags: NLM_F_REQUEST | NLM_F_DUMP,
             nlmsg_seq: 1, nlmsg_pid: 0,
         };
-        let reply = synthesize_reply(&req, 1234);
+        let reply = synthesize_reply(&req, 1234, false);
         assert_eq!(reply.len(), 3, "expected 3 datagrams (lo, eth0, DONE)");
         let t0 = u16::from_ne_bytes(reply[0][4..6].try_into().unwrap());
         assert_eq!(t0, RTM_NEWLINK);
@@ -232,7 +245,7 @@ mod tests {
             nlmsg_type: RTM_GETADDR, nlmsg_flags: NLM_F_REQUEST | NLM_F_DUMP,
             nlmsg_seq: 1, nlmsg_pid: 0,
         };
-        let reply = synthesize_reply(&req, 1234);
+        let reply = synthesize_reply(&req, 1234, false);
         assert_eq!(reply.len(), 5, "expected 5 datagrams (lo v4, lo v6, eth0 v4, eth0 v6, DONE)");
         assert!(reply[0].windows(4).any(|w| w == [127, 0, 0, 1]));
         let mut v6 = [0u8; 16]; v6[15] = 1;
@@ -244,12 +257,45 @@ mod tests {
     }
 
     #[test]
+    fn loopback_only_link_dump_is_just_lo_then_done() {
+        let req = ParsedRequest {
+            nlmsg_type: RTM_GETLINK, nlmsg_flags: NLM_F_REQUEST | NLM_F_DUMP,
+            nlmsg_seq: 1, nlmsg_pid: 0,
+        };
+        let reply = synthesize_reply(&req, 1234, true);
+        assert_eq!(reply.len(), 2, "expected 2 datagrams (lo, DONE)");
+        let t0 = u16::from_ne_bytes(reply[0][4..6].try_into().unwrap());
+        assert_eq!(t0, RTM_NEWLINK);
+        assert!(reply[0].windows(3).any(|w| w == b"lo\0"));
+        assert!(!reply[0].windows(5).any(|w| w == b"eth0\0"));
+        let t1 = u16::from_ne_bytes(reply[1][4..6].try_into().unwrap());
+        assert_eq!(t1, NLMSG_DONE);
+    }
+
+    #[test]
+    fn loopback_only_addr_dump_is_lo_v4_lo_v6_then_done() {
+        let req = ParsedRequest {
+            nlmsg_type: RTM_GETADDR, nlmsg_flags: NLM_F_REQUEST | NLM_F_DUMP,
+            nlmsg_seq: 1, nlmsg_pid: 0,
+        };
+        let reply = synthesize_reply(&req, 1234, true);
+        assert_eq!(reply.len(), 3, "expected 3 datagrams (lo v4, lo v6, DONE)");
+        assert!(reply[0].windows(4).any(|w| w == [127, 0, 0, 1]));
+        let mut v6 = [0u8; 16]; v6[15] = 1;
+        assert!(reply[1].windows(16).any(|w| w == v6));
+        assert!(!reply[0].windows(4).any(|w| w == VIRTUAL_IF_IP));
+        assert!(!reply[1].windows(16).any(|w| w == VIRTUAL_IF_IP6));
+        let t2 = u16::from_ne_bytes(reply[2][4..6].try_into().unwrap());
+        assert_eq!(t2, NLMSG_DONE);
+    }
+
+    #[test]
     fn unknown_type_returns_eopnotsupp() {
         let req = ParsedRequest {
             nlmsg_type: 999, nlmsg_flags: NLM_F_REQUEST,
             nlmsg_seq: 7, nlmsg_pid: 0,
         };
-        let reply = synthesize_reply(&req, 1234);
+        let reply = synthesize_reply(&req, 1234, false);
         assert_eq!(reply.len(), 1);
         let t = u16::from_ne_bytes(reply[0][4..6].try_into().unwrap());
         assert_eq!(t, NLMSG_ERROR);

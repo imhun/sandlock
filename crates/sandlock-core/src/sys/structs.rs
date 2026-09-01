@@ -225,6 +225,7 @@ pub const TIOCLINUX: u64 = 0x541C;
 pub const SIOCGIFNAME: u64 = 0x8910;
 pub const SIOCGIFCONF: u64 = 0x8912;
 pub const SIOCGIFFLAGS: u64 = 0x8913;
+pub const SIOCSIFFLAGS: u64 = 0x8914;
 pub const SIOCGIFADDR: u64 = 0x8915;
 pub const SIOCGIFDSTADDR: u64 = 0x8917;
 pub const SIOCGIFBRDADDR: u64 = 0x8919;

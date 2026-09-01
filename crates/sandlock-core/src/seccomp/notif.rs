@@ -812,6 +812,12 @@ pub struct NotifPolicy {
     /// `false` — the legacy dup-based on-behalf connect stays the default
     /// until per-sandbox netns (S2.2) makes injection mandatory.
     pub fd_inject_connect: bool,
+    /// S2.2: the sandbox spawns in its own network namespace (only
+    /// loopback). The supervisor-side dup fallback of the injection path is
+    /// disabled when set: a dup'd socket lives in the sandbox's loopback-only
+    /// netns and can never reach the planned destination, so the injection
+    /// path fails closed instead of silently attempting it.
+    pub net_isolation: bool,
     pub cow_enabled: bool,
     pub chroot_root: Option<std::path::PathBuf>,
     /// Virtual paths allowed for reading under chroot (original user-specified paths).
