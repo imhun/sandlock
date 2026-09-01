@@ -19,7 +19,7 @@
 
 use sandlock_core::Sandbox;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::{Ipv4Addr, TcpListener, UdpSocket};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 
@@ -1206,4 +1206,298 @@ async fn test_net_isolation_two_sandboxes_mutually_invisible() {
          identifiers (per-spawn unshare), got A={} B={}",
         inode_a, inode_b
     );
+}
+
+// ============================================================
+// S2.4: UDP — connected injection + datagram on-behalf under net_isolation
+// ============================================================
+
+/// UDP echo server on the host loopback that answers exactly `count`
+/// datagrams with the bytes it received (deterministic payloads, so the
+/// assertion can be exact). The caller keeps the original socket to close it
+/// at test end; the worker runs on a `try_clone` (same file description, so
+/// closing the original does NOT wake it) and a read timeout bounds the
+/// worker so a sandbox that never sends cannot hang the suite.
+fn spawn_udp_echo_server(
+    count: usize,
+) -> (u16, UdpSocket, std::thread::JoinHandle<()>) {
+    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = sock.local_addr().unwrap().port();
+    let worker = sock.try_clone().unwrap();
+    worker
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut buf = [0u8; 64];
+        for _ in 0..count {
+            let Ok((n, peer)) = worker.recv_from(&mut buf) else {
+                break;
+            };
+            let _ = worker.send_to(&buf[..n], peer);
+        }
+    });
+    (port, sock, handle)
+}
+
+/// UDP collector bound on `ip` (a host-netns fixture address) that forwards
+/// every received datagram payload to the returned receiver as exact bytes,
+/// so a test can assert the sandbox's on-behalf datagram actually arrived at
+/// the host-side server (not just that the syscall returned success — an
+/// unconnected UDP send reports success even when the datagram is dropped).
+fn spawn_udp_collector(
+    ip: Ipv4Addr,
+    count: usize,
+) -> (u16, std::sync::mpsc::Receiver<Vec<u8>>) {
+    let sock = UdpSocket::bind((ip, 0)).unwrap();
+    let port = sock.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 64];
+        for _ in 0..count {
+            let Ok((n, _)) = sock.recv_from(&mut buf) else {
+                break;
+            };
+            if tx.send(buf[..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    (port, rx)
+}
+
+/// Connected UDP under `net_isolation` + `fd_inject_connect` is the full
+/// plan-1 UDP path: the supervisor mints a host-side UDP socket, connect()s
+/// it to the host echo server, and injects it (ADDFD|SEND), so the trapped
+/// connect returns the injected fd number and the data plane is the injected
+/// fd — kernel-direct send/recv, no supervisor in the data path. QUIC-style:
+/// one connect, then multiple datagram round-trips over the same fd.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_net_isolation_connected_udp_injected_quic_echo() {
+    let out = temp_file("netns-udp-connect");
+    let (port, sock, srv) = spawn_udp_echo_server(2);
+
+    let policy = base_policy()
+        .net_isolation(true)
+        .net_allow(format!("127.0.0.1:{}", port))
+        .fd_inject_connect(true)
+        .build()
+        .unwrap();
+
+    // Raw libc connect: the ADDFD|SEND injection makes the syscall return the
+    // injected fd number (positive), which CPython's socket.connect() wrapper
+    // rejects — same known wrapper incompatibility as the TCP injection tests.
+    let script = format!(
+        concat!(
+            "import ctypes, socket, struct\n",
+            "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+            "libc.connect.restype = ctypes.c_int\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+            "s.settimeout(5)\n",
+            "fd = s.fileno()\n",
+            "addr = struct.pack('<H', socket.AF_INET) + struct.pack('!H', {port}) + socket.inet_aton('127.0.0.1') + b'\\x00' * 8\n",
+            "buf = ctypes.create_string_buffer(addr)\n",
+            "ctypes.set_errno(0)\n",
+            "ret = libc.connect(fd, buf, len(addr))\n",
+            "if ret < 0:\n",
+            "  open('{out}', 'w').write(f'connect_err={{ctypes.get_errno()}}')\n",
+            "  raise SystemExit(0)\n",
+            "s.send(b'ping')\n",
+            "d1 = s.recv(4)\n",
+            "s.send(b'pong')\n",
+            "d2 = s.recv(4)\n",
+            "s.close()\n",
+            "open('{out}', 'w').write(f'ret={{ret}} fd={{fd}} echo1={{d1.decode()}} echo2={{d2.decode()}}')\n",
+        ),
+        port = port,
+        out = out.display(),
+    );
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "exit={:?} stderr={:?}",
+        result.code(),
+        result.stderr
+    );
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    drop(sock);
+    srv.join().unwrap();
+
+    let parts: Vec<&str> = content.split_whitespace().collect();
+    assert_eq!(parts.len(), 4, "unexpected result line: {content}");
+    let ret_val: i32 = parts[0]
+        .strip_prefix("ret=")
+        .expect("ret field")
+        .parse()
+        .unwrap();
+    let fd_val: i32 = parts[1].strip_prefix("fd=").expect("fd field").parse().unwrap();
+    assert_eq!(
+        ret_val, fd_val,
+        "UDP connect must return the injected fd number, got: {content}"
+    );
+    assert_eq!(
+        parts[2], "echo1=ping",
+        "first datagram over the injected fd must reach the host echo server"
+    );
+    assert_eq!(
+        parts[3], "echo2=pong",
+        "second datagram over the same injected fd must reach the host echo server"
+    );
+}
+
+/// Unconnected datagram sendto under `net_isolation` reuses the on-behalf
+/// send path: there is no connect to inject, so the supervisor performs the
+/// send. The sandbox's loopback-only netns cannot route a non-loopback
+/// destination, so the supervisor must send from a fresh host-side socket —
+/// the sandbox socket would otherwise drop the datagram (or fail
+/// ENETUNREACH). The host-side collector on a pre-seeded fixture address is
+/// the reachability proof: exact payload, not just a successful sendto.
+///
+/// The same sandbox also round-trips a UDP datagram on its OWN loopback
+/// (allowed fixed port): that destination must stay in the sandbox netns
+/// (dup'd-fd path), so in-sandbox UDP services (e.g. the S2.3 DNS gateway)
+/// are not misrouted to the host's loopback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_net_isolation_datagram_sendto_on_behalf_reaches_host() {
+    // Pre-seeded by the container entrypoint (unprivileged fixture): the test
+    // harness runs as uid 65534 and cannot mutate /etc/hosts or add lo
+    // addresses itself, so the hostname must be one the entrypoint prepared.
+    let _host = WorkerLocalHost::setup("api.egress.test");
+    let loopback_port: u16 = 47_999;
+    let out = temp_file("netns-udp-dgram");
+    let (port, rx) = spawn_udp_collector(_host.addr(), 1);
+
+    let policy = base_policy()
+        .net_isolation(true)
+        .net_allow(format!("127.0.0.1:{}", loopback_port))
+        .net_allow(format!("{}:{}", _host.addr(), port))
+        .build()
+        .unwrap();
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+            "s.settimeout(5)\n",
+            // In-sandbox UDP loopback must stay sandbox-local (dup'd fd).
+            "l = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+            "l.bind(('127.0.0.1', {loopback_port}))\n",
+            "l2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+            "l2.sendto(b'lo', ('127.0.0.1', {loopback_port}))\n",
+            "ldata, _ = l.recvfrom(4)\n",
+            "l.close()\n",
+            "l2.close()\n",
+            // External datagram: on-behalf, host-side socket under net_isolation.
+            "try:\n",
+            "  n = s.sendto(b'ping', ('{ip}', {port}))\n",
+            "  open('{out}', 'w').write(f'lo={{ldata.decode()}} sent={{n}}')\n",
+            "except OSError as e:\n",
+            "  open('{out}', 'w').write(f'lo={{ldata.decode()}} send_err={{e.errno}}')\n",
+            "s.close()\n",
+        ),
+        loopback_port = loopback_port,
+        ip = _host.addr(),
+        port = port,
+        out = out.display(),
+    );
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "exit={:?} stderr={:?}",
+        result.code(),
+        result.stderr
+    );
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(
+        content, "lo=lo sent=4",
+        "in-sandbox UDP loopback must round-trip locally and the external \
+         sendto must report 4 bytes, got: {content}"
+    );
+
+    // Reachability proof: the datagram must arrive at the host-side server
+    // with exactly the sent payload (no partial match, no dropped packet).
+    let got = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("on-behalf datagram never arrived at the host collector");
+    assert_eq!(got, b"ping", "host collector must receive exactly b'ping'");
+}
+
+/// Contrast contract: connected UDP under `net_isolation` WITHOUT
+/// `fd_inject_connect` must NOT reach the host. The dup'd-socket on-behalf
+/// connect lands on the sandbox's own loopback (UDP connect sends no packet,
+/// so it succeeds); the send to the empty sandbox loopback is queued and the
+/// ICMP port-unreachable surfaces as ECONNREFUSED on the next recv — the host
+/// echo server must never receive anything. This locks the "no injection, no
+/// egress" degradation for connected UDP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_net_isolation_connected_udp_without_fd_inject_not_reachable() {
+    let out = temp_file("netns-udp-noinject");
+    // Bind the host-side UDP socket only (no worker): the sandbox's datagram
+    // must never arrive, so there is nothing to receive.
+    let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = sock.local_addr().unwrap().port();
+
+    let policy = base_policy()
+        .net_isolation(true)
+        .net_allow(format!("127.0.0.1:{}", port))
+        .build()
+        .unwrap();
+    let script = format!(
+        concat!(
+            "import ctypes, socket, struct\n",
+            "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+            "libc.connect.restype = ctypes.c_int\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+            "s.settimeout(2)\n",
+            "fd = s.fileno()\n",
+            "addr = struct.pack('<H', socket.AF_INET) + struct.pack('!H', {port}) + socket.inet_aton('127.0.0.1') + b'\\x00' * 8\n",
+            "buf = ctypes.create_string_buffer(addr)\n",
+            "ctypes.set_errno(0)\n",
+            "ret = libc.connect(fd, buf, len(addr))\n",
+            "if ret < 0:\n",
+            "  open('{out}', 'w').write(f'connect_err={{ctypes.get_errno()}}')\n",
+            "  raise SystemExit(0)\n",
+            "s.send(b'ping')\n",
+            "try:\n",
+            "  d = s.recv(4)\n",
+            "  open('{out}', 'w').write(f'ret={{ret}} recv_ok')\n",
+            "except OSError as e:\n",
+            "  open('{out}', 'w').write(f'ret={{ret}} recv_err={{e.errno}}')\n",
+            "s.close()\n",
+        ),
+        port = port,
+        out = out.display(),
+    );
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "exit={:?} stderr={:?}",
+        result.code(),
+        result.stderr
+    );
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(
+        content, "ret=0 recv_err=111",
+        "netns UDP connect without injection must stay sandbox-local: the \
+         send to the empty sandbox loopback must surface ECONNREFUSED (ICMP \
+         port unreachable) on the next recv, \
+         got: {content}"
+    );
+    drop(sock);
 }

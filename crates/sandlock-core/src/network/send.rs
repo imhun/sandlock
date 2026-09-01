@@ -5,7 +5,7 @@
 // connect was gated when it happened).
 
 use std::net::IpAddr;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use crate::seccomp::ctx::SupervisorCtx;
@@ -27,6 +27,106 @@ use super::verdict::{
 };
 use super::{query_socket_protocol, socket_is_unix, Protocol};
 use super::dns_synth::SyntheticDns;
+
+// ============================================================
+// net_isolation host-socket substitution (S2.4)
+// ============================================================
+
+/// True when the dup'd socket already has a peer: `getpeername` succeeds only
+/// on a connected socket. A connected socket keeps the dup-based send path
+/// under `net_isolation` — after fd injection the dup *is* the host-side
+/// connected socket, and a kernel-connected socket reached only sandbox-local
+/// loopback anyway (a non-loopback connect cannot succeed in a loopback-only
+/// netns).
+fn socket_has_peer(fd: RawFd) -> bool {
+    let mut sa: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    unsafe { libc::getpeername(fd, &mut sa as *mut _ as *mut libc::sockaddr, &mut len) == 0 }
+}
+
+/// Whether an on-behalf datagram send must go through a fresh supervisor-side
+/// socket instead of the child's dup'd fd.
+///
+/// A per-sandbox netns (S2.2 `net_isolation`) has only loopback: the dup'd
+/// child socket cannot route a non-loopback destination (the send fails
+/// ENETUNREACH at best, or is silently dropped at worst). The sandbox's own
+/// loopback — including the in-netns DNS gateway (S2.3, `127.0.1.x:53`, which
+/// the send handlers exempt before this runs) — and any connected socket must
+/// keep the dup-based path: the first is the only traffic the sandbox netns
+/// can route, and the second is either the injected host socket or a
+/// sandbox-local connection. The destination is the *rewritten* sockaddr (a
+/// wildcard domain resolves to a real, non-loopback address by the time this
+/// runs; the SSRF guard refuses loopback resolutions), so the decision matches
+/// what the supervisor will actually send to.
+fn send_needs_host_socket(ctx: &SupervisorCtx, dup_fd: RawFd, addr_bytes: &[u8]) -> bool {
+    if !ctx.policy.net_isolation {
+        return false;
+    }
+    let Some(ip) = parse_ip_from_sockaddr(addr_bytes) else {
+        return false;
+    };
+    datagram_dest_requires_host_socket(ip, socket_has_peer(dup_fd))
+}
+
+/// Pure half of [`send_needs_host_socket`]: a datagram to a non-loopback
+/// destination on an *unconnected* socket must leave the sandbox's
+/// loopback-only netns via a host-side socket. Loopback destinations (the
+/// sandbox's own lo, including the in-netns DNS gateway) and connected
+/// sockets (the injected host socket, or a sandbox-local connection) keep
+/// the dup-based path.
+fn datagram_dest_requires_host_socket(ip: IpAddr, socket_connected: bool) -> bool {
+    !ip.is_loopback() && !socket_connected
+}
+
+/// Resolve one on-behalf datagram send to a terminal action, sending through
+/// a fresh host-side socket when [`send_needs_host_socket`] demands it (S2.4):
+/// a `net_isolation` sandbox's socket cannot reach the destination, so the
+/// supervisor mints a host-netns socket, sends the datagram from it, and
+/// closes it. The blocking decision still follows the child's socket mode
+/// (`dup_fd`); the fresh socket is blocking, which the non-blocking first
+/// attempt (MSG_DONTWAIT) and the off-loop deferral both tolerate. A host
+/// socket that cannot be minted fails closed with ECONNREFUSED — never a
+/// silent fallback to the sandbox-netns dup, which cannot reach the
+/// destination anyway.
+fn resolve_send_netns(
+    ctx: &SupervisorCtx,
+    dup_fd: OwnedFd,
+    m: MaterializedMsg,
+    flags: i32,
+) -> NotifAction {
+    let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
+    if send_needs_host_socket(ctx, dup_fd.as_raw_fd(), &m.addr) {
+        match super::connect::new_host_socket(dup_fd.as_raw_fd()) {
+            Some(host) => resolve_send(host, m, flags, blocking),
+            None => NotifAction::Errno(ECONNREFUSED),
+        }
+    } else {
+        resolve_send(dup_fd, m, flags, blocking)
+    }
+}
+
+/// Select the send fd for one `sendmmsg` batch entry: the child's dup, or a
+/// host-side socket created lazily on the first entry the sandbox netns
+/// cannot route (see [`send_needs_host_socket`]). Once a host socket is
+/// created it carries the whole rest of the batch, so a mixed batch's earlier
+/// loopback entries stay sandbox-local and only entries after the first
+/// external one may see host-loopback semantics (exotic; documented). `Err` is
+/// returned when a host socket is required but cannot be minted — the caller
+/// fails the batch closed, matching the single-message path.
+fn batch_entry_send_fd<'a>(
+    ctx: &SupervisorCtx,
+    dup_fd: &'a OwnedFd,
+    host_sock: &'a mut Option<OwnedFd>,
+    addr: &[u8],
+) -> Result<&'a OwnedFd, i32> {
+    if !send_needs_host_socket(ctx, dup_fd.as_raw_fd(), addr) {
+        return Ok(dup_fd);
+    }
+    if host_sock.is_none() {
+        *host_sock = super::connect::new_host_socket(dup_fd.as_raw_fd());
+    }
+    host_sock.as_ref().ok_or(ECONNREFUSED)
+}
 
 // ============================================================
 // sendto_on_behalf / sendmsg_on_behalf — on-behalf (TOCTOU-safe)
@@ -165,8 +265,7 @@ pub(super) async fn sendto_on_behalf(
             _scm_fds: Vec::new(),
             _pinned: None,
         };
-        let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
-        resolve_send(dup_fd, m, flags, blocking)
+        resolve_send_netns(ctx, dup_fd, m, flags)
     } else {
         // Non-IP family. Gate a NAMED AF_UNIX datagram the same way as connect:
         // sendto to a named socket is a WRITE on its inode, so deny unless the
@@ -353,10 +452,7 @@ pub(super) async fn sendmsg_on_behalf(
     let protocol = query_socket_protocol(dup_fd.as_raw_fd());
 
     match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, protocol, msghdr_ptr).await {
-        Ok(m) => {
-            let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
-            resolve_send(dup_fd, m, flags, blocking)
-        }
+        Ok(m) => resolve_send_netns(ctx, dup_fd, m, flags),
         Err(errno) => NotifAction::Errno(errno),
     }
 }
@@ -580,6 +676,7 @@ pub(super) async fn sendmmsg_on_behalf(
         let protocol = query_socket_protocol(dup_fd.as_raw_fd());
         let mut sent: usize = 0;
         let mut first_errno: Option<i32> = None;
+        let mut host_sock: Option<OwnedFd> = None;
         for i in 0..vlen {
             let entry_ptr = mmsg_entry_ptr(msgvec_ptr, i);
             let m = match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, protocol, entry_ptr)
@@ -591,8 +688,15 @@ pub(super) async fn sendmmsg_on_behalf(
                     break;
                 }
             };
+            let send_fd = match batch_entry_send_fd(ctx, &dup_fd, &mut host_sock, &m.addr) {
+                Ok(fd) => fd,
+                Err(errno) => {
+                    first_errno = Some(errno);
+                    break;
+                }
+            };
             match batch_send_step(
-                &dup_fd, m, flags, notif_fd, notif.id, notif.pid,
+                send_fd, m, flags, notif_fd, notif.id, notif.pid,
                 mmsg_msglen_addr(entry_ptr), sent,
             ) {
                 BatchStep::Sent => sent += 1,
@@ -637,6 +741,7 @@ pub(super) async fn sendmmsg_on_behalf(
 
     let mut sent: usize = 0;
     let mut first_errno: Option<i32> = None;
+    let mut host_sock: Option<OwnedFd> = None;
 
     for i in 0..vlen {
         let entry_ptr = mmsg_entry_ptr(msgvec_ptr, i);
@@ -649,8 +754,15 @@ pub(super) async fn sendmmsg_on_behalf(
                 break;
             }
         };
+        let send_fd = match batch_entry_send_fd(ctx, &dup_fd, &mut host_sock, &m.addr) {
+            Ok(fd) => fd,
+            Err(errno) => {
+                first_errno = Some(errno);
+                break;
+            }
+        };
         match batch_send_step(
-            &dup_fd, m, flags, notif_fd, notif.id, notif.pid,
+            send_fd, m, flags, notif_fd, notif.id, notif.pid,
             mmsg_msglen_addr(entry_ptr), sent,
         ) {
             BatchStep::Sent => sent += 1,
@@ -671,5 +783,61 @@ pub(super) async fn sendmmsg_on_behalf(
         // failed, so first_errno is set. Fall back to ECONNREFUSED
         // rather than panicking on the unwrap if invariants ever drift.
         NotifAction::Errno(first_errno.unwrap_or(ECONNREFUSED))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn datagram_dest_requires_host_socket_matches_netns_reachability() {
+        // Loopback stays on the sandbox's own lo (incl. the in-netns DNS
+        // gateway 127.0.1.x): no host socket.
+        assert!(!datagram_dest_requires_host_socket("127.0.0.1".parse().unwrap(), false));
+        assert!(!datagram_dest_requires_host_socket("127.0.1.1".parse().unwrap(), false));
+        assert!(!datagram_dest_requires_host_socket("::1".parse().unwrap(), false));
+        // A non-loopback destination on an unconnected socket cannot be
+        // routed by the loopback-only netns: host socket required.
+        assert!(datagram_dest_requires_host_socket("198.18.0.100".parse().unwrap(), false));
+        assert!(datagram_dest_requires_host_socket("93.184.216.34".parse().unwrap(), false));
+        assert!(datagram_dest_requires_host_socket("2001:4860:4860::8888".parse().unwrap(), false));
+        // A connected socket keeps the dup-based path: post-injection the dup
+        // IS the host socket; a kernel-connected socket reached only
+        // sandbox-local loopback.
+        assert!(!datagram_dest_requires_host_socket("198.18.0.100".parse().unwrap(), true));
+    }
+
+    #[test]
+    fn socket_has_peer_distinguishes_connected_udp() {
+        let a = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        let b = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        assert!(a >= 0 && b >= 0, "socket(2) must succeed in the test env");
+        assert!(!socket_has_peer(a), "an unconnected UDP socket has no peer");
+
+        // UDP connect() sends no packet and needs no listener; it only pins
+        // the default peer, which getpeername then reports.
+        let sa = libc::sockaddr_in {
+            sin_family: libc::AF_INET as u16,
+            sin_port: 9999u16.to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            },
+            sin_zero: [0; 8],
+        };
+        let rc = unsafe {
+            libc::connect(
+                a,
+                &sa as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "UDP connect to loopback must succeed");
+        assert!(socket_has_peer(a), "a connected UDP socket has a peer");
+
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
     }
 }

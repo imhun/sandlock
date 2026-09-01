@@ -667,8 +667,11 @@ fn connect_dup(fd: RawFd, addr: &[u8]) -> NotifAction {
 /// Returns `None` when the child's socket parameters cannot be reproduced —
 /// e.g. `socket(2)` fails for an ICMP ping socket an unprivileged supervisor
 /// cannot mint — in which case callers fail closed or fall back to the
-/// legacy dup-based on-behalf connect.
-fn new_host_socket(dup_fd: RawFd) -> Option<OwnedFd> {
+/// legacy dup-based on-behalf connect. Reused by the send path (S2.4): a
+/// `net_isolation` sandbox's loopback-only netns cannot route an unconnected
+/// datagram to a non-loopback destination, so the on-behalf send mints a
+/// fresh host-side socket the same way.
+pub(super) fn new_host_socket(dup_fd: RawFd) -> Option<OwnedFd> {
     let mut domain: libc::c_int = 0;
     let mut sock_type: libc::c_int = 0;
     let mut protocol: libc::c_int = 0;
