@@ -500,8 +500,11 @@ pub(super) fn sendmmsg_named_unix_on_behalf(
                 break;
             }
         };
+        // No host-socket substitution on this path: the send fd is the child's
+        // own dup, so its mode is the child's mode.
+        let child_blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
         match batch_send_step(
-            &dup_fd, m, flags, notif_fd, notif.id, notif.pid,
+            &dup_fd, m, flags, child_blocking, notif_fd, notif.id, notif.pid,
             mmsg_msglen_addr(entry_ptr), sent,
         ) {
             BatchStep::Sent => sent += 1,

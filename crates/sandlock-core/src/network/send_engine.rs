@@ -194,6 +194,13 @@ pub(crate) enum BatchStep {
 /// entry, or at entry 0 of a non-blocking child, is a contract-legal
 /// `Stop(EAGAIN)`; a hard error is `Stop(err)`.
 ///
+/// `child_blocking` is the CHILD socket's blocking mode (computed by the
+/// caller with [`wants_blocking`] on the child's dup), not the mode of
+/// `dup_fd` itself: the S2.4 host-socket substitution sends a batch through a
+/// fresh, blocking host-side socket even when the child socket is
+/// non-blocking, and the kernel contract to reproduce is the child's — a
+/// non-blocking child must get `EAGAIN`, never a deferred "success".
+///
 /// `dup_fd` is borrowed; the two deferred cases `try_clone` it (a `dup(2)` of
 /// the same file description, so semantics match handing over the original).
 /// If the clone fails after a partial send, the entry is counted with its
@@ -204,16 +211,16 @@ pub(crate) fn batch_send_step(
     dup_fd: &OwnedFd,
     m: MaterializedMsg,
     flags: i32,
+    child_blocking: bool,
     notif_fd: RawFd,
     notif_id: u64,
     notif_pid: u32,
     msglen_addr: u64,
     prior_count: usize,
 ) -> BatchStep {
-    let blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
     let ret = send_materialized_at(dup_fd.as_raw_fd(), &m, 0, flags | libc::MSG_DONTWAIT);
     if ret >= 0 {
-        if blocking && (ret as usize) < m.data.len() {
+        if child_blocking && (ret as usize) < m.data.len() {
             // Partial stream on a blocking socket: finish this entry off the
             // loop and report it as completed with its full byte count.
             let dup = match dup_fd.try_clone() {
@@ -238,7 +245,7 @@ pub(crate) fn batch_send_step(
     }
     let err = unsafe { *libc::__errno_location() };
     if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
-        if prior_count == 0 && blocking {
+        if prior_count == 0 && child_blocking {
             // Entry 0 would block entirely: a blocking socket never returns
             // EAGAIN, so complete it off the loop.
             let dup = match dup_fd.try_clone() {
@@ -252,4 +259,103 @@ pub(crate) fn batch_send_step(
         return BatchStep::Stop(libc::EAGAIN);
     }
     BatchStep::Stop(err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::io::FromRawFd;
+
+    fn materialized(data: Vec<u8>) -> MaterializedMsg {
+        MaterializedMsg {
+            data,
+            control: None,
+            addr: Vec::new(),
+            _scm_fds: Vec::new(),
+            _pinned: None,
+        }
+    }
+
+    /// S2.4 regression lock: a `sendmmsg` batch's blocking decision must come
+    /// from the CHILD socket's mode, not from the send fd's own flags. The
+    /// host-socket substitution hands the batch to a fresh, blocking host-side
+    /// socket even when the child is non-blocking; if the supervisor deferred
+    /// a would-block into "delayed success" instead of `EAGAIN`, the child's
+    /// event-loop semantics would silently change. The test reproduces that
+    /// exact shape — a blocking (host-like) fd with a full send buffer driven
+    /// by a non-blocking child — using a stream socketpair: a deterministic
+    /// full buffer is not reliably reproducible on UDP, and the would-block /
+    /// blocking-mode semantics under test are identical.
+    #[test]
+    fn batch_send_step_would_block_follows_child_mode_not_send_fd_mode() {
+        let mut fds = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
+            0,
+            "socketpair(2) must succeed"
+        );
+        let (sender, receiver) = (fds[0], fds[1]);
+
+        // Fill the send buffer while the fd is non-blocking; stop on the first
+        // EAGAIN, then confirm the buffer is truly at capacity with a 1-byte
+        // probe (the final fill may have partially fit).
+        let orig_fl = unsafe { libc::fcntl(sender, libc::F_GETFL) };
+        assert!(orig_fl >= 0, "F_GETFL must succeed");
+        unsafe { libc::fcntl(sender, libc::F_SETFL, orig_fl | libc::O_NONBLOCK) };
+        let chunk = vec![0xABu8; 64 << 10];
+        let mut fills = 0usize;
+        loop {
+            let rc = unsafe {
+                libc::send(sender, chunk.as_ptr() as *const libc::c_void, chunk.len(), 0)
+            };
+            if rc < 0 {
+                assert_eq!(
+                    unsafe { *libc::__errno_location() },
+                    libc::EAGAIN,
+                    "filling a non-blocking stream socket must end in EAGAIN"
+                );
+                break;
+            }
+            assert!(rc > 0, "send during fill must make progress");
+            fills += 1;
+            assert!(fills < 8192, "send buffer did not fill (infinite-loop guard)");
+        }
+        let one = [0u8; 1];
+        let rc = unsafe { libc::send(sender, one.as_ptr() as *const libc::c_void, 1, 0) };
+        assert_eq!(rc, -1, "the send buffer must be at capacity");
+        assert_eq!(unsafe { *libc::__errno_location() }, libc::EAGAIN);
+
+        // Restore blocking mode: the fd now looks like a fresh host-side
+        // socket (blocking), while the child we model is non-blocking.
+        unsafe { libc::fcntl(sender, libc::F_SETFL, orig_fl) };
+        assert!(wants_blocking(sender, 0), "premise: the send fd itself is blocking");
+
+        let sender_owned = unsafe { OwnedFd::from_raw_fd(sender) };
+
+        // Non-blocking child on a full buffer: the kernel contract is EAGAIN.
+        // The fixed code must not defer it into a "delayed success".
+        let step = batch_send_step(
+            &sender_owned, materialized(vec![0xCDu8; 64 << 10]), 0, false,
+            -1, 0, 0, 0, 0,
+        );
+        assert!(
+            matches!(step, BatchStep::Stop(e) if e == libc::EAGAIN),
+            "a non-blocking child on a full buffer must Stop(EAGAIN), never defer"
+        );
+
+        // Same shape, blocking child: entry 0 would-block must defer off the
+        // loop (`Done`), preserving the kernel's no-spurious-EAGAIN contract
+        // for blocking sockets. Nothing was sent by the call above, so the
+        // buffer is still full.
+        let step = batch_send_step(
+            &sender_owned, materialized(vec![0xCDu8; 64 << 10]), 0, true,
+            -1, 0, 0, 0, 0,
+        );
+        assert!(
+            matches!(step, BatchStep::Done(_)),
+            "a blocking child on a full buffer must defer to completion, not Stop(EAGAIN)"
+        );
+
+        unsafe { libc::close(receiver) };
+    }
 }

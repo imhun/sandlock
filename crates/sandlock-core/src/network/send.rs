@@ -107,12 +107,14 @@ fn resolve_send_netns(
 
 /// Select the send fd for one `sendmmsg` batch entry: the child's dup, or a
 /// host-side socket created lazily on the first entry the sandbox netns
-/// cannot route (see [`send_needs_host_socket`]). Once a host socket is
-/// created it carries the whole rest of the batch, so a mixed batch's earlier
-/// loopback entries stay sandbox-local and only entries after the first
-/// external one may see host-loopback semantics (exotic; documented). `Err` is
-/// returned when a host socket is required but cannot be minted — the caller
-/// fails the batch closed, matching the single-message path.
+/// cannot route (see [`send_needs_host_socket`]). Routing is per-entry:
+/// loopback (and connected) entries always go through the child's dup
+/// (sandbox-netns semantics) even after a host socket exists, while every
+/// external entry shares the one lazily-minted host socket — a single source
+/// port for the whole batch, matching the kernel's single-socket `sendmmsg`
+/// semantics. `Err` is returned when a host socket is required but cannot be
+/// minted — the caller fails the batch closed, matching the single-message
+/// path.
 fn batch_entry_send_fd<'a>(
     ctx: &SupervisorCtx,
     dup_fd: &'a OwnedFd,
@@ -677,6 +679,13 @@ pub(super) async fn sendmmsg_on_behalf(
         let mut sent: usize = 0;
         let mut first_errno: Option<i32> = None;
         let mut host_sock: Option<OwnedFd> = None;
+        // Blocking is decided by the CHILD's socket mode, not the send fd's:
+        // `batch_entry_send_fd` may hand the batch to a fresh blocking host
+        // socket (S2.4), whose flags would wrongly make a non-blocking child
+        // look blocking (deferring a would-block into "success" instead of
+        // EAGAIN). The child dup is the same for every entry and the flags do
+        // not change, so compute once for the whole batch.
+        let child_blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
         for i in 0..vlen {
             let entry_ptr = mmsg_entry_ptr(msgvec_ptr, i);
             let m = match send_msghdr_on_behalf(notif, ctx, notif_fd, &dup_fd, protocol, entry_ptr)
@@ -696,7 +705,7 @@ pub(super) async fn sendmmsg_on_behalf(
                 }
             };
             match batch_send_step(
-                send_fd, m, flags, notif_fd, notif.id, notif.pid,
+                send_fd, m, flags, child_blocking, notif_fd, notif.id, notif.pid,
                 mmsg_msglen_addr(entry_ptr), sent,
             ) {
                 BatchStep::Sent => sent += 1,
@@ -742,6 +751,9 @@ pub(super) async fn sendmmsg_on_behalf(
     let mut sent: usize = 0;
     let mut first_errno: Option<i32> = None;
     let mut host_sock: Option<OwnedFd> = None;
+    // Same as the policy branch above: the batch's blocking decision follows
+    // the child socket's mode, not the (possibly fresh host) send fd's.
+    let child_blocking = wants_blocking(dup_fd.as_raw_fd(), flags);
 
     for i in 0..vlen {
         let entry_ptr = mmsg_entry_ptr(msgvec_ptr, i);
@@ -762,7 +774,7 @@ pub(super) async fn sendmmsg_on_behalf(
             }
         };
         match batch_send_step(
-            send_fd, m, flags, notif_fd, notif.id, notif.pid,
+            send_fd, m, flags, child_blocking, notif_fd, notif.id, notif.pid,
             mmsg_msglen_addr(entry_ptr), sent,
         ) {
             BatchStep::Sent => sent += 1,
