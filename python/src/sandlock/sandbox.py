@@ -414,9 +414,13 @@ class Sandbox:
     while the host sees the requested UID, so distinct ``uid`` values across
     sandboxes give kernel-enforced file and unix-socket isolation.
     With an unprivileged supervisor the single-entry map can only cover the
-    caller's own euid: the requested UID is visible inside the namespace and
-    the host identity stays the caller's.  The child has no real host
-    privileges regardless of the mapped UID."""
+    caller's own euid, so a ``uid`` that differs from the supervisor identity
+    cannot be honored: the sandbox would silently keep the supervisor's host
+    uid and per-sandbox isolation would be absent.  Such requests are
+    **refused** at spawn with an explicit error.  Per-sandbox independent
+    host uids require a privileged supervisor (root/CAP_SETUID in the parent
+    user namespace) or an equivalent mapping mechanism.  The child has no
+    real host privileges regardless of the mapped UID."""
 
     gid: int | None = None
     """Host GID paired with ``uid`` (set both or neither).  A single-entry

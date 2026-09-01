@@ -302,14 +302,16 @@ fn test_cow_commit_runs_on_cli_exit() {
     assert_eq!(contents.trim(), "committed");
 }
 
-/// `--user N:N` maps the sandbox to UID `N` via an unprivileged
-/// user namespace, even when the host UID is non-zero. This is the only
-/// remaining `CLONE_NEWUSER` site after the overlayfs backend removal;
-/// the test guards against accidentally tearing it out.
+/// `--user 0:0` makes the child see UID 0 when the supervisor is privileged
+/// (host identity 0 — the userns is skipped entirely because the supervisor
+/// already has that identity).  An unprivileged supervisor cannot map a
+/// different host uid (single-entry userns map only covers the caller's own
+/// euid), so the request is refused fail-closed instead of silently running
+/// with the caller's identity.
 #[test]
 fn test_uid_mapping_fakes_root() {
-    // `id -u` reports the in-namespace UID. Passing --user 0:0 should make
-    // the child see UID 0 (fake root) regardless of the host UID.
+    let euid = unsafe { libc::geteuid() };
+    // `id -u` reports the in-namespace UID.
     let output = sandlock_bin()
         .args(args_for_host(&[
             "run",
@@ -319,22 +321,40 @@ fn test_uid_mapping_fakes_root() {
         ]))
         .output()
         .expect("failed to run sandlock");
-    assert!(
-        output.status.success(),
-        "sandlock --user 0:0 failed: stderr={}",
-        String::from_utf8_lossy(&output.stderr),
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        "0",
-        "expected UID 0 inside sandbox; got stdout={:?}",
-        String::from_utf8_lossy(&output.stdout),
-    );
+    if euid == 0 {
+        assert!(
+            output.status.success(),
+            "sandlock --user 0:0 failed: stderr={}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "0",
+            "expected UID 0 inside sandbox; got stdout={:?}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+    } else {
+        assert!(
+            !output.status.success(),
+            "unprivileged --user 0:0 must be refused, got success"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).lines().next().unwrap(),
+            format!(
+                "Error: process error: child process error: {}",
+                run_as_refused_msg(0, 0, euid),
+            ),
+            "unprivileged --user 0:0 must refuse with the exact fail-closed error",
+        );
+    }
 }
 
+/// Arbitrary `--user` values are the sandbox's HOST identity under a
+/// privileged supervisor (inside sees uid 0), and are refused fail-closed
+/// under an unprivileged supervisor.
 #[test]
 fn test_uid_mapping_arbitrary_uid() {
-    // Arbitrary --user value should also map cleanly (not just 0).
+    let euid = unsafe { libc::geteuid() };
     let output = sandlock_bin()
         .args(args_for_host(&[
             "run",
@@ -344,15 +364,44 @@ fn test_uid_mapping_arbitrary_uid() {
         ]))
         .output()
         .expect("failed to run sandlock");
-    assert!(
-        output.status.success(),
-        "sandlock --user 1234:1234 failed: stderr={}",
-        String::from_utf8_lossy(&output.stderr),
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        "1234",
-    );
+    if euid == 0 {
+        assert!(
+            output.status.success(),
+            "sandlock --user 1234:1234 failed: stderr={}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        // Privileged contract: `RunAs` is the HOST identity — inside sees
+        // uid 0 (fake root), the host sees 1234.
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "0",
+            "privileged: inside uid must be 0 (host identity 1234)",
+        );
+    } else {
+        assert!(
+            !output.status.success(),
+            "unprivileged --user 1234:1234 must be refused, got success"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).lines().next().unwrap(),
+            format!(
+                "Error: process error: child process error: {}",
+                run_as_refused_msg(1234, 1234, euid),
+            ),
+            "unprivileged --user 1234:1234 must refuse with the exact fail-closed error",
+        );
+    }
+}
+
+/// Exact fail-closed refusal message printed by the CLI for an unprivileged
+/// `RunAs` remap (see `sandbox-core` `do_create_stdio`); kept in lockstep.
+fn run_as_refused_msg(uid: u32, gid: u32, euid: u32) -> String {
+    format!(
+        "RunAs({uid}, {gid}) refused: unprivileged supervisor (euid={euid}) cannot map an \
+         arbitrary host uid (single-entry userns map can only cover the caller's own euid); \
+         per-sandbox independent host uids require a privileged supervisor \
+         (root/CAP_SETUID in the parent user namespace) or an equivalent mechanism"
+    )
 }
 
 /// `sandlock run --profile-file` prints a hint to stderr suggesting

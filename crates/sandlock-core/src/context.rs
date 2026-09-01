@@ -570,10 +570,15 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
                         fail!("setresuid(0) to activate mapped host uid");
                     }
                 } else {
-                    // Unprivileged fallback (single-entry map can only cover
-                    // the caller's own euid): the requested uid is visible
-                    // inside the namespace and the host uid stays the
-                    // caller's — the historical contract.
+                    // Defense-in-depth only: `do_create_stdio` refuses an
+                    // unprivileged `RunAs` remap *before* forking, because a
+                    // single-entry map can only cover the caller's own euid
+                    // (no CAP_SETUID in the parent namespace) — the sandbox
+                    // would silently keep the supervisor's host uid and
+                    // per-sandbox isolation would be absent.  If this branch
+                    // is ever reached outside that path, self-map the
+                    // requested uid inside the namespace as a last resort
+                    // rather than running as the overflow uid (65534).
                     if write_id_maps(real_uid, real_gid, run_as.uid, run_as.gid).is_err() {
                         fail!(
                             "uid_map/gid_map write (is unprivileged userns restricted? \

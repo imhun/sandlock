@@ -90,10 +90,15 @@ impl ByteSize {
 ///   different `RunAs` ids therefore get kernel-enforced file and unix-socket
 ///   isolation (0700 + distinct host uid), even against a shared volume.
 /// * **Unprivileged supervisor**: a single-entry userns can only map the
-///   caller's own euid, so the requested `uid`/`gid` are visible *inside* the
-///   namespace and the host identity stays the caller's (the historical
-///   contract).  Cross-sandbox host-uid isolation is then impossible by
-///   kernel design.
+///   caller's own euid, so a `RunAs` that differs from the supervisor
+///   identity can never be honored as a *host* uid — the sandbox would
+///   silently keep the caller's host identity and cross-sandbox isolation
+///   would be absent.  Such requests are **refused** at spawn with an
+///   explicit error.  Per-sandbox independent host uids require a
+///   privileged supervisor (root/CAP_SETUID in the parent user namespace)
+///   or an equivalent mapping mechanism; only a `RunAs` matching the
+///   supervisor's own identity (which skips the userns entirely) is
+///   accepted without privilege.
 ///
 /// Either way exactly one uid and one gid are representable (no
 /// supplementary groups on the privileged path, no id ranges).
@@ -1966,13 +1971,35 @@ impl Sandbox {
         // can only ever map its own euid — the single-entry map `0 -> host_uid`
         // needs the parent to hold CAP_SETUID/CAP_SETGID there (root).  The
         // pipes exist exactly when `RunAs` differs from our own identity and
-        // we are privileged; the unprivileged path keeps the historical
-        // child self-map (requested uid visible inside, host uid = caller's).
+        // we are privileged.
         let real_uid = unsafe { libc::getuid() };
         let real_gid = unsafe { libc::getgid() };
         let privileged_userns = unsafe { libc::geteuid() } == 0;
         let userns_remap =
             matches!(self.user, Some(run_as) if run_as.uid != real_uid || run_as.gid != real_gid);
+
+        // Fail closed on unprivileged `RunAs` remaps.  A single-entry userns
+        // map written by the child can only cover the caller's own euid (no
+        // CAP_SETUID in the parent namespace), so an unprivileged supervisor
+        // can never honor a *different* host uid: the sandbox would silently
+        // run with the supervisor's host identity, per-sandbox isolation
+        // would be absent, and the requested `RunAs` would be a lie.  Refuse
+        // before fork so the caller gets an explicit error instead of a
+        // sandbox that looks right but is not isolated.  Per-sandbox
+        // independent uids require a privileged supervisor (root/CAP_SETUID
+        // in the parent user namespace) or an equivalent mapping mechanism.
+        if userns_remap && !privileged_userns {
+            let run_as = self.user.expect("userns_remap implies a RunAs");
+            return Err(SandboxRuntimeError::Child(format!(
+                "RunAs({}, {}) refused: unprivileged supervisor (euid={}) cannot map an arbitrary \
+                 host uid (single-entry userns map can only cover the caller's own euid); \
+                 per-sandbox independent host uids require a privileged supervisor \
+                 (root/CAP_SETUID in the parent user namespace) or an equivalent mechanism",
+                run_as.uid, run_as.gid, real_uid,
+            ))
+            .into());
+        }
+
         let map_pipes = if privileged_userns && userns_remap {
             // (ready: child writes / parent reads, done: parent writes /
             // child reads). `make_cloexec_pipe` returns (read, write).
@@ -2268,7 +2295,13 @@ impl Sandbox {
         // map-done pipe until the maps are written. On failure the child is
         // SIGKILL'd directly (the pid-ns intermediate has not setpgid'd yet,
         // so killpg could hit the supervisor's own group) and the error is
-        // returned; Drop then only reaps the already-dead child.
+        // returned. `child_pid` is only registered after this handshake, so
+        // Drop's killpg+waitpid cannot reap this child — it is reaped
+        // explicitly below instead (a SIGKILLed child would otherwise linger
+        // as a zombie until the supervisor exits). On the pid-ns path the
+        // intermediate has not forked the leader yet (the map handshake
+        // precedes the final fork), so waiting for the direct child is
+        // sufficient.
         if let Some((ready, done)) = map_pipes {
             let ready_r = ready.0;
             let done_w = done.1;
@@ -2283,6 +2316,8 @@ impl Sandbox {
             if let Err(e) = map_result {
                 eprintln!("sandlock: user-namespace map write for child {pid}: {e}");
                 unsafe { libc::kill(pid, libc::SIGKILL) };
+                let mut status: i32 = 0;
+                unsafe { libc::waitpid(pid, &mut status, 0) };
                 return Err(SandboxRuntimeError::Child(format!(
                     "uid_map/gid_map write for sandbox child (is unprivileged userns \
                      restricted? e.g. kernel.apparmor_restrict_unprivileged_userns=1): {e}"

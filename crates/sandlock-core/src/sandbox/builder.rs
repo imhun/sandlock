@@ -848,9 +848,13 @@ impl SandboxBuilder {
     /// map `0 -> uid`, the process appears as uid 0 inside the namespace, and
     /// distinct `uid`s across sandboxes give kernel-enforced file and
     /// unix-socket isolation.  With an **unprivileged** supervisor the
-    /// single-entry map can only cover the caller's own euid, so the requested
-    /// ids are visible inside the namespace and the host identity stays the
-    /// caller's (historical behavior, no host privilege required).
+    /// single-entry map can only cover the caller's own euid, so a request
+    /// for a *different* host identity cannot be honored — the sandbox would
+    /// silently keep the caller's host uid and cross-sandbox isolation would
+    /// be absent.  Such requests are therefore **refused** at spawn with an
+    /// explicit error.  Per-sandbox independent host uids require a
+    /// privileged supervisor (root/CAP_SETUID in the parent user namespace)
+    /// or an equivalent mapping mechanism.
     ///
     /// If `uid`/`gid` already match the process's real uid/gid at launch, no
     /// user namespace is created — the process already has that identity, so
