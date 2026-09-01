@@ -1804,6 +1804,20 @@ impl Sandbox {
             return Err(SandboxRuntimeError::Child("empty command".into()).into());
         }
 
+        // fd_inject_connect is a seccomp-supervisor feature: the supervisor
+        // performs the host connect and ADDFD injection on its side. With
+        // no_supervisor there is no listener to intercept connect(), so the
+        // switch would be silently ignored — refuse the combination instead
+        // of running with a quietly weaker network path.
+        if self.fd_inject_connect && self.no_supervisor {
+            return Err(SandboxRuntimeError::Child(
+                "fd_inject_connect requires the seccomp supervisor and is \
+                 incompatible with no_supervisor=true"
+                    .into(),
+            )
+            .into());
+        }
+
         // Resolve the chroot root eagerly, before any fork or confinement work:
         // a configured-but-missing chroot must be a hard error, never a silent
         // drop to "no confinement".

@@ -258,6 +258,91 @@ async fn test_socks5_fail_closed_when_proxy_unreachable_inner() {
     );
 }
 
+/// With `fd_inject_connect` on, an allowed TCP connect is still tunneled
+/// through the SOCKS5 egress proxy: the fresh host-side socket dials the
+/// proxy, the tunnel is injected into the sandbox, and the trapped connect()
+/// returns the injected fd number — never a direct path to the origin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_socks5_tunnels_tcp_with_fd_injection() {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        test_socks5_tunnels_tcp_with_fd_injection_inner(),
+    )
+    .await
+    .expect("socks5 fd-injection tunnel test timed out");
+}
+
+async fn test_socks5_tunnels_tcp_with_fd_injection_inner() {
+    let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin_port = origin.local_addr().unwrap().port();
+    let origin_server = tokio::spawn(async move {
+        let (mut stream, _) = origin.accept().unwrap();
+        stream.write_all(b"TUNNELED-OK").unwrap();
+    });
+    let (proxy_port, proxy_handle, seen) = spawn_socks5_forwarder();
+
+    // The destination filter allows only the origin; the proxy endpoint is
+    // NOT in net_allow, so the sandbox cannot dial it directly.
+    let mut policy = base_policy()
+        .net_allow(format!("127.0.0.1:{}", origin_port))
+        .egress_proxy(format!("127.0.0.1:{}", proxy_port))
+        .fd_inject_connect(true)
+        .build()
+        .unwrap();
+    let script = format!(concat!(
+        "import ctypes, socket, struct\n",
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+        "libc.connect.restype = ctypes.c_int\n",
+        "libc.recv.restype = ctypes.c_ssize_t\n",
+        "fd = libc.socket(socket.AF_INET, socket.SOCK_STREAM, 0)\n",
+        "addr = struct.pack('<H', socket.AF_INET) + struct.pack('!H', {origin}) + socket.inet_aton('127.0.0.1') + b'\\x00' * 8\n",
+        "buf = ctypes.create_string_buffer(addr)\n",
+        "ctypes.set_errno(0)\n",
+        "ret = libc.connect(fd, buf, len(addr))\n",
+        "if ret < 0:\n",
+        "  print(f'CONNECT_ERR:{{ctypes.get_errno()}}')\n",
+        "  raise SystemExit(0)\n",
+        "data = b''\n",
+        "buf2 = ctypes.create_string_buffer(64)\n",
+        "while len(data) < 11:\n",
+        "  n = libc.recv(fd, buf2, 64, 0)\n",
+        "  if n <= 0:\n",
+        "    break\n",
+        "  data += buf2.raw[:n]\n",
+        "print(f'RET={{ret}} FD={{fd}} DATA={{data[:11].decode()}}')\n",
+    ), origin = origin_port);
+
+    let result = policy.run(&["python3", "-c", &script]).await.unwrap();
+    let out = stdout_of(&result);
+    let parts: Vec<&str> = out.split_whitespace().collect();
+    assert_eq!(parts.len(), 3, "unexpected stdout: {out:?}");
+    let ret: i32 = parts[0]
+        .strip_prefix("RET=")
+        .expect("RET field")
+        .parse()
+        .unwrap();
+    let fd: i32 = parts[1]
+        .strip_prefix("FD=")
+        .expect("FD field")
+        .parse()
+        .unwrap();
+    assert_eq!(
+        ret, fd,
+        "injected connect must return the fd number under egress, got: {out:?}"
+    );
+    assert_eq!(
+        parts[2], "DATA=TUNNELED-OK",
+        "child must reach the origin through the tunnel under fd injection, got: {out:?}"
+    );
+
+    origin_server.await.unwrap();
+    let _ = proxy_handle.join();
+    let seen = seen.lock().unwrap().clone().expect("proxy must see a CONNECT");
+    assert_eq!(seen.atyp, 0x01, "literal IP target uses ATYP=IPv4");
+    assert_eq!(seen.host, "127.0.0.1");
+    assert_eq!(seen.port, origin_port);
+}
+
 /// A wildcard-domain destination keeps its name: the proxy receives
 /// ATYP=domain and resolves it remotely.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

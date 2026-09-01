@@ -160,19 +160,23 @@ pub(super) async fn connect_on_behalf(
                             );
                             return match result {
                                 Ok(()) => {
-                                    mirror_child_fd_flags(
+                                    mirror_child_file_status_flags(
                                         host.as_raw_fd(),
                                         dup_fd.as_raw_fd(),
                                     );
-                                    inject_connected_fd(host, sockfd)
+                                    inject_connected_fd(host, sockfd, notif.pid)
                                 }
                                 Err(_) => NotifAction::Errno(ECONNREFUSED),
                             };
                         }
-                        // A fresh socket could not be created (e.g. a
-                        // privileged protocol an unprivileged supervisor
-                        // cannot mint): fall through to the legacy
-                        // dup-based path below.
+                        // A fresh host-side socket could not be created (e.g.
+                        // EMFILE/ENFILE). The SOCKS5 egress tunnel is
+                        // mandatory once the proxy is configured: failing the
+                        // connect closed (ECONNREFUSED) here matches the old
+                        // dup-based egress semantics (which always returned),
+                        // and never falls through to the direct path below —
+                        // that would silently bypass the proxy.
+                        return NotifAction::Errno(ECONNREFUSED);
                     } else {
                         return match crate::network::egress::socks5_connect(
                             dup_fd.as_raw_fd(),
@@ -232,7 +236,11 @@ pub(super) async fn connect_on_behalf(
             if let Some(host) = new_host_socket(dup_fd.as_raw_fd()) {
                 // Injection path: connect the fresh host-side socket to the
                 // planned target, then inject it at the child's socket fd so
-                // the sandbox's connect() returns the fd number.
+                // the sandbox's connect() returns the fd number. The host
+                // socket is blocking and the connect must COMPLETE before the
+                // SETFD|SEND injection responds, so the child never observes
+                // EINPROGRESS on this path; the child's SO_SNDTIMEO bounds the
+                // wait (see `new_host_socket`).
                 if plan.record_orig_dest {
                     if let Some(ref map) = orig_dest_map {
                         // The local-address probe must bind in the socket's
@@ -254,8 +262,11 @@ pub(super) async fn connect_on_behalf(
                     )
                 };
                 return if ret == 0 {
-                    mirror_child_fd_flags(host.as_raw_fd(), dup_fd.as_raw_fd());
-                    inject_connected_fd(host, sockfd)
+                    mirror_child_file_status_flags(
+                        host.as_raw_fd(),
+                        dup_fd.as_raw_fd(),
+                    );
+                    inject_connected_fd(host, sockfd, notif.pid)
                 } else {
                     NotifAction::Errno(unsafe { *libc::__errno_location() })
                 };
@@ -625,10 +636,21 @@ fn connect_dup(fd: RawFd, addr: &[u8]) -> NotifAction {
 /// (SO_DOMAIN / SO_TYPE / SO_PROTOCOL) so it can be connected in the host
 /// netns and injected into the sandbox.
 ///
+/// The fresh socket is blocking. With `SECCOMP_ADDFD_FLAG_SETFD|SEND` the
+/// notification response IS the injection, so the host connect must complete
+/// before the child's `connect()` returns — the child can never observe
+/// `EINPROGRESS` on this path, and its own per-syscall timeout/cancel cannot
+/// interrupt the supervisor-side connect while it is in flight. To keep the
+/// supervisor from blocking for the kernel's default TCP timeout, the child's
+/// `SO_SNDTIMEO` (the connect timeout a blocking child would honor) is copied
+/// onto the host socket, bounding the wait by the child's own timeout. A
+/// per-sandbox netns (S2.2) still needs a real non-blocking scheme
+/// (EINPROGRESS-compatible response before completion); that is out of scope.
+///
 /// Returns `None` when the child's socket parameters cannot be reproduced —
 /// e.g. `socket(2)` fails for an ICMP ping socket an unprivileged supervisor
-/// cannot mint — in which case callers fall back to the legacy dup-based
-/// on-behalf connect.
+/// cannot mint — in which case callers fail closed or fall back to the
+/// legacy dup-based on-behalf connect.
 fn new_host_socket(dup_fd: RawFd) -> Option<OwnedFd> {
     let mut domain: libc::c_int = 0;
     let mut sock_type: libc::c_int = 0;
@@ -654,14 +676,48 @@ fn new_host_socket(dup_fd: RawFd) -> Option<OwnedFd> {
         return None;
     }
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    mirror_child_connect_timeout(owned.as_raw_fd(), dup_fd);
     Some(owned)
 }
 
-/// Mirror the child socket's fd semantics onto the host socket before
-/// injection: `O_NONBLOCK` (file status flags) and `FD_CLOEXEC` (fd flags).
-/// The injected fd must preserve the child's blocking mode and close-on-exec
-/// behavior, otherwise read/write semantics or exec hygiene silently change.
-fn mirror_child_fd_flags(host_fd: RawFd, dup_fd: RawFd) {
+/// Copy the child socket's `SO_SNDTIMEO` (its connect timeout) onto the fresh
+/// host socket, so the blocking host connect is bounded by the child's own
+/// timeout instead of the kernel default (see `new_host_socket`). The dup'd
+/// fd shares the child's socket options, so `getsockopt` here reads the
+/// child's value.
+fn mirror_child_connect_timeout(host_fd: RawFd, dup_fd: RawFd) {
+    let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
+    let mut len: libc::socklen_t = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            dup_fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDTIMEO,
+            &mut tv as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    } == 0
+    {
+        unsafe {
+            libc::setsockopt(
+                host_fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDTIMEO,
+                &tv as *const _ as *const libc::c_void,
+                len,
+            );
+        }
+    }
+}
+
+/// Mirror the child socket's shared file status flags onto the host socket
+/// before injection: `O_NONBLOCK` (and `O_ASYNC`). These ride the open file
+/// description, so setting them with `fcntl` on the host fd is exactly what
+/// the injected fd will see. `FD_CLOEXEC` is deliberately NOT mirrored here:
+/// it is a per-fd-table-entry flag in the child, decided solely by ADDFD's
+/// `newfd_flags` (see [`child_fd_cloexec`]); `fcntl` on the host fd cannot
+/// carry it across.
+fn mirror_child_file_status_flags(host_fd: RawFd, dup_fd: RawFd) {
     let fl = unsafe { libc::fcntl(dup_fd, libc::F_GETFL) };
     if fl >= 0 {
         let status = fl & (libc::O_NONBLOCK | libc::O_ASYNC);
@@ -671,21 +727,47 @@ fn mirror_child_fd_flags(host_fd: RawFd, dup_fd: RawFd) {
             }
         }
     }
-    let fd = unsafe { libc::fcntl(dup_fd, libc::F_GETFD) };
-    if fd >= 0 && (fd & libc::FD_CLOEXEC) != 0 {
-        unsafe {
-            libc::fcntl(host_fd, libc::F_SETFD, libc::FD_CLOEXEC);
-        }
-    }
+}
+
+/// Read whether the child's socket fd has `FD_CLOEXEC` set, from
+/// `/proc/<pid>/fdinfo/<fd>` (`flags:` line, octal). The injected fd's
+/// close-on-exec is decided by ADDFD's `newfd_flags`, and fcntl on the
+/// supervisor's copy cannot affect the child's fd-table entry, so the
+/// supervisor must ask the kernel for the child's own flags. The child is
+/// blocked in the trapped `connect()`, so the fd cannot be closed or replaced
+/// underneath this read by the connecting thread (another thread racing an
+/// `fcntl(F_SETFD)` remains a best-effort race, same as any flag probe).
+///
+/// Returns `None` when the flags cannot be read; callers then keep the
+/// current non-CLOEXEC default and log, rather than failing the connect.
+fn child_fd_cloexec(pid: u32, sockfd: i32) -> Option<bool> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{sockfd}")).ok()?;
+    let flags = text
+        .lines()
+        .find_map(|l| l.strip_prefix("flags:"))
+        .map(str::trim)?;
+    let v = u32::from_str_radix(flags, 8).ok()?;
+    Some(v & (libc::O_CLOEXEC as u32) != 0)
 }
 
 /// Build the action that atomically replaces the child's socket fd with the
 /// connected supervisor-side socket (`SETFD|SEND`): the child's `connect()`
-/// returns the fd number and the data plane is the injected fd.
-fn inject_connected_fd(host: OwnedFd, sockfd: i32) -> NotifAction {
+/// returns the fd number and the data plane is the injected fd. The child's
+/// own `FD_CLOEXEC` state is carried via `newfd_flags` (the only fd flag
+/// ADDFD supports), so a `SOCK_CLOEXEC` socket stays close-on-exec after
+/// injection and a plain socket does not gain it.
+fn inject_connected_fd(host: OwnedFd, sockfd: i32, pid: u32) -> NotifAction {
+    let cloexec = child_fd_cloexec(pid, sockfd).unwrap_or_else(|| {
+        eprintln!(
+            "sandlock: cannot read /proc/{pid}/fdinfo/{sockfd} to mirror FD_CLOEXEC; \
+             injected fd defaults to non-CLOEXEC"
+        );
+        false
+    });
     NotifAction::InjectFdSendAt {
         srcfd: host,
         targetfd: sockfd,
+        newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
     }
 }
 
@@ -857,6 +939,82 @@ mod tests {
         let plan = plan_connect_target(&a, Some(proxy), Some(41234)).unwrap();
         assert_eq!(parse_port_from_sockaddr(&plan.addr), Some(3128));
         assert!(plan.record_orig_dest);
+    }
+
+    // --- S2.1 injection helpers ---
+
+    #[test]
+    fn mirror_child_connect_timeout_copies_so_sndtimeo() {
+        let src = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        let dst = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(src >= 0 && dst >= 0, "socket(2) must succeed in the test env");
+        let tv = libc::timeval { tv_sec: 3, tv_usec: 500_000 };
+        let len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    src,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDTIMEO,
+                    &tv as *const _ as *const libc::c_void,
+                    len,
+                )
+            },
+            0,
+            "setting SO_SNDTIMEO on the source socket"
+        );
+
+        mirror_child_connect_timeout(dst, src);
+
+        let mut out: libc::timeval = unsafe { std::mem::zeroed() };
+        let mut out_len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+        assert_eq!(
+            unsafe {
+                libc::getsockopt(
+                    dst,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDTIMEO,
+                    &mut out as *mut _ as *mut libc::c_void,
+                    &mut out_len,
+                )
+            },
+            0,
+            "reading SO_SNDTIMEO from the host socket"
+        );
+        assert_eq!(out.tv_sec, 3);
+        assert_eq!(out.tv_usec, 500_000);
+        unsafe {
+            libc::close(src);
+            libc::close(dst);
+        }
+    }
+
+    #[test]
+    fn child_fd_cloexec_reads_own_fd_flags() {
+        let plain = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        let cloexec =
+            unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        let flipped = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(
+            plain >= 0 && cloexec >= 0 && flipped >= 0,
+            "socket(2) must succeed in the test env"
+        );
+        let pid = std::process::id();
+        assert_eq!(child_fd_cloexec(pid, plain), Some(false));
+        assert_eq!(child_fd_cloexec(pid, cloexec), Some(true));
+        // fcntl-set FD_CLOEXEC is also visible through fdinfo.
+        assert_eq!(
+            unsafe { libc::fcntl(flipped, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+        assert_eq!(child_fd_cloexec(pid, flipped), Some(true));
+        // A missing fd reads as None: callers keep the non-CLOEXEC default.
+        assert_eq!(child_fd_cloexec(pid, 1_000_000), None);
+        unsafe {
+            libc::close(plain);
+            libc::close(cloexec);
+            libc::close(flipped);
+        }
     }
 
 }

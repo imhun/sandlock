@@ -230,3 +230,114 @@ async fn test_default_connect_unchanged_returns_zero() {
     assert_eq!(ret_val, 0, "legacy on-behalf connect must return 0");
     assert_eq!(parts[2], "echo=ping", "legacy data plane must still work");
 }
+
+/// The injected fd must preserve the child's own close-on-exec: ADDFD's
+/// `newfd_flags` (not fcntl on the supervisor's copy) decides the child-side
+/// FD_CLOEXEC, and the supervisor derives it from `/proc/<pid>/fdinfo/<fd>`.
+/// A `SOCK_CLOEXEC` socket stays close-on-exec after injection; a plain
+/// socket must not gain it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fd_inject_connect_preserves_child_cloexec() {
+    for (mode, expect_cloexec) in [("CLOEXEC", true), ("PLAIN", false)] {
+        let out = temp_file(&format!("inject-cloexec-{mode}"));
+        let (port, srv) = spawn_echo_server();
+        let policy = base_policy()
+            .net_allow(format!("127.0.0.1:{}", port))
+            .fd_inject_connect(true)
+            .build()
+            .unwrap();
+
+        let script = format!(concat!(
+            "import ctypes, socket, struct, fcntl\n",
+            "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+            "libc.connect.restype = ctypes.c_int\n",
+            "libc.send.restype = ctypes.c_ssize_t\n",
+            "libc.recv.restype = ctypes.c_ssize_t\n",
+            "if '{mode}' == 'CLOEXEC':\n",
+            "  fd = libc.socket(socket.AF_INET, socket.SOCK_STREAM | socket.SOCK_CLOEXEC, 0)\n",
+            "else:\n",
+            "  fd = libc.socket(socket.AF_INET, socket.SOCK_STREAM, 0)\n",
+            "cloexec_before = bool(fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC)\n",
+            "addr = struct.pack('<H', socket.AF_INET) + struct.pack('!H', {port}) + socket.inet_aton('127.0.0.1') + b'\\x00' * 8\n",
+            "buf = ctypes.create_string_buffer(addr)\n",
+            "ctypes.set_errno(0)\n",
+            "ret = libc.connect(fd, buf, len(addr))\n",
+            "if ret < 0:\n",
+            "  open('{out}', 'w').write(f'connect_err={{ctypes.get_errno()}}')\n",
+            "  raise SystemExit(0)\n",
+            "cloexec_after = bool(fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC)\n",
+            "payload = b'ping'\n",
+            "n = libc.send(fd, payload, 4, 0)\n",
+            "buf2 = ctypes.create_string_buffer(4)\n",
+            "n2 = libc.recv(fd, buf2, 4, 0)\n",
+            "open('{out}', 'w').write(f'ret={{ret}} fd={{fd}} cloexec_before={{cloexec_before}} cloexec_after={{cloexec_after}} echo={{buf2.raw[:n2].decode()}}')\n",
+        ), mode = mode, port = port, out = out.display());
+
+        let result = policy
+            .clone()
+            .run_interactive(&["python3", "-c", &script])
+            .await
+            .unwrap();
+        assert!(
+            result.success(),
+            "exit={:?} stderr={:?}",
+            result.code(),
+            result.stderr
+        );
+
+        let content = std::fs::read_to_string(&out).unwrap_or_default();
+        let _ = std::fs::remove_file(&out);
+        srv.join().unwrap();
+
+        let parts: Vec<&str> = content.split_whitespace().collect();
+        assert_eq!(parts.len(), 5, "unexpected result line: {content}");
+        let ret_val: i32 = parts[0]
+            .strip_prefix("ret=")
+            .expect("ret field")
+            .parse()
+            .unwrap();
+        let fd_val: i32 = parts[1].strip_prefix("fd=").expect("fd field").parse().unwrap();
+        assert_eq!(
+            ret_val, fd_val,
+            "connect must return the injected fd number, got: {content}"
+        );
+        assert_eq!(
+            parts[2],
+            format!(
+                "cloexec_before={}",
+                if expect_cloexec { "True" } else { "False" }
+            ),
+            "child-side FD_CLOEXEC before connect must match the socket mode"
+        );
+        assert_eq!(
+            parts[3],
+            format!("cloexec_after={}", if expect_cloexec { "True" } else { "False" }),
+            "injected fd must preserve the child's FD_CLOEXEC, got: {content}"
+        );
+        assert_eq!(parts[4], "echo=ping", "echo over the injected fd must work");
+    }
+}
+
+/// fd_inject_connect is a seccomp-supervisor feature; with no_supervisor
+/// there is no listener to intercept connect(), so the switch would be
+/// silently ignored. The combination must fail fast, never run weaker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fd_inject_connect_rejected_with_no_supervisor() {
+    let policy = base_policy()
+        .no_supervisor(true)
+        .fd_inject_connect(true)
+        .build()
+        .unwrap();
+    let err = policy
+        .clone()
+        .run_interactive(&["python3", "-c", "pass"])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "process error: child process error: fd_inject_connect requires the seccomp \
+         supervisor and is incompatible with no_supervisor=true",
+        "no_supervisor + fd_inject_connect must fail closed"
+    );
+}

@@ -120,10 +120,15 @@ pub enum NotifAction {
     /// replaced and the syscall returns the fd number. Used by the connect
     /// fd-injection path, where the sandbox's socket fd is swapped for the
     /// supervisor's connected host-side socket. The `OwnedFd` is closed
-    /// automatically after the ioctl completes.
+    /// automatically after the ioctl completes. `newfd_flags` carries the
+    /// child-side fd flags for the injected fd (O_CLOEXEC — the only flag
+    /// ADDFD supports): FD_CLOEXEC is a per-fd-table-entry flag in the child
+    /// and cannot be mirrored via fcntl on the host fd, so the caller derives
+    /// it from the child's own fd flags.
     InjectFdSendAt {
         srcfd: OwnedFd,
         targetfd: i32,
+        newfd_flags: u32,
     },
     /// Synthetic return value (the child sees this as the syscall result).
     ReturnValue(i64),
@@ -1014,17 +1019,19 @@ fn inject_fd_and_send_at(
     id: u64,
     srcfd: RawFd,
     targetfd: i32,
+    newfd_flags: u32,
 ) -> io::Result<i32> {
     let addfd = SeccompNotifAddfd {
         id,
         flags: SECCOMP_ADDFD_FLAG_SETFD | SECCOMP_ADDFD_FLAG_SEND,
         srcfd: srcfd as u32,
         newfd: targetfd as u32,
-        // fd status flags are mirrored on the host socket via fcntl instead
-        // of newfd_flags: the running kernel (7.0.14-orbstack) rejects
-        // O_NONBLOCK in newfd_flags with EINVAL, and the fcntl copy works on
-        // every kernel since the flags ride the shared file description.
-        newfd_flags: 0,
+        // ADDFD installs a NEW fd-table entry in the child, so its flags are
+        // decided solely by newfd_flags (the kernel implements only
+        // O_CLOEXEC — O_NONBLOCK in newfd_flags is rejected with EINVAL).
+        // O_NONBLOCK, being a shared file status flag, is mirrored on the
+        // host socket via fcntl instead; FD_CLOEXEC cannot ride that path.
+        newfd_flags,
     };
     let ret = unsafe {
         libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong, &addfd as *const _)
@@ -1559,12 +1566,12 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
                 Err(_) => send_resp_raw(fd, &inject_failure_resp(id)),
             }
         }
-        NotifAction::InjectFdSendAt { srcfd, targetfd } => {
+        NotifAction::InjectFdSendAt { srcfd, targetfd, newfd_flags } => {
             // SETFD|SEND atomically replaces the child's fd slot at
             // `targetfd` and responds — the syscall returns the fd number.
             // On failure, deny (fail closed) rather than letting the original
             // syscall continue unmediated.
-            match inject_fd_and_send_at(fd, id, srcfd.as_raw_fd(), targetfd) {
+            match inject_fd_and_send_at(fd, id, srcfd.as_raw_fd(), targetfd, newfd_flags) {
                 Ok(_new_fd) => Ok(()),
                 Err(_) => send_resp_raw(fd, &inject_failure_resp(id)),
             }
