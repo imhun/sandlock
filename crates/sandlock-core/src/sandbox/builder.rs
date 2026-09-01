@@ -138,6 +138,11 @@ pub struct SandboxBuilder {
 
     #[cfg_attr(feature = "cli", arg(short = 'c', long = "cpu"))]
     pub max_cpu: Option<u8>,
+    /// Max seccomp user-notifications processed per second for this sandbox.
+    /// When exceeded the supervisor sleeps out the remainder of the window
+    /// (the sandbox's intercepted syscalls queue in the kernel), bounding
+    /// supervisor CPU spent on a notification flood. None = unlimited.
+    pub notify_rate_limit: Option<u32>,
 
     #[cfg_attr(feature = "cli", arg(long = "random-seed"))]
     pub random_seed: Option<u64>,
@@ -300,6 +305,7 @@ impl Default for SandboxBuilder {
             max_processes: None,
             max_open_files: None,
             max_cpu: None,
+            notify_rate_limit: None,
             random_seed: None,
             time_start: None,
             no_randomize_memory: false,
@@ -368,6 +374,7 @@ impl Clone for SandboxBuilder {
             max_processes: self.max_processes,
             max_open_files: self.max_open_files,
             max_cpu: self.max_cpu,
+            notify_rate_limit: self.notify_rate_limit,
             random_seed: self.random_seed,
             time_start: self.time_start,
             no_randomize_memory: self.no_randomize_memory,
@@ -665,6 +672,12 @@ impl SandboxBuilder {
 
     pub fn max_cpu(mut self, pct: u8) -> Self {
         self.max_cpu = Some(pct);
+        self
+    }
+
+    /// Limit seccomp user-notifications processed per second (0 disables).
+    pub fn notify_rate_limit(mut self, per_sec: u32) -> Self {
+        self.notify_rate_limit = if per_sec == 0 { None } else { Some(per_sec) };
         self
     }
 
@@ -1095,6 +1108,7 @@ impl SandboxBuilder {
             max_processes: self.max_processes.unwrap_or(64),
             max_open_files: self.max_open_files,
             max_cpu: self.max_cpu,
+            notify_rate_limit: self.notify_rate_limit,
             random_seed: self.random_seed,
             time_start: self.time_start,
             no_randomize_memory: self.no_randomize_memory,

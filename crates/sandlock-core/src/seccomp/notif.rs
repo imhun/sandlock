@@ -2393,6 +2393,7 @@ pub async fn supervisor(
     ctx: Arc<super::ctx::SupervisorCtx>,
     pending_handlers: Vec<(i64, std::sync::Arc<dyn super::dispatch::Handler>)>,
     startup: tokio::sync::oneshot::Sender<io::Result<()>>,
+    notify_rate_limit: Option<u32>,
 ) {
     // Register the notif fd with the Tokio IO driver so we can wait for
     // readiness via epoll instead of a dedicated blocking thread.
@@ -2436,6 +2437,15 @@ pub async fn supervisor(
     // processes.
     let defer_sem = Arc::new(tokio::sync::Semaphore::new(DEFER_MAX_INFLIGHT));
 
+    // Per-sandbox notification rate cap. When the window budget is exceeded
+    // the supervisor sleeps out the remainder of the second instead of
+    // draining the kernel queue at full speed; intercepted syscalls queue in
+    // the kernel (or the sandbox blocks), so a flood cannot pin the
+    // supervisor's CPU or memory.
+    let rate_limit = notify_rate_limit.unwrap_or(0);
+    let mut rate_window_start = std::time::Instant::now();
+    let mut rate_window_count: u32 = 0;
+
     // Edge-triggered drain: each `readable().await` returns once per
     // epoll edge, then we drain the kernel queue via `probe_notif_fd`
     // until empty. The drain is necessary because tokio's AsyncFd is
@@ -2470,6 +2480,27 @@ pub async fn supervisor(
                         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
                         Err(_) => break 'outer,
                     };
+                    if rate_limit > 0 {
+                        let now = std::time::Instant::now();
+                        if now.duration_since(rate_window_start)
+                            >= std::time::Duration::from_secs(1)
+                        {
+                            rate_window_start = now;
+                            rate_window_count = 0;
+                        }
+                        rate_window_count += 1;
+                        if rate_window_count > rate_limit {
+                            let elapsed =
+                                now.saturating_duration_since(rate_window_start);
+                            let wait = std::time::Duration::from_secs(1)
+                                .saturating_sub(elapsed);
+                            if !wait.is_zero() {
+                                tokio::time::sleep(wait).await;
+                            }
+                            rate_window_start = std::time::Instant::now();
+                            rate_window_count = 0;
+                        }
+                    }
                     handle_notification(notif, &ctx, &dispatch_table, fd, &defer_sem).await;
                 }
                 NotifFdState::Empty => break,

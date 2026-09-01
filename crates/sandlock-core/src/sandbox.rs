@@ -498,6 +498,9 @@ pub struct Sandbox {
     pub max_processes: u32,
     pub max_open_files: Option<u32>,
     pub max_cpu: Option<u8>,
+    /// Max seccomp user-notifications processed per second (see builder).
+    #[serde(skip)]
+    pub notify_rate_limit: Option<u32>,
 
     // Reproducibility
     pub random_seed: Option<u64>,
@@ -658,6 +661,7 @@ impl Clone for Sandbox {
             max_processes: self.max_processes,
             max_open_files: self.max_open_files,
             max_cpu: self.max_cpu,
+            notify_rate_limit: self.notify_rate_limit,
             random_seed: self.random_seed,
             time_start: self.time_start,
             no_randomize_memory: self.no_randomize_memory,
@@ -2412,7 +2416,13 @@ impl Sandbox {
             let control_dir_opt = self.rt().control_dir.clone();
 
             self.rt_mut().notif_handle = Some(tokio::spawn(
-                notif::supervisor(notif_fd, ctx, handlers, startup_tx),
+                notif::supervisor(
+                    notif_fd,
+                    ctx,
+                    handlers,
+                    startup_tx,
+                    self.notify_rate_limit,
+                ),
             ));
             // Wait for the supervisor to register the notif fd with the IO
             // driver before we release the child to execve. Otherwise an

@@ -182,6 +182,9 @@ _b_max_memory = _builder_fn("sandlock_sandbox_builder_max_memory", ctypes.c_uint
 _b_max_disk = _builder_fn("sandlock_sandbox_builder_max_disk", ctypes.c_uint64)
 _b_max_processes = _builder_fn("sandlock_sandbox_builder_max_processes", ctypes.c_uint32)
 _b_max_cpu = _builder_fn("sandlock_sandbox_builder_max_cpu", ctypes.c_uint8)
+_b_notify_rate_limit = _builder_fn(
+    "sandlock_sandbox_builder_notify_rate_limit", ctypes.c_uint32
+)
 _b_num_cpus = _builder_fn("sandlock_sandbox_builder_num_cpus", ctypes.c_uint32)
 _b_net_allow = _builder_fn("sandlock_sandbox_builder_net_allow", ctypes.c_char_p)
 _b_net_deny = _builder_fn("sandlock_sandbox_builder_net_deny", ctypes.c_char_p)
@@ -1202,6 +1205,8 @@ class _NativePolicy:
             b = _b_max_processes(b, policy.max_processes)
         if policy.max_cpu is not None:
             b = _b_max_cpu(b, policy.max_cpu)
+        if policy.notify_rate_limit is not None:
+            b = _b_notify_rate_limit(b, policy.notify_rate_limit)
         if policy.num_cpus is not None:
             b = _b_num_cpus(b, policy.num_cpus)
         if policy.cpu_cores is not None:

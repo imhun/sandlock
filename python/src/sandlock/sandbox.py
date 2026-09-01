@@ -327,6 +327,13 @@ class Sandbox:
     Enforced by the parent via SIGSTOP/SIGCONT cycling on the process
     group — applies to all processes in the sandbox collectively."""
 
+    notify_rate_limit: int | None = None
+    """Max seccomp user-notifications the supervisor processes per second
+    for this sandbox (None = unlimited).  When the budget is exceeded the
+    supervisor sleeps out the remainder of the window instead of draining
+    the kernel queue, bounding supervisor CPU spent on a notification
+    flood."""
+
     cpu_cores: Sequence[int] | None = None
     """CPU cores to pin the sandbox to.  When set, sched_setaffinity()
     is called in the child to restrict it to the specified cores.
