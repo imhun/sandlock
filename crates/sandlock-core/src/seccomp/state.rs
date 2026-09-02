@@ -492,6 +492,17 @@ pub struct NetworkState {
     /// an entry — the `close` handler, or NetworkState teardown with the
     /// sandbox — closes the host listener.
     pub inbound: HashMap<u64, crate::network::inbound::InboundListener>,
+    /// E7.1: epoll registration tracking for inbound-mapped listeners.
+    /// Keyed by `(pid, epoll fd)` — fd numbers are per-process, and the
+    /// sandbox runs several processes (the gateway plus its stdio MCP
+    /// subprocess) whose epoll fds overlap, so a bare epfd key would make
+    /// one process's `epoll_wait` consume another's registrations. Each
+    /// entry records the watched fd's registered event mask + payload so
+    /// `epoll_wait` can synthesize readiness for mapped listeners (whose
+    /// host-side queued connections never land in the sandbox's own kernel
+    /// backlog).
+    pub epoll_registrations:
+        HashMap<(u32, i32), HashMap<i32, crate::network::readiness::EpollRegistration>>,
 }
 
 impl NetworkState {
@@ -511,6 +522,7 @@ impl NetworkState {
             egress_proxy: None,
             inbound_map: HashMap::new(),
             inbound: HashMap::new(),
+            epoll_registrations: HashMap::new(),
         }
     }
 

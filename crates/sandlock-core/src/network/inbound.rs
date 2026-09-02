@@ -31,7 +31,7 @@
 // own accept queue, which the worker then accepts and injects.
 
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::seccomp::ctx::SupervisorCtx;
@@ -53,6 +53,10 @@ pub struct InboundListener {
     /// `accept()`. Shared so concurrent accepts on the same listener (or a
     /// fork-inherited fd) can wait on one queue.
     pub conns: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<OwnedFd>>>,
+    /// E7.1: number of connections currently queued in `conns`. The
+    /// poll/epoll readiness synthesizer peeks this without consuming, so an
+    /// event-loop server wakes and calls `accept()`.
+    pub pending: Arc<AtomicUsize>,
     /// The eager-accept worker. Aborted (and cancellation flagged) on drop.
     pub worker: tokio::task::JoinHandle<()>,
     cancel: Arc<AtomicBool>,
@@ -80,7 +84,7 @@ const WORKER_POLL_SLICE_MS: i32 = 2000;
 /// The sandbox listening socket's inode, used as the stable key for the
 /// inbound mapping. For sockets `fstat` returns the socket inode, shared by
 /// every dup/fork of the same socket.
-fn socket_ino(fd: RawFd) -> Option<u64> {
+pub(crate) fn socket_ino(fd: RawFd) -> Option<u64> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut st) } == 0 {
         Some(st.st_ino)
@@ -239,10 +243,19 @@ fn spawn_inbound_worker(
     host_listener: RawFd,
     sandbox_listener: RawFd,
     cancel: Arc<AtomicBool>,
-) -> Result<(tokio::sync::mpsc::Receiver<OwnedFd>, tokio::task::JoinHandle<()>), i32> {
+) -> Result<
+    (
+        tokio::sync::mpsc::Receiver<OwnedFd>,
+        tokio::task::JoinHandle<()>,
+        Arc<AtomicUsize>,
+    ),
+    i32,
+> {
     let host_dup = duplicate_fd(host_listener)?;
     let sandbox_dup = duplicate_fd(sandbox_listener)?;
     let (tx, rx) = tokio::sync::mpsc::channel::<OwnedFd>(INBOUND_QUEUE_CAP);
+    let pending = Arc::new(AtomicUsize::new(0));
+    let pending_for_worker = Arc::clone(&pending);
     let cancel_for_worker = Arc::clone(&cancel);
     let worker = tokio::task::spawn_blocking(move || {
         let host = host_dup;
@@ -259,9 +272,10 @@ fn spawn_inbound_worker(
             if tx.blocking_send(fd).is_err() {
                 break;
             }
+            pending_for_worker.fetch_add(1, Ordering::SeqCst);
         }
     });
-    Ok((rx, worker))
+    Ok((rx, worker, pending))
 }
 
 /// `handle_listen` — a sandbox `listen()` on a mapped port:
@@ -331,7 +345,7 @@ pub(crate) async fn handle_listen(
     }
 
     let cancel = Arc::new(AtomicBool::new(false));
-    let (rx, worker) = match spawn_inbound_worker(
+    let (rx, worker, pending) = match spawn_inbound_worker(
         host_listener.as_raw_fd(),
         dup_fd.as_raw_fd(),
         Arc::clone(&cancel),
@@ -348,6 +362,7 @@ pub(crate) async fn handle_listen(
             host_port,
             sandbox_port,
             conns,
+            pending,
             worker,
             cancel,
         },
@@ -396,10 +411,10 @@ async fn handle_accept_impl(
     };
     // Snapshot the shared queue while holding the network lock briefly; the
     // accept itself (queued-pop or deferred wait) happens outside it.
-    let conns = {
+    let (conns, pending) = {
         let ns = ctx.network.lock().await;
         match ns.inbound.get(&ino) {
-            Some(l) => Arc::clone(&l.conns),
+            Some(l) => (Arc::clone(&l.conns), Arc::clone(&l.pending)),
             None => return NotifAction::Continue,
         }
     };
@@ -410,6 +425,7 @@ async fn handle_accept_impl(
         let mut guard = conns.lock().await;
         match guard.try_recv() {
             Ok(fd) => {
+                pending.fetch_sub(1, Ordering::SeqCst);
                 return finish_accept(
                     fd,
                     notif,
@@ -444,15 +460,18 @@ async fn handle_accept_impl(
             tokio::select! {
                 r = recv => {
                     return match r {
-                        Some(fd) => finish_accept(
-                            fd,
-                            &notif_owned,
-                            notif_fd,
-                            addr_ptr,
-                            addrlen_ptr,
-                            flags,
-                            nonblocking,
-                        ),
+                        Some(fd) => {
+                            pending.fetch_sub(1, Ordering::SeqCst);
+                            finish_accept(
+                                fd,
+                                &notif_owned,
+                                notif_fd,
+                                addr_ptr,
+                                addrlen_ptr,
+                                flags,
+                                nonblocking,
+                            )
+                        }
                         None => NotifAction::Errno(libc::EIO),
                     };
                 }

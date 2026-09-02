@@ -376,7 +376,21 @@ const PORT_REMAP_SYSCALLS: &[i64] = &[
 /// it) is served from that host listener with the accepted fd injected into
 /// the sandbox. `close` is already on the notif list via the netlink block,
 /// so the close handler chain can drop the mapping when the listener closes.
-const INBOUND_MAPPING_SYSCALLS: &[i64] = &[libc::SYS_listen, libc::SYS_accept4];
+// E7.1: besides listen/accept, event-loop servers (uvicorn/asyncio, Node,
+// Go) need poll/epoll readiness synthesis so a host-side queued connection
+// wakes their accept(); `epoll_ctl` tracking tells `epoll_wait` which fds
+// are mapped listeners. `poll`/`epoll_wait` exist only on the legacy ABI
+// (x86_64); the generic ABI (aarch64/riscv64) has only `ppoll`/
+// `epoll_pwait`, which glibc's `poll()`/`epoll_wait()` wrappers call — so
+// intercepting the generic pair covers both. All are trapped only when the
+// feature is on — the default path never notifies on them.
+const INBOUND_MAPPING_SYSCALLS: &[i64] = &[
+    libc::SYS_listen,
+    libc::SYS_accept4,
+    libc::SYS_ppoll,
+    libc::SYS_epoll_ctl,
+    libc::SYS_epoll_pwait,
+];
 
 /// Determine which syscalls need `SECCOMP_RET_USER_NOTIF`.
 pub(crate) fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> {
@@ -474,6 +488,8 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
     // Inbound port mapping (S2.5)
     if features.inbound_port_map {
         nrs.extend(INBOUND_MAPPING_SYSCALLS);
+        nrs.push_optional(arch::sys_poll());
+        nrs.push_optional(arch::sys_epoll_wait());
         nrs.push_optional(arch::sys_accept());
     }
 

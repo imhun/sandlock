@@ -2447,12 +2447,18 @@ async fn handle_notification(
             let _ = send_response(fd, notif.id, NotifAction::Errno(libc::EPERM));
             return;
         }
-        // The S2.5 inbound accept defers unboundedly: its future
-        // self-terminates when a connection arrives, the mapping is dropped
-        // (receiver closed), or the child's notification id becomes invalid —
-        // so it cannot park forever. Every other deferred handler keeps the
-        // 30s `DEFER_TIMEOUT` safety cap.
-        let limit = if nr == libc::SYS_accept4 || Some(nr) == arch::sys_accept() {
+        // The S2.5 inbound accept and the E7.1 poll/epoll readiness waits
+        // defer unboundedly: their futures self-terminate when a connection
+        // arrives, the mapping is dropped, or the child's notification id
+        // becomes invalid — so they cannot park forever. Every other deferred
+        // handler keeps the 30s `DEFER_TIMEOUT` safety cap.
+        let limit = if nr == libc::SYS_accept4
+            || Some(nr) == arch::sys_accept()
+            || Some(nr) == arch::sys_poll()
+            || Some(nr) == arch::sys_epoll_wait()
+            || nr == libc::SYS_ppoll
+            || nr == libc::SYS_epoll_pwait
+        {
             None
         } else {
             Some(DEFER_TIMEOUT)

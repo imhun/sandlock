@@ -2150,3 +2150,154 @@ async fn test_net_isolation_inbound_mapping_coexists_with_outbound_fd_injection(
         output
     );
 }
+
+/// E7.1: an event-loop server (asyncio, epoll-driven like uvicorn) inside a
+/// netns sandbox must serve host-side connections queued by the S2.5 eager
+/// worker: the poll/epoll readiness synthesis makes the sandbox's listener
+/// fd report readable so `accept()` gets called. Exact 4-byte echo over the
+/// mapped host port.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_net_isolation_inbound_mapping_epoll_event_loop_serves_external() {
+    let host_port = alloc_host_port_in_range(50005);
+    let sandbox_port = host_port;
+    let script = format!(
+        concat!(
+            "import asyncio, os\n",
+            "async def main():\n",
+            "    async def handle(r, w):\n",
+            "        data = await r.read(4)\n",
+            "        w.write(data)\n",
+            "        await w.drain()\n",
+            "        w.close()\n",
+            "        os._exit(0)\n",
+            "    server = await asyncio.start_server(handle, '127.0.0.1', {sandbox_port})\n",
+            "    await asyncio.get_running_loop().create_future()\n",
+            "asyncio.run(main())\n",
+        ),
+        sandbox_port = sandbox_port,
+    );
+    let policy = base_policy()
+        .net_isolation(true)
+        .net_bind_map(host_port, sandbox_port)
+        .net_allow(format!("127.0.0.1:{}", sandbox_port))
+        .net_allow_bind_port(sandbox_port)
+        .build()
+        .unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut policy = policy.clone();
+        let _ = tx.send(policy.run(&["python3", "-c", &script]).await);
+    });
+    let client_task = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut conn = loop {
+            match TcpStream::connect(("127.0.0.1", host_port)) {
+                Ok(s) => break s,
+                Err(_) => {
+                    if Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "external client never reached the mapped host port",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        conn.set_read_timeout(Some(Duration::from_secs(5)))?;
+        conn.write_all(b"ping")?;
+        let mut buf = [0u8; 4];
+        conn.read_exact(&mut buf)?;
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    });
+    let result = tokio::time::timeout(Duration::from_secs(15), rx)
+        .await
+        .expect("event-loop server sandbox did not exit")
+        .expect("event-loop server sandbox never reported")
+        .expect("event-loop server sandbox run failed");
+    task.await.unwrap();
+    let client_outcome = client_task.await.unwrap();
+    assert!(
+        result.success(),
+        "asyncio server sandbox failed: exit={:?} stderr={:?}",
+        result.code(),
+        result.stderr
+    );
+    assert_eq!(
+        client_outcome.expect("asyncio server client exchange failed"),
+        "ping",
+        "asyncio server must echo over the mapped port"
+    );
+}
+
+/// E7.1 poll-path: a `select.poll()`-based event loop (no epoll) inside a
+/// netns sandbox must serve the host-side mapped connection too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_net_isolation_inbound_mapping_poll_event_loop_serves_external() {
+    let host_port = alloc_host_port_in_range(50005);
+    let sandbox_port = host_port;
+    let script = format!(
+        concat!(
+            "import os, select, socket\n",
+            "s = socket.socket()\n",
+            "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n",
+            "s.bind(('127.0.0.1', {sandbox_port}))\n",
+            "s.listen(1)\n",
+            "p = select.poll()\n",
+            "p.register(s, select.POLLIN)\n",
+            "for fd, _ev in p.poll():\n",
+            "    if fd == s.fileno():\n",
+            "        conn, _ = s.accept()\n",
+            "        data = conn.recv(4)\n",
+            "        conn.sendall(data)\n",
+            "        conn.close()\n",
+            "        os._exit(0)\n",
+        ),
+        sandbox_port = sandbox_port,
+    );
+    let policy = base_policy()
+        .net_isolation(true)
+        .net_bind_map(host_port, sandbox_port)
+        .net_allow(format!("127.0.0.1:{}", sandbox_port))
+        .net_allow_bind_port(sandbox_port)
+        .build()
+        .unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut policy = policy.clone();
+        let _ = tx.send(policy.run(&["python3", "-c", &script]).await);
+    });
+    let mut conn = None;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        match TcpStream::connect(("127.0.0.1", host_port)) {
+            Ok(s) => {
+                conn = Some(s);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    let mut conn = conn.expect("external client never reached the mapped host port");
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    conn.write_all(b"pong").unwrap();
+    let mut buf = [0u8; 4];
+    conn.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"pong", "poll server must echo over the mapped port");
+    drop(conn);
+
+    let result = tokio::time::timeout(Duration::from_secs(15), rx)
+        .await
+        .expect("poll server sandbox did not exit")
+        .expect("poll server sandbox never reported")
+        .expect("poll server sandbox run failed");
+    task.await.unwrap();
+    assert!(
+        result.success(),
+        "poll server sandbox failed: exit={:?} stderr={:?}",
+        result.code(),
+        result.stderr
+    );
+}
