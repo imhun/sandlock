@@ -260,8 +260,9 @@ async fn test_socks5_fail_closed_when_proxy_unreachable_inner() {
 
 /// With `fd_inject_connect` on, an allowed TCP connect is still tunneled
 /// through the SOCKS5 egress proxy: the fresh host-side socket dials the
-/// proxy, the tunnel is injected into the sandbox, and the trapped connect()
-/// returns the injected fd number — never a direct path to the origin.
+/// proxy, the tunnel is injected into the sandbox at the child's own socket
+/// fd, and the trapped connect() returns 0 (normal success semantics) —
+/// never a direct path to the origin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_socks5_tunnels_tcp_with_fd_injection() {
     tokio::time::timeout(
@@ -326,10 +327,8 @@ async fn test_socks5_tunnels_tcp_with_fd_injection_inner() {
         .expect("FD field")
         .parse()
         .unwrap();
-    assert_eq!(
-        ret, fd,
-        "injected connect must return the fd number under egress, got: {out:?}"
-    );
+    assert_eq!(ret, 0, "injected connect must return 0 under egress, got: {out:?}");
+    assert!(fd >= 3, "the child's socket fd must stay intact, got: {out:?}");
     assert_eq!(
         parts[2], "DATA=TUNNELED-OK",
         "child must reach the origin through the tunnel under fd injection, got: {out:?}"

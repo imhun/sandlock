@@ -372,8 +372,10 @@ class Sandbox:
     fd_inject_connect: bool = False
     """Enable the connect fd-injection path: the supervisor performs the
     connect on a fresh host-side socket and injects the connected fd into
-    the sandbox, so the trapped ``connect()`` returns the child-side fd
-    number.  Defaults to ``False`` (legacy on-behalf connect)."""
+    the sandbox at the child's own socket fd number, so the trapped
+    ``connect()`` returns 0 (normal success semantics) and the child's
+    socket fd now refers to the host-connected socket.  Defaults to
+    ``False`` (legacy on-behalf connect)."""
 
     port_mappings: Mapping[int, int] | None = None
     """Inbound port mappings ``{host_port: sandbox_port}`` for

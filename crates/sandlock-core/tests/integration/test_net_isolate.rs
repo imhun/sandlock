@@ -2,12 +2,13 @@
 //! per-sandbox network isolation plan 1).
 //!
 //! With the `fd_inject_connect` switch on, the supervisor performs the
-//! connect on a fresh host-side socket and injects it into the sandbox via
-//! `SECCOMP_ADDFD_FLAG_SETFD|SEND`, so the trapped `connect()` returns the
-//! child-side fd number (not 0) and the data plane is the injected fd.
-//! With the switch off (default) the legacy dup-based on-behalf connect
-//! returns 0. Policy decisions (allow verdict, synthetic-IP refusal) run
-//! before the host connect in both modes.
+//! connect on a fresh host-side socket and injects it into the sandbox at
+//! the child's own socket fd number (`SECCOMP_ADDFD_FLAG_SETFD` + plain
+//! success response), so the trapped `connect()` returns 0 (normal success
+//! semantics) and the data plane is the injected fd. With the switch off
+//! (default) the legacy dup-based on-behalf connect also returns 0. Policy
+//! decisions (allow verdict, synthetic-IP refusal) run before the host
+//! connect in both modes.
 //!
 //! With the `net_isolation` switch on (default off), the sandbox spawns in
 //! its own network namespace containing only loopback, brought up from
@@ -89,7 +90,8 @@ fn spawn_echo_server() -> (u16, std::thread::JoinHandle<()>) {
 }
 
 /// Raw `connect()` via libc so the test can observe the syscall's return
-/// value: 0 on the legacy on-behalf path, the fd number under fd injection.
+/// value: 0 on both the legacy on-behalf path and the fd-injection path
+/// (the injection swaps the child's own socket fd and responds success).
 fn connect_script(port: u16, out: &std::path::Path) -> String {
     format!(
         concat!(
@@ -133,11 +135,12 @@ fn connect_script(port: u16, out: &std::path::Path) -> String {
     )
 }
 
-/// With `fd_inject_connect` on, the trapped connect returns the child-side
-/// fd number (SECCOMP_ADDFD_FLAG_SEND semantics) and the data plane is the
-/// injected fd: an echo round-trip over that fd succeeds.
+/// With `fd_inject_connect` on, the trapped connect returns 0 (the child's
+/// socket fd is atomically replaced by the host-connected socket) and the
+/// data plane is the injected fd: an echo round-trip over the same fd
+/// succeeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_fd_inject_connect_returns_injected_fd_and_echoes() {
+async fn test_fd_inject_connect_returns_zero_and_echoes() {
     let out = temp_file("inject-echo");
     let (port, srv) = spawn_echo_server();
 
@@ -164,8 +167,9 @@ async fn test_fd_inject_connect_returns_injected_fd_and_echoes() {
     let _ = std::fs::remove_file(&out);
     srv.join().unwrap();
 
-    // ret == fd proves the ADDFD|SEND path returned the injected fd number
-    // rather than 0; echo over that fd proves the data plane is live.
+    // ret == 0 proves the injected connect keeps normal success semantics
+    // (the child's socket fd was swapped for the host-connected socket);
+    // echo over that same fd proves the data plane is live.
     let parts: Vec<&str> = content.split_whitespace().collect();
     assert_eq!(
         parts.len(),
@@ -180,11 +184,66 @@ async fn test_fd_inject_connect_returns_injected_fd_and_echoes() {
         .parse()
         .unwrap();
     let fd_val: i32 = fd.strip_prefix("fd=").expect("fd field").parse().unwrap();
+    assert_eq!(ret_val, 0, "connect must return 0, got: {content}");
     assert_eq!(
-        ret_val, fd_val,
-        "connect must return the injected fd number, got: {content}"
+        fd_val, 3,
+        "the child's original socket fd must be unchanged, got: {content}"
     );
     assert_eq!(echo, "echo=ping", "echo over the injected fd must work");
+}
+
+/// The CPython `socket.connect()` wrapper must work on the fd-injection
+/// path: CPython checks for an exact 0 syscall return, so the supervisor
+/// must not surface the injected fd number (a positive return is misread as
+/// `OSError: [Errno 0]`). Real `socket.connect()` + echo over the same
+/// socket, under `net_isolation` (the full plan-1 path).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fd_inject_connect_cpython_socket_connect_echoes() {
+    let out = temp_file("cpython-inject-echo");
+    let (port, srv) = spawn_echo_server();
+
+    let policy = base_policy()
+        .net_isolation(true)
+        .net_allow(format!("127.0.0.1:{}", port))
+        .fd_inject_connect(true)
+        .build()
+        .unwrap();
+
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.settimeout(5)\n",
+            "s.connect(('127.0.0.1', {port}))\n",
+            "s.sendall(b'ping')\n",
+            "data = s.recv(4)\n",
+            "s.close()\n",
+            "open('{out}', 'w').write(f'echo={{data.decode()}}')\n",
+        ),
+        port = port,
+        out = out.display(),
+    );
+
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "exit={:?} stderr={:?}",
+        result.code(),
+        result.stderr
+    );
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    srv.join().unwrap();
+
+    assert_eq!(
+        content, "echo=ping",
+        "CPython socket.connect() must succeed on the fd-injection path"
+    );
 }
 
 /// Direct connect to an unregistered synthetic IP must still be refused with
@@ -339,11 +398,15 @@ async fn test_fd_inject_connect_preserves_child_cloexec() {
             .expect("ret field")
             .parse()
             .unwrap();
-        let fd_val: i32 = parts[1].strip_prefix("fd=").expect("fd field").parse().unwrap();
-        assert_eq!(
-            ret_val, fd_val,
-            "connect must return the injected fd number, got: {content}"
-        );
+    let fd_val: i32 = parts[1].strip_prefix("fd=").expect("fd field").parse().unwrap();
+    assert_eq!(
+        ret_val, 0,
+        "connect must return 0, got: {content}"
+    );
+    assert!(
+        fd_val >= 3,
+        "the child's original socket fd must stay intact, got: {content}"
+    );
         assert_eq!(
             parts[2],
             format!(
@@ -666,7 +729,7 @@ async fn test_default_shared_netns_contrast_loopback_shared() {
 /// sandbox's connect is trapped, the supervisor connects on a host-side
 /// socket (host netns) and injects the connected fd, so the sandbox reaches
 /// the host echo server from inside its loopback-only netns. The trapped
-/// connect returns the injected fd number.
+/// connect returns 0 (normal success semantics).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_net_isolation_with_fd_inject_reaches_host_echo() {
     let out = temp_file("netns-inject-echo");
@@ -709,8 +772,12 @@ async fn test_net_isolation_with_fd_inject_reaches_host_echo() {
         .parse()
         .unwrap();
     assert_eq!(
-        ret_val, fd_val,
-        "connect must return the injected fd number, got: {content}"
+        ret_val, 0,
+        "connect must return 0, got: {content}"
+    );
+    assert!(
+        fd_val >= 3,
+        "the child's original socket fd must stay intact, got: {content}"
     );
     assert_eq!(
         parts[2], "echo=ping",
@@ -822,9 +889,11 @@ async fn test_net_isolation_wildcard_dns_resolves_subdomain_and_refuses_bare() {
 /// grants subdomains only; the supervisor verdict denies before any
 /// host-side connect, ECONNREFUSED). The client uses the raw
 /// `connect()`/send/recv form like the S2.1 fd-injection tests: CPython's
-/// `socket.connect()` requires an exact 0 return, while the ADDFD|SEND
-/// injection semantics return the injected fd number (positive) — a known
-/// wrapper incompatibility, not a data-plane failure.
+/// `socket.connect()` requires an exact 0 return, and the injection path
+/// now delivers exactly that (the supervisor injects at the child's own fd
+/// and responds with a plain success) — see
+/// `test_fd_inject_connect_cpython_socket_connect_echoes` for the real
+/// wrapper regression.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_net_isolation_wildcard_connect_with_fd_inject() {
     let _host = WorkerLocalHost::setup("conn.example.com");
@@ -1290,10 +1359,11 @@ fn spawn_udp_collector(
 
 /// Connected UDP under `net_isolation` + `fd_inject_connect` is the full
 /// plan-1 UDP path: the supervisor mints a host-side UDP socket, connect()s
-/// it to the host echo server, and injects it (ADDFD|SEND), so the trapped
-/// connect returns the injected fd number and the data plane is the injected
-/// fd — kernel-direct send/recv, no supervisor in the data path. QUIC-style:
-/// one connect, then multiple datagram round-trips over the same fd.
+/// it to the host echo server, and injects it at the child's own socket fd
+/// (returning 0), so the trapped connect keeps normal success semantics and
+/// the data plane is the injected fd — kernel-direct send/recv, no
+/// supervisor in the data path. QUIC-style: one connect, then multiple
+/// datagram round-trips over the same fd.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_net_isolation_connected_udp_injected_quic_echo() {
     let out = temp_file("netns-udp-connect");
@@ -1306,9 +1376,9 @@ async fn test_net_isolation_connected_udp_injected_quic_echo() {
         .build()
         .unwrap();
 
-    // Raw libc connect: the ADDFD|SEND injection makes the syscall return the
-    // injected fd number (positive), which CPython's socket.connect() wrapper
-    // rejects — same known wrapper incompatibility as the TCP injection tests.
+    // Raw libc connect: the injection replaces the child's own socket fd and
+    // the syscall returns 0 (normal success semantics), so CPython's
+    // socket.connect() wrapper works here too.
     let script = format!(
         concat!(
             "import ctypes, socket, struct\n",
@@ -1360,8 +1430,12 @@ async fn test_net_isolation_connected_udp_injected_quic_echo() {
         .unwrap();
     let fd_val: i32 = parts[1].strip_prefix("fd=").expect("fd field").parse().unwrap();
     assert_eq!(
-        ret_val, fd_val,
-        "UDP connect must return the injected fd number, got: {content}"
+        ret_val, 0,
+        "UDP connect must return 0, got: {content}"
+    );
+    assert!(
+        fd_val >= 3,
+        "the child's original UDP socket fd must stay intact, got: {content}"
     );
     assert_eq!(
         parts[2], "echo1=ping",

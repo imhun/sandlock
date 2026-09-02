@@ -226,8 +226,10 @@ pub struct SandboxBuilder {
 
     /// S2.1: when true, an IP `connect()` is executed on a fresh
     /// supervisor-side socket and the connected fd is injected into the
-    /// sandbox via `SECCOMP_ADDFD_FLAG_SETFD|SEND`, so the trapped syscall
-    /// returns the child-side fd number instead of 0. Defaults to `false`
+    /// sandbox at the child's own socket fd number
+    /// (`SECCOMP_ADDFD_FLAG_SETFD` + plain-success response), so the trapped
+    /// syscall returns 0 (normal success semantics) while the child's socket
+    /// fd now refers to the host-connected socket. Defaults to `false`
     /// (legacy dup-based on-behalf connect). CLI surface intentionally not
     /// exposed yet — the flag lands with the per-sandbox netns work (S2.2).
     #[cfg_attr(feature = "cli", clap(skip))]

@@ -246,12 +246,13 @@ pub(super) async fn connect_on_behalf(
         if ctx.policy.fd_inject_connect {
             if let Some(host) = new_host_socket(dup_fd.as_raw_fd()) {
                 // Injection path: connect the fresh host-side socket to the
-                // planned target, then inject it at the child's socket fd so
-                // the sandbox's connect() returns the fd number. The host
-                // socket is blocking and the connect must COMPLETE before the
-                // SETFD|SEND injection responds, so the child never observes
-                // EINPROGRESS on this path; the child's SO_SNDTIMEO bounds the
-                // wait (see `new_host_socket`).
+                // planned target, then inject it at the child's socket fd —
+                // the sandbox's connect() returns 0 (its socket fd now
+                // refers to the host-connected socket). The host socket is
+                // blocking and the connect must COMPLETE before the injection
+                // responds, so the child never observes EINPROGRESS on this
+                // path; the child's SO_SNDTIMEO bounds the wait (see
+                // `new_host_socket`).
                 if plan.record_orig_dest {
                     if let Some(ref map) = orig_dest_map {
                         // The local-address probe must bind in the socket's
@@ -653,16 +654,15 @@ fn connect_dup(fd: RawFd, addr: &[u8]) -> NotifAction {
 /// (SO_DOMAIN / SO_TYPE / SO_PROTOCOL) so it can be connected in the host
 /// netns and injected into the sandbox.
 ///
-/// The fresh socket is blocking. With `SECCOMP_ADDFD_FLAG_SETFD|SEND` the
-/// notification response IS the injection, so the host connect must complete
-/// before the child's `connect()` returns — the child can never observe
-/// `EINPROGRESS` on this path, and its own per-syscall timeout/cancel cannot
-/// interrupt the supervisor-side connect while it is in flight. To keep the
-/// supervisor from blocking for the kernel's default TCP timeout, the child's
-/// `SO_SNDTIMEO` (the connect timeout a blocking child would honor) is copied
-/// onto the host socket, bounding the wait by the child's own timeout. A
-/// per-sandbox netns (S2.2) still needs a real non-blocking scheme
-/// (EINPROGRESS-compatible response before completion); that is out of scope.
+/// The fresh socket is blocking. The injection (`SECCOMP_ADDFD_FLAG_SETFD` +
+/// plain-success response) can only be delivered after the host connect
+/// completes, so the child can never observe `EINPROGRESS` on this path, and
+/// its own per-syscall timeout/cancel cannot interrupt the supervisor-side
+/// connect while it is in flight. To keep the supervisor from blocking for
+/// the kernel's default TCP timeout, the child's `SO_SNDTIMEO` (the connect
+/// timeout a blocking child would honor) is copied onto the host socket,
+/// bounding the wait by the child's own timeout. A real non-blocking scheme
+/// (EINPROGRESS-compatible response before completion) remains out of scope.
 ///
 /// Returns `None` when the child's socket parameters cannot be reproduced —
 /// e.g. `socket(2)` fails for an ICMP ping socket an unprivileged supervisor
@@ -771,11 +771,13 @@ fn child_fd_cloexec(pid: u32, sockfd: i32) -> Option<bool> {
 }
 
 /// Build the action that atomically replaces the child's socket fd with the
-/// connected supervisor-side socket (`SETFD|SEND`): the child's `connect()`
-/// returns the fd number and the data plane is the injected fd. The child's
-/// own `FD_CLOEXEC` state is carried via `newfd_flags` (the only fd flag
-/// ADDFD supports), so a `SOCK_CLOEXEC` socket stays close-on-exec after
-/// injection and a plain socket does not gain it.
+/// connected supervisor-side socket (`SETFD` + plain-success response): the
+/// child's `connect()` returns 0 (normal success semantics — SEND would make
+/// it return the fd number, which CPython's `socket.connect()` rejects as
+/// `[Errno 0]`) and the data plane is the injected fd. The child's own
+/// `FD_CLOEXEC` state is carried via `newfd_flags` (the only fd flag ADDFD
+/// supports), so a `SOCK_CLOEXEC` socket stays close-on-exec after injection
+/// and a plain socket does not gain it.
 fn inject_connected_fd(host: OwnedFd, sockfd: i32, pid: u32) -> NotifAction {
     let cloexec = child_fd_cloexec(pid, sockfd).unwrap_or_else(|| {
         eprintln!(
@@ -784,7 +786,7 @@ fn inject_connected_fd(host: OwnedFd, sockfd: i32, pid: u32) -> NotifAction {
         );
         false
     });
-    NotifAction::InjectFdSendAt {
+    NotifAction::InjectFdAt {
         srcfd: host,
         targetfd: sockfd,
         newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },

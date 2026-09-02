@@ -116,16 +116,19 @@ pub enum NotifAction {
         on_success: OnInjectSuccess,
     },
     /// Inject a file descriptor into the child **at a fixed fd number** using
-    /// SECCOMP_ADDFD_FLAG_SETFD|SEND: the child's fd slot is atomically
-    /// replaced and the syscall returns the fd number. Used by the connect
-    /// fd-injection path, where the sandbox's socket fd is swapped for the
-    /// supervisor's connected host-side socket. The `OwnedFd` is closed
-    /// automatically after the ioctl completes. `newfd_flags` carries the
-    /// child-side fd flags for the injected fd (O_CLOEXEC — the only flag
-    /// ADDFD supports): FD_CLOEXEC is a per-fd-table-entry flag in the child
-    /// and cannot be mirrored via fcntl on the host fd, so the caller derives
-    /// it from the child's own fd flags.
-    InjectFdSendAt {
+    /// SECCOMP_ADDFD_FLAG_SETFD (no SEND), then respond with a plain success
+    /// (syscall return value 0). Used by the connect fd-injection path, where
+    /// the sandbox's socket fd is swapped for the supervisor's connected
+    /// host-side socket and `connect()` must keep its normal success return
+    /// value: SEND would make the trapped syscall return the fd number, which
+    /// strict runtimes (CPython's `socket.connect()` checks for exactly 0)
+    /// misreport as `[Errno 0]`. The `OwnedFd` is closed automatically after
+    /// the ioctl completes. `newfd_flags` carries the child-side fd flags for
+    /// the injected fd (O_CLOEXEC — the only flag ADDFD supports): FD_CLOEXEC
+    /// is a per-fd-table-entry flag in the child and cannot be mirrored via
+    /// fcntl on the host fd, so the caller derives it from the child's own fd
+    /// flags.
+    InjectFdAt {
         srcfd: OwnedFd,
         targetfd: i32,
         newfd_flags: u32,
@@ -807,9 +810,11 @@ pub struct NotifPolicy {
     pub port_remap: bool,
     /// S2.1: when true, an IP `connect()` is performed on a fresh
     /// supervisor-side socket which is then injected into the sandbox at the
-    /// child's socket fd number (`SECCOMP_ADDFD_FLAG_SETFD|SEND`), so the
-    /// trapped syscall returns the fd number instead of 0. Defaults to
-    /// `false` — the legacy dup-based on-behalf connect stays the default
+    /// child's socket fd number (`SECCOMP_ADDFD_FLAG_SETFD` + plain-success
+    /// response), so the trapped syscall returns 0 (normal success
+    /// semantics — the fd number is never surfaced to the child, keeping
+    /// strict runtimes like CPython's `socket.connect()` working). Defaults
+    /// to `false` — the legacy dup-based on-behalf connect stays the default
     /// until per-sandbox netns (S2.2) makes injection mandatory.
     pub fd_inject_connect: bool,
     /// S2.2: the sandbox spawns in its own network namespace (only
@@ -1020,13 +1025,15 @@ fn inject_fd_and_send(fd: RawFd, id: u64, srcfd: RawFd, newfd_flags: u32) -> io:
 }
 
 /// Inject a file descriptor into the child process at a fixed fd number using
-/// SECCOMP_ADDFD_FLAG_SETFD|SEND.
+/// SECCOMP_ADDFD_FLAG_SETFD (without SEND).
 ///
 /// The SETFD flag installs `srcfd` at `targetfd` (atomically replacing
-/// whatever occupies that slot) and the SEND flag responds to the syscall
-/// with the ioctl return value — which under SETFD is `targetfd` itself.
-/// After this call, no additional SECCOMP_IOCTL_NOTIF_SEND is needed.
-fn inject_fd_and_send_at(
+/// whatever occupies that slot). The notification stays pending; the caller
+/// must still send a response via `SECCOMP_IOCTL_NOTIF_SEND` — the connect
+/// path responds with a plain success (return value 0) so `connect()` keeps
+/// its normal success semantics for runtimes that check for exactly 0
+/// (CPython's `socket.connect()` rejects a positive return as `[Errno 0]`).
+fn inject_fd_at(
     fd: RawFd,
     id: u64,
     srcfd: RawFd,
@@ -1035,7 +1042,7 @@ fn inject_fd_and_send_at(
 ) -> io::Result<i32> {
     let addfd = SeccompNotifAddfd {
         id,
-        flags: SECCOMP_ADDFD_FLAG_SETFD | SECCOMP_ADDFD_FLAG_SEND,
+        flags: SECCOMP_ADDFD_FLAG_SETFD,
         srcfd: srcfd as u32,
         newfd: targetfd as u32,
         // ADDFD installs a NEW fd-table entry in the child, so its flags are
@@ -1578,13 +1585,14 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
                 Err(_) => send_resp_raw(fd, &inject_failure_resp(id)),
             }
         }
-        NotifAction::InjectFdSendAt { srcfd, targetfd, newfd_flags } => {
-            // SETFD|SEND atomically replaces the child's fd slot at
-            // `targetfd` and responds — the syscall returns the fd number.
-            // On failure, deny (fail closed) rather than letting the original
-            // syscall continue unmediated.
-            match inject_fd_and_send_at(fd, id, srcfd.as_raw_fd(), targetfd, newfd_flags) {
-                Ok(_new_fd) => Ok(()),
+        NotifAction::InjectFdAt { srcfd, targetfd, newfd_flags } => {
+            // SETFD (no SEND) atomically replaces the child's fd slot at
+            // `targetfd`, then the response returns 0 — connect() reports a
+            // normal success while the child's socket fd now refers to the
+            // host-side connected socket. On failure, deny (fail closed)
+            // rather than letting the original syscall continue unmediated.
+            match inject_fd_at(fd, id, srcfd.as_raw_fd(), targetfd, newfd_flags) {
+                Ok(_new_fd) => respond_value(fd, id, 0),
                 Err(_) => send_resp_raw(fd, &inject_failure_resp(id)),
             }
         }

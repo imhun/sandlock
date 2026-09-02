@@ -562,9 +562,10 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_net_isolation(
 }
 
 /// Enable the connect fd-injection path: the supervisor performs the connect
-/// on a fresh host-side socket and injects the connected fd into the sandbox,
-/// so the trapped `connect()` returns the child-side fd number. Defaults to
-/// `false` (legacy on-behalf connect).
+/// on a fresh host-side socket and injects the connected fd into the sandbox
+/// at the child's own socket fd number, so the trapped `connect()` returns 0
+/// (normal success semantics) and the child's socket fd now refers to the
+/// host-connected socket. Defaults to `false` (legacy on-behalf connect).
 ///
 /// # Safety
 /// `b` must be a valid builder pointer.
