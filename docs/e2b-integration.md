@@ -49,8 +49,8 @@
 | **P6** | 无特权默认路径的细节补齐：`getsockname/getpeername` 反映合成视图、非阻塞 `connect` 的 `EINPROGRESS` 语义 | 低 | 已知限制条目化 |
 | **P7** | wheel 矩阵补 cp310 / cp312–313（沿用 zig 交叉编译流程） | 低 | E2B 运行时已统一 3.14 |
 | **P8** | 上游 PR 推送（需有写权限的 token）+ 合入后 E2B 回切官方 wheel | 中 | 阻塞在权限，不在技术 |
-| **P9** ✅**已采纳，见 §7** | 支持**一沙箱一实例**：`Sandbox.spawn(cmd, cwd=None, env=None) -> Process`（不占用"单活进程"busy 标记、每个 Process 自持 handle、并发上限由 `max_processes` 内核核算）+ per-exec `cwd`/`env` 覆盖（见 §3.7 评估） | 中（做进程级 checkpoint / 开 `pid_ns` 的前置） | E2B 当前不需要，故未催 |
-| ~~P10~~ ⊘被 §7 取代 | ~~跨实例的共享资源组~~：一旦 §7 落地，记账边界即沙箱边界，无需组对象；仅作为 §7 不可行时的退路保留：内存/CPU/进程数目前按 `Sandbox` 实例各自记账（`brk`/`mmap` 的 USER_NOTIF 记账挂在实例的 `ctx` 上），同一沙箱的 N 个并发命令 ⇒ N 份配额。希望提供"调用方给一个 resource-group id，多个 Sandbox 共享同一份内存/CPU/进程核算"的能力（见 §3.8 实测） | 高（多租户 QoS/超卖） | E2B 侧可先用 per-sandbox cgroup 兜，但记账与 `max_memory` 语义不一致会持续踩坑 |
+| **P9** ✅**已采纳，见 §8** | 支持**一沙箱一实例**：`Sandbox.spawn(cmd, cwd=None, env=None) -> Process`（不占用"单活进程"busy 标记、每个 Process 自持 handle、并发上限由 `max_processes` 内核核算）+ per-exec `cwd`/`env` 覆盖（见 §3.7 评估） | 中（做进程级 checkpoint / 开 `pid_ns` 的前置） | E2B 当前不需要，故未催 |
+| ~~P10~~ ⊘被 §8 取代 | ~~跨实例的共享资源组~~：一旦 §8 落地，记账边界即沙箱边界，无需组对象；仅作为 §8 不可行时的退路保留：内存/CPU/进程数目前按 `Sandbox` 实例各自记账（`brk`/`mmap` 的 USER_NOTIF 记账挂在实例的 `ctx` 上），同一沙箱的 N 个并发命令 ⇒ N 份配额。希望提供"调用方给一个 resource-group id，多个 Sandbox 共享同一份内存/CPU/进程核算"的能力（见 §3.8 实测） | 高（多租户 QoS/超卖） | E2B 侧可先用 per-sandbox cgroup 兜，但记账与 `max_memory` 语义不一致会持续踩坑 |
 
 ## 3. 未解决问题
 
@@ -167,7 +167,7 @@ E2B 只能退到"固定 uid + Landlock"模型；叠加 SL-1 时隔离更弱（ro
 
 反过来，复用实例能买到、但目前 E2B 用不上的能力：跨命令统一 pid namespace
 （E2B 侧 `pid_ns` **零引用**，默认关）、进程级 checkpoint/恢复（E2B 的 pause 是 SIGSTOP、
-快照是文件系统拷贝）、真正的沙箱级并发进程核算。因此把正确切法记为 **P9**（已于 §7 采纳为实施方案）：
+快照是文件系统拷贝）、真正的沙箱级并发进程核算。因此把正确切法记为 **P9**（已于 §8 采纳为实施方案）：
 不是复用 Python 对象，而是复用已经建好的 `_NativePolicy`（`_sdk.py:1120`，本来就在
 `__del__` 才释放、每次 `create` 都用同一个 `native.ptr`），只把"单活进程"限制改成
 "`spawn` 返回独立 `Process` + `max_processes` 内核核算"。触发条件：一旦要开 `pid_ns`
@@ -244,7 +244,7 @@ fork 侧复跑命令（非 root 全程，入口脚本做一次性 root 准备）
 > 反向引用（E2B 仓库 `docs/HANDOFF.md`、`docs/sandbox-disk-quota.md`、
 > `docs/superpowers/plans/*`）已改为指到这里。
 
-## 6. 同步约定
+## 7. 同步约定
 
 1. 本文是 sandlock 侧的唯一事实源；E2B 仓库 `docs/sandlock-upstream-issues.md` 退化为编号索引
    （SL-1 / T4 / T5 → 本文对应小节）。
@@ -252,7 +252,7 @@ fork 侧复跑命令（非 root 全程，入口脚本做一次性 root 准备）
    因 XPASS 立刻失败，提示摘除标记与恢复断言。
 3. 编号沿用：`SL-*` = fork 缺陷，`T*` = E2B 待办，`R*/S*/E*/M*` = 已落地方案编号。
 
-## 7. 采纳方案：每沙箱一个实例（2026-09-03 复核后按最小改动界定）
+## 8. 采纳方案：每沙箱一个实例（2026-09-03 复核后按最小改动界定）
 
 > 决策：一个 E2B 沙箱 = 一个长命 sandlock 实例，命令是"往这个实例里 exec 一个进程"。
 > 目的：让**执行边界 = 产品边界**，§3.8 的内存/CPU/进程数超卖从根上消失。
@@ -268,7 +268,7 @@ fork 侧复跑命令（非 root 全程，入口脚本做一次性 root 准备）
 | 活沙箱有**控制通道**（unix socket + JSON 帧，带 `args` 字段，目前 `dead_code`） | `control.rs:274 ControlRequest`、`:340 "config"`、`:341 "ports"` |
 | 宿主可拿到 pid、kill、wait、pause/resume、port mappings、checkpoint | FFI `sandlock_handle_{pid,kill,wait,wait_timeout,checkpoint,free,port_mappings}` |
 
-⇒ **不需要**三层重写（我上一版 §7 写重了）。真正缺的是"从宿主再往活沙箱里塞一个根进程并把 stdio 交出来"，
+⇒ **不需要**三层重写（我上一版 §8 写重了）。真正缺的是"从宿主再往活沙箱里塞一个根进程并把 stdio 交出来"，
 以及"实例生命周期不再等于第一个进程的生命周期"。
 
 ### 7.2 缺口（这才是改造面）
