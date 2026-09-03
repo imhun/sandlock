@@ -194,6 +194,13 @@ root 属主，实例复用只会把这个错位从"每条命令"变成"整个沙
 用户命令再并发几条；官方 SDK 的 `background=True` 进程也各占一个实例。
 同理 `max_processes`（每实例 64）与 `max_cpu`（每实例一份）也会被乘以 K。
 
+**K 由什么决定（E2B 侧）**：`envd_service/process/manager.py` 的 `_CommandGate` 限制每沙箱并发
+命令数，默认 `E2B_MAX_CONCURRENT_COMMANDS_PER_SANDBOX=1`（多的排队、超队列 429）；
+但 **MCP 网关不走闸口**（`runtime/context.py:167` 直接 `executor.start()`，且长驻）。
+因此 `K = max_concurrent_commands_per_sandbox + 长驻实例数(网关=1)` ——
+**默认配置就已经实测超卖**：网关 + 一条命令各申请 450M 同时成功 ⇒ 900M 峰值 / 标称 512M
+= **1.76x**（各 300M 时 1.17x）；闸口调到 N 则约 **(N+1)x**。
+
 **不受影响的**：磁盘——XFS project id 是按沙箱目录设置、被所有实例共享，所以多条命令写同一个
 project，限额是真加总的（这也是为什么只有内存/CPU/进程数会超）。
 
