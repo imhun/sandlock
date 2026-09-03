@@ -161,6 +161,20 @@ E2B 只能退到"固定 uid + Landlock"模型；叠加 SL-1 时隔离更弱（ro
 fork 侧复跑命令（非 root 全程，入口脚本做一次性 root 准备）见
 `sandlock-e2b/docs/HANDOFF.md`「sandlock fork 验证」。
 
+## 6. 迁入本仓库的 E2B 方案文档
+
+这些是 E2B 为 sandlock 写的改动方案，原先放在 `sandlock-e2b/docs/`，现统一在此（保持原文件名）：
+
+| 文档 | 内容 | 状态 |
+|---|---|---|
+| `docs/sandlock-network-wildcard.md` | E2B Network API 能力对齐总纲（R1–R14：通配解析、合成地址、SSRF 护栏、credential 注入、host mask、SOCKS5 on-behalf） | ✅ 已落地（§1 对应条目） |
+| `docs/netns-isolation-fd-injection.md` | 方案 1：loopback netns + supervisor fd 注入（ADDFD 无特权可行性与 PoC 结论） | ✅ 落地为 S1.1/S2.1–S2.5；netns 部分已从运行时基线移除 |
+| `docs/sandbox-level-cow.md` | 沙箱级 COW（常驻 supervisor 路线）评估 | ❌ **已否决**，最终采用 XFS project quota（方案在 E2B 仓库 `docs/sandbox-disk-quota.md`） |
+| `docs/upstream-pr-netns-free.md` | 无特权上游 PR 的范围、分支与推送状态 | ⏸ 分支就绪，推送受 token 权限阻塞（§0） |
+
+> 反向引用（E2B 仓库 `docs/HANDOFF.md`、`docs/sandbox-disk-quota.md`、
+> `docs/superpowers/plans/*`）已改为指到这里。
+
 ## 6. 同步约定
 
 1. 本文是 sandlock 侧的唯一事实源；E2B 仓库 `docs/sandlock-upstream-issues.md` 退化为编号索引
