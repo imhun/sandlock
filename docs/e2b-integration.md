@@ -208,121 +208,6 @@ project，限额是真加总的（这也是为什么只有内存/CPU/进程数�
 所以实例级超卖直接变成**节点超卖**：E9 的空闲检测/驱逐/自动扩缩看到的都是"预留值"，
 实际 RSS 可以远超，OOM 会先于准入判定发生。
 
-## 7. 采纳方案：每沙箱一个实例（Instance 化改造）
-
-> 决策（2026-09-03）：确定按"一个 E2B 沙箱 = 一个 sandlock 实例 = N 个并发子进程"实现，
-> 取代 P10（共享资源组）。目标不是省那几毫秒，而是让**执行边界 = 产品边界**：
-> 内存/CPU/进程数/冻结/身份自然归沙箱，超卖问题（§3.8）从根上消失。
-
-### 7.1 验收标准（做到什么算完成）
-
-1. 同一沙箱内 K 条并发命令共享**一份** `max_memory`/`max_processes`/`max_cpu` 预算：
-   §3.8 的"网关 + 一条命令各 450M ⇒ 900M"必须变成第二个申请被拒。
-2. 命令之间互不干扰：任一命令 kill/崩溃/超时不影响同沙箱其它命令（除显式沙箱级操作）。
-3. E2B 现有全部语义保持：每命令独立 `cwd/env`、独立 stdio/PTY、独立 stdin 通道、
-   `update_network` 语义有明确定义（见 Q6，必须先定）。
-4. 无泄漏：最后一个子进程退出/沙箱删除/迁移/驱逐后，instance 的 runtime、FD、控制目录、
-   tokio 线程全部回收（worker 长跑 24h 无 FD/线程增长）。
-5. 命令首字节 p50 ≤ 现有 8.1ms（`tests/perf` 预算收紧为 8ms 防回退）。
-
-### 7.2 现状事实（改造的根据，逐条带坐标）
-
-| 事实 | 坐标 |
-|---|---|
-| 每次 `create/popen` **新建 Sandbox 对象 + 新建 tokio runtime**：`prepare()` → `policy.clone().with_name()` | `sandlock-ffi/src/lib.rs:1309-1326`、`build_live_runtime` |
-| 运行时状态是**单槽**：`child_pid`、`leader_pid`、`_stdin_write`、`_stdout_read`、`_stderr_read`、`state: RuntimeState` | `sandlock-core/src/sandbox.rs:292,299,307,308,317` |
-| `Process<'a> { sandbox: &'a mut Sandbox }`：借用互斥 ⇒ 结构上只能有一个活子进程；`take_stdin/take_stdout` 直接读写沙箱级槽位 | `sandbox.rs:3022-3045` |
-| `ResourceState`（`mem_used/proc_count/peak_*/hold_forks/held_notif_ids/load_avg`）在**每次 create 路径里 new** | `sandbox.rs:1829`(`do_create_stdio`)→`2809`，赋值 `2868` |
-| 沙箱级操作全部锚在 `leader_pid.or(child_pid)`：pause/resume/stat/throttle | `sandbox.rs:890-895,1375-1404` |
-| 名字即身份：控制目录 `sandbox_dir(name)`，冲突时用 `kill(pid,0)` 判活，判死就 `remove_dir_all` 抢占 | `control.rs:126-148`；`sandbox.rs:2486-2506` |
-| `wait()` 收尾会 abort notif/throttle/loadavg/control 任务、清控制目录、回收 COW 分支、关 DNS 网关 ⇒ 全是"沙箱级"动作 | `sandbox.rs:1050-1086` |
-| CPU 限流是每实例一个采样任务，作用于 `group_pid` | `sandbox.rs:2969-2972` |
-| 限额的 live 通道只有 `max_memory`（`PolicyFnState.live_policy` 的 `grant_/restrict_max_memory`），网络/Landlock 无在线更新 | `policy_fn.rs:213-241`、`resource.rs:676-683` |
-
-⇒ 结论：这不是"去掉 `_check_not_running`"级别的改动，而是要把 **Policy / Instance / Child 三层拆开**。
-
-### 7.3 目标架构
-
-```text
-SandboxPolicy   （不可变配置：fs/net/limits/uid/chroot/egress…，可 clone，无运行时）
-      │ build
-SandboxInstance （长命，= 一个 E2B 沙箱；Send+Sync；持 tokio runtime、notif listener、
-      │           ResourceState、PolicyFnState、NetworkState、控制目录/身份 token、
-      │           DNS 网关、COW 分支（沙箱级）、child table）
-      ├── Child #1  （pid、每子进程 stdio 三端、cwd/env 覆盖、RuntimeState、ProcessIndex 项）
-      └── Child #n  （并发上限由 ResourceState.max_processes 内核化核算）
-```
-
-- `Instance::spawn(cmd, SpawnOpts{cwd, env, stdio, extra_writable, bind_ports}) -> Child`
-- `Instance::kill_child(id, sig)` / `Child::wait()`；`Instance::freeze()/thaw()/checkpoint()`
-  为**沙箱级**（跨全部 child），`Instance::shutdown()` 幂等并回收。
-- 引用计数：child 表空 ⇒ instance 进入 idle；E2B 侧决定 idle TTL（建议：保留预算但释放
-  listener/线程，或干脆立即 free，由 §7.6 的 M1 先取"立即 free"）。
-
-### 7.4 API 形状
-
-| 层 | 新增 | 保留 |
-|---|---|---|
-| Rust core | `SandboxInstance`、`Child`、`SpawnOpts`；`ResourceState` 提升为 instance 字段；child 表 + 每 child 的 stdio/pid/state | `Sandbox`（改名 `SandboxPolicy` 或保留别名），单命令 `run()` 走"临时 instance" |
-| FFI | `sandlock_instance_new/free`（refcount）、`sandlock_instance_spawn`、`sandlock_child_wait/kill/take_stdio/resize`、`sandlock_instance_stats`、`sandlock_instance_update_limits` | `sandlock_popen/create/start/wait`（内部退化为"一次性 instance"）⇒ ABI 不破 |
-| Python | `SandboxInstance(policy)` + `.spawn()` → `Process`（自持句柄）；`Process` 不再是 `&'a mut Sandbox` | `Sandbox.run()/popen()` 现语义不变 |
-| CLI/profile | `sandlock-cli` 不变；profile TOML 可选新增 `identity.mode = per_sandbox` | — |
-
-新字段一律登记进 `_HANDLED_FIELDS`（顺带补 SL-2 漏掉的 `notify_rate_limit`）。
-
-### 7.5 问题点清单（全部要在实施前定/修，按优先级）
-
-| # | 问题 | 影响 | 决定/建议 |
-|---|---|---|---|
-| Q1 | 单槽 child/stdio/状态 + `Process<'a>` 借用模型 | 不改就无法并发；`take_stdin` 等会串台 | 全部 per-child 化；`Child` 自持 fd 与 handle（P0） |
-| Q2 | runtime/listener 目前每 create 新建 | 提升到 instance 后要 `Send+Sync` + 内部锁；单 runtime 卡死拖全部命令 | instance 持一个 multi-thread runtime；notif handler 加超时与看门狗（P0） |
-| Q3 | **pid_ns 下 ns pid 1 = 首个子进程**：它退出即销毁整个 pid namespace ⇒ 连带杀死同沙箱其它命令 | 开 `pid_ns` 后是致命语义 | M1 明确**不支持共享 pidns**；要支持则引入沙箱内 reaper/init（instance 先 fork 一个 ns pid 1），并复测 freeze/stat（P0，须早定） |
-| Q4 | freeze/checkpoint 是单进程语义（`hold_forks`、单 address space） | 沙箱级冻结才满足一致快照；单 child checkpoint 会**静默只存一条命令** | checkpoint 要么扩展为多进程，要么在 child>1 时**显式报错**，禁止静默降级（P0） |
-| Q5 | `cwd/env/extra_writable/bind_ports` 现在是策略字段，而 E2B 每命令都不同（PTY 要 `/dev/ptmx,/dev/pts`；MCP 要 `net_allow_bind`） | 不解决就只能每命令重建实例（回到原点） | 提供 `SpawnOpts` 覆盖：per-spawn `cwd`/`env`（execve 前 chdir + envp，保留 `clean_env` 语义）、per-spawn 额外可写与 bind 端口（P0） |
-| Q6 | **`update_network` 语义改变**：现在"下一条命令生效"是免费得到的；实例常驻后策略属于 instance | 不定清楚会出现"改了网络策略但已在跑的 child 不变"或"改策略必须杀全部命令" | 三选一，需 E2B 拍：(a) 新增 `instance.update_net_policy()` 在线生效（Landlock 只能加不能撤，deny→allow 方向做不到）；(b) 新 child 用新策略、老 child 保持（要求 per-child 网络视图，改动大）；(c) 改策略即优雅 drain（等 child 结束）并回报生效延迟。**建议 (c) + 文档化**（P0，最需早定） |
-| Q7 | 名字成为身份：`kill(pid,0)` 判活会被 **pid 复用**骗过 ⇒ 误删活沙箱控制目录（两 worker/重启竞态） | 可用性/安全（别人的沙箱目录被清） | 目录内加身份校验（supervisor 启动写 token + `/proc/<pid>/stat` starttime），冲突时**拒绝**而非抢占（P1，但简单必做） |
-| Q8 | 生命周期与泄漏：今天进程退出即回收，改后要显式 free | FD/线程/目录堆积；worker 长跑必炸 | instance refcount + E2B 侧 delete/kill/migrate/evict/restart 全路径释放；加"最后一次 child 退出且 idle 超时"兜底 reaper；用 `E2B_TEST_STRICT_SKIPS` 那套环境跑 24h 泄漏测试（P0） |
-| Q9 | 爆炸半径：一个 listener/runtime 服务全部命令，panic 或卡死影响整箱 | 从"一条命令失败"变成"整个沙箱失败" | 定义失败策略：handler panic ⇒ 标记 instance dead ⇒ E2B 见 503 后重建沙箱；禁止静默重启 listener（P1） |
-| Q10 | **`max_processes` 语义收紧**：现在每命令 64（K 条命令共 K×64），改后整箱 64 | 现网可能立刻出现"多开几条命令 fork 失败" | 迁移时把默认从 64 提到能覆盖真实并发（如 256），并在 E2B 侧按沙箱显式配置；变更写进 release note（P0，回归风险最大项） |
-| Q11 | SL-1 交互：chroot 形态 `fs_denied` 的代打开使文件属主变 root，实例常驻后从"每命令"变成"整箱生命周期"，worker 写的 `command-logs.jsonl` 与沙箱写的文件混在同一生命周期里 | 日志/配额归属更难查，问题被放大 | instance 化前先把 §3.1（SL-1 修法 P1/P2）落掉，或至少先去掉非 chroot 形态的 denial（E2B 已做）（P1） |
-| Q12 | 兼容与 ABI：三层拆分是破坏式重构 | 现有 CLI/测试/其它语言绑定会碎 | 旧 `sandlock_popen/run` 内部实现为"一次性 instance"，新 API 并行提供，至少一个版本周期不删（P1） |
-| Q13 | 多阶段流水线（`SharedCow`）与 stage 归属：stage 是 child 还是 instance？ | 事务性 pipeline 语义会变（分支提交粒度） | 明确：COW 分支属 instance（沙箱级），stage 属 child；`shared_cow` 现逻辑迁移时逐项复测（P1） |
-| Q14 | 性能：锁竞争、单 runtime 调度 | 命令延迟可能不降反升 | 保留 §3.7 探针为基准（fresh 8.11ms / reused 7.48ms p50），M1 起纳入 CI 预算（P2） |
-| Q15 | 测试面（真正的大头） | 并发/信号/stdin 死锁/泄漏都得新写 | 见 §7.7；fork 侧先绿，E2B 侧再切开关（P0） |
-
-### 7.6 分期实施
-
-- **M0 拆分（无行为变化）**：`SandboxPolicy` 与 `SandboxInstance` 分离，instance 内部仍"一个 child"；
-  旧 API 走 `instance` 一次性包装。验收：fork 三套测试全绿（lib 788 / integration 465 / python 430）+
-  E2B 全量不变（867 passed / 1 skipped / 2 xfailed）。
-- **M1 child 表 + per-child stdio/状态 + `SpawnOpts.cwd/env`（Q1、Q5）**：仍不并发暴露（内部支持，
-  外部只允许一个 child）。验收：单测覆盖 child 表增删、fd 归属、`wait` 幂等。
-- **M2 开放并发（Q2、Q8、Q9、Q10）**：`spawn` 可并发；instance 生命周期与 reaper；
-  `max_processes` 沙箱级并调默认值；泄漏测试。验收：§7.1 第 1/4/5 条。
-- **M3 沙箱级操作（Q3、Q4、Q6、Q13）**：freeze/checkpoint/网络策略语义落地（含 pid_ns 的
-  reaper 方案或明确不支持），与 §3.1 的 SL-1 修法联动。验收：§7.1 第 3 条 + Q4 不静默降级。
-- **M4 E2B 接线**：`SandlockExecutor` 持 instance（沙箱级）+ child 映射到 pid；`update_network`
-  按 Q6 决定实现；控制目录身份校验（Q7）。验收：E2B 全量 0 failed，§3.8 探针必须变成"第二个被拒"。
-
-### 7.7 测试矩阵（实施即按此补齐）
-
-fork：并发 spawn 的记账（内存/CPU/进程数）、child 退出归还、kill 路由正确性、单 child panic 隔离、
-`wait` 幂等/双 wait、stdin 关闭死锁（`Process::take_stdin` 注释的情形要 per-child 复现）、
-checkpoint/freeze 多 child、pid_ns reaper、控制目录身份抢占拒绝、24h 泄漏（FD/线程/目录计数）、
-旧 API 回归（证明不破坏）。
-E2B：`tests/sdk/python/test_commands.py`（并发/后台/connect/kill/超时）、`test_pty.py`、
-`test_mcp.py`（网关与用户命令并发）、`test_features.py`（卷 + 配额）、`tests/security/*`
-（属主/SL-1 断言）、`tests/perf`（首字节预算 8ms）、§3.8 超卖探针转**断言**。
-
-### 7.8 需要 E2B 侧同步做的
-
-`SandlockExecutor` 从"无状态工厂"变成"每沙箱一个 instance 的持有者"（含 free 时机：delete/kill/
-migrate/evict/worker shutdown/异常重启）；`_build_sandbox` 里 per-command 的策略字段改为 `SpawnOpts`
-（PTY 可写集、`net_allow_bind`/MCP 端口）；`max_processes` 默认值与调容量联动（Q10）；
-`update_network` 落地 Q6 的选择；控制目录名用 e2b `sandbox_id` 并配身份 token（Q7）；
-`command-logs.jsonl` 与 SL-1（Q11）复测；`docs/SCALING.md` 与 `resource-contention.md` 的
-"按沙箱预留 = 按实例核算"一致性说明（§3.8 那条随之关闭）。
-
 ## 4. E2B 侧当前缓解（不改 fork）
 
 - 纯 sandlock（无 chroot）形态**不再下发** `fs_denied`：这些路径本就不在 Landlock 可读白名单内，
@@ -366,3 +251,86 @@ fork 侧复跑命令（非 root 全程，入口脚本做一次性 root 准备）
 2. fork 修复后，请在本文把条目状态改为"已修（commit/PR）"，E2B 侧的 `xfail(strict=True)` 会
    因 XPASS 立刻失败，提示摘除标记与恢复断言。
 3. 编号沿用：`SL-*` = fork 缺陷，`T*` = E2B 待办，`R*/S*/E*/M*` = 已落地方案编号。
+
+## 7. 采纳方案：每沙箱一个实例（2026-09-03 复核后按最小改动界定）
+
+> 决策：一个 E2B 沙箱 = 一个长命 sandlock 实例，命令是"往这个实例里 exec 一个进程"。
+> 目的：让**执行边界 = 产品边界**，§3.8 的内存/CPU/进程数超卖从根上消失。
+
+### 7.1 复核：fork 已经支持什么（这部分不用做）
+
+| 已具备 | 证据 |
+|---|---|
+| **沙箱内部进程树**：子进程的 fork/clone 被拦截并登记 | `resource.rs:85 handle_fork`、`ProcessIndex::key_for`、`resource.rs:130 rs.proc_count += 1` |
+| 进程数按**树**核算（不是按单进程） | `proc_count`/`peak_proc_count` + `max_processes`（`state.rs:12`） |
+| 冻结是**整棵树**：`hold_forks` 挂起 fork，checkpoint freeze 已按沙箱设计 | `state.rs` 注释、`resource.rs:119` |
+| 内存记账按地址空间归属、exec/exit 会**自动归还有效额度**（多进程已经是对的） | `resource.rs:693` 注释、`604/610/625/658` |
+| 活沙箱有**控制通道**（unix socket + JSON 帧，带 `args` 字段，目前 `dead_code`） | `control.rs:274 ControlRequest`、`:340 "config"`、`:341 "ports"` |
+| 宿主可拿到 pid、kill、wait、pause/resume、port mappings、checkpoint | FFI `sandlock_handle_{pid,kill,wait,wait_timeout,checkpoint,free,port_mappings}` |
+
+⇒ **不需要**三层重写（我上一版 §7 写重了）。真正缺的是"从宿主再往活沙箱里塞一个根进程并把 stdio 交出来"，
+以及"实例生命周期不再等于第一个进程的生命周期"。
+
+### 7.2 缺口（这才是改造面）
+
+1. **`exec` verb + fd 传递**：控制协议现在只有 `config`/`ports`，且**全仓库没有 SCM_RIGHTS/sendfd**
+   ⇒ 新增 `exec`（args: argv、cwd、env、额外可写、bind 端口、pty 请求）并用
+   `sendmsg/recvmsg + SCM_RIGHTS` 把 stdin/stdout/stderr（或 pty master）三个 fd 传回宿主。
+2. **实例生命周期解耦**：`wait()` 的收尾会 abort notif/throttle/loadavg/**control listener**、
+   清控制目录、关 DNS 网关（`sandbox.rs:1050-1086`，`control_handle` 见 :1065/:3123）
+   ⇒ 要变成"最后一个被 exec 出来的进程退出"或显式 `instance.shutdown()` 才做这些。
+3. **child id 与退出回报**：`sandlock_handle_wait` 等全部锚在单槽 `leader_pid.or(child_pid)`
+   （:1375/:1389/:1404）⇒ 需要 `exec` 返回 child id、按 id wait/kill、退出码经控制通道回报；
+   宿主侧 `Process` 不再是 `&'a mut Sandbox` 的借用（:3022）。
+4. **per-exec 的 `cwd`/`env`**：今天 `cwd`/`env`/`clean_env` 是策略字段（builder 上设），
+   每命令可变 ⇒ 需要 execve 前 chdir + envp 构造（E2B 现依赖：PTY 的 `/dev/ptmx,/dev/pts` 可写、
+   MCP 的 `net_allow_bind` 端口，也都要变成 per-exec 增量）。
+5. **`ResourceState` 归属**：它现在在 `do_create_stdio()` 里 new（:1829→:2809）⇒ 提升到 instance，
+   否则每 exec 又拿到一份新预算，改造就白做。
+6. **名字 = 身份**：`control.rs:136-147` 用 `kill(pid,0)` 判活、判死就 `remove_dir_all` 抢占
+   ⇒ 沙箱 id 作 name 后，pid 复用/双 worker 竞态会误清活沙箱目录 ⇒ 加身份 token（写 token 文件 +
+   比对 `/proc/<pid>/stat` starttime），冲突时**拒绝**而非抢占。
+
+### 7.3 目标形态（宿主侧 API）
+
+```text
+SandboxInstance（长命：runtime、notif listener、ResourceState、PolicyFn/Network/Procfs/COW 状态、
+                 控制 socket、DNS 网关、控制目录+身份 token）
+   ├─ exec(argv, cwd?, env?, stdio|pty, extra_writable?, bind_ports?) -> {child_id, fds...}
+   ├─ wait(child_id) / kill(child_id, sig) / resize(child_id)      ← 按 child
+   ├─ freeze() / thaw() / checkpoint() / stats()                   ← 沙箱级（多数已现成）
+   └─ shutdown()   幂等：停 listener、关网关、清目录、回收预算
+```
+FFI 增量：`sandlock_instance_exec` / `sandlock_instance_wait_child` / `..._kill_child`（或统一走控制
+socket，宿主只拿 fd）；Python 增量：`SandboxInstance.exec(...)` 返回自持句柄的 `Process`。
+旧 API（`Sandbox.run/popen/spawn`）保持"一次性实例"语义不破 ⇒ ABI 与既有测试不炸。
+
+### 7.4 必须提前定的语义（不定会返工）
+
+| # | 待决 | 建议 |
+|---|---|---|
+| S1 | **`max_processes` 从"每命令 64"变"整箱 64"** ⇒ 现网可能立刻 fork 失败 | 同步上调默认（如 256），写进 release note；E2B 侧按沙箱显式配 |
+| S2 | **`update_network`**：实例长命后"下一条命令生效"不再自动成立（Landlock 只能加不能撤，deny→allow 做不到在线放宽） | 采用"新策略对**新 exec** 生效、已在跑的 child 保持原策略"，并在 API 上回报 staleness；在线收紧走已有 `PolicyFnState.live_policy` 路子 |
+| S3 | **checkpoint 范围**：冻结已是整树，但内存快照目前面向单 address space | 多 child 时**显式拒绝**（禁止静默只存一条命令）；要支持得单独设计 |
+| S4 | **pid_ns**：ns pid 1 = 首个进程，它退出会带走整棵树 | 实例化后需要一个内部 reaper/init（或明确"共享 pidns 暂不支持"），否则不能和 `pid_ns=true` 同时用 |
+| S5 | **失败爆炸半径**：listener/runtime panic 现在会带走整箱而不是一条命令 | 定义 instance dead ⇒ 宿主见明确错误 ⇒ E2B 重建沙箱；不做静默重启 |
+| S6 | **`fs_denied`(SL-1) 与长命实例叠加**：chroot 形态代打开的属主错位会从"每命令"变"整箱生命周期" | 先落 SL-1 修法（§2 P1/P2），或至少在实例化前复测 `command-logs.jsonl` 归属 |
+| S7 | 泄漏面（今天"进程退出即回收"天然无泄漏） | 显式 `shutdown()` + child 表空 + idle 超时兜底；E2B 的 delete/kill/迁移/驱逐/重启全路径接；24h FD/线程泄漏测试 |
+
+### 7.5 分期与验收
+
+- **M0**：`ResourceState` 与 listener/控制目录生命周期从 create 路径提到 instance（行为不变，旧 API
+  走一次性 instance）。验收：fork 三套全绿 + E2B 全量不变（当前 `867 passed / 1 skipped / 2 xfailed`）。
+- **M1**：`exec` + SCM_RIGHTS + child id + 按 child 的 wait/kill/resize（不开放 e2b 使用）。
+  验收：lib/integration 新增并发 exec、fd 归属、双 wait 幂等、stdin 关闭不死锁的用例。
+- **M2**：per-exec `cwd/env/extra_writable/bind_ports`（Q4/S2 的 staleness 语义同时定死）。
+- **M3**：S1 默认值调整、S3/S4 的拒绝或支持、S5/S6/S7 的生命周期与泄漏兜底。
+- **M4**：E2B 接线（`SandlockExecutor` 持 instance、`_CommandGate` 保留、控制目录名用 sandbox_id
+  + 身份 token），并把 §3.8 的超卖探针从"记录"改成**断言**（第二条命令申请应被拒）。
+
+### 7.6 需要 E2B 同步做的
+
+instance 持有与释放时机（delete/kill/migrate/evict/worker 重启）；`_build_sandbox` 的 per-command
+字段改走 `exec` 参数；`max_processes` 默认与容量联动（S1）；`update_network` 按 S2 落地并改契约测试；
+`command-logs.jsonl` 与 SL-1 复测（S6）；`docs/SCALING.md`、`resource-contention.md` 里
+"按沙箱预留 = 按实例核算"的一致性说明随之关闭 §3.8。
