@@ -49,6 +49,7 @@
 | **P6** | 无特权默认路径的细节补齐：`getsockname/getpeername` 反映合成视图、非阻塞 `connect` 的 `EINPROGRESS` 语义 | 低 | 已知限制条目化 |
 | **P7** | wheel 矩阵补 cp310 / cp312–313（沿用 zig 交叉编译流程） | 低 | E2B 运行时已统一 3.14 |
 | **P8** | 上游 PR 推送（需有写权限的 token）+ 合入后 E2B 回切官方 wheel | 中 | 阻塞在权限，不在技术 |
+| **P9** | 支持**一沙箱一实例**：`Sandbox.spawn(cmd, cwd=None, env=None) -> Process`（不占用"单活进程"busy 标记、每个 Process 自持 handle、并发上限由 `max_processes` 内核核算）+ per-exec `cwd`/`env` 覆盖（见 §3.7 评估） | 中（做进程级 checkpoint / 开 `pid_ns` 的前置） | E2B 当前不需要，故未催 |
 
 ## 3. 未解决问题
 
@@ -138,6 +139,41 @@ E2B 只能退到"固定 uid + Landlock"模型；叠加 SL-1 时隔离更弱（ro
 
 `port_mappings`、`notify_rate_limit`、`pid_ns` 等字段在 **CLI / profile TOML / FFI / Python** 四层的
 暴露是否与 `Sandbox()` 完全对齐，目前只按 E2B 用到的路径验证过，缺一次矩阵化核对。
+
+### 3.7 设计评估：一沙箱一 sandlock 实例（2026-09-03 实测）
+
+现状是**一命令一实例**：`sandlock-e2b/envd_service/executors/sandlock.py` 的
+`start()` 里每条命令 `_build_sandbox(config)` 新建一个 `Sandbox`。评估过改成
+"一沙箱一实例"，实测数据（容器内，root supervisor，host_uid=4242，`/bin/sh -c 'echo hi'`，N=25）：
+
+| 指标 | 每命令新实例 | 复用同一实例 |
+|---|---|---|
+| 策略构建（Python→builder FFI 重放全套字段） | **0.12 ms** p50 | — |
+| `run()`（含 fork + execve + 等待） | 8.11 ms p50 / 11.10 p95 | **7.48 ms** p50 / 9.90 p95 |
+| 差值 | — | 省 ≈0.6 ms/命令（≈8%） |
+| 第二条命令在第一条存活时 | 正常（各自实例） | **0.2 ms 内被拒**：`RuntimeError: sandbox is already running` |
+
+结论：**当前不值得改**。收益只有 8% 的命令内开销（且这部分只占 e2b 首字节预算 100 ms 的一小截，
+瓶颈在 RPC/流式管道与 `asyncio.to_thread` 调度），而代价是三处功能倒退：
+
+1. 绑定层规定一个 `Sandbox` 同时只能有一个活子进程（`python/src/sandlock/sandbox.py:670`
+   `_check_not_running`），而 e2b 语义允许同一沙箱并发命令、后台进程、以及**长驻的 MCP 网关**
+   共存 —— 现在正是靠"每命令一实例"满足的；
+2. `cwd` / `env` / `clean_env` 是**策略字段**，每命令可变（`ExecConfig.cwd/env`）⇒
+   复用实例必须支持 per-exec 覆盖；
+3. 句柄归属是刻意拆开的（`_reject_if_popen`：popen 的 handle 归 `Process`，
+   沙箱生命周期方法不得触碰），复用前要把"每个 handle 独立 wait/kill、不串扰"重做一遍。
+
+反过来，复用实例能买到、但目前 E2B 用不上的能力：跨命令统一 pid namespace
+（E2B 侧 `pid_ns` **零引用**，默认关）、进程级 checkpoint/恢复（E2B 的 pause 是 SIGSTOP、
+快照是文件系统拷贝）、真正的沙箱级并发进程核算。因此把正确切法记为 **P9**：
+不是复用 Python 对象，而是复用已经建好的 `_NativePolicy`（`_sdk.py:1120`，本来就在
+`__del__` 才释放、每次 `create` 都用同一个 `native.ptr`），只把"单活进程"限制改成
+"`spawn` 返回独立 `Process` + `max_processes` 内核核算"。触发条件：一旦要开 `pid_ns`
+或做进程级 checkpoint，P9 就是前置项。
+
+另注：P9 不改变 §3.1（SL-1）的结论——chroot 形态下 `fs_denied` 的代打开仍会把文件写成
+root 属主，实例复用只会把这个错位从"每条命令"变成"整个沙箱生命周期"，日志与配额归属更难查。
 
 ## 4. E2B 侧当前缓解（不改 fork）
 
