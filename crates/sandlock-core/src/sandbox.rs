@@ -2678,10 +2678,11 @@ impl Sandbox {
                         .into());
                     }
                     Err(e) => {
-                        // Best-effort: in nested sandboxes /dev/shm may be
-                        // restricted by the outer sandlock's landlock policy.
-                        // Warn and continue without a control socket rather
-                        // than failing the sandbox.
+                        // Best-effort: in nested sandboxes the control state
+                        // root (/tmp/sandlock-ctl-<uid> by default) may be
+                        // outside the outer sandlock's Landlock view.  Warn
+                        // and continue without a control socket rather than
+                        // failing the sandbox.
                         eprintln!(
                             "sandlock: control socket setup failed for '{}': {} \
                              (introspection unavailable for this sandbox)",

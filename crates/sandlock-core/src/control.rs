@@ -311,14 +311,19 @@ pub(crate) fn setup_runtime_dir_no_socket(
 
     // Identity token first: the dir is not complete without it, and a
     // concurrent enumerator that sees the dir before the pid file must not
-    // mistake a mid-setup dir for a live sandbox.
+    // mistake a mid-setup dir for a live sandbox.  Created in one step with
+    // the final 0600 mode (create_new fails closed if the file exists).
     let token = generate_token()?;
     let token_file = token_path(&dir);
-    std::fs::write(&token_file, format!("{}\n", token))?;
-    #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&token_file)?;
+        writeln!(f, "{}", token)?;
     }
 
     // Raw-name metadata (for `sandlock ps`; the dir name itself is hashed).
@@ -376,20 +381,23 @@ enum ExistingDir {
 
 /// Decide whether an existing runtime dir may be reclaimed.
 ///
-/// Refusal is the default; only two cases reclaim:
+/// Refusal is the default.  Exactly one case reclaims at create time:
 ///
-/// * the pid file records a supervisor starttime that no longer matches
-///   `/proc/<pid>/stat` (the recorded owner is gone; if the pid was reused,
-///   the starttime mismatch proves this dir predates the current occupant).
-///   When `/proc` is unreadable, `kill(pid, 0)` is used only to distinguish
-///   "process provably gone" (ESRCH) from "cannot tell" — the latter refuses,
-/// * the pid file is missing/unparseable **and** the dir is not recent (an
-///   abandoned mid-setup dir; a recent pid-less dir may be a live sandbox
-///   whose setup is still in progress, or — as in the SL-7 regression test —
-///   a live sandbox whose pid file was lost, so it must not be touched).
+/// * a valid pid file exists AND its recorded supervisor starttime is
+///   readable and no longer matches `/proc/<pid>/stat` — the recorded owner
+///   is unambiguously gone (and if the pid was reused, the starttime
+///   mismatch proves this dir predates the current occupant).
 ///
-/// `kill(pid, 0)` failure alone is never a reclaim reason, and neither is an
-/// unreadable pid file on its own.
+/// Every other state refuses with `Ambiguous` at create time: a current
+/// starttime that cannot be read (the process may be alive behind an
+/// unreadable /proc), a legacy two-line pid file with no recorded starttime
+/// (`kill(pid, 0)` cannot detect pid reuse), and a missing or unparseable
+/// pid file **regardless of the dir's age** — the dir may be a live sandbox
+/// whose pid file was lost (the SL-7 regression test pins exactly this, with
+/// both a fresh and a backdated dir), or a setup still in progress.  Create
+/// time must never `remove_dir_all` a pid-less dir; genuinely dead pid-less
+/// debris is reclaimed only by the explicit `list_live_sandboxes`/`sandlock
+/// ps` pruning path, which applies its own recency guard.
 fn classify_existing_dir(dir: &Path, name: &str) -> Result<ExistingDir, std::io::Error> {
     // A foreign dir squatting in this hash slot is never ours to reclaim.
     if let Some(existing_name) = read_name(dir) {
@@ -416,32 +424,24 @@ fn classify_existing_dir(dir: &Path, name: &str) -> Result<ExistingDir, std::io:
                     Ok(ExistingDir::Stale)
                 }
                 None => {
-                    // /proc unreadable or the process is gone.  Fail closed:
-                    // reclaim only when kill(pid, 0) proves there is no such
-                    // process (ESRCH); an alive-but-unreadable process must
-                    // refuse.
-                    if (unsafe { libc::kill(supervisor_pid, 0) }) == 0 {
-                        Ok(ExistingDir::Ambiguous)
-                    } else {
-                        Ok(ExistingDir::Stale)
-                    }
+                    // Current starttime unreadable (process gone or /proc
+                    // restricted): staleness is not unambiguously proven, so
+                    // refuse at create time; ps pruning reclaims dead dirs.
+                    Ok(ExistingDir::Ambiguous)
                 }
             }
         }
         Some((_, _, None)) => {
             // Legacy two-line pid file with no recorded starttime: staleness
             // cannot be proven (kill(pid,0) cannot detect pid reuse), so
-            // refuse; `sandlock ps` pruning handles such leftovers.
+            // refuse at create time; `sandlock ps` pruning handles such
+            // leftovers.
             Ok(ExistingDir::Ambiguous)
         }
-        None => {
-            let now = std::time::SystemTime::now();
-            if dir_is_recent(dir, &now) {
-                Ok(ExistingDir::Ambiguous)
-            } else {
-                Ok(ExistingDir::Stale)
-            }
-        }
+        // Missing or unparseable pid file: never reclaimable at create time
+        // (the dir could belong to a live sandbox whose pid file was lost, no
+        // matter how old the dir looks).
+        None => Ok(ExistingDir::Ambiguous),
     }
 }
 

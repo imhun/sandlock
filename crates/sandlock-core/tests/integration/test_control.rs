@@ -1226,11 +1226,79 @@ sys.exit(0)
     let _ = child_b.wait();
 }
 
+/// Spawn a same-name sandbox and require it to exit quickly with a refusal
+/// (rather than starting after preempting the live dir).
+fn spawn_and_expect_refused(name: &str) {
+    let mut second = start_sleep_sandbox(name);
+    let mut exited = None;
+    for _ in 0..40 {
+        if let Some(status) = second.try_wait().expect("try_wait on second sandbox") {
+            exited = Some(status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let status = match exited {
+        Some(status) => status,
+        None => {
+            let _ = second.kill();
+            let _ = second.wait();
+            panic!(
+                "second create with the same name preempted the live sandbox \
+                 instead of refusing (it is still running)"
+            );
+        }
+    };
+    assert!(
+        !status.success(),
+        "second sandbox with the same name must fail"
+    );
+    let stderr = child_stderr(&mut second);
+    assert!(
+        stderr.contains("already running"),
+        "refusal should say 'already running': {}",
+        stderr
+    );
+}
+
+/// Assert the first sandbox's runtime dir survived a refused same-name create
+/// and its token-authenticated control socket still serves.
+fn assert_first_sandbox_intact(name: &str, dir: &std::path::Path) {
+    assert!(dir.exists(), "first sandbox dir must survive: {:?}", dir);
+    let sock = sandlock_core::control::sock_path(dir);
+    assert!(sock.exists(), "first sandbox socket must survive: {:?}", sock);
+    match sandlock_core::control::send_control_request(
+        name,
+        "config",
+        serde_json::Value::Object(Default::default()),
+    ) {
+        Ok(r) => {
+            assert!(
+                r.ok,
+                "first sandbox must still serve config after the refused create: {:?}",
+                r.err
+            );
+        }
+        Err(e) => {
+            panic!(
+                "first sandbox control request after refused create failed: {}",
+                e
+            );
+        }
+    }
+}
+
 /// A second create with a live sandbox's name must refuse — never preempt.
 /// The preemption trigger is a live sandbox whose pid file is unreadable (a
 /// torn write / lost file): today's code treats that as dead and
 /// `remove_dir_all`s the live dir; the fix must refuse because the dir cannot
 /// be proven stale, and the first sandbox's directory must survive intact.
+///
+/// Both pid-less dir ages are pinned: freshly modified (<2s, the recency
+/// window) and backdated past it (>2s — the classifier must not reclaim a
+/// pid-less dir at create time just because it looks old; only `sandlock ps`
+/// pruning may reclaim such debris).
 #[test]
 fn test_name_conflict_refuses_preempt() {
     isolate_ctl_root();
@@ -1252,65 +1320,45 @@ fn test_name_conflict_refuses_preempt() {
             // is demonstrably still alive (it serves control requests below).
             std::fs::remove_file(&pid_file).expect("remove first sandbox pid file");
 
-            // Second create with the same name.  On the fixed code this exits
-            // quickly with a refusal; today it starts successfully (it just
-            // preempted the live dir) and keeps running.
-            let mut second = start_sleep_sandbox(&name);
-            let mut exited = None;
-            for _ in 0..40 {
-                if let Some(status) = second.try_wait().expect("try_wait on second sandbox") {
-                    exited = Some(status);
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(250));
-            }
+            // Variant 1: pid-less dir freshly modified (inside the 2s recency
+            // window).  Same-name create must refuse and the live dir must
+            // survive.
+            spawn_and_expect_refused(&name);
+            assert_first_sandbox_intact(&name, &dir);
 
-            let status = match exited {
-                Some(status) => status,
-                None => {
-                    let _ = second.kill();
-                    let _ = second.wait();
-                    panic!(
-                        "second create with the same name preempted the live sandbox \
-                         instead of refusing (it is still running)"
-                    );
-                }
+            // Variant 2: pid-less dir backdated ~5s — past the recency
+            // window.  Create time must STILL refuse (create never reclaims a
+            // pid-less dir, no matter its age); only the explicit ps pruning
+            // path reclaims dead pid-less debris.
+            let now = std::time::SystemTime::now();
+            let old_secs = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock before epoch")
+                .as_secs() as libc::time_t
+                - 5;
+            let old_time = libc::timespec {
+                tv_sec: old_secs,
+                tv_nsec: 0,
             };
+            let times = [old_time, old_time];
+            let dir_cstr = CString::new(dir.to_str().unwrap()).expect("valid C string");
+            let rc = unsafe {
+                libc::utimensat(libc::AT_FDCWD, dir_cstr.as_ptr(), times.as_ptr(), 0)
+            };
+            assert_eq!(rc, 0, "utimensat failed on {:?}", dir);
+            let backdated = std::fs::metadata(&dir)
+                .expect("dir metadata after backdate")
+                .modified()
+                .expect("dir mtime");
+            let age = now.duration_since(backdated).expect("backdated mtime");
             assert!(
-                !status.success(),
-                "second sandbox with the same name must fail"
-            );
-            let stderr = child_stderr(&mut second);
-            assert!(
-                stderr.contains("already running"),
-                "refusal should say 'already running': {}",
-                stderr
+                age.as_secs() >= 4,
+                "dir should be backdated past the recency window, age: {:?}",
+                age
             );
 
-            // The first sandbox's dir must still be there with a live,
-            // token-authenticated control socket.
-            assert!(dir.exists(), "first sandbox dir must survive: {:?}", dir);
-            let sock = sandlock_core::control::sock_path(&dir);
-            assert!(sock.exists(), "first sandbox socket must survive: {:?}", sock);
-            match sandlock_core::control::send_control_request(
-                &name,
-                "config",
-                serde_json::Value::Object(Default::default()),
-            ) {
-                Ok(r) => {
-                    assert!(
-                        r.ok,
-                        "first sandbox must still serve config after the refused create: {:?}",
-                        r.err
-                    );
-                }
-                Err(e) => {
-                    panic!(
-                        "first sandbox control request after refused create failed: {}",
-                        e
-                    );
-                }
-            }
+            spawn_and_expect_refused(&name);
+            assert_first_sandbox_intact(&name, &dir);
 
             // Restore the pid file (the test removed it; the supervisor never
             // rewrites it) so the sandbox stays listed and cleanly killable.

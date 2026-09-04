@@ -350,7 +350,8 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
             // Read both PIDs from the per-sandbox pid file (no socket
-            // round-trip).  Format: child_pid\nsupervisor_pid\n
+            // round-trip).  Format: child_pid\nsupervisor_pid\nstarttime\n —
+            // the third (starttime identity) line is not needed for kill.
             let dir = sandlock_core::control::sandbox_dir(&name);
             let pid_file = sandlock_core::control::pid_path(&dir);
             let pid_str = match std::fs::read_to_string(&pid_file) {
