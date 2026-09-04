@@ -9,11 +9,12 @@
 #   1. non-root phase (entrypoint drops to uid 65534): core_lib, core_integ,
 #      ffi, cli, cli_build, python — `sh scripts/test-all.sh`
 #   2. root-mode phase: oci — `sh scripts/test-all.sh --oci-root` as root.
-core_lib = 790
-core_integ = 475 # F1.3 (SL-7): +4 plan tests in test_control.rs (peer-uid auth
-                 # closes, sibling cannot read policy, name conflict refuses
-                 # preempt, verb without token rejected); existing control
-                 # tests adapted in place (hashed state root + token protocol)
+core_lib = 791 # F1.4 (SL-8): +1 plan unit test pidfd_release_is_idempotent
+               # in resource.rs
+core_integ = 477 # F1.4 (SL-8): +2 plan tests in test_resource.rs
+                 # (test_setsid_orphan_returns_proc_count,
+                 # test_proc_count_matches_live_after_orphan_storm); the F1.3
+                 # control-auth pair (471 -> 475) is included in this total
 ffi = 89
 cli = 95      # after F0.4 wiring (cli suite includes net_bind_map tests)
 oci = 131     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e2e

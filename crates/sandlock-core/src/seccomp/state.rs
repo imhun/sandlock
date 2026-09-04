@@ -16,6 +16,13 @@ pub struct ResourceState {
     pub peak_proc_count: u32,
     /// Maximum allowed concurrent processes.
     pub max_processes: u32,
+    /// True when the per-child pidfd watcher is the authoritative `proc_count`
+    /// releaser: every counted fork child is birth-registered (argv-safety
+    /// mode), its exit releases the slot exactly once, and blocking wait4
+    /// notifications must NOT decrement (`handle_wait` is an idempotent
+    /// no-op). False in lazy mode, where watcher coverage is incomplete and a
+    /// reaping wait4 remains the only release for watcher-less children.
+    pub pidfd_release_authoritative: bool,
     /// Estimated anonymous memory usage (bytes).
     pub mem_used: u64,
     /// Peak anonymous memory usage observed since sandbox start (bytes).
@@ -39,6 +46,7 @@ impl ResourceState {
             proc_count: 0,
             peak_proc_count: 1, // root process always exists; handle_fork counts children only
             max_processes,
+            pidfd_release_authoritative: false,
             mem_used: 0,
             peak_mem_used: 0,
             max_memory_bytes,
@@ -205,8 +213,28 @@ struct ProcessEntry {
     /// outside the async mutex so address-space lookups need only the
     /// index's read lock.
     tgid: i32,
+    /// Exit-release bookkeeping for this process slot (see `ProcessRelease`).
+    release: Arc<ProcessRelease>,
     state: Arc<AsyncMutex<PerProcessState>>,
     cwd: SharedCwd,
+}
+
+/// Per-entry bookkeeping for the exactly-once `proc_count` release.
+///
+/// In argv-safety mode every counted fork child is registered (and given a
+/// pidfd watcher) at birth, before it can run user code. The watcher's exit
+/// cleanup owns that child's release: `counted` records that the slot was
+/// fork-counted, and `released` is the one-shot latch that keeps duplicate
+/// exit observations (watcher + periodic GC, watcher + a stale duplicate
+/// readiness event, or a re-registration race) from releasing the same child
+/// twice.
+#[derive(Default)]
+pub(crate) struct ProcessRelease {
+    /// True when this entry was birth-registered as a fork-counted child, so
+    /// its pidfd watcher owns the `proc_count` release on exit.
+    pub counted: bool,
+    /// One-shot latch: set by whichever cleanup first performs the release.
+    pub released: std::sync::atomic::AtomicBool,
 }
 
 impl ProcessIndex {
@@ -216,12 +244,25 @@ impl ProcessIndex {
         }
     }
 
-    /// Register a process by reading its start_time once and
-    /// allocating its `PerProcessState`. Returns the canonical key,
-    /// or None if the process is already gone. The caller is
-    /// responsible for keeping the pidfd alive — the per-child
-    /// watcher task does this via `AsyncFd<OwnedFd>`.
+    /// Register a process with a non-counted slot (root, threads, and lazy
+    /// registrations; the release, if any, happens on the wait4 side).
     pub fn register(&self, pid: i32) -> Option<PidKey> {
+        self.register_with(pid, false)
+    }
+
+    /// Register a birth-tracked, fork-counted child whose pidfd watcher owns
+    /// the exactly-once `proc_count` release on exit. Used by the argv-safety
+    /// ptrace fork-event path, where every counted child is registered before
+    /// it can run user code.
+    pub(crate) fn register_counted(&self, pid: i32) -> Option<PidKey> {
+        self.register_with(pid, true)
+    }
+
+    /// Register a process by reading its start_time once and allocating its
+    /// `PerProcessState`. Returns the canonical key, or None if the process is
+    /// already gone. The caller is responsible for keeping the pidfd alive —
+    /// the per-child watcher task does this via `AsyncFd<OwnedFd>`.
+    fn register_with(&self, pid: i32, counted: bool) -> Option<PidKey> {
         let start_time = read_pid_start_time(pid)?;
         let key = PidKey { pid, start_time };
         // Unreadable /proc means the task is its own address space as far
@@ -230,6 +271,10 @@ impl ProcessIndex {
         let entry = ProcessEntry {
             key,
             tgid,
+            release: Arc::new(ProcessRelease {
+                counted,
+                released: std::sync::atomic::AtomicBool::new(false),
+            }),
             state: Arc::new(AsyncMutex::new(PerProcessState::default())),
             cwd: self.inherited_cwd(pid, tgid),
         };
@@ -321,6 +366,23 @@ impl ProcessIndex {
             .map(|e| (e.key, Arc::clone(&e.state)))
     }
 
+    /// Per-process state plus the exit-release slot, for the pidfd-watcher /
+    /// GC cleanup path. Returns None if the pid isn't tracked.
+    pub(crate) fn entry_for_cleanup(
+        &self,
+        pid: i32,
+    ) -> Option<(
+        PidKey,
+        Arc<AsyncMutex<PerProcessState>>,
+        Arc<ProcessRelease>,
+    )> {
+        self.inner
+            .read()
+            .ok()?
+            .get(&pid)
+            .map(|e| (e.key, Arc::clone(&e.state), Arc::clone(&e.release)))
+    }
+
     /// Per-address-space state for `pid`: the thread-group leader's
     /// entry when `pid` is a thread, otherwise its own. Memory
     /// accounting keys off this because threads share one address
@@ -389,9 +451,19 @@ impl ProcessIndex {
     /// task in case a pidfd watcher failed to spawn or the kernel
     /// didn't deliver the readability event.
     pub fn prune_dead(&self) {
+        for key in self.dead_keys() {
+            self.unregister(key);
+        }
+    }
+
+    /// Snapshot the keys whose process is gone (or whose start_time has
+    /// changed, i.e. the pid was recycled). The backstop task runs the full
+    /// `cleanup_pid` on each so the exactly-once release latch still fires for
+    /// counted children whose watcher missed the exit.
+    pub(crate) fn dead_keys(&self) -> Vec<PidKey> {
         let candidates: Vec<(i32, PidKey)> = match self.inner.read() {
             Ok(g) => g.iter().map(|(p, e)| (*p, e.key)).collect(),
-            Err(_) => return,
+            Err(_) => return Vec::new(),
         };
         let mut dead = Vec::new();
         for (pid, key) in candidates {
@@ -400,16 +472,7 @@ impl ProcessIndex {
                 _ => dead.push(key),
             }
         }
-        if dead.is_empty() {
-            return;
-        }
-        if let Ok(mut g) = self.inner.write() {
-            for key in dead {
-                if g.get(&key.pid).map(|e| e.key) == Some(key) {
-                    g.remove(&key.pid);
-                }
-            }
-        }
+        dead
     }
 }
 
@@ -899,6 +962,7 @@ mod tests {
             let stale = ProcessEntry {
                 key: stale_key,
                 tgid: self_pid,
+                release: Arc::new(ProcessRelease::default()),
                 state: Arc::new(AsyncMutex::new(PerProcessState::default())),
                 cwd: SharedCwd::default(),
             };
@@ -959,6 +1023,7 @@ mod tests {
         let stale = ProcessEntry {
             key: stale_key,
             tgid: self_pid,
+            release: Arc::new(ProcessRelease::default()),
             state: Arc::new(AsyncMutex::new(PerProcessState::default())),
             cwd: SharedCwd::default(),
         };

@@ -139,6 +139,11 @@ pub(crate) async fn handle_fork(
 /// run, so handlers can rely on `ProcessIndex::key_for(notif.pid)`
 /// returning a fresh PidKey.
 ///
+/// `counted` marks a birth-registered, fork-counted child (argv-safety fork
+/// events only): its pidfd watcher owns the exactly-once `proc_count`
+/// release on exit. Lazy registrations (root, threads, never-birth-tracked
+/// children) pass `false` and keep the wait4-side release semantics.
+///
 /// With `policy_fn` active, fork-like syscalls additionally register
 /// new child processes at creation time via ptrace fork events, before
 /// the child can run user code. Without `policy_fn`, lazy registration
@@ -151,7 +156,7 @@ pub(crate) async fn handle_fork(
 /// parent has waited (which we observe), so a stale entry has no
 /// window in which to be hit. We deliberately do *not* re-stat
 /// /proc/<pid>/stat on every notification.
-pub(crate) fn register_pid_if_new(ctx: &Arc<SupervisorCtx>, pid: i32) -> bool {
+pub(crate) fn register_pid_if_new(ctx: &Arc<SupervisorCtx>, pid: i32, counted: bool) -> bool {
     if ctx.processes.contains(pid) {
         return true;
     }
@@ -174,7 +179,11 @@ pub(crate) fn register_pid_if_new(ctx: &Arc<SupervisorCtx>, pid: i32) -> bool {
         }
     };
 
-    let key = match ctx.processes.register(pid) {
+    let key = match if counted {
+        ctx.processes.register_counted(pid)
+    } else {
+        ctx.processes.register(pid)
+    } {
         Some(k) => k,
         None => return false, // process exited between pidfd_open and stat read
     };
@@ -185,7 +194,11 @@ pub(crate) fn register_pid_if_new(ctx: &Arc<SupervisorCtx>, pid: i32) -> bool {
 }
 
 pub(crate) async fn register_child_if_new(ctx: &Arc<SupervisorCtx>, pid: i32) {
-    let _ = register_pid_if_new(ctx, pid);
+    // Lazy registration from a notification: the pid may be the root, a
+    // thread, or a fork child that was never birth-registered. It did not go
+    // through the argv-safety fork-event path, so its proc_count release (if
+    // any) stays on the wait4 side — never mark it `counted`.
+    let _ = register_pid_if_new(ctx, pid, false);
 }
 
 /// Command sent to the per-trace ptrace worker after `prepare` returns.
@@ -472,7 +485,10 @@ fn handle_fork_event(caller_tid: i32, ctx: &Arc<SupervisorCtx>) -> io::Result<bo
     }
 
     let child_pid = child_pid as i32;
-    if !register_pid_if_new(ctx, child_pid) {
+    // This path only runs for fork-counted, non-thread creations (see
+    // `requires_process_creation_tracking`), so the birth-registered slot owns
+    // the exactly-once proc_count release via its pidfd watcher.
+    if !register_pid_if_new(ctx, child_pid, true) {
         let _ = unsafe { libc::kill(child_pid, libc::SIGKILL) };
         detach_traced(child_pid);
         return Err(io::Error::new(
@@ -539,16 +555,32 @@ pub(crate) async fn abort_process_creation_tracking(mut trace: ProcessCreationTr
     }
 }
 
-/// Handle wait4/waitid notifications — decrement the concurrent process count.
+/// Handle wait4/waitid notifications.
 ///
-/// Only blocking waits reach the supervisor (WNOHANG/WNOWAIT calls are
-/// filtered out by BPF and allowed without notification).  A blocking wait
-/// will definitely reap a child, so we decrement before the kernel executes it.
+/// Release semantics are mode-dependent, and both modes are idempotent with
+/// respect to the pidfd watcher's release:
+///
+/// * argv-safety mode (`pidfd_release_authoritative`): every counted fork
+///   child is birth-registered with a pidfd watcher, and a child's exit
+///   always precedes any wait that reaps it — so the watcher cleanup is
+///   guaranteed to observe the exit and release `proc_count` exactly once.
+///   A wait4 notification here would be a second release for the same child,
+///   so it is a no-op.
+/// * lazy mode: children are only registered once they notify, so a counted
+///   child can be reaped with no watcher ever having existed. Only blocking
+///   waits reach the supervisor (WNOHANG/WNOWAIT calls are filtered out by
+///   BPF), and a blocking wait definitely reaps a child, so the wait remains
+///   the release path; the watcher's cleanup never releases these children
+///   (they are never marked `counted`), which keeps the two paths from
+///   double-releasing.
 pub(crate) async fn handle_wait(
     _notif: &SeccompNotif,
     resource: &Arc<Mutex<ResourceState>>,
 ) -> NotifAction {
     let mut rs = resource.lock().await;
+    if rs.pidfd_release_authoritative {
+        return NotifAction::Continue;
+    }
     rs.proc_count = rs.proc_count.saturating_sub(1);
     NotifAction::Continue
 }
@@ -1218,5 +1250,81 @@ mod tests {
         assert_eq!(waited, caller, "wait caller");
         assert_eq!(flags.read(FORK_FAILED), 0, "fork in caller failed");
         caller_guard.disarm();
+    }
+
+    /// A counted child's proc_count release fires exactly once no matter how
+    /// many exit observations arrive (pidfd watcher cleanup, the wait4 path,
+    /// a duplicate watcher/GC cleanup) — and the count never goes below the
+    /// live-process baseline.
+    #[tokio::test]
+    async fn pidfd_release_is_idempotent() {
+        let notif = fake_notif(libc::SYS_wait4 as i64, 0);
+
+        // argv-safety mode: every counted fork child is birth-registered and
+        // its pidfd watcher owns the release. The parent's later wait4 for
+        // the same child must not release again (`handle_wait` no-ops when
+        // pidfd release is authoritative).
+        let authoritative = fake_supervisor_ctx(true);
+        {
+            let mut rs = authoritative.resource.lock().await;
+            rs.pidfd_release_authoritative = true;
+        }
+        let self_pid = std::process::id() as i32;
+        let key = authoritative
+            .processes
+            .register_counted(self_pid)
+            .expect("birth-registered counted child registers");
+        {
+            let mut rs = authoritative.resource.lock().await;
+            rs.proc_count = 2; // root + the counted child
+        }
+
+        // Exit observed by the pidfd watcher: releases once.
+        crate::seccomp::notif::cleanup_pid(&authoritative, key).await;
+        // Wait4 notification for the same child: must not double-release.
+        handle_wait(&notif, &authoritative.resource).await;
+        // Duplicate exit observation (GC backstop / double readiness): must
+        // not release again.
+        crate::seccomp::notif::cleanup_pid(&authoritative, key).await;
+
+        {
+            let rs = authoritative.resource.lock().await;
+            assert_eq!(
+                rs.proc_count, 1,
+                "watcher release + wait4 + duplicate cleanup must release the \
+                 counted child exactly once"
+            );
+            assert_eq!(
+                rs.peak_proc_count, 1,
+                "release must not lower the observed peak"
+            );
+        }
+
+        // Lazy mode: children are not birth-registered, so the watcher
+        // cleanup must not release (wait4 is the sole release), and repeated
+        // triggers must not drive the count below the live floor.
+        let lazy = fake_supervisor_ctx(false);
+        let lazy_key = lazy.processes.register(self_pid).expect("lazy entry registers");
+        {
+            let mut rs = lazy.resource.lock().await;
+            rs.proc_count = 2; // root + the lazily-tracked child
+        }
+        crate::seccomp::notif::cleanup_pid(&lazy, lazy_key).await;
+        {
+            let rs = lazy.resource.lock().await;
+            assert_eq!(rs.proc_count, 2, "uncounted watcher cleanup must not release");
+        }
+        // The parent's blocking wait4 is the only release for this child.
+        handle_wait(&notif, &lazy.resource).await;
+        // A duplicate watcher/GC cleanup must not release on top of the wait.
+        crate::seccomp::notif::cleanup_pid(&lazy, lazy_key).await;
+        {
+            let rs = lazy.resource.lock().await;
+            assert_eq!(
+                rs.proc_count, 1,
+                "wait4 release for a watcher-less child applies exactly once, \
+                 with no second release from the watcher cleanup"
+            );
+        }
     }
 }

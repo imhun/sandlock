@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
-use sandlock_core::sandbox::ByteSize;
+use sandlock_core::policy_fn::Verdict;
+use sandlock_core::sandbox::{ByteSize, ProcessStats};
 use sandlock_core::{Sandbox, ExitStatus};
 
 use libc;
@@ -490,4 +491,200 @@ async fn test_pause_resume() {
         "expected Signal or Killed after pause/resume/kill, got {:?}",
         result.exit_status,
     );
+}
+
+/// Build a guest script that spawns `rounds` setsid orphans (fork a child
+/// that calls setsid, sleeps briefly, and `_exit`s; the parent never waits),
+/// waits for them to exit, then probes fork-ability with one fork+wait.
+/// Every phase is written to `out` so the host side can observe it; the
+/// script stays alive after the probe so the host can poll supervisor stats.
+fn orphan_storm_script(rounds: u32, out: &std::path::Path) -> String {
+    let settle = if rounds == 0 {
+        0.0
+    } else {
+        0.4 + (rounds - 1) as f64 * 0.15 + 2.0
+    };
+    format!(
+        concat!(
+            "import os, time\n",
+            "out = '{out}'\n",
+            "rounds = {rounds}\n",
+            "def mark(text):\n",
+            "    open(out, 'w').write(text)\n",
+            "for i in range(rounds):\n",
+            "    try:\n",
+            "        p = os.fork()\n",
+            "    except OSError as e:\n",
+            "        mark('FORK_FAILED:%d' % e.errno); time.sleep(60); os._exit(1)\n",
+            "    if p == 0:\n",
+            "        os.setsid()\n",
+            "        time.sleep(0.4 + i * 0.15)\n",
+            "        os._exit(0)\n",
+            "time.sleep({settle})\n",
+            "mark('ROUNDS_DONE')\n",
+            "last = None\n",
+            "for _ in range(200):\n",
+            "    try:\n",
+            "        probe = os.fork()\n",
+            "        if probe == 0:\n",
+            "            os._exit(0)\n",
+            "        os.waitpid(probe, 0)\n",
+            "        mark('PROBE_OK')\n",
+            "        break\n",
+            "    except OSError as e:\n",
+            "        last = e.errno\n",
+            "        time.sleep(0.05)\n",
+            "else:\n",
+            "    mark('PROBE_EAGAIN:%s' % last)\n",
+            "time.sleep(120)\n",
+        ),
+        out = out.display(),
+        rounds = rounds,
+        settle = settle,
+    )
+}
+
+/// Poll the marker file until it contains `needle`; returns the last content
+/// read (empty when the file never appeared). Loop control only — assertions
+/// on the outcome are exact `assert_eq!`s in the callers.
+async fn wait_for_marker(out: &std::path::Path, needle: &str, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    let mut content = String::new();
+    while Instant::now() < deadline {
+        match std::fs::read_to_string(out) {
+            Ok(c) => {
+                if c.contains(needle) {
+                    return c;
+                }
+                content = c;
+            }
+            Err(_) => content.clear(),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    content
+}
+
+/// Poll the supervisor's process accounting until it equals `want` (or the
+/// deadline passes, returning the last snapshot for the exact assertion).
+async fn wait_for_process_stats(
+    sb: &Sandbox,
+    want: ProcessStats,
+    timeout: Duration,
+) -> ProcessStats {
+    let deadline = Instant::now() + timeout;
+    let mut last = sb.process_stats().await;
+    while Instant::now() < deadline {
+        last = sb.process_stats().await;
+        if last == want {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    last
+}
+
+/// A setsid orphan exits without any sandbox-side blocking wait: today the
+/// `proc_count` slot it took at fork is never returned, so with
+/// `max_processes = 2` every later fork fails EAGAIN even though nothing is
+/// running. With the pidfd watcher as the authoritative releaser the slot
+/// returns at exit, the probe fork+wait succeeds, and the supervisor's
+/// bookkeeping matches its live watcher count (1 = root).
+#[tokio::test]
+async fn test_setsid_orphan_returns_proc_count() {
+    let out = temp_path("setsid-orphan");
+    let _ = std::fs::remove_file(&out);
+    let script = orphan_storm_script(1, &out);
+
+    let mut sb = base_policy()
+        .max_processes(2)
+        .policy_fn(|_e, _c| Verdict::Allow)
+        .build()
+        .unwrap();
+    sb.create_interactive(&["python3", "-c", &script]).await.unwrap();
+    sb.start().unwrap();
+
+    let outcome = wait_for_marker(&out, "PROBE_", Duration::from_secs(60)).await;
+    assert_eq!(
+        outcome.trim(),
+        "PROBE_OK",
+        "after the setsid orphan exits the sandbox must still be forkable \
+         (released slot, no EAGAIN); guest marker: {:?}",
+        outcome.trim(),
+    );
+
+    let settled = wait_for_process_stats(
+        &sb,
+        ProcessStats { proc_count: 1, live_watchers: 1, drift: 0 },
+        Duration::from_secs(15),
+    )
+    .await;
+    assert_eq!(
+        settled,
+        ProcessStats { proc_count: 1, live_watchers: 1, drift: 0 },
+        "proc_count must return to the root baseline and reconcile with the \
+         live watcher count after the orphan exits",
+    );
+
+    sb.kill().unwrap();
+    let result = sb.wait().await.unwrap();
+    assert!(
+        matches!(result.exit_status, ExitStatus::Signal(libc::SIGKILL) | ExitStatus::Killed),
+        "expected Signal or Killed after orphan storm cleanup, got {:?}",
+        result.exit_status,
+    );
+    let _ = std::fs::remove_file(&out);
+}
+
+/// An orphan storm ratchets `proc_count` today (`1/7→2/8→2/5` style), one
+/// unreleased slot per exited orphan. After N rounds every child has exited,
+/// so the reconciled expectation is proc_count == live watcher count == the
+/// root baseline, drift 0, and one more fork+wait must still succeed.
+#[tokio::test]
+async fn test_proc_count_matches_live_after_orphan_storm() {
+    const ROUNDS: u32 = 6;
+    let out = temp_path("orphan-storm");
+    let _ = std::fs::remove_file(&out);
+    let script = orphan_storm_script(ROUNDS, &out);
+
+    let mut sb = base_policy()
+        .max_processes(ROUNDS + 1)
+        .policy_fn(|_e, _c| Verdict::Allow)
+        .build()
+        .unwrap();
+    sb.create_interactive(&["python3", "-c", &script]).await.unwrap();
+    sb.start().unwrap();
+
+    let outcome = wait_for_marker(&out, "PROBE_", Duration::from_secs(90)).await;
+    assert_eq!(
+        outcome.trim(),
+        "PROBE_OK",
+        "after {} orphan rounds every slot must be returned and a probe fork \
+         must succeed; guest marker: {:?}",
+        ROUNDS,
+        outcome.trim(),
+    );
+
+    let settled = wait_for_process_stats(
+        &sb,
+        ProcessStats { proc_count: 1, live_watchers: 1, drift: 0 },
+        Duration::from_secs(20),
+    )
+    .await;
+    assert_eq!(
+        settled,
+        ProcessStats { proc_count: 1, live_watchers: 1, drift: 0 },
+        "proc_count must match the live watcher count after the orphan storm \
+         (no leaked slots); got {:?}",
+        settled,
+    );
+
+    sb.kill().unwrap();
+    let result = sb.wait().await.unwrap();
+    assert!(
+        matches!(result.exit_status, ExitStatus::Signal(libc::SIGKILL) | ExitStatus::Killed),
+        "expected Signal or Killed after orphan storm cleanup, got {:?}",
+        result.exit_status,
+    );
+    let _ = std::fs::remove_file(&out);
 }

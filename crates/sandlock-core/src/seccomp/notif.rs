@@ -8,6 +8,7 @@ use std::io;
 use std::net::IpAddr;
 use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::error::NotifError;
@@ -2565,7 +2566,14 @@ pub async fn supervisor(
     // child on an old kernel, or its watcher panicked). At 5 minutes
     // this is cheap enough to leave on; the primary cleanup path is
     // still per-child pidfd readiness in `spawn_pid_watcher`.
-    let gc = tokio::spawn(process_index_gc(Arc::clone(&ctx.processes)));
+    // Pass only the two pieces the sweep touches: holding the full
+    // `SupervisorCtx` here would keep the COW/network/time state alive after
+    // the supervisor task is aborted (an abandoned sandbox must still release
+    // its branch/listeners when its runtime reaps the child).
+    let gc = tokio::spawn(process_index_gc(
+        Arc::clone(&ctx.processes),
+        Arc::clone(&ctx.resource),
+    ));
 
     // Bounds the number of in-flight deferred handler futures (see
     // `DEFER_MAX_INFLIGHT`). Shared across all notifications this supervisor
@@ -2647,17 +2655,27 @@ pub async fn supervisor(
     gc.abort();
 }
 
-/// Periodic sweep that drops `ProcessIndex` entries for exited PIDs.
-/// Per-process state hangs off these entries via `Arc`, so dropping
-/// them releases everything in one step.
-async fn process_index_gc(processes: Arc<super::state::ProcessIndex>) {
+/// Periodic sweep that runs full exit cleanup for `ProcessIndex` entries
+/// whose process is gone. Called as a defensive backstop in case a pidfd
+/// watcher failed to spawn or the kernel didn't deliver the readability
+/// event; routing through `cleanup_pid_with` (not a bare unregister) keeps
+/// the exactly-once proc_count release latch and the memory-charge credit
+/// consistent with the primary watcher path. Deliberately holds only the
+/// index and the resource state, never the full supervisor context: an
+/// aborted supervisor must still be able to drop its COW/network/time state.
+async fn process_index_gc(
+    processes: Arc<super::state::ProcessIndex>,
+    resource: Arc<tokio::sync::Mutex<super::state::ResourceState>>,
+) {
     let interval = std::time::Duration::from_secs(300);
     loop {
         tokio::time::sleep(interval).await;
         if processes.len() == 0 {
             continue;
         }
-        processes.prune_dead();
+        for key in processes.dead_keys() {
+            cleanup_pid_with(&processes, &resource, key).await;
+        }
     }
 }
 
@@ -2713,14 +2731,35 @@ pub(crate) fn spawn_pid_watcher(
 /// killing innocent workloads. Only a thread-group leader's entry carries
 /// a charge, so crediting whatever this entry holds is self-limiting.
 pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::state::PidKey) {
-    if let Some((entry_key, state)) = ctx.processes.entry_for(key.pid) {
+    cleanup_pid_with(&ctx.processes, &ctx.resource, key).await;
+}
+
+/// Body of `cleanup_pid`; takes the two pieces the cleanup actually touches so
+/// the low-frequency GC backstop does not have to hold the full supervisor
+/// context (see `process_index_gc`).
+async fn cleanup_pid_with(
+    processes: &Arc<super::state::ProcessIndex>,
+    resource: &Arc<tokio::sync::Mutex<super::state::ResourceState>>,
+    key: super::state::PidKey,
+) {
+    if let Some((entry_key, state, release)) = processes.entry_for_cleanup(key.pid) {
         if entry_key == key {
             let mut per = state.lock().await;
-            let mut st = ctx.resource.lock().await;
+            let mut st = resource.lock().await;
             crate::resource::release_charge(&mut st, &mut per);
+            // Authoritative exactly-once release: a birth-registered counted
+            // child (argv-safety mode) frees its proc_count slot when the
+            // pidfd watcher observes its exit. The one-shot latch makes
+            // duplicate exit observations (watcher + GC, or a double
+            // readiness wake) release at most once, and the wait4 side never
+            // releases again in that mode (`handle_wait` is gated on
+            // `pidfd_release_authoritative`).
+            if release.counted && !release.released.swap(true, Ordering::AcqRel) {
+                st.proc_count = st.proc_count.saturating_sub(1);
+            }
         }
     }
-    ctx.processes.unregister(key);
+    processes.unregister(key);
 }
 
 // ============================================================

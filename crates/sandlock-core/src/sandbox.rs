@@ -317,6 +317,7 @@ struct Runtime {
     _stdin_write: Option<std::os::fd::OwnedFd>,
     seccomp_cow: Option<crate::cow::seccomp::SeccompCowBranch>,
     supervisor_resource: Option<Arc<tokio::sync::Mutex<crate::seccomp::state::ResourceState>>>,
+    supervisor_processes: Option<Arc<crate::seccomp::state::ProcessIndex>>,
     supervisor_cow: Option<Arc<tokio::sync::Mutex<crate::seccomp::state::CowState>>>,
     supervisor_network: Option<Arc<tokio::sync::Mutex<crate::seccomp::state::NetworkState>>>,
     ctrl_fd: Option<std::os::fd::OwnedFd>,
@@ -769,6 +770,24 @@ impl Clone for Sandbox {
     }
 }
 
+/// Live process-accounting snapshot from the supervisor (SL-8 reconciliation).
+///
+/// `proc_count` is the bookkeeping count (`handle_fork` +1, released on the
+/// authoritative exit path). `live_watchers` is the number of registered,
+/// pidfd-watcher-backed processes the supervisor still tracks. `drift` is the
+/// signed deviation (`proc_count − live_watchers`); in argv-safety mode a
+/// persistent positive drift is the orphan-leak alarm, and zero is the
+/// quiescent expectation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessStats {
+    /// Bookkeeping concurrent-process count (root + unreleased fork children).
+    pub proc_count: u32,
+    /// Live pidfd-watcher-backed tracked processes (`ProcessIndex` size).
+    pub live_watchers: u32,
+    /// `proc_count − live_watchers` (signed; positive = leaked slots).
+    pub drift: i64,
+}
+
 impl Sandbox {
     pub fn builder() -> SandboxBuilder {
         SandboxBuilder::default()
@@ -968,6 +987,32 @@ impl Sandbox {
         } else {
             (0, 0)
         }
+    }
+
+    /// Return the live process-accounting snapshot from the supervisor.
+    ///
+    /// `live_watchers` is the number of registered, pidfd-watcher-backed
+    /// processes still in the index; `drift` is `proc_count - live_watchers`.
+    /// In argv-safety mode (where every counted fork child is birth-registered
+    /// and released on pidfd exit) the two should agree while the sandbox is
+    /// quiescent, so a persistent positive drift is the SL-8 orphan-leak alarm.
+    /// In lazy mode registration coverage is partial, so the fields are
+    /// diagnostic rather than exact (threads and never-notified children can
+    /// legitimately differ).
+    pub async fn process_stats(&self) -> ProcessStats {
+        if let Some(rt) = self.runtime.as_ref() {
+            if let (Some(res), Some(procs)) = (
+                rt.supervisor_resource.as_ref(),
+                rt.supervisor_processes.as_ref(),
+            ) {
+                let rs = res.lock().await;
+                let proc_count = rs.proc_count;
+                let live_watchers = procs.len() as u32;
+                let drift = proc_count as i64 - live_watchers as i64;
+                return ProcessStats { proc_count, live_watchers, drift };
+            }
+        }
+        ProcessStats { proc_count: 0, live_watchers: 0, drift: 0 }
     }
 
     /// Wait for the child process to exit.
@@ -1659,6 +1704,7 @@ impl Sandbox {
                 _stdin_write: None,
                 seccomp_cow: None,
                 supervisor_resource: None,
+                supervisor_processes: None,
                 supervisor_cow: None,
                 supervisor_network: None,
                 ctrl_fd: None,
@@ -1765,6 +1811,7 @@ impl Sandbox {
             _stdin_write: None,
             seccomp_cow: None,
             supervisor_resource: None,
+            supervisor_processes: None,
             supervisor_cow: None,
             supervisor_network: None,
             ctrl_fd: None,
@@ -2826,7 +2873,13 @@ impl Sandbox {
                 notif_policy.max_memory_bytes,
                 notif_policy.max_processes,
             );
+            // The sandbox's root child is the baseline "1" (peak starts at 1
+            // in `ResourceState::new` too). When argv safety is active every
+            // counted fork child is birth-registered with a pidfd watcher, so
+            // exits — not wait4 reaps — own the proc_count release; mirror
+            // that mode into the state that `handle_wait` consults.
             res_state.proc_count = 1;
+            res_state.pidfd_release_authoritative = notif_policy.argv_safety_required;
 
             let mut cow_state = CowState::new();
             cow_state.branch = seccomp_cow_branch;
@@ -2899,6 +2952,7 @@ impl Sandbox {
             let processes = Arc::new(crate::seccomp::state::ProcessIndex::new());
 
             let netlink_state = Arc::new(crate::netlink::NetlinkState::new());
+            self.rt_mut().supervisor_processes = Some(Arc::clone(&processes));
             let ctx = Arc::new(SupervisorCtx {
                 resource: Arc::clone(&res_state),
                 cow: Arc::clone(&cow_state),
