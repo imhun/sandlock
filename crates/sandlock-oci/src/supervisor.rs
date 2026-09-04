@@ -15,7 +15,7 @@
 //! the sandbox's state directory.
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -35,6 +35,17 @@ use crate::state::SandboxState;
 /// correlation is unambiguous), while an `Exited{pid}` is routed to the waiter
 /// registered for that pid (an exec, or the main workload). An `Exited` that
 /// arrives before its waiter registers is buffered in `early_exits`.
+///
+/// Two guards keep `Exited` routing bounded against forged/compromised frames:
+///
+/// - `announced` holds exactly the pids init has announced via `Started` (the
+///   only children whose exit is legitimately expected). An `Exited` for any
+///   other pid is dropped and counted in `unknown_exits` — never buffered and
+///   never allowed to resolve a waiter.
+/// - `early_exits` is capped at `early_exit_cap` (default
+///   [`InitLink::DEFAULT_EARLY_EXIT_CAP`] = 1024, configurable at
+///   construction). An insert beyond the cap drops the frame and counts it in
+///   `overflow_drops`, so a hostile peer cannot grow memory without limit.
 struct LinkState {
     /// Sender for the reply to the in-flight request (a `Started` or `Err`).
     pending: Option<oneshot::Sender<Resp>>,
@@ -42,6 +53,30 @@ struct LinkState {
     exit_waiters: HashMap<i32, oneshot::Sender<Resp>>,
     /// Exits that arrived before a waiter registered.
     early_exits: HashMap<i32, Resp>,
+    /// Pids announced via `Started` whose exit has not yet been delivered
+    /// (buffered, waiter-resolved, overflow-dropped, or detached-forgotten).
+    announced: HashSet<i32>,
+    /// Exited frames dropped because the pid was never announced.
+    unknown_exits: u64,
+    /// Exited frames dropped because `early_exits` was full.
+    overflow_drops: u64,
+    /// Maximum `early_exits` size (default 1024; configurable at construction).
+    early_exit_cap: usize,
+}
+
+/// Snapshot of the link's routing state, for tests and future metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinkStats {
+    /// Live early-exit buffer entries (arrived before waiter registration).
+    early_exits: usize,
+    /// Announced pids whose exit is still expected.
+    announced: usize,
+    /// Dropped because the pid was never announced.
+    unknown_exits: u64,
+    /// Dropped because the `early_exits` buffer was full.
+    overflow_drops: u64,
+    /// Configured `early_exits` cap.
+    early_exit_cap: usize,
 }
 
 struct InitLink {
@@ -51,10 +86,24 @@ struct InitLink {
 }
 
 impl InitLink {
+    /// Default cap on buffered early-exit frames (see [`LinkState`]).
+    const DEFAULT_EARLY_EXIT_CAP: usize = 1024;
+
     /// Build the link and spawn the background reader that routes replies.
     fn new(
         writer: std::os::unix::net::UnixStream,
         reader: tokio::net::UnixStream,
+    ) -> Arc<Self> {
+        Self::with_early_exit_cap(writer, reader, Self::DEFAULT_EARLY_EXIT_CAP)
+    }
+
+    /// Like [`InitLink::new`], with a configurable `early_exits` cap. The cap
+    /// bounds the number of exit frames buffered for announced-but-unwaited
+    /// children; frames beyond it are dropped and counted (never unbounded).
+    fn with_early_exit_cap(
+        writer: std::os::unix::net::UnixStream,
+        reader: tokio::net::UnixStream,
+        early_exit_cap: usize,
     ) -> Arc<Self> {
         let link = Arc::new(InitLink {
             writer: tokio::sync::Mutex::new(writer),
@@ -62,6 +111,10 @@ impl InitLink {
                 pending: None,
                 exit_waiters: HashMap::new(),
                 early_exits: HashMap::new(),
+                announced: HashSet::new(),
+                unknown_exits: 0,
+                overflow_drops: 0,
+                early_exit_cap,
             }),
         });
         let weak = link.clone();
@@ -97,11 +150,38 @@ impl InitLink {
         let (tx, rx) = oneshot::channel();
         let mut st = self.state.lock().unwrap();
         if let Some(resp) = st.early_exits.remove(&pid) {
+            st.announced.remove(&pid);
             let _ = tx.send(resp);
         } else {
+            // Belt: waiters are only ever created for pids init announced via
+            // `Started` (routed before `request` returns), so a waiter pid is
+            // announced by construction — keep the registry consistent.
+            st.announced.insert(pid);
             st.exit_waiters.insert(pid, tx);
         }
         rx
+    }
+
+    /// Drop exit interest in a pid that will never be waited on (a detached
+    /// exec, which init does not report an `Exited` for). Any stale buffered
+    /// frame is discarded with it; a later frame for the pid is treated as
+    /// expected-silent (dropped + counted), never buffered.
+    fn forget_detached(&self, pid: i32) {
+        let mut st = self.state.lock().unwrap();
+        st.announced.remove(&pid);
+        st.early_exits.remove(&pid);
+    }
+
+    /// Snapshot of routing sizes and drop counters (tests / future metrics).
+    fn stats(&self) -> LinkStats {
+        let st = self.state.lock().unwrap();
+        LinkStats {
+            early_exits: st.early_exits.len(),
+            announced: st.announced.len(),
+            unknown_exits: st.unknown_exits,
+            overflow_drops: st.overflow_drops,
+            early_exit_cap: st.early_exit_cap,
+        }
     }
 
     /// Send `Shutdown` to init. No reply is expected (init exits).
@@ -130,16 +210,42 @@ async fn reader_task(link: Arc<InitLink>, reader: tokio::net::UnixStream) {
         };
         let mut st = link.state.lock().unwrap();
         match resp {
-            Resp::Started { .. } | Resp::Err { .. } => {
+            Resp::Started { pid } => {
+                // A `Started` is only legitimate as the reply to the in-flight
+                // request. A stray one (no pending request) is forged: ignore
+                // it entirely rather than announcing a pid that never existed.
+                if let Some(tx) = st.pending.take() {
+                    st.announced.insert(pid);
+                    let _ = tx.send(Resp::Started { pid });
+                }
+            }
+            Resp::Err { .. } => {
                 if let Some(tx) = st.pending.take() {
                     let _ = tx.send(resp);
                 }
             }
             Resp::Exited { pid, .. } => {
+                // Waiter present: the supervisor itself registered interest in
+                // this pid after its `Started`, so this is the authoritative
+                // resolution — only this path may decide an exec's exit.
                 if let Some(tx) = st.exit_waiters.remove(&pid) {
+                    st.announced.remove(&pid);
                     let _ = tx.send(resp);
+                } else if st.announced.contains(&pid) {
+                    // Early-exit race: announced but the waiter has not
+                    // registered yet. Buffer it, bounded by the cap. Either
+                    // outcome consumes the pid's expectation: a buffered frame
+                    // will be resolved by `register_exit`, a dropped one can
+                    // never be delivered.
+                    st.announced.remove(&pid);
+                    if st.early_exits.len() < st.early_exit_cap {
+                        st.early_exits.insert(pid, resp);
+                    } else {
+                        st.overflow_drops += 1;
+                    }
                 } else {
-                    st.early_exits.insert(pid, resp);
+                    // Never announced (and no waiter): forged/unknown frame.
+                    st.unknown_exits += 1;
                 }
             }
         }
@@ -149,6 +255,8 @@ async fn reader_task(link: Arc<InitLink>, reader: tokio::net::UnixStream) {
     let mut st = link.state.lock().unwrap();
     st.pending.take();
     st.exit_waiters.clear();
+    st.announced.clear();
+    st.early_exits.clear();
 }
 
 /// Map an init `Resp::Exited` (if any) to the on-disk `ExitInfo`.
@@ -734,6 +842,12 @@ async fn handle_exec(
                         let _ = stream.write_all(b"\n").await;
                     }
                 });
+            } else {
+                // Detached execs are never waited on and init never reports
+                // their exit, so drop the announced registration: a later
+                // frame for this pid is expected-silent (dropped + counted),
+                // never buffered.
+                link.forget_detached(pid);
             }
         }
         Ok(Resp::Err { msg }) => {
@@ -1142,5 +1256,304 @@ mod tests {
         assert!(json.contains("signal"));
         let back: SupervisorCmd = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, SupervisorCmd::Signal { signum: 9 }));
+    }
+
+    // ── F1.2 H1/H2: bounded early_exits + registered-pid exit routing ──────
+    //
+    // Reader-driven by design: the supervisor's control channel is an internal
+    // socketpair read by `reader_task`, and since F1.1 no workload can write
+    // the child end (CONTROL_FD is CLOEXEC). The faithful injection point is
+    // therefore the peer end of a real socketpair feeding the same `InitLink`
+    // + `reader_task` path the supervisor runs (see tmp/sdd/f1.2-report.md).
+
+    /// Resident set size in bytes, from /proc/self/statm (Linux gate env).
+    fn rss_bytes() -> u64 {
+        let statm =
+            std::fs::read_to_string("/proc/self/statm").expect("read /proc/self/statm (Linux)");
+        let pages: u64 = statm
+            .split_whitespace()
+            .nth(1)
+            .expect("statm resident field")
+            .parse()
+            .expect("statm resident pages numeric");
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        pages * page
+    }
+
+    /// Build an `InitLink` over a real socketpair with the given early-exit
+    /// cap and return it plus the CHILD end, exactly as `supervisor_main`
+    /// wires them (writer + reader are dups of the daemon end). The test owns
+    /// the child end and plays sandlock-init: it reads `Req`s and writes
+    /// `Resp` frames — including forged ones — through the same `reader_task`
+    /// the live supervisor runs.
+    fn reader_driven_link(cap: usize) -> (Arc<InitLink>, tokio::net::UnixStream) {
+        let (daemon, child) = std::os::unix::net::UnixStream::pair().unwrap();
+        daemon.set_nonblocking(true).unwrap();
+        child.set_nonblocking(true).unwrap();
+        let writer = daemon.try_clone().unwrap();
+        let reader = tokio::net::UnixStream::from_std(daemon).unwrap();
+        let child = tokio::net::UnixStream::from_std(child).unwrap();
+        (InitLink::with_early_exit_cap(writer, reader, cap), child)
+    }
+
+    async fn write_resp(peer: &mut tokio::net::UnixStream, resp: &Resp) {
+        use tokio::io::AsyncWriteExt;
+        let mut line = serde_json::to_vec(resp).unwrap();
+        line.push(b'\n');
+        peer.write_all(&line).await.unwrap();
+    }
+
+    /// Read one newline-delimited `Req` frame from the child end.
+    async fn read_req_line(peer: &mut tokio::net::UnixStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut line = Vec::new();
+        let mut chunk = [0u8; 256];
+        loop {
+            let n = peer.read(&mut chunk).await.expect("read request frame");
+            assert!(n > 0, "daemon closed the channel mid-request");
+            line.extend_from_slice(&chunk[..n]);
+            if line.contains(&b'\n') {
+                return line;
+            }
+        }
+    }
+
+    /// Spawn a fake-sandlock-init task that answers the next `pids.len()`
+    /// requests with `Started { pid }` each, then returns the child stream.
+    fn spawn_init_announcer(
+        mut child: tokio::net::UnixStream,
+        pids: Vec<i32>,
+    ) -> tokio::task::JoinHandle<tokio::net::UnixStream> {
+        tokio::spawn(async move {
+            for pid in pids {
+                let line = read_req_line(&mut child).await;
+                assert!(
+                    String::from_utf8_lossy(&line).contains("req"),
+                    "expected a request frame, got {:?}",
+                    line
+                );
+                write_resp(&mut child, &Resp::Started { pid }).await;
+            }
+            child
+        })
+    }
+
+    /// Poll until `pred` holds for the link's routed state (frames are routed
+    /// by the background `reader_task`, so tests wait for quiescence).
+    async fn wait_for(link: &InitLink, pred: impl Fn(&LinkStats) -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !pred(&link.stats()) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for frame routing: {:?}",
+                link.stats()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn early_exits_cap_drops_overflow() {
+        const CAP: usize = 8;
+        const CHILDREN: i32 = 10;
+        let (link, child) = reader_driven_link(CAP);
+        let req = Req::RunExec {
+            argv: vec!["true".into()],
+            env: vec![],
+            cwd: None,
+            detach: false,
+        };
+
+        // Announce CAP + 2 children through the real request/Started path
+        // (each `request` resolves with init's `Started`), leaving every child
+        // announced-but-unregistered exactly like the early-exit race window.
+        let announcer = spawn_init_announcer(child, (1..=CHILDREN).collect());
+        for pid in 1..=CHILDREN {
+            match link.request(&req, &[]).await.expect("request must be answered") {
+                Resp::Started { pid: got } => assert_eq!(got, pid),
+                other => panic!("expected Started, got {:?}", other),
+            }
+        }
+        let mut child = announcer.await.expect("init announcer");
+        assert_eq!(link.stats().announced, CHILDREN as usize);
+
+        // Now deliver their Exited frames before any waiter registers — the
+        // early-exit race the buffer exists for — so the buffer fills to the
+        // cap and the two excess frames are dropped + counted.
+        for pid in 1..=(CAP as i32 + 2) {
+            write_resp(
+                &mut child,
+                &Resp::Exited { pid, code: Some(pid), signal: None },
+            )
+            .await;
+        }
+        wait_for(&link, |s| s.overflow_drops == 2).await;
+
+        let stats = link.stats();
+        assert_eq!(stats.early_exits, CAP, "buffer must stop at the configured cap");
+        assert_eq!(stats.early_exit_cap, CAP, "cap must be the configured value");
+        assert_eq!(stats.announced, 0, "every announced exit was delivered or dropped");
+        assert_eq!(stats.unknown_exits, 0);
+        assert_eq!(stats.overflow_drops, 2, "frames beyond the cap are dropped + counted");
+        {
+            let st = link.state.lock().unwrap();
+            for pid in 1..=CAP as i32 {
+                assert!(
+                    st.early_exits.contains_key(&pid),
+                    "pid {} (first-come) must be the buffered frame",
+                    pid
+                );
+            }
+            assert!(!st.early_exits.contains_key(&(CAP as i32 + 1)));
+            assert!(!st.early_exits.contains_key(&(CAP as i32 + 2)));
+            assert!(st.exit_waiters.is_empty());
+            assert!(st.pending.is_none());
+        }
+
+        // A duplicate frame for the overflow-dropped pid is now unknown too:
+        // its registry entry was consumed by the drop, so nothing re-buffers.
+        write_resp(
+            &mut child,
+            &Resp::Exited { pid: CAP as i32 + 1, code: Some(0), signal: None },
+        )
+        .await;
+        wait_for(&link, |s| s.unknown_exits == 1).await;
+        let stats = link.stats();
+        assert_eq!(stats.early_exits, CAP);
+        assert_eq!(stats.overflow_drops, 2);
+
+        // Detached-exec lifecycle: after Started the supervisor drops the
+        // registration (init never reports a detached exec's exit), so a late
+        // frame for that pid is expected-silent: dropped + counted, buffered
+        // nowhere.
+        const DETACHED: i32 = 77;
+        let detach_req = Req::RunExec {
+            argv: vec!["true".into()],
+            env: vec![],
+            cwd: None,
+            detach: true,
+        };
+        let announcer = spawn_init_announcer(child, vec![DETACHED]);
+        match link.request(&detach_req, &[]).await.expect("request must be answered") {
+            Resp::Started { pid } => assert_eq!(pid, DETACHED),
+            other => panic!("expected Started, got {:?}", other),
+        }
+        let mut child = announcer.await.expect("init announcer");
+        assert_eq!(link.stats().announced, 1);
+        // handle_exec's detach branch drops the registration after Started.
+        link.forget_detached(DETACHED);
+        assert_eq!(link.stats().announced, 0);
+        write_resp(
+            &mut child,
+            &Resp::Exited { pid: DETACHED, code: Some(0), signal: None },
+        )
+        .await;
+        wait_for(&link, |s| s.unknown_exits == 2).await;
+        let stats = link.stats();
+        assert_eq!(stats.early_exits, CAP);
+        assert_eq!(stats.announced, 0);
+        assert_eq!(stats.unknown_exits, 2);
+        assert_eq!(stats.overflow_drops, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_unknown_pid_exit_frame_bounded() {
+        // Default (unconfigured) cap: 1024.
+        const FORGED: i32 = 424_242;
+        const UNKNOWN_FRAMES: u64 = 60_000;
+        let (link, child) = reader_driven_link(InitLink::DEFAULT_EARLY_EXIT_CAP);
+        assert_eq!(link.stats().early_exit_cap, 1024);
+        let req = Req::RunExec {
+            argv: vec!["true".into()],
+            env: vec![],
+            cwd: None,
+            detach: false,
+        };
+
+        // (a) A forged Exited whose pid matches a FUTURE exec (announced only
+        // later) must be dropped as unknown — never buffered — so it cannot
+        // become that exec's recorded exit.
+        // The fake init writes the forged frame BEFORE its real Started, while
+        // the supervisor's request is already in flight.
+        let mut child = child;
+        let announcer = tokio::spawn(async move {
+            let line = read_req_line(&mut child).await;
+            assert!(String::from_utf8_lossy(&line).contains("req"));
+            write_resp(
+                &mut child,
+                &Resp::Exited { pid: FORGED, code: Some(9), signal: None },
+            )
+            .await;
+            write_resp(&mut child, &Resp::Started { pid: FORGED }).await;
+            child
+        });
+        match link.request(&req, &[]).await.expect("request must be answered") {
+            Resp::Started { pid } => assert_eq!(pid, FORGED),
+            other => panic!("expected Started, got {:?}", other),
+        }
+        let mut child = announcer.await.expect("fake init");
+        // Deterministic: the forged frame precedes Started on the socket, so it
+        // was routed (and dropped as unknown) before the request resolved.
+        assert_eq!(link.stats().unknown_exits, 1);
+        assert_eq!(link.stats().early_exits, 0, "forged frame must not buffer");
+
+        // handle_exec then registers its waiter for the announced pid.
+        assert_eq!(link.stats().announced, 1);
+        let mut rx = link.register_exit(FORGED);
+        assert!(
+            matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "a forged pre-announcement Exited must never resolve an exec waiter"
+        );
+
+        // (b) 60k forged frames for never-announced pids: all dropped, memory
+        // stays flat (acceptance: RSS growth < 1 MB after 60k frames).
+        let before = rss_bytes();
+        for i in 0..UNKNOWN_FRAMES {
+            write_resp(
+                &mut child,
+                &Resp::Exited {
+                    pid: 1_000_000 + i as i32,
+                    code: Some(1),
+                    signal: None,
+                },
+            )
+            .await;
+        }
+        wait_for(&link, |s| s.unknown_exits == UNKNOWN_FRAMES + 1).await;
+        let stats = link.stats();
+        assert_eq!(stats.unknown_exits, UNKNOWN_FRAMES + 1);
+        assert_eq!(stats.early_exits, 0, "unknown frames must never buffer");
+        assert_eq!(stats.overflow_drops, 0);
+        let grown = rss_bytes().saturating_sub(before);
+        assert!(
+            grown < 1024 * 1024,
+            "60k forged Exited frames must grow RSS by < 1 MB (grew {} bytes)",
+            grown
+        );
+
+        // (c) Only the real wait path decides the exit: init's genuine Exited
+        // for the registered pid resolves the waiter with its exact values.
+        write_resp(
+            &mut child,
+            &Resp::Exited { pid: FORGED, code: Some(0), signal: None },
+        )
+        .await;
+        let resp = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("real Exited must resolve the waiter")
+            .expect("oneshot must not be canceled before delivery");
+        match resp {
+            Resp::Exited { pid, code, signal } => {
+                assert_eq!(pid, FORGED);
+                assert_eq!(code, Some(0));
+                assert_eq!(signal, None);
+            }
+            other => panic!("expected real Exited, got {:?}", other),
+        }
+        let stats = link.stats();
+        assert_eq!(stats.announced, 0, "waiter resolution clears the registry");
+        assert_eq!(stats.unknown_exits, UNKNOWN_FRAMES + 1);
+        assert_eq!(stats.early_exits, 0);
+        assert_eq!(stats.overflow_drops, 0);
     }
 }

@@ -13,8 +13,12 @@ core_lib = 790
 core_integ = 471
 ffi = 89
 cli = 95      # after F0.4 wiring (cli suite includes net_bind_map tests)
-oci = 127     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e2e
+oci = 131     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e2e
               # supervises OCI-default root containers; S1.2 fail-closes
-              # RunAs(0,0) for non-root supervisors (tested feature). 127 = 51+63+13.
+              # RunAs(0,0) for non-root supervisors (tested feature). 131 = 53+65+13
+              # (lib + bin + integration: the bin target recompiles the crate
+              # module tests, so the F1.2 pair supervisor::tests::
+              # early_exits_cap_drops_overflow / test_unknown_pid_exit_frame_bounded
+              # runs in both unit targets, +4 over 127 = 51+63+13).
 cli_build = 0 # workspace release build gate (no test binaries; 0 = build passed)
 python = 441  # fork S2.x-era python tests landed after the plan's 430/431 estimate
