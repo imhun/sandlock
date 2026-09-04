@@ -44,13 +44,31 @@ use sandlock_oci::supervisor::{SupervisorCmd, SupervisorReply};
 ///   value every 20 ms.
 /// - `killpg-self <tag> <info>`: write the header, then
 ///   `killpg(getpgid(0), SIGKILL)` — the SECE-6 guest trigger.
+/// - `spawn-then-exit <tag> <info> <gc-info> <gc-cnt>`: fork a grandchild
+///   that **stays in this process's group** (no setpgid) and beats
+///   `<gc-cnt>`; the parent writes its header to `<info>` and exits, so init
+///   reaps the parent while the grandchild remains a live member of the dead
+///   parent's group (dead-leader coverage probe).
+/// - `sig-count <tag> <info> <count> <signum>`: install a handler for
+///   `<signum>` that counts deliveries, write the header, then busy-spin.
+///   After the first delivery, settle long enough for a would-be second
+///   delivery to arrive, write the observed count to `<count>`, and exit 0
+///   on exactly one delivery (7 otherwise).
 const PGPROBE_C: &str = r##"
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+static volatile sig_atomic_t term_count = 0;
+
+static void on_term(int sig) {
+    (void)sig;
+    term_count++;
+}
 
 static void xwrite(int fd, const char *s, size_t n) {
     while (n > 0) {
@@ -84,6 +102,15 @@ static void beat(int fd) {
     xwrite(fd, buf, 21);
 }
 
+static void write_count(const char *path, int v) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) _exit(8);
+    char buf[32];
+    int n = snprintf(buf, sizeof buf, "%d\n", v);
+    if (n > 0) xwrite(fd, buf, (size_t)n);
+    close(fd);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 100;
     if (strcmp(argv[1], "beat") == 0 && argc == 5) {
@@ -97,6 +124,47 @@ int main(int argc, char **argv) {
         header(argv[2], argv[3]);
         killpg(getpgrp(), SIGKILL);
         _exit(42); /* reachable only if the group kill did not kill us */
+    }
+    if (strcmp(argv[1], "spawn-then-exit") == 0 && argc == 6) {
+        pid_t g = fork();
+        if (g < 0) return 9;
+        if (g == 0) {
+            /* Grandchild: stays in the parent's process group (no setpgid). */
+            header(argv[2], argv[4]);
+            int fd = open(argv[5], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) _exit(10);
+            struct timespec t = { 0, 20000000 };
+            for (;;) { beat(fd); nanosleep(&t, NULL); }
+        }
+        header(argv[2], argv[3]);
+        _exit(0);
+    }
+    if (strcmp(argv[1], "sig-count") == 0 && argc == 6) {
+        int sig = atoi(argv[5]);
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = on_term;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_RESTART;
+        if (sigaction(sig, &sa, NULL) != 0) return 11;
+        header(argv[2], argv[3]);
+        /* Busy-spin (no nanosleep): the process stays runnable so a second
+         * delivery is not lost to scheduler delay. For a queued (realtime)
+         * signal every injection is observable; standard signals like SIGTERM
+         * coalesce if both arrive before the first is delivered, which is why
+         * the count probe uses the realtime signal the test passes in. */
+        volatile unsigned long sink = 0;
+        struct timespec settle = { 0, 900000000 };
+        for (;;) {
+            if (term_count == 0) {
+                sink++;
+                continue;
+            }
+            /* Settle so a would-be double delivery is counted before exit. */
+            nanosleep(&settle, NULL);
+            write_count(argv[4], (int)term_count);
+            _exit(term_count == 1 ? 0 : 7);
+        }
     }
     return 101;
 }
@@ -121,29 +189,31 @@ fn rootfs_helper() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/rootfs-helper")
 }
 
-/// Minimal OCI bundle whose main process is the long-lived `spawn-loop`
-/// keepalive (it forks a worker that advances `/keepalive.cnt`).
-fn write_bundle_config(bundle: &Path) {
-    let config = r#"{
-  "ociVersion": "1.0.2",
-  "root": { "path": "rootfs", "readonly": false },
-  "process": {
-    "terminal": false,
-    "user": { "uid": 0, "gid": 0 },
-    "cwd": "/",
-    "args": ["/rootfs-helper", "spawn-loop", "/keepalive.cnt"],
-    "env": ["PATH=/usr/bin:/bin"]
-  },
-  "mounts": [],
-  "linux": {
-    "resources": {
-      "devices": [ { "allow": false, "access": "rwm" } ]
-    },
-    "namespaces": [ { "type": "mount" } ]
-  }
-}
-"#;
-    fs::write(bundle.join("config.json"), config).unwrap();
+/// Minimal OCI bundle whose main process runs `cmd` inside the rootfs.
+fn write_bundle_config(bundle: &Path, cmd: &[&str]) {
+    let config = serde_json::json!({
+        "ociVersion": "1.0.2",
+        "root": { "path": "rootfs", "readonly": false },
+        "process": {
+            "terminal": false,
+            "user": { "uid": 0, "gid": 0 },
+            "cwd": "/",
+            "args": cmd,
+            "env": ["PATH=/usr/bin:/bin"]
+        },
+        "mounts": [],
+        "linux": {
+            "resources": {
+                "devices": [ { "allow": false, "access": "rwm" } ]
+            },
+            "namespaces": [ { "type": "mount" } ]
+        }
+    });
+    fs::write(
+        bundle.join("config.json"),
+        serde_json::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
 }
 
 /// Compile the static process-group probe into the rootfs (exec'd at
@@ -340,6 +410,16 @@ fn state_pid(root: &Path, id: &str) -> Option<i32> {
     v.get("pid").and_then(|p| p.as_i64()).map(|p| p as i32)
 }
 
+/// Read the recorded `exit_info.code` out of state.json, if present.
+fn state_exit_code(root: &Path, id: &str) -> Option<i32> {
+    let s = fs::read_to_string(root.join(id).join("state.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    v.get("exit_info")
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_i64())
+        .map(|c| c as i32)
+}
+
 /// One OCI container under test.
 struct Container {
     _tmp: TempDir,
@@ -354,10 +434,12 @@ struct Container {
 }
 
 impl Container {
-    /// Build the bundle, `create` + `start` the sandbox, and wait until the
-    /// main keepalive workload is genuinely running. On partial failure the
-    /// sandbox is deleted and reaped before returning `Err`.
-    fn boot(tag: &str) -> Result<Self, String> {
+    /// Build the bundle, `create` + `start` the sandbox with `main_args`, and
+    /// wait until the main workload is genuinely running (`ready_info` names
+    /// an info-marker file the main process writes, or None to poll the
+    /// spawn-loop keepalive counter). On partial failure the sandbox is
+    /// deleted and reaped before returning `Err`.
+    fn boot_impl(tag: &str, main_args: &[&str], ready_info: Option<&str>) -> Result<Self, String> {
         let tmp = TempDir::new().map_err(|e| format!("tempdir: {e}"))?;
         let base = tmp.path().to_path_buf();
         let root = base.join("root");
@@ -372,7 +454,7 @@ impl Container {
             fs::set_permissions(rootfs.join("rootfs-helper"), fs::Permissions::from_mode(0o755))
                 .unwrap();
         }
-        write_bundle_config(&bundle);
+        write_bundle_config(&bundle, main_args);
         build_pgprobe(&rootfs)?;
 
         let id = format!("f17-{tag}-{}", std::process::id());
@@ -402,19 +484,34 @@ impl Container {
         }
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            if read_counter(&c.rootfs.join("keepalive.cnt"))
-                .map(|v| v > 2)
-                .unwrap_or(false)
-            {
+            let ready = match ready_info {
+                Some(name) => wait_info(&c.rootfs.join(name), Duration::from_millis(0)).is_some(),
+                None => read_counter(&c.rootfs.join("keepalive.cnt"))
+                    .map(|v| v > 2)
+                    .unwrap_or(false),
+            };
+            if ready {
                 c.main_pid = state_pid(&c.root, &c.id).expect("state.pid after start");
                 return Ok(c);
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let msg = format!("keepalive never advanced:\n{}", c.log_text());
+        let msg = format!("main workload never became ready:\n{}", c.log_text());
         let _ = c.run(&["delete", &c.id, "--force"]);
         let _ = reap_children(Duration::from_secs(2));
         Err(msg)
+    }
+
+    /// Boot with the long-lived `spawn-loop` keepalive main (advances
+    /// `/keepalive.cnt`).
+    fn boot(tag: &str) -> Result<Self, String> {
+        Self::boot_impl(tag, &["/rootfs-helper", "spawn-loop", "/keepalive.cnt"], None)
+    }
+
+    /// Boot with a pgprobe main that writes `<main.info>` inside the rootfs
+    /// when it is running.
+    fn boot_pgprobe_main(tag: &str, main_args: &[&str]) -> Result<Self, String> {
+        Self::boot_impl(tag, main_args, Some("main.info"))
     }
 
     fn log_text(&self) -> String {
@@ -755,30 +852,95 @@ fn test_instance_kill_covers_all_child_groups() {
             }
         };
     let main_pid = c.main_pid;
-    let groups = [info_a.pid, info_b.pid, main_pid];
+
+    // Dead-leader coverage: exec child C forks a grandchild that STAYS in C's
+    // group, then C exits and init reaps it. The grandchild remains a live
+    // member of the dead C group, so the instance kill below must still reach
+    // it via the retained dead-groups set (a reaped child's pgid must not
+    // silently vanish from teardown coverage).
+    let c_out = c.base.join("c.out");
+    let c_err = c.base.join("c.err");
+    let c_info = c.rootfs.join("c.info");
+    let gc_info = c.rootfs.join("gc.info");
+    let gc_cnt = c.rootfs.join("gc.cnt");
+    let exec_c = c.exec_detached(
+        &["/pgprobe", "spawn-then-exit", "C", "/c.info", "/gc.info", "/gc.cnt"],
+        &c_out,
+        &c_err,
+    );
+    if !exec_c.success() {
+        let _ = c.teardown(&[info_a.pid, info_b.pid, main_pid]);
+        panic!("detached exec of C failed:\n{}", fs::read_to_string(&c_err).unwrap_or_default());
+    }
+    let info_c = match wait_info(&c_info, Duration::from_secs(5)) {
+        Some(i) => i,
+        None => {
+            let _ = c.teardown(&[info_a.pid, info_b.pid, main_pid]);
+            panic!("C never wrote its info marker");
+        }
+    };
+    // C exits immediately; wait until init has fully reaped it (removed from
+    // the live child table) before the instance kill.
+    let c_reaped = {
+        let end = Instant::now() + Duration::from_secs(5);
+        let mut gone = false;
+        while Instant::now() < end {
+            if !Path::new("/proc").join(info_c.pid.to_string()).exists() {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        gone
+    };
+    let info_gc = match wait_info(&gc_info, Duration::from_secs(5)) {
+        Some(i) => i,
+        None => {
+            let _ = c.teardown(&[info_a.pid, info_b.pid, info_c.pid, main_pid]);
+            panic!("grandchild never wrote its info marker");
+        }
+    };
+    let gc_beating = wait_counter_gt(&gc_cnt, 3, Duration::from_secs(5));
 
     // Instance-level kill: CLI kill --all → SupervisorCmd::Signal{SIGKILL}.
     let kill_ok = c.run(&["kill", &c.id, "--all", "SIGKILL"]).success();
     let stopped = wait_state_stopped(&c.root, &c.id, Duration::from_secs(5));
-    let all_dead = wait_not_live(&[info_a.pid, info_b.pid, main_pid], Duration::from_secs(5));
+    let all_dead = wait_not_live(
+        &[info_a.pid, info_b.pid, main_pid, info_gc.pid],
+        Duration::from_secs(5),
+    );
+    let groups = [info_a.pid, info_b.pid, main_pid, info_c.pid];
     let lingering = live_pids_with_pgrp(&groups);
-    let cleaned = c.teardown(&[info_a.pid, info_b.pid, main_pid]);
+    let cleaned = c.teardown(&[info_a.pid, info_b.pid, info_c.pid, info_gc.pid, main_pid]);
 
+    assert!(c_reaped, "exec child C must be reaped by init before the instance kill");
+    assert!(gc_beating, "the grandchild must be live and beating in C's group before the instance kill");
+    assert_eq!(
+        info_gc.pgid, info_c.pid,
+        "the grandchild must stay in the dead child's group (gc pgid {} != C pid {}) — \
+         scenario premise",
+        info_gc.pgid,
+        info_c.pid
+    );
     assert!(kill_ok, "kill --all SIGKILL must succeed:\n{}", c.log_text());
     assert!(stopped, "container state must become stopped after the instance kill");
     assert!(
         all_dead,
-        "instance kill must reach every registered child group: A={}, B={}, main={} \
+        "instance kill must reach every registered child group AND every retained \
+         dead child group: A={}, B={}, main={}, grandchild={} (in dead group of C={}) \
          still live",
         info_a.pid,
         info_b.pid,
-        main_pid
+        main_pid,
+        info_gc.pid,
+        info_c.pid
     );
     assert!(
         lingering.is_empty(),
-        "no live process may remain in any registered child group ({groups:?}); \
-         still live: {lingering:?}. This is the per-child-group coverage check: \
-         killing init's group alone misses every exec'd sibling after the setpgid fix",
+        "no live process may remain in any registered or dead child group \
+         ({groups:?}); still live: {lingering:?}. The grandchild is the \
+         dead-leader case: C was reaped before the kill, so its pgid must be \
+         retained in the dead-groups set or the grandchild outlives the kill",
     );
     assert!(cleaned, "delete --force and child reaping must succeed");
 }
@@ -874,4 +1036,75 @@ fn test_signal_to_sibling_pid_rejected() {
         c.log_text()
     );
     assert!(cleaned, "delete --force and child reaping must succeed");
+
+    // ── Phase 2: instance signal must be delivered exactly once ─────────────
+    // The main workload traps the signal, counts deliveries, settles (so a
+    // would-be second delivery is observed), writes the count, and exits 0
+    // only for exactly one. The probe uses SIGRTMIN (34): realtime signals
+    // are queued, so every injection is observable — a killpg +
+    // pidfd_send_signal pair would deterministically count 2 and exit 7. The
+    // same double-injection path would deliver SIGTERM twice to a graceful
+    // handler whenever the second injection lands while the first is being
+    // handled (standard signals coalesce only if both arrive before the first
+    // delivery starts), which is the review finding this pins.
+    let rt_sig = libc::SIGRTMIN();
+    let t = match Container::boot_pgprobe_main(
+        "term",
+        &[
+            "/pgprobe",
+            "sig-count",
+            "MAIN",
+            "/main.info",
+            "/sig.count",
+            &rt_sig.to_string(),
+        ],
+    ) {
+        Ok(t) => t,
+        Err(msg) => panic!("term container boot failed: {msg}"),
+    };
+    let main_info_path = t.rootfs.join("main.info");
+    let main_info = match wait_info(&main_info_path, Duration::from_secs(5)) {
+        Some(i) => i,
+        None => panic!("sig-count main never wrote its info marker:\n{}", t.log_text()),
+    };
+    let main_pid = t.main_pid;
+    let term_ok = t
+        .run(&["kill", &t.id, "--all", &rt_sig.to_string()])
+        .success();
+    let stopped2 = wait_state_stopped(&t.root, &t.id, Duration::from_secs(10));
+    let count_text = fs::read_to_string(t.rootfs.join("sig.count")).unwrap_or_default();
+    let exit_code = state_exit_code(&t.root, &t.id);
+    let cleaned2 = t.teardown(&[main_pid]);
+
+    assert_eq!(
+        main_info.pgid, main_pid,
+        "sig-count main must be its own group leader (pgid {} != pid {})",
+        main_info.pgid,
+        main_pid
+    );
+    assert!(
+        term_ok,
+        "kill --all {rt_sig} must succeed:\n{}",
+        t.log_text()
+    );
+    assert!(
+        stopped2,
+        "sig-count main must exit (and the container stop) after the instance signal"
+    );
+    assert_eq!(
+        count_text.trim(),
+        "1",
+        "instance signal {rt_sig} must be delivered exactly once to an in-group \
+         workload; got {count_text:?} deliveries. A killpg + pidfd_send_signal pair \
+         double-delivers non-idempotent signums to children that never left their \
+         group (SIGTERM twice breaks graceful handlers whenever the second lands \
+         during the first)"
+    );
+    assert_eq!(
+        exit_code,
+        Some(0),
+        "sig-count main must exit 0 on a single delivery (7 = double delivery); \
+         state exit code: {exit_code:?}"
+    );
+    assert!(cleaned2, "delete --force and child reaping must succeed");
 }

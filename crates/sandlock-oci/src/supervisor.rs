@@ -618,6 +618,8 @@ async fn supervisor_main(
             SupervisorCmd::Shutdown => {
                 // `delete` before `start`: tell init to exit, then return so
                 // the Sandbox Drop reaps it.
+                // Ok is an enqueue ack only: init acts on the frame and exits
+                // asynchronously.
                 link.shutdown().await;
                 let reply = serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default();
                 let _ = stream.write_all(&reply).await;
@@ -780,12 +782,16 @@ async fn serve_one_running_init(
             // init acts on the frame without answering, and a SIGKILLed main
             // workload reports its own Exited through the normal reaper path.
             link.send(&Req::Signal { signum }).await;
+            // Ok is an enqueue ack only (fire-and-forget frame): init may
+            // deliver asynchronously, so Ok does not mean delivery happened.
             let reply = serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default();
             let _ = stream.write_all(&reply).await;
             let _ = stream.write_all(b"\n").await;
             RunningCmd::Continue
         }
         SupervisorCmd::Shutdown => {
+            // Ok is an enqueue ack only; the actual Shutdown frame is sent by
+            // the caller (serve_running_init) after this reply.
             let reply = serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default();
             let _ = stream.write_all(&reply).await;
             let _ = stream.write_all(b"\n").await;
@@ -997,6 +1003,8 @@ async fn serve_one_running(
             RunningCmd::Continue
         }
         SupervisorCmd::Shutdown => {
+            // Ok is an accept ack only: the caller kills the restored child
+            // after this reply, so Ok does not mean the child is gone yet.
             let reply = serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default();
             let _ = stream.write_all(&reply).await;
             let _ = stream.write_all(b"\n").await;

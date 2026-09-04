@@ -723,8 +723,8 @@ fn cmd_kill(id: &str, signal: &str, all: bool) -> Result<()> {
         // its own group leader; SECE-6/F1.7). Fall back to a direct killpg
         // only when the daemon is unreachable (already exited) — that fallback
         // is best-effort and semantically degraded: killpg(state.pid) reaches
-        // init's own group (usually just init), missing exec'd children in
-        // their own groups.
+        // only the recorded pid's own group, missing exec'd children in their
+        // own groups.
         let sent = supervisor::send_command(
             id,
             supervisor::SupervisorCmd::Signal { signum },
@@ -771,7 +771,8 @@ fn cmd_delete(id: &str, force: bool) -> Result<()> {
     // This correctly targets the workload and all exec'd siblings even though
     // state.pid is the main workload, not a pgid. Fall back to a direct killpg
     // if the daemon is already gone; like the kill fallback this degrades to
-    // init's own group and may miss per-child groups (best effort only).
+    // the recorded pid's own group and may miss per-child groups (best effort
+    // only).
     if state.status == Status::Running && state.pid > 0 && state.is_alive() {
         let sent = supervisor::send_command(id, supervisor::SupervisorCmd::Shutdown);
         if sent.is_err() {

@@ -16,13 +16,19 @@
 //! before this change one command killed the whole container). Instance-level
 //! operations (main-exit teardown, `Shutdown`, `Signal`) traverse the
 //! registered child-group set: group-first `killpg` plus a per-child
-//! `pidfd_send_signal` complement, so a child that later `setsid()`s away
-//! from its group is still reached by its pidfd while siblings are never
-//! touched. There is deliberately **no** pid-addressed signal verb on the
-//! wire: a compromised control-channel holder can request instance-level
-//! delivery only, never a signal to an arbitrary pid (the same-uid direct
-//! `kill(2)` between sandbox processes is a kernel boundary sandlock does not
-//! mediate, §4.15).
+//! `pidfd_send_signal` complement that fires **only when the child has left
+//! its own group** (best-effort `getpgid` check), so an in-group child gets
+//! exactly one delivery from the group signal and an escapee (e.g. a child
+//! that `setsid()`s away) is still reached by its pidfd while siblings are
+//! never touched. When a child is reaped, its pgid is retained in a
+//! `dead_groups` set so live descendants that stayed in the dead child's
+//! group are still covered by later instance-level operations; the entry is
+//! dropped once `killpg` reports ESRCH (the group is empty), so the set does
+//! not grow without bound. There is deliberately **no** pid-addressed signal
+//! verb on the wire: a compromised control-channel holder can request
+//! instance-level delivery only, never a signal to an arbitrary pid (the
+//! same-uid direct `kill(2)` between sandbox processes is a kernel boundary
+//! sandlock does not mediate, §4.15).
 //!
 //! # Orphan reaping (SL-6)
 //!
@@ -64,7 +70,7 @@ mod fdrecv;
 
 pub use proto::{Req, Resp, CONTROL_FD};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::os::unix::io::RawFd;
 
@@ -204,14 +210,18 @@ enum ChildKind {
 /// Per-child metadata recorded by init at spawn time.
 struct Child {
     kind: ChildKind,
+    /// The child's pid (== its pgid unless it escaped the group).
+    pid: i32,
     /// Process group id of this child. `spawn()` makes every child its own
     /// group leader before exec, so pgid == child pid.
     pgid: i32,
     /// pidfd for this child, opened parent-side right after fork; the
     /// escapee-resistant half of instance-level delivery (`pidfd_send_signal`
-    /// still reaches the child if it leaves its group/session). -1 when
-    /// `pidfd_open` is unavailable (kernels that old cannot run the sandlock
-    /// feature set anyway; group-first delivery still applies).
+    /// still reaches the child if it leaves its group/session). Only used
+    /// when the child has actually escaped its own group — an in-group child
+    /// gets exactly one delivery from the group signal. -1 when `pidfd_open`
+    /// is unavailable (kernels that old cannot run the sandlock feature set
+    /// anyway; group-first delivery still applies).
     pidfd: i32,
 }
 
@@ -226,16 +236,25 @@ fn open_child_pidfd(pid: i32) -> i32 {
 }
 
 /// Deliver `signum` to one registered child. Group-first: `killpg` reaches
-/// every process the child forked that stayed in its group (its subtree),
-/// without touching any sibling's group. Then the pidfd complement: a child
-/// that escaped its group (e.g. `setsid()`) is still signaled directly via
-/// its pidfd, which never races on pid reuse. Both calls are best-effort:
-/// ESRCH/empty-group failures are expected once a child has exited.
+/// every process the child forked that stayed in its group (its subtree) —
+/// including the child itself when it is still in that group — without
+/// touching any sibling's group. The pidfd complement fires **only when the
+/// child has escaped its own group** (best-effort `getpgid` compare): an
+/// in-group child therefore receives exactly one delivery (killpg), while an
+/// escapee (e.g. `setsid()`) is still signaled directly via its pidfd, which
+/// never races on pid reuse. Accepted race: a child that changes groups
+/// between the `getpgid` check and the `killpg` may miss this round's direct
+/// signal (or, conversely, receive it via the group); escapee coverage is
+/// best-effort by design. All calls are best-effort: ESRCH/empty-group
+/// failures are expected once a child has exited.
 fn signal_child(child: &Child, signum: i32) {
-    unsafe {
-        libc::killpg(child.pgid, signum);
-    }
-    if child.pidfd >= 0 {
+    let escaped = if child.pidfd >= 0 {
+        let pg = unsafe { libc::getpgid(child.pid) };
+        pg != child.pgid
+    } else {
+        false
+    };
+    if escaped {
         unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal as libc::c_long,
@@ -246,15 +265,36 @@ fn signal_child(child: &Child, signum: i32) {
             );
         }
     }
+    unsafe {
+        libc::killpg(child.pgid, signum);
+    }
 }
 
-/// Deliver `signum` to every registered child group: the instance-level kill
-/// / teardown / supervisor-signal primitive. Iterates the exact set of
-/// children init spawned; adopted orphans and arbitrary pids are never
-/// addressed.
-fn signal_all_children(children: &HashMap<i32, Child>, signum: i32) {
+/// Deliver `signum` to every registered child group and every retained dead
+/// child group: the instance-level kill / teardown / supervisor-signal
+/// primitive. Live children are delivered group-first (with the escape-only
+/// pidfd complement); `dead_groups` holds the pgids of reaped children whose
+/// group may still contain live descendants that never left it — a pgid is
+/// dropped once `killpg` returns ESRCH (empty group), bounding the set. Only
+/// init-spawned children (and their retained groups) are ever addressed;
+/// adopted orphans and arbitrary pids never are.
+fn signal_all_children(
+    children: &HashMap<i32, Child>,
+    dead_groups: &mut HashSet<i32>,
+    signum: i32,
+) {
     for child in children.values() {
         signal_child(child, signum);
+    }
+    let mut emptied = Vec::new();
+    for &pgid in dead_groups.iter() {
+        let r = unsafe { libc::killpg(pgid, signum) };
+        if r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            emptied.push(pgid);
+        }
+    }
+    for pgid in emptied {
+        dead_groups.remove(&pgid);
     }
 }
 
@@ -265,8 +305,9 @@ const REAP_POLL_MS: i32 = 100;
 /// Run the confined PID-1 control loop on [`CONTROL_FD`]. Returns when the
 /// daemon closes the channel or sends `Shutdown`. When the main workload
 /// exits, the loop reports its `Exited`, signals every registered child group
-/// (main's own group first, then each exec sibling's), and `_exit`s the
-/// process from the reap sweep — the container ends with the workload.
+/// plus every retained dead child group (main's own group is retained when it
+/// is reaped, so its forked descendants are still collapsed), and `_exit`s
+/// the process from the reap sweep — the container ends with the workload.
 ///
 /// This runs in the confined fork created by
 /// `Sandbox::create_with_in_child_main`; it uses only `libc` + `serde_json`
@@ -287,6 +328,12 @@ pub fn run_init() {
     // Child table: pids init spawned, routed exactly-once on reap. A pid is
     // removed when it is reaped, so a recycled pid cannot double-report.
     let mut children: HashMap<i32, Child> = HashMap::new();
+    // Retained pgids of reaped children: their group may still hold live
+    // descendants that never left it (adopted orphans of a dead exec child,
+    // forked workers of a dead main, ...). Instance-level operations keep
+    // covering these groups; `signal_all_children` drops an entry once the
+    // group is empty (killpg ESRCH), so the set is bounded.
+    let mut dead_groups: HashSet<i32> = HashSet::new();
     // Reconciler count for adopted orphans init did not spawn: reaped silently
     // and counted locally. The count is intentionally never wire-exposed: the
     // supervisor's F1.2 announced registry treats an `Exited` frame for a pid
@@ -307,18 +354,20 @@ pub fn run_init() {
                             libc::close(child.pidfd);
                         }
                     }
+                    // Keep the group id alive for teardown coverage: live
+                    // descendants that stayed in this child's group are
+                    // adopted by init but must not escape later instance-level
+                    // operations (regression vs the old whole-group killpg).
+                    dead_groups.insert(child.pgid);
                     match child.kind {
                         ChildKind::Main => {
                             if code.is_some() || signal.is_some() {
                                 send(ctl, &Resp::Exited { pid, code, signal });
-                                // Collapse the main child's own group first
-                                // (its forked descendants may outlive it), then
-                                // every remaining registered child group, so
-                                // no exec'd sibling survives the container.
-                                unsafe {
-                                    libc::killpg(child.pgid, libc::SIGKILL);
-                                }
-                                signal_all_children(&children, libc::SIGKILL);
+                                // Collapse the main child's own group (now in
+                                // dead_groups) and every remaining registered
+                                // child group, so no descendant or exec'd
+                                // sibling survives the container.
+                                signal_all_children(&children, &mut dead_groups, libc::SIGKILL);
                                 // _exit rather than std::process::exit: this
                                 // is a fork of the supervisor, so atexit
                                 // handlers would run inherited (tokio/glibc)
@@ -400,6 +449,7 @@ pub fn run_init() {
                     pid,
                     Child {
                         kind: ChildKind::Main,
+                        pid,
                         // spawn() setpgid(0,0)'d the child: pgid == child pid.
                         pgid: pid,
                         pidfd: open_child_pidfd(pid),
@@ -432,6 +482,7 @@ pub fn run_init() {
                     pid,
                     Child {
                         kind: if detach { ChildKind::ExecDetach } else { ChildKind::ExecAttach },
+                        pid,
                         pgid: pid,
                         pidfd: open_child_pidfd(pid),
                     },
@@ -441,17 +492,19 @@ pub fn run_init() {
             Req::Shutdown => {
                 if children.values().any(|c| c.kind == ChildKind::Main) {
                     // Teardown: instance-level SIGKILL over the child-group
-                    // set, then exit the loop (the sandbox Drop reaps init).
-                    signal_all_children(&children, libc::SIGKILL);
+                    // set (live + retained dead groups), then exit the loop
+                    // (the sandbox Drop reaps init).
+                    signal_all_children(&children, &mut dead_groups, libc::SIGKILL);
                 }
                 break;
             }
             Req::Signal { signum } => {
                 // Instance-level signal relayed by the supervisor: traverse
-                // the registered child-group set. No pid payload exists on
-                // this verb, so even a forged frame cannot address an
-                // arbitrary process (see the module docs, SECE-6 boundary).
-                signal_all_children(&children, signum);
+                // the registered child-group set plus retained dead groups.
+                // No pid payload exists on this verb, so even a forged frame
+                // cannot address an arbitrary process (see the module docs,
+                // SECE-6 boundary).
+                signal_all_children(&children, &mut dead_groups, signum);
             }
         }
     }
