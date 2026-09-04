@@ -4,9 +4,9 @@
 > 本文只管 **fork（本仓库）** 一侧：所有改动在本仓库内完成，所有验证用本仓库自己的测试套件跑通，**不依赖 `sandlock-e2b` 仓库的任何动作**（不需要它的 xfail 标记、它的 test-runner 镜像、它的 compose 部署）。E2B 侧接线见该仓库 backlog `E10/M4`，不在本计划范围。
 > 编号沿用 `docs/e2b-integration.md` §7 同步约定：`SL-*` = fork 缺陷，`P*` = E2B 提出的待做方案，`M*` = 每沙箱一实例的里程碑。
 
-**Goal:** 在 fork 内一次性交付全部未完成目标 —— 安全前置 `SL-4/5/6/7/8` + 进程组/帧上限/deadline（M0′）、每沙箱一实例 `M0–M3`、路径中介身份 `P1/P2`、`fs_mount` 细粒度 `P5`、`net_isolation`+chroot 入站映射 `P4`、`P6` 已知限制补齐、**候选路线 B：supervisor 进程化（`sandlock-supervise`，待 E2B/用户确认）** —— per-uid 隔离与 SL-1 由构造解决；`P3` 一行修复在 F0.3 —— 每一项都带本仓库内的红→绿测试，且 fork 三套基线（lib 788 / integration 465 / python 430）零回退。
+**Goal:** 在 fork 内一次性交付全部未完成目标 —— 安全前置 `SL-4/5/6/7/8` + 进程组/帧上限/deadline（M0′）、每沙箱一实例 `M0–M3`、路径中介身份 `P1/P2`、`fs_mount` 细粒度 `P5`、`net_isolation`+chroot 入站映射 `P4`、`P6` 已知限制补齐、**路线 B：supervisor 进程化（`sandlock-supervise`，2026-09-04 用户已确认）** —— per-uid 隔离与 SL-1 由构造解决；`P3` 一行修复在 F0.3 —— 每一项都带本仓库内的红→绿测试，且 fork 三套基线（lib 788 / integration 465 / python 430）零回退。
 
-**Architecture:** 四条独立可交付的主线，按"能不能立刻在 fork 内验证"排序：(1) **F0 独立性基座** —— 把"完整套件一键跑 + wheel 构建 + 与 tip 一致性自证"收进本仓库，后续每条主线的验收都复用它；(2) **F1 安全门槛 M0′** —— 全部是既有代码的正确性/鉴权缺陷，可在当前 `sandlock-oci` 路径上先跑红，不依赖实例化改造；(3) **F2–F5 实例化 M0→M3** —— 三层边界（Policy / Instance / Child）落地，`exec` 从 `sandlock-oci` **下沉复用**到 core，不新写；(4) **F2b supervisor 进程化（候选路线 B，待 E2B/用户确认）**（2026-09-04 评估拟走 B 档：特权只在 create，服务中介的进程 euid == 沙箱 host uid）—— 它把 SL-1 从“修中介身份”变成“不需要修”，并把 SL-7 的控制通道从文件系统改成 create 时交接的 fd；(5) **F6–F7 文件身份断言与形态补齐**（SL-1 fail-closed / P5 / P4）—— 与主线 2/3 正交，可并行。
+**Architecture:** 四条独立可交付的主线，按"能不能立刻在 fork 内验证"排序：(1) **F0 独立性基座** —— 把"完整套件一键跑 + wheel 构建 + 与 tip 一致性自证"收进本仓库，后续每条主线的验收都复用它；(2) **F1 安全门槛 M0′** —— 全部是既有代码的正确性/鉴权缺陷，可在当前 `sandlock-oci` 路径上先跑红，不依赖实例化改造；(3) **F2–F5 实例化 M0→M3** —— 三层边界（Policy / Instance / Child）落地，`exec` 从 `sandlock-oci` **下沉复用**到 core，不新写；(4) **F2b supervisor 进程化（路线 B，2026-09-04 用户已确认）**（特权只在 create，服务中介的进程 euid == 沙箱 host uid）—— 它把 SL-1 从“修中介身份”变成“不需要修”，并把 SL-7 的控制通道从文件系统改成 create 时交接的 fd；(5) **F6–F7 文件身份断言与形态补齐**（SL-1 fail-closed / P5 / P4）—— 与主线 2/3 正交，可并行。
 
 **Tech Stack:** Rust 2021（`sandlock-core` / `sandlock-ffi` / `sandlock-cli` / `sandlock-oci`）、Landlock + seccomp `USER_NOTIF`、`pidfd` / `SCM_RIGHTS` / `SO_PEERCRED`、tokio、cbindgen（C 头文件）、PyO3 + ctypes Python 绑定（`python/src/sandlock`）、Go SDK（`go/`，经 pkg-config 链接 `libsandlock_ffi.so`）、zig 交叉编译 manylinux_2_34 wheel、GitHub Actions（`ci.yml`）。
 
@@ -225,9 +225,9 @@ python = 430
 - **F2.2** `shutdown()` 按 §5.3 七步固定顺序实现且幂等（Draining → `Shutdown` 帧 + grace 5 s → 逐 child pidfd SIGKILL → 组集合 `killpg` → 实例组兜底 → 关宿主端 stdio → abort 后台任务 → token 比对后清目录 → 归还端口/预算/日志收尾）。验收：`shutdown()` 调三次不 panic、控制目录消失、无残留进程。
 - **F2.3** `stats()` 增 `proc_count_vs_live`、`children_live`、`instance_state`（F1.4 的对账器在此露出）。
 
-## 阶段 F2b（候选路线 B —— 待 E2B/用户确认）：supervisor 进程化 `sandlock-supervise`
+## 阶段 F2b（路线 B —— 2026-09-04 用户已确认）：supervisor 进程化 `sandlock-supervise`
 
-> 2026-09-04 评估结论：per-uid 隔离拟走 **B 档**（**待 E2B/用户确认**，未确认前不视为已定路线）—— 特权只存在于 create 那一下，**服务中介的进程本身就是该沙箱的 host uid**。于是 SL-1（中介以 supervisor 身份代执行）与 SL-7（控制目录可枚举、`SO_PEERCRED` 形同虚设）**由构造消除**，不再需要在中介里补身份或丢 capability。⛔ **状态：候选路线，待确认**——已确认的只有「每沙箱一个长命实例」（e2b-integration §8）；未拍板前按 A 档兜底，per-uid 断言不得宣称成立。交接形态取舍已于 2026-09-04 拍板：**双传输（常驻池 path+token / 按需 launcher fd 交接）+ supervise 单代次**（见 F2b.2/F2b.3）。仍需拍板：per-uid 隔离是否本期必须、B 档是否最终确认（否则 A 档兜底）、按需形态是否接受 file-cap launcher（③，`cap_setuid,cap_setgid`，稳态清零）。
+> 2026-09-04 用户确认：per-uid 隔离走 **B 档** —— 特权只存在于 create 那一下，**服务中介的进程本身就是该沙箱的 host uid**。于是 SL-1（中介以 supervisor 身份代执行）与 SL-7（控制目录可枚举、`SO_PEERCRED` 形同虚设）**由构造消除**，不再需要在中介里补身份或丢 capability。✅ **状态：已确认（用户拍板 2026-09-04）**——连同「每沙箱一个长命实例」（e2b-integration §8）一并生效。交接形态：**双传输（常驻池 path+token / 按需 launcher fd 交接）+ supervise 单代次**（F2b.2/F2b.3）；按需形态接受 ③ file-cap launcher（`cap_setuid,cap_setgid`，稳态清零）。A 档仅作“拿不到第二 uid 环境”的部署兜底，该环境下 per-uid 断言不成立。
 >
 > 顺序：`F0 → F1（安全门槛）→ F2（M0）→ F2b.1/.2/.3（进程边界与控制通道）→ F3（exec，先在同进程验、再经 supervise 通道验同一套帧）→ F4 → F5 → F2b.4/.5（预算与交付物）→ F6–F9`。F2b 与 F3 共用同一份 instance API，区别只是它被谁持有。
 
@@ -257,7 +257,7 @@ python = 430
 - **传输 2（常驻池 / 预启 slot）——path + token**：slot 由部署层以 uid X 拉起、worker 不是父进程 ⇒ 拿不到 create 时 socketpair，只能 connect 路径。**权限方向必须反转**：不能 0700 X 独占（worker 连不上）。socket 放共享目录（root-owned 1777+sticky 或注册通道专用目录），目录名哈希，peer 检查改为 **`SO_PEERCRED` ∈ 允许清单（worker uid 65534）+ token 握手**（F1.3 同一套断言）。
 - 单机/CLI 仍保留同 uid path 模式（0700 + 哈希目录名 + 非 root 时 `SO_PEERCRED` 不匹配即断开），语义并入传输 2 的"允许清单只含自身"特例。
 
-> **2026-09-04 E2B 拍板（生效前提：B 档被最终确认）：两种传输都实现，不二选一。**
+> **2026-09-04 E2B 拍板（B 档已确认）：两种传输都实现，不二选一。**
 > 常驻/预启形态走传输 2（path + token），按需/launcher 形态走传输 1（fd 交接）；
 > 两种传输共用同一套 verb/帧/auth 断言。**supervise 固定为单代次：一个进程只服务一个沙箱，
 > `shutdown()` 清场后 `exit(0)`**；任何“省重启”的复用诉求都回退为进程重启这一种实现（见 F2b.3）。
@@ -288,7 +288,7 @@ python = 430
 代价与约束：
 
 - **一个 uid = 一个 supervise 进程 = 一个沙箱**（若一个 supervise 同时服务两个沙箱，那俩又回到共享 uid）。所以并发达 N 就需要 N 个 uid 槽；容量从"进程数"问题变成"uid 池大小"问题，`E2B_UID_POOL_SIZE`（默认 1000）与节点 PID/RSS 预算要一起看（F2b.4）。
-- **回收策略（候选，待 B 档确认后生效）：轮转槽位池（2026-09-04 评估）**，但要把上一轮的算例改正一处 —— **复用窗口不是 `M/N`**。
+- **回收策略（已确认）：轮转槽位池（2026-09-04）**，但要把上一轮的算例改正一处 —— **复用窗口不是 `M/N`**。
   立论基础就是「中介身份恒等于持有实例进程的 euid」，所以 slot 进程的 uid **只能在启动时定死**，段大小 M 不拉长窗口：同一 uid 要再服务一个沙箱，必须等它当前这个沙箱结束并重启该进程 ⇒ **窗口 = 同时存活的 slot 数 N**。M 的作用只剩「保证同一时刻 uid 唯一 + 审计区分度 + 不与别的身份撞号」。
   把窗口做大只有两条路：
   - **W1（默认）**：增大 N，用 N × F2b.4 的 ≤8 MB 预算换窗口（N=100 ⇒ 窗口 100 代）。部署形态就是 ① 的 slot 池，运行期零特权。
@@ -441,7 +441,7 @@ python = 430
 | 档 | 中介身份 | 本任务的改动 | 支持状态 |
 |---|---|---|---|
 | **A** 非 root supervisor，沙箱与它同 uid（无 per-sandbox uid） | 天然正确 | 只加断言 + 文档口径（不得把"同 uid"写成"per-uid 隔离"，§3.5） | ✅ 默认（生产） |
-| **B** 每沙箱一个 supervisor 进程，其 euid == 该沙箱 host uid（F2b） | 天然正确**且** per-uid 成立 | 加"两 supervisor 不同 uid"的跨箱用例；中介线程不再需要任何身份技巧 | ⏳ 候选路线（待 E2B/用户确认；未确认前 A 档兜底） |
+| **B** 每沙箱一个 supervisor 进程，其 euid == 该沙箱 host uid（F2b） | 天然正确**且** per-uid 成立 | 加"两 supervisor 不同 uid"的跨箱用例；中介线程不再需要任何身份技巧 | ✅ 已确认路线（2026-09-04 用户拍板） |
 | **C** 单个中介进程持 `CAP_SETUID` + 每沙箱 `RunAs(X)`（今天测试容器测出的那档；= 方案 R） | **不正确，除非补每线程降权** | **显式不支持**：create 时检测到"本进程 euid==0 且 `host_uid != 0` 且启用了路径中介"⇒ 拒绝建箱（沿用 `sandbox.rs:2087-2104` 的 fail-closed 范式），错误信息指名"请用 `sandlock-supervise` 把实例交给 uid X 的进程，或显式 `mediation_run_as=supervisor` 承认降级" | ⛔ 默认拒绝 |
 
 - [ ] **Step 1 A 档测试**（`integration/test_mediation_identity.rs`，非 root）：`fs_denied` 非空 ⇒ 必走代执行；沙箱内 `openat(O_CREAT,0644)`（显式 `umask(0)`）⇒ 宿主 `stat` 断言 `st_uid == 本进程 euid`、`st_mode == 0o100644`；沙箱内 `chmod 0600` 自己文件 ⇒ 宿主侧看到新 mode；`fs_denied` 目标仍 `EACCES`（防"改身份顺手放宽白名单"）。
