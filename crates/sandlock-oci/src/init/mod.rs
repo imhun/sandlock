@@ -28,11 +28,11 @@
 //! Reaps are routed through a child table: children init spawned (main /
 //! attach exec / detach exec) are answered per the protocol below, exactly
 //! once per pid; adopted orphans that init did not spawn are reaped silently
-//! and counted by a local reconciler counter (`reaped_unknown` in
-//! [`run_init`]) — they are never reported, because the supervisor's F1.2
-//! announced-registry would count an unexpected `Exited` as forged. Replies
-//! are single-writer (only the main loop calls [`send`]), which keeps the
-//! supervisor's `Started` → `Exited` correlation intact.
+//! and counted by a local reconciler counter — they are never reported,
+//! because the supervisor's F1.2 announced-registry would count an unexpected
+//! `Exited` as forged. Replies are single-writer (only the main loop calls
+//! [`send`]), which keeps the supervisor's `Started` → `Exited` correlation
+//! intact.
 //!
 //! # Wire protocol
 //!
@@ -172,8 +172,9 @@ enum ChildKind {
 const REAP_POLL_MS: i32 = 100;
 
 /// Run the confined PID-1 control loop on [`CONTROL_FD`]. Returns when the
-/// daemon closes the channel or sends `Shutdown`; the main-workload reaper may
-/// `_exit` the process first when the workload exits.
+/// daemon closes the channel or sends `Shutdown`. When the main workload
+/// exits, the loop reports its `Exited`, kills the process group, and `_exit`s
+/// the process from the reap sweep — the container ends with the workload.
 ///
 /// This runs in the confined fork created by
 /// `Sandbox::create_with_in_child_main`; it uses only `libc` + `serde_json`
@@ -194,11 +195,13 @@ pub fn run_init() {
     // Child table: pids init spawned, routed exactly-once on reap. A pid is
     // removed when it is reaped, so a recycled pid cannot double-report.
     let mut children: HashMap<i32, ChildKind> = HashMap::new();
-    // Reconciler counter for adopted orphans init did not spawn: reaped
-    // silently and counted here (observable via the absence of defuncts, the
-    // same reconciliation surface the supervisor's F1.2 registry provides on
-    // its side of the wire).
-    let mut reaped_unknown: u64 = 0;
+    // Reconciler count for adopted orphans init did not spawn: reaped silently
+    // and counted locally. The count is intentionally never wire-exposed: the
+    // supervisor's F1.2 announced registry treats an `Exited` frame for a pid
+    // it never saw a `Started` for as forged, so reconciliation is observed as
+    // defunct-absence in the reaper integration tests, not as a frame. The
+    // leading underscore marks the counter as deliberately unread.
+    let mut _reaped_unknown: u64 = 0;
     loop {
         // Reap every exited child (known or adopted) before (re)blocking on
         // the control channel. Replies are only ever sent from this loop, so
@@ -228,7 +231,7 @@ pub fn run_init() {
                     // Adopted orphan (double-fork descendant): reap, count,
                     // and drop. Never reply: the supervisor never announced
                     // this pid, so an Exited frame would be treated as forged.
-                    reaped_unknown += 1;
+                    _reaped_unknown += 1;
                 }
             }
         }
@@ -325,11 +328,4 @@ pub fn run_init() {
         }
     }
 
-    // Reached only on `Shutdown` or control-channel EOF (a main-workload exit
-    // `_exit`s above). The counter has no wire consumer today — an
-    // `Exited`/stat frame for an unannounced pid would be rejected by the
-    // supervisor's announced registry — so it is deliberately local; keeping
-    // it live documents the init-side reconciliation surface for future
-    // metrics wiring.
-    let _ = reaped_unknown;
 }
