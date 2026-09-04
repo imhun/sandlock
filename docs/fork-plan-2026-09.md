@@ -227,7 +227,7 @@ python = 430
 
 ## 阶段 F2b（候选路线 B —— 待 E2B/用户确认）：supervisor 进程化 `sandlock-supervise`
 
-> 2026-09-04 评估结论：per-uid 隔离拟走 **B 档**（**待 E2B/用户确认**，未确认前不视为已定路线）—— 特权只存在于 create 那一下，**服务中介的进程本身就是该沙箱的 host uid**。于是 SL-1（中介以 supervisor 身份代执行）与 SL-7（控制目录可枚举、`SO_PEERCRED` 形同虚设）**由构造消除**，不再需要在中介里补身份或丢 capability。⛔ **状态：候选路线，待确认**——已确认的只有「每沙箱一个长命实例」（e2b-integration §8）；未拍板前按 A 档兜底，per-uid 断言不得宣称成立；需拍板项：① per-uid 是否本期必须（否则 A 档即可）、② 交接形态（① slot 池 + 路径通道 vs ②③④ 特权 launcher + fd 交接，F2b.3 注明需 E2B 侧拍板）、③ 生产是否接受新增最小特权入口（root launcher / setuid helper / 每沙箱降权单元，当前 worker 是 `USER 65534`）。
+> 2026-09-04 评估结论：per-uid 隔离拟走 **B 档**（**待 E2B/用户确认**，未确认前不视为已定路线）—— 特权只存在于 create 那一下，**服务中介的进程本身就是该沙箱的 host uid**。于是 SL-1（中介以 supervisor 身份代执行）与 SL-7（控制目录可枚举、`SO_PEERCRED` 形同虚设）**由构造消除**，不再需要在中介里补身份或丢 capability。⛔ **状态：候选路线，待确认**——已确认的只有「每沙箱一个长命实例」（e2b-integration §8）；未拍板前按 A 档兜底，per-uid 断言不得宣称成立。交接形态取舍已于 2026-09-04 拍板：**双传输（常驻池 path+token / 按需 launcher fd 交接）+ supervise 单代次**（见 F2b.2/F2b.3）。仍需拍板：per-uid 隔离是否本期必须、B 档是否最终确认（否则 A 档兜底）、按需形态是否接受 file-cap launcher（③，`cap_setuid,cap_setgid`，稳态清零）。
 >
 > 顺序：`F0 → F1（安全门槛）→ F2（M0）→ F2b.1/.2/.3（进程边界与控制通道）→ F3（exec，先在同进程验、再经 supervise 通道验同一套帧）→ F4 → F5 → F2b.4/.5（预算与交付物）→ F6–F9`。F2b 与 F3 共用同一份 instance API，区别只是它被谁持有。
 
@@ -248,25 +248,31 @@ python = 430
 
 **测试：** `integration/test_supervise.rs :: test_supervise_refuses_wrong_uid`、`test_policy_roundtrip_covers_every_field`（字段清单与 builder 支持集取并集后逐项断言，禁"未识别即忽略"）。
 
-### Task F2b.2：控制通道改"create 时交接的 fd"（fd 即凭证）
+### Task F2b.2：控制通道双传输（path+token 常驻池 / fd 交接按需）
 
 **Files:** Modify `crates/sandlock-core/src/control.rs`（现状：`UnixListener::bind(control.sock)` :111，peer uid 只告警 :236-262）
 
 - 今天的模型是"supervisor bind 一个文件路径，别人来 connect"，peer 检查假设**对端与我自己同 uid**。B 档下对端是 worker（另一个 uid）⇒ 该检查方向必须反过来，而且 0700 目录反而会让合法 worker 连不上。
-- 改法：`socketpair()` 在 create 时建立，一端随 `SCM_RIGHTS` 交给 supervisor 子进程（fd 号固定并记入实例状态），另一端留在宿主 worker ⇒ **路径不参与鉴权**，也不存在"沙箱内枚举他人控制目录"（§3.9 SL-7 的实测面）。凭证=fd 本身，再叠一次 token 握手防中间替换。
-- 兼容：保留 path 模式给 CLI/单机用法，但 path 模式强制 `0700` + 哈希目录名 + **非 root 时 `SO_PEERCRED` 不匹配即断开**（F1.3 的语义在两种模式下同一套断言）。
+- **传输 1（按需 launcher / 同进程父→子）——fd 交接**：`socketpair()` 在 create 时建立，一端随 `SCM_RIGHTS` 交给 supervise 子进程（fd 号固定并记入实例状态），另一端留在宿主 worker ⇒ **路径不参与鉴权**，也不存在"沙箱内枚举他人控制目录"（§3.9 SL-7 的实测面）。凭证=fd 本身，再叠一次 token 握手防中间替换。
+- **传输 2（常驻池 / 预启 slot）——path + token**：slot 由部署层以 uid X 拉起、worker 不是父进程 ⇒ 拿不到 create 时 socketpair，只能 connect 路径。**权限方向必须反转**：不能 0700 X 独占（worker 连不上）。socket 放共享目录（root-owned 1777+sticky 或注册通道专用目录），目录名哈希，peer 检查改为 **`SO_PEERCRED` ∈ 允许清单（worker uid 65534）+ token 握手**（F1.3 同一套断言）。
+- 单机/CLI 仍保留同 uid path 模式（0700 + 哈希目录名 + 非 root 时 `SO_PEERCRED` 不匹配即断开），语义并入传输 2 的"允许清单只含自身"特例。
 
-**测试：** `integration/test_control.rs :: test_socketpair_channel_rejects_third_party`、`test_path_mode_peer_uid_mismatch_closes`、`test_sandbox_cannot_reach_sibling_channel`（沙箱内枚举/连接一律 `EACCES`/`ECONNREFUSED`）。
+> **2026-09-04 E2B 拍板（生效前提：B 档被最终确认）：两种传输都实现，不二选一。**
+> 常驻/预启形态走传输 2（path + token），按需/launcher 形态走传输 1（fd 交接）；
+> 两种传输共用同一套 verb/帧/auth 断言。**supervise 固定为单代次：一个进程只服务一个沙箱，
+> `shutdown()` 清场后 `exit(0)`**；任何“省重启”的复用诉求都回退为进程重启这一种实现（见 F2b.3）。
+
+**测试：** `integration/test_control.rs :: test_socketpair_channel_rejects_third_party`、`test_fd_handoff_channel_rejects_third_party`、`test_path_mode_peer_uid_mismatch_closes`、`test_registered_path_channel_accepts_allowlisted_peer_with_token`、`test_sandbox_cannot_reach_sibling_channel`（沙箱内枚举/连接一律 `EACCES`/`ECONNREFUSED`）。
 
 ### Task F2b.3：身份交接契约（fork 只定契约，不装特权）
 
 - fork 提供并测试的是："supervisor 进程以任意非 root uid 运行 ⇒ 全功能（含 Landlock/seccomp/notif/DNS 网关/入站映射）"，以及 `--uid` 自检。
 - **"如何把进程变成 uid X" 留在 fork 之外**（E2B 侧 `uid_pool.py` 的 provisioning 或运维的 launcher/systemd），fork 侧只在 `docs/` 写清契约与两种可选实现（root launcher 持 CAP_SETUID/SETGID/CHOWN；或 setuid helper），默认**不安装任何 setuid 二进制**。
-- create 期需要特权完成的三件事写进契约：workspace 目录 `chown X`（需 CAP_CHOWN）、supervisor 进程降权、控制 fd 交接。三者都在 fork 之外 ⇒ fork 的 CI 与本机验证全程非 root。
+- create 期需要特权完成的三件事写进契约（按需 launcher 形态）：workspace 目录 `chown X`（需 CAP_CHOWN，建议改为 supervise 自建目录以免掉）、supervisor 进程降权、控制 fd 交接；常驻池（①）形态三者都不需要——身份由部署定、workspace 自建、控制走 path+token。特权动作都在 fork 之外 ⇒ fork 的 CI 与本机验证全程非 root。
 
 **测试：** `integration/test_supervise.rs :: test_supervisor_as_foreign_uid_is_fully_functional`（本任务的核心验收，用 `unshare`+自映射或 `setpriv` 在测试里以第二 uid 起 supervise，断言建箱/中介/入站端口/stats 全通），并在 CI 里以非 root 跑通。
 
-**"无 root"能做到的四种做法（2026-09-04 对比后拟选 ① —— 连同「① 与 fd 交接不共存」的取舍需 E2B 侧确认）**
+**"无 root"能做到的四种做法（2026-09-04 拍板：常驻形态选 ①；按需形态选 ③ file-cap launcher；不再要求 ① 与 fd 交接二选一）**
 
 | 做法 | 运行期 root | 需要装/配什么 | 自研特权代码 | 备注 |
 |---|---|---|---|---|
@@ -277,6 +283,7 @@ python = 430
 | （对照）什么都不给 = 今天形态 | ❌ | — | — | 拿不到 distinct host uid ⇒ 只能 A 档 |
 
 选 ① 的理由：它是唯一「运行期零特权、且不给宿主加 setuid/sysctl 例外」的做法。**落地形态取决于部署**：E2B 是容器部署（`docker-compose.yml:36`、`docker-compose.prod.yml:90` 的 envd 都是 `user: "65534:65534"`，共享卷 `sandbox-data:/var/lib/e2b-sandboxes`；另有 `deploy/k8s/worker.yaml`）⇒ 容器里没有 systemd 当 PID1，模板单元不可用。① 的实际形态是：**节点上预起 N 个 `sandlock-supervise` slot 容器，每个固定一个不重叠 uid、空闲待命**；分配 = 连接 + token，回收 = 重启该 slot。这条不需要 docker.sock，也不需要 kube API 的运行期创建权限（另一种落地是每沙箱一个 Pod，见 `deploy/k8s/`；但那要给 worker/控制面运行期创建权限，docker.sock 路线等于交出宿主 root，不选）。顺带：compose 里 `user: 65534` 配 `cap_add: SYS_ADMIN` 的实效本来就依赖 ambient cap（`xfs_quota.py:709` 探的是 effective cap 而非 euid），slot 池路线不碰这个不确定性。
+按需形态（worker 自拉、两种部署都可能有）用 ③ file-cap launcher（`cap_setuid,cap_setgid`，瞬时有、落位后清零），fork 不装任何 setuid；② 多 entry userns 与 ④ setuid-root helper 维持排除。
 
 代价与约束：
 
@@ -291,6 +298,14 @@ python = 430
   1. 回收 = **先清场再复用**：该 uid 名下 inode 归零（`find -uid X` 为空）、XFS project 清理、workspace / `/tmp` / 控制目录销毁；
   2. 分配游标必须持久（W2 下段内未过期 uid 不得回卷重复发放）；
   3. fork 在 `stats()` 里露出「当前 host uid + 段 + 该进程已服务过的代次计数」，E2B 侧据此对账。
+
+**2026-09-04 E2B 拍板：supervise 生命周期（写入本文，实施约束）**
+
+- **单代次**：一个 supervise 进程 = 一个沙箱代次；`shutdown()` 完成清场（inode 归零、XFS project 清理、workspace / `/tmp` / 控制目录销毁）后 `exit(0)`。
+- **不做 in-process 多代复用**：连续服务多个沙箱需要完美重置 runtime（notif/listener/child 表/记账/token），任何遗漏都把 D2 的"清场不干净"从窗口风险变成即时风险；一律以进程重启划代。
+- 常驻池 = 部署层保持 N 个进程待命，各自服务一代后由部署层重启（同 uid 或按轮转游标取新 uid）；按需 = launcher 每代拉新进程。supervise 行为对两者完全一致，不产生第二套实现。
+- **回收权归启动者**：worker（65534）不能 `kill` 不同 uid 的 slot 进程（无 CAP_KILL）⇒ 销毁/缩容只允许三种：slot 协议自退、PDEATHSIG（worker 死亡兜底）、启动者（部署层/launcher）回收。E2B 侧不得设计 worker 直接 kill。
+
 **方案 R（未采纳前的完整记述）：单个中介进程 + 每沙箱启动时分配 host uid**
 
 用户提出的这条是成立的，机制上就是既有代码的 privileged 路径：中介进程持 `CAP_SETUID/CAP_SETGID`，`fork` 出沙箱后由**父进程**替它写 `0 -> X` 的 map（`context.rs:312` 正是这条路径，与非 root 的自映射 `context.rs:290` 相对）⇒ 每个沙箱拿到互不相同的 host uid，per-uid DAC 成立，**不需要 N 个常驻进程**。
@@ -319,7 +334,7 @@ python = 430
 
 - 交接细节改为：worker 通过 systemd socket activation 或固定路径连上 supervise（两者 uid 不同 ⇒ F1.3 的 `SO_PEERCRED` 语义必须从"对端==我"改成"对端 ∈ 允许清单 + token 握手"）；若坚持 create 时 `socketpair` 交接，则需 ②/③/④ 之一，不能是 ①。
 
-> 这一条会改写 F2b.2/F2b.3 的接口选择：**① 与"fd 即凭证"不共存**（进程由 init 起，worker 拿不到创建时的 socketpair）。要么"① + 路径通道 + peer 允许清单 + token"，要么"②③④ + fd 交接（无需路径鉴权）"。这个取舍需要 E2B 侧拍一次。
+> 这一条会改写 F2b.2/F2b.3 的接口选择：**① 与"fd 即凭证"不共存**（进程由 init 起，worker 拿不到创建时的 socketpair）。**2026-09-04 E2B 已拍板：不做二选一**——常驻/预启走「① + 路径通道 + peer 允许清单 + token」，按需/launcher 走「③ file-cap launcher + create 时 fd 交接」；fork 的 control 层两种 transport 都实现（见 F2b.2）。
 
 **⚠ 部署前提（必须写进 `docs/`）**：B 需要一个 create 期的特权入口。E2B 当前生产 worker 是 `USER 65534`（非 root），**它自己无法把进程变成 uid X**，也无法 `chown` workspace ⇒ 落地 B 必须新增一个最小特权组件（root launcher 持 `CAP_SETUID/CAP_SETGID/CAP_CHOWN`，或 setuid helper），或改由 systemd/编排给每沙箱一个降权单元。拿不到这个组件时，部署按 A 档运行（per-uid 断言不成立，文档与 `stats()` 要如实反映）。
 
