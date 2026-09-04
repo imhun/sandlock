@@ -1140,3 +1140,35 @@ mod render_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod net_bind_map_tests {
+    use super::*;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn test_net_bind_map_flag_reaches_builder() {
+        let cli = Cli::try_parse_from([
+            "sandlock", "run", "--net-bind-map", "50005:8080", "--", "echo", "hi",
+        ])
+        .expect("a valid --net-bind-map HOST:SANDBOX value must parse");
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        assert_eq!(args.sandbox_builder.net_bind_map, vec![(50005, 8080)]);
+    }
+
+    #[test]
+    fn test_net_bind_map_rejects_privileged_port() {
+        let err = Cli::try_parse_from([
+            "sandlock", "run", "--net-bind-map", "49999:8080", "--", "echo", "hi",
+        ])
+        .err()
+        .expect("a host port below the reserved 50005+ range must be rejected");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::ValueValidation,
+            "the reserved-range refusal must surface as a value-validation error"
+        );
+    }
+}

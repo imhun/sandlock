@@ -63,6 +63,7 @@ pub struct SandboxBuilder {
     /// by injecting the accepted connection fd. This is the MCP-server path:
     /// an external gateway connects to `host_port` to reach a server that
     /// listens inside the loopback-only sandbox netns.
+    #[cfg_attr(feature = "cli", arg(long = "net-bind-map", value_name = "HOST:SANDBOX", value_parser = parse_port_pair))]
     pub net_bind_map: Vec<(u16, u16)>,
 
     #[cfg_attr(feature = "cli", arg(long = "http-allow", value_name = "RULE"))]
@@ -1286,6 +1287,33 @@ impl SandboxBuilder {
         p.validate()?;
         Ok(p)
     }
+}
+
+/// Parse a `HOST:SANDBOX` port pair for `--net-bind-map`, e.g. `50005:8080`.
+///
+/// Enforces the same reserved-range rule the builder checks at build time:
+/// host ports below 50005 are reserved, so refusing them here surfaces a
+/// clear clap error at parse time. The sandbox port has no reserved
+/// constraint; malformed input (no colon, extra colons, non-numeric ports)
+/// is rejected as well.
+#[cfg(feature = "cli")]
+fn parse_port_pair(s: &str) -> Result<(u16, u16), String> {
+    let (host, sandbox) = s.split_once(':').ok_or_else(|| {
+        format!("invalid --net-bind-map '{s}': expected HOST:SANDBOX, e.g. 50005:8080")
+    })?;
+    let host_port: u16 = host.parse().map_err(|_| {
+        format!("invalid --net-bind-map '{s}': host port '{host}' is not a port (0-65535)")
+    })?;
+    if host_port < 50005 {
+        return Err(format!(
+            "net_bind_map: host port {host_port} is below the reserved \
+             inbound mapping range (50005+); pick a host_port >= 50005"
+        ));
+    }
+    let sandbox_port: u16 = sandbox.parse().map_err(|_| {
+        format!("invalid --net-bind-map '{s}': sandbox port '{sandbox}' is not a port (0-65535)")
+    })?;
+    Ok((host_port, sandbox_port))
 }
 
 /// An fs grant that exposes a credential file to the sandboxed child, with the
