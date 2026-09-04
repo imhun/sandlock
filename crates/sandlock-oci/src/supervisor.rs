@@ -46,6 +46,14 @@ use crate::state::SandboxState;
 ///   [`InitLink::DEFAULT_EARLY_EXIT_CAP`] = 1024, configurable at
 ///   construction). An insert beyond the cap drops the frame and counts it in
 ///   `overflow_drops`, so a hostile peer cannot grow memory without limit.
+///
+/// A request that exceeds its per-request deadline marks the link `Dead`: the
+/// in-flight reply sender is dropped (`pending` cleared, so a late
+/// `Started`/`Err` is discarded), and every later `request` fails fast without
+/// sending. `Dead` does **not** touch exit routing (`exit_waiters`,
+/// `announced`, `early_exits`): an announced child's exit still resolves its
+/// waiter through the real path, and those registries are only cleared by the
+/// channel-close teardown at the end of `reader_task`.
 struct LinkState {
     /// Sender for the reply to the in-flight request (a `Started` or `Err`).
     pending: Option<oneshot::Sender<Resp>>,
@@ -62,6 +70,11 @@ struct LinkState {
     overflow_drops: u64,
     /// Maximum `early_exits` size (default 1024; configurable at construction).
     early_exit_cap: usize,
+    /// True once a request exceeded its deadline: requests fail fast and the
+    /// in-flight reply was discarded (see the struct docs for Dead semantics).
+    dead: bool,
+    /// Per-request reply deadline (default 5 s; configurable at construction).
+    request_timeout: Duration,
 }
 
 /// Snapshot of the link's routing state, for tests and future metrics.
@@ -77,6 +90,8 @@ struct LinkStats {
     overflow_drops: u64,
     /// Configured `early_exits` cap.
     early_exit_cap: usize,
+    /// Whether the link is Dead (an earlier request exceeded its deadline).
+    dead: bool,
 }
 
 struct InitLink {
@@ -88,6 +103,8 @@ struct InitLink {
 impl InitLink {
     /// Default cap on buffered early-exit frames (see [`LinkState`]).
     const DEFAULT_EARLY_EXIT_CAP: usize = 1024;
+    /// Default per-request reply deadline (see [`LinkState`]).
+    const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// Build the link and spawn the background reader that routes replies.
     fn new(
@@ -100,10 +117,33 @@ impl InitLink {
     /// Like [`InitLink::new`], with a configurable `early_exits` cap. The cap
     /// bounds the number of exit frames buffered for announced-but-unwaited
     /// children; frames beyond it are dropped and counted (never unbounded).
+    /// The request deadline stays at the default.
     fn with_early_exit_cap(
         writer: std::os::unix::net::UnixStream,
         reader: tokio::net::UnixStream,
         early_exit_cap: usize,
+    ) -> Arc<Self> {
+        Self::with_options(writer, reader, early_exit_cap, Self::DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    /// Like [`InitLink::new`], with a configurable per-request reply deadline.
+    /// A request whose `Started`/`Err` reply does not arrive within the
+    /// deadline returns a timeout error and marks the link Dead (see
+    /// [`LinkState`]). The `early_exits` cap stays at the default.
+    fn with_request_timeout(
+        writer: std::os::unix::net::UnixStream,
+        reader: tokio::net::UnixStream,
+        request_timeout: Duration,
+    ) -> Arc<Self> {
+        Self::with_options(writer, reader, Self::DEFAULT_EARLY_EXIT_CAP, request_timeout)
+    }
+
+    /// Full constructor: configurable `early_exits` cap and request deadline.
+    fn with_options(
+        writer: std::os::unix::net::UnixStream,
+        reader: tokio::net::UnixStream,
+        early_exit_cap: usize,
+        request_timeout: Duration,
     ) -> Arc<Self> {
         let link = Arc::new(InitLink {
             writer: tokio::sync::Mutex::new(writer),
@@ -115,6 +155,8 @@ impl InitLink {
                 unknown_exits: 0,
                 overflow_drops: 0,
                 early_exit_cap,
+                dead: false,
+                request_timeout,
             }),
         });
         let weak = link.clone();
@@ -125,23 +167,59 @@ impl InitLink {
     /// Send a request (optionally with SCM_RIGHTS `fds`) and return its
     /// immediate `Started`/`Err` reply. The writer lock is held across the
     /// await so requests are serialized and each reply pairs with its request.
+    ///
+    /// A request whose reply does not arrive within the configured deadline
+    /// (default 5 s) fails with a `TimedOut` error and marks the link Dead:
+    /// the in-flight reply sender is dropped so a late reply is discarded, and
+    /// every subsequent request fails fast without sending. Exit waiting
+    /// (`register_exit`/`forget_detached`) is unaffected by Dead — only the
+    /// channel-close path clears waiters.
     async fn request(&self, req: &Req, fds: &[RawFd]) -> std::io::Result<Resp> {
+        if self.is_dead() {
+            return Err(dead_link_error());
+        }
         let mut bytes = serde_json::to_vec(req)?;
         bytes.push(b'\n');
         let writer = self.writer.lock().await;
+        // Re-check under the writer lock: the only way the link turns Dead is
+        // a timed-out request, which marks it while still holding this lock,
+        // so a request that passed the first check must not send afterwards.
+        if self.is_dead() {
+            return Err(dead_link_error());
+        }
         let (tx, rx) = oneshot::channel();
-        {
+        let request_timeout = {
             let mut st = self.state.lock().unwrap();
             st.pending = Some(tx);
-        }
+            st.request_timeout
+        };
         crate::fdpass::send_with_fds(&writer, &bytes, fds)?;
         // Hold the writer lock until the reply lands so a concurrent request
         // cannot overwrite `pending` before this one is answered.
-        let resp = rx.await.map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "sandlock-init closed control channel")
-        })?;
+        let reply = tokio::time::timeout(request_timeout, rx).await;
+        if reply.is_err() {
+            // Deadline exceeded. Still holding the writer lock, so no other
+            // request can interleave: drop the reply sender (a late reply is
+            // then discarded by `reader_task`) and mark the link Dead so
+            // subsequent requests fail fast without sending.
+            let mut st = self.state.lock().unwrap();
+            st.pending.take();
+            st.dead = true;
+        }
         drop(writer);
-        Ok(resp)
+        match reply {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(_)) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "sandlock-init closed control channel",
+            )),
+            Err(_) => Err(request_timeout_error(request_timeout)),
+        }
+    }
+
+    /// Whether the link is Dead (an earlier request timed out).
+    fn is_dead(&self) -> bool {
+        self.state.lock().unwrap().dead
     }
 
     /// Register interest in the exit of `pid`. If the exit was already reported
@@ -181,6 +259,7 @@ impl InitLink {
             unknown_exits: st.unknown_exits,
             overflow_drops: st.overflow_drops,
             early_exit_cap: st.early_exit_cap,
+            dead: st.dead,
         }
     }
 
@@ -200,6 +279,31 @@ impl InitLink {
     async fn shutdown(&self) {
         self.send(&Req::Shutdown).await;
     }
+}
+
+/// Error returned when a request's reply did not arrive within its deadline
+/// and the link was marked Dead (F1.8). F5/M3 will fold the Dead/timeout
+/// surface into the unified S5 error code; until then the io error carries
+/// the deadline semantics explicitly.
+fn request_timeout_error(request_timeout: Duration) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "request to sandlock-init timed out after {:?} (no reply); \
+             control link marked Dead: late replies are discarded and further requests fail fast",
+            request_timeout
+        ),
+    )
+}
+
+/// Error returned by a request sent after the link was marked Dead: fail fast,
+/// without sending (F1.8). F5/M3 unification note: same as
+/// [`request_timeout_error`].
+fn dead_link_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "init control link is Dead (an earlier request timed out); request not sent",
+    )
 }
 
 /// Background reader: parse newline-delimited `Resp` from init and route each.
@@ -224,7 +328,15 @@ async fn reader_task(link: Arc<InitLink>, reader: tokio::net::UnixStream) {
                 // it entirely rather than announcing a pid that never existed.
                 if let Some(tx) = st.pending.take() {
                     st.announced.insert(pid);
-                    let _ = tx.send(Resp::Started { pid });
+                    if tx.send(Resp::Started { pid }).is_err() {
+                        // The requesting task is gone (deadline exceeded —
+                        // link Dead — or the task was canceled), so its
+                        // receiver was dropped before this reply was routed.
+                        // A Started that was never delivered must leave no
+                        // registry entry: remove the announcement so the late
+                        // reply cannot pollute the announced set.
+                        st.announced.remove(&pid);
+                    }
                 }
             }
             Resp::Err { .. } => {
@@ -605,6 +717,19 @@ async fn supervisor_main(
                         let _ = stream.write_all(b"\n").await;
                         return Ok(None);
                     }
+                    Err(e) => {
+                        // The request could not be answered: the channel
+                        // closed, or the reply deadline expired (link marked
+                        // Dead). Surface the reason to the CLI instead of
+                        // hanging (F1.8).
+                        let reply = serde_json::to_vec(&SupervisorReply::Err {
+                            msg: e.to_string(),
+                        })
+                        .unwrap_or_default();
+                        let _ = stream.write_all(&reply).await;
+                        let _ = stream.write_all(b"\n").await;
+                        return Ok(None);
+                    }
                     other => {
                         let msg = format!("unexpected init reply to RunMain: {:?}", other);
                         let reply = serde_json::to_vec(&SupervisorReply::Err { msg })
@@ -867,6 +992,14 @@ async fn handle_exec(
         }
         Ok(Resp::Err { msg }) => {
             let reply = serde_json::to_vec(&SupervisorReply::Err { msg }).unwrap_or_default();
+            let _ = stream.write_all(&reply).await;
+            let _ = stream.write_all(b"\n").await;
+        }
+        Err(e) => {
+            // The request could not be answered (channel closed or deadline
+            // exceeded / link Dead); relay the reason to the CLI (F1.8).
+            let reply =
+                serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() }).unwrap_or_default();
             let _ = stream.write_all(&reply).await;
             let _ = stream.write_all(b"\n").await;
         }
@@ -1320,6 +1453,20 @@ mod tests {
         (InitLink::with_early_exit_cap(writer, reader, cap), child)
     }
 
+    /// Like [`reader_driven_link`], with a configurable per-request deadline
+    /// (F1.8 tests use a short one so the timeout path runs in milliseconds).
+    fn reader_driven_link_with_timeout(
+        request_timeout: Duration,
+    ) -> (Arc<InitLink>, tokio::net::UnixStream) {
+        let (daemon, child) = std::os::unix::net::UnixStream::pair().unwrap();
+        daemon.set_nonblocking(true).unwrap();
+        child.set_nonblocking(true).unwrap();
+        let writer = daemon.try_clone().unwrap();
+        let reader = tokio::net::UnixStream::from_std(daemon).unwrap();
+        let child = tokio::net::UnixStream::from_std(child).unwrap();
+        (InitLink::with_request_timeout(writer, reader, request_timeout), child)
+    }
+
     async fn write_resp(peer: &mut tokio::net::UnixStream, resp: &Resp) {
         use tokio::io::AsyncWriteExt;
         let mut line = serde_json::to_vec(resp).unwrap();
@@ -1579,5 +1726,139 @@ mod tests {
         assert_eq!(stats.unknown_exits, UNKNOWN_FRAMES + 1);
         assert_eq!(stats.early_exits, 0);
         assert_eq!(stats.overflow_drops, 0);
+    }
+
+    // ── F1.8: per-request deadline + Dead link (fork-plan-2026-09 F1.8) ─────
+    //
+    // Reader-driven like the F1.2 pair: a real socketpair feeds the same
+    // `InitLink` + `reader_task` path the live supervisor runs, and the test
+    // owns the peer end, playing a sandlock-init that answers one request and
+    // then goes silent. No live-supervisor harness verb can inject a hang
+    // (there is no protocol frame that makes init stop answering; a real wedge
+    // would need process-state surgery on a root-mode e2e container), so the
+    // wedge is expressed at the exact injection point — the request await —
+    // with a short configurable deadline (see tmp/sdd/f1.8-report.md).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_request_timeout_returns_error_within_deadline() {
+        const TIMEOUT: Duration = Duration::from_millis(200);
+        assert_eq!(
+            InitLink::DEFAULT_REQUEST_TIMEOUT,
+            Duration::from_secs(5),
+            "production default deadline must stay 5s"
+        );
+        let (link, child) = reader_driven_link_with_timeout(TIMEOUT);
+        let req = Req::RunExec {
+            argv: vec!["true".into()],
+            env: vec![],
+            cwd: None,
+            detach: false,
+        };
+
+        // (a) One healthy request/Started round-trip announces pid 111, then
+        // register the attached-exec waiter the supervisor would hold — the
+        // exit-waiter that Dead must NOT clear.
+        let announcer = spawn_init_announcer(child, vec![111]);
+        match link.request(&req, &[]).await.expect("request must be answered") {
+            Resp::Started { pid } => assert_eq!(pid, 111),
+            other => panic!("expected Started, got {:?}", other),
+        }
+        let mut child = announcer.await.expect("init announcer");
+        let mut exit_rx = link.register_exit(111);
+        assert_eq!(link.stats().announced, 1);
+
+        // (b) Peer goes silent: the request must fail at ~the configured
+        // deadline (within the deadline + 1s acceptance), never hang.
+        let started = tokio::time::Instant::now();
+        let err = link
+            .request(&req, &[])
+            .await
+            .expect_err("request to a silent peer must return an error");
+        let elapsed = started.elapsed();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            err.to_string(),
+            "request to sandlock-init timed out after 200ms (no reply); \
+             control link marked Dead: late replies are discarded and further requests fail fast"
+        );
+        assert!(
+            elapsed >= TIMEOUT.saturating_sub(Duration::from_millis(50)),
+            "request returned before its deadline elapsed ({:?})",
+            elapsed
+        );
+        assert!(
+            elapsed <= TIMEOUT + Duration::from_secs(1),
+            "request exceeded the deadline + 1s acceptance ({:?})",
+            elapsed
+        );
+        {
+            let st = link.state.lock().unwrap();
+            assert!(st.dead, "a timeout must mark the link Dead");
+            assert!(
+                st.pending.is_none(),
+                "a timeout must clear the pending sender so late replies are discarded"
+            );
+            assert!(
+                st.exit_waiters.contains_key(&111),
+                "Dead must not clear registered exit waiters"
+            );
+        }
+        assert!(link.stats().dead, "Dead must be visible in the stats snapshot");
+
+        // (c) Second request on the Dead link: fail fast, without sending and
+        // without waiting out another deadline.
+        let started = tokio::time::Instant::now();
+        let err = link
+            .request(&req, &[])
+            .await
+            .expect_err("request on a Dead link must fail");
+        let elapsed = started.elapsed();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            err.to_string(),
+            "init control link is Dead (an earlier request timed out); request not sent"
+        );
+        assert!(
+            elapsed < TIMEOUT,
+            "Dead request must fail fast, waited {:?}",
+            elapsed
+        );
+
+        // (d) The exit waiter registered before the timeout is untouched: the
+        // announced child's genuine Exited still resolves it exactly.
+        write_resp(
+            &mut child,
+            &Resp::Exited { pid: 111, code: Some(7), signal: None },
+        )
+        .await;
+        let resp = tokio::time::timeout(Duration::from_secs(5), &mut exit_rx)
+            .await
+            .expect("genuine Exited must resolve the waiter")
+            .expect("oneshot must not be canceled by Dead");
+        match resp {
+            Resp::Exited { pid, code, signal } => {
+                assert_eq!(pid, 111);
+                assert_eq!(code, Some(7));
+                assert_eq!(signal, None);
+            }
+            other => panic!("expected Exited, got {:?}", other),
+        }
+
+        // (e) The timed-out request's late Started arrives after Dead: with no
+        // pending sender it must be discarded without announcing the pid.
+        write_resp(&mut child, &Resp::Started { pid: 4242 }).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        {
+            let st = link.state.lock().unwrap();
+            assert!(st.dead);
+            assert!(st.pending.is_none());
+            assert!(
+                !st.announced.contains(&4242),
+                "a late Started must not announce a pid on a Dead link"
+            );
+            assert!(st.announced.is_empty(), "waiter resolution consumed pid 111");
+            assert!(st.exit_waiters.is_empty());
+            assert!(st.early_exits.is_empty());
+            assert_eq!(st.unknown_exits, 0);
+        }
     }
 }
