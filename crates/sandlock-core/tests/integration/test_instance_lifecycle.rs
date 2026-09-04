@@ -392,6 +392,88 @@ async fn test_shutdown_escalates_after_grace_for_term_ignoring_child() {
     let _ = std::fs::remove_file(&marker);
 }
 
+/// I-1 regression: when the direct child exits compliantly inside the grace
+/// window (here: it traps TERM and exits 0), `shutdown` must still run the
+/// §5.3 step-3 group SIGKILL sweep — a same-group descendant that ignored
+/// TERM must not outlive the session just because the direct child itself
+/// cooperated. The direct child keeps a foreground loop running (so it is
+/// still alive when shutdown starts) while a backgrounded `sh` ignores TERM
+/// and records its own pid after installing the ignore, then `exec`s a long
+/// `sleep` (so it performs no further supervisor-gated syscalls after
+/// shutdown — a looping child would otherwise be SIGSYS-killed by the closed
+/// notif fd and mask the leak). Shutdown must reap the direct child with its
+/// compliant exit status *and* kill the background descendant via the group
+/// sweep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_shutdown_group_sweep_after_compliant_grace_exit() {
+    let marker = std::env::temp_dir().join(format!(
+        "sandlock-f22-sweep-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let marker_arg = marker.display().to_string();
+
+    let mut inst = SandboxInstance::launch(
+        base_policy().build().unwrap().with_name("inst-life-sweep-i1"),
+        &[
+            "sh",
+            "-c",
+            &format!(
+                "trap 'exit 0' TERM; \
+                 sh -c 'trap \"\" TERM; echo $$ > {marker_arg}; \
+                         exec sleep 1000' & \
+                 while :; do sleep 1; done"
+            ),
+        ],
+    )
+    .await
+    .expect("launch");
+    let child_pid = inst.pid().expect("launched process pid");
+    assert!(
+        poll_until(|| marker.exists(), Duration::from_secs(10)).await,
+        "the TERM-ignoring background child must install its trap before \
+         shutdown is tested"
+    );
+    let bg_pid: i32 = std::fs::read_to_string(&marker)
+        .expect("marker must hold the background child's pid")
+        .trim()
+        .parse()
+        .expect("marker pid must parse");
+    assert!(
+        !process_is_gone(bg_pid),
+        "the background child must still be running when shutdown starts"
+    );
+
+    let grace = Duration::from_secs(2);
+    inst.shutdown_with_grace(grace)
+        .await
+        .expect("shutdown with compliant direct child");
+    assert_eq!(inst.phase(), InstancePhase::ShutDown);
+    assert!(
+        process_is_gone(child_pid),
+        "the direct child must not survive its session's shutdown"
+    );
+
+    // The direct child exited compliantly (exit 0) inside the grace window:
+    // shutdown recorded that status, which later wait_child hands back.
+    let result = inst.wait_child().await.expect("wait_child after shutdown");
+    assert!(
+        result.success(),
+        "the compliant direct child's exit status must be recorded (stderr: {:?})",
+        result.stderr
+    );
+
+    // The group sweep must have killed the TERM-ignoring background
+    // descendant even though the direct child never needed escalation.
+    assert!(
+        poll_until(|| process_is_gone(bg_pid), Duration::from_secs(5)).await,
+        "the same-group TERM-ignoring descendant must not survive a compliant \
+         shutdown (bg pid {bg_pid})"
+    );
+
+    let _ = std::fs::remove_file(&marker);
+}
+
 /// `shutdown` releases the F1.3 control directory (hashed dir + token +
 /// socket) and the DNS gateway, and leaves no leftover process or fd behind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

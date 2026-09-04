@@ -447,7 +447,14 @@ impl SandboxInstance {
 
         if let Some(reaped) = self.wait_direct_child_exit(pid, grace).await {
             // The child (or its relayed status) exited within the grace
-            // window; no escalation was needed.
+            // window, so the per-child SIGKILL rung (3a) is unnecessary. But
+            // the group rungs (3b/3c) still run: a same-group descendant that
+            // ignored or handled TERM must not survive just because the
+            // direct child cooperated (reviewer I-1 — F2.1's shutdown was an
+            // unconditional group SIGKILL, so the TERM-first corner must not
+            // silently leak in-group residue). An empty group makes both
+            // best-effort killpgs return ESRCH, which is harmless.
+            self.sweep_session_groups(pid, group);
             if self.tty_foreground_taken {
                 let fg_pid = self.leader_pid.unwrap_or(pid);
                 restore_tty_foreground(fg_pid);
@@ -456,7 +463,8 @@ impl SandboxInstance {
             return reaped;
         }
 
-        // §5.3 step 3 — escalation: the child ignored the shutdown request.
+        // §5.3 step 3 — escalation: the child ignored the shutdown request
+        // (3a per-child SIGKILL, then the 3b/3c group sweep).
         self.escalate_kill(pid, group);
 
         // The direct child is dead or dying after the SIGKILL ladder; reap it.
@@ -472,8 +480,8 @@ impl SandboxInstance {
         reaped
     }
 
-    /// §5.3 step 3 — the SIGKILL escalation ladder, reached only after the
-    /// grace window expired with the child still alive:
+    /// §5.3 step 3 — the SIGKILL escalation ladder, reached when the grace
+    /// window expired with the child still alive:
     ///
     /// 3a. per-child pidfd SIGKILL — targets the direct child through its
     ///     pidfd (no pid-reuse race); `kill(pid)` when no pidfd exists;
@@ -493,7 +501,12 @@ impl SandboxInstance {
     /// In M0's single-group topology rungs 3b and 3c address the same group
     /// (the second call returns ESRCH once the first emptied it), which is
     /// fine — both are best-effort and ESRCH after an earlier rung is the
-    /// expected outcome, not an error.
+    /// expected outcome, not an error. Rungs 3b/3c also run *after* a
+    /// compliant in-grace reap ([`SandboxInstance::sweep_session_groups`]) so
+    /// a TERM-ignoring same-group descendant cannot outlive shutdown just
+    /// because the direct child exited within the grace window (reviewer
+    /// I-1); 3a is skipped on that path because the direct child is already
+    /// reaped.
     fn escalate_kill(&self, pid: i32, group: i32) {
         // 3a. Per-child pidfd SIGKILL.
         match self.pidfd.as_ref() {
@@ -512,9 +525,20 @@ impl SandboxInstance {
                 unsafe { libc::kill(pid, libc::SIGKILL) };
             }
         }
-        // 3b. Direct child's own group.
+        self.sweep_session_groups(pid, group);
+    }
+
+    /// §5.3 step-3 group rungs (3b + 3c): best-effort SIGKILL sweep of the
+    /// session's process groups, used on both the escalation path (after the
+    /// grace window expired) and the compliant path (after an in-grace reap),
+    /// so no same-group descendant survives shutdown. An empty group makes
+    /// `killpg` return ESRCH, which is expected and harmless.
+    fn sweep_session_groups(&self, pid: i32, group: i32) {
+        // 3b. Direct child's own group (non-pid-ns: pgid == child pid;
+        // pid-ns: the unconfined intermediate never created a group, ESRCH).
         unsafe { libc::killpg(pid, libc::SIGKILL) };
-        // 3c. Instance-group fallback.
+        // 3c. Instance-group fallback (leader group, or the direct child's
+        // group without a PID namespace).
         unsafe { libc::killpg(group, libc::SIGKILL) };
     }
 
