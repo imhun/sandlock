@@ -1081,14 +1081,27 @@ fn verify(sandbox: &Sandbox, parsed: &ParsedPolicy) -> Result<(), String> {
     check!("host_mask", &p.host_mask, &sandbox.host_mask);
 
     if prov.contains("egress_proxy") {
-        // Credentials are asserted at the builder level in `apply`; here we
-        // only know the config object landed (opaque outside core).
-        if p.egress_proxy.is_some() != sandbox.egress_proxy.is_some() {
-            return fail(
-                "egress_proxy",
-                &p.egress_proxy,
-                &sandbox.egress_proxy.is_some(),
-            );
+        // Full post-build read-back: `Sandbox::egress_proxy` is public (the
+        // F2b.1 report listed it as builder-level only, but the config struct
+        // — address/username/password — is part of the crate's public
+        // surface), so verify field-for-field equality instead of an is_some
+        // marker.
+        let expected = p.egress_proxy.as_ref().map(|proxy| {
+            (
+                proxy.address.clone(),
+                proxy.username.clone(),
+                proxy.password.clone(),
+            )
+        });
+        let effective = sandbox.egress_proxy.as_ref().map(|cfg| {
+            (
+                cfg.address.clone(),
+                cfg.username.clone(),
+                cfg.password.clone(),
+            )
+        });
+        if expected != effective {
+            return fail("egress_proxy", &expected, &effective);
         }
     }
     if prov.contains("max_memory") {
@@ -1616,6 +1629,47 @@ mod tests {
         let err = validate(br#"{"egress_proxy": {"address": "127.0.0.1:1080", "username": "u"}}"#)
             .unwrap_err();
         assert!(err.contains("username and password"), "got: {err}");
+    }
+
+    #[test]
+    fn egress_proxy_full_config_reads_back_equal() {
+        // The post-build read-back is full-equality (address/username/
+        // password), not an is_some marker: a password that lands on the
+        // Sandbox differently from the provided wire value fails by name.
+        let ok = validate(
+            br#"{"egress_proxy": {
+                "address": "127.0.0.1:1080",
+                "username": "socksuser",
+                "password": "sockspass"
+            }}"#,
+        )
+        .expect("full egress config validates");
+        let cfg = ok.egress_proxy.clone().expect("egress config landed");
+        assert_eq!(cfg.address, "127.0.0.1:1080");
+        assert_eq!(cfg.username.as_deref(), Some("socksuser"));
+        assert_eq!(cfg.password.as_deref(), Some("sockspass"));
+
+        // The F2b.1 gap was an is_some marker that could not see field drift
+        // *inside* the config.  A post-build mismatch is structurally
+        // impossible via the public apply path (the Sandbox stores the
+        // literal config), so the negative pins verify()'s comparison
+        // directly: a config whose password drifted after apply must fail
+        // the read-back by name.
+        let parsed = parse(
+            br#"{"egress_proxy": {
+                "address": "127.0.0.1:1080",
+                "username": "u",
+                "password": "p"
+            }}"#,
+        )
+        .expect("parse");
+        let mut sandbox = apply(&parsed).expect("apply").build().expect("build");
+        sandbox.egress_proxy.as_mut().unwrap().password = Some("tampered".into());
+        let err = verify(&sandbox, &parsed).unwrap_err();
+        assert!(
+            err.contains("egress_proxy"),
+            "egress_proxy field drift must fail verify by name, got: {err}"
+        );
     }
 
     #[test]

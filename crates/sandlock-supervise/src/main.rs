@@ -17,13 +17,13 @@
 //! 3. **control fd**: `--control-fd N` must name an open descriptor (the
 //!    launcher's side of the F2b.2 control socketpair).
 //!
-//! F2b.1 validates and stands ready; the actual serve loop (and this
-//! process staying alive to serve it) lands with F2b.2/F2b.3.
+//! F2b.2 (single generation): with `--serve` the validated policy is kept
+//! and the handed-over control fd is served until a `shutdown` verb ends the
+//! generation (exit 0).  Without `--serve` the binary keeps the F2b.1
+//! validate-and-exit behaviour.
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use std::io::Read;
-use std::os::fd::FromRawFd;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 
@@ -71,6 +71,17 @@ struct Cli {
     /// Control-channel descriptor handed over by the launcher (F2b.2).
     #[arg(long = "control-fd", value_name = "N")]
     control_fd: RawFd,
+
+    /// Serve the control channel until a shutdown verb ends the generation
+    /// (single-generation lifecycle).  Without this flag the binary
+    /// validates and exits (F2b.1 behaviour).
+    #[arg(long)]
+    serve: bool,
+
+    /// Optional per-generation channel token for the fd transport (the belt
+    /// over the fd credential).  When set, every control verb must carry it.
+    #[arg(long, value_name = "TOKEN")]
+    token: Option<String>,
 }
 
 fn main() {
@@ -95,9 +106,11 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     // 2. Full-field policy read + validate (parse → apply → field-by-field
-    //    read-back; failures name the offending field).
+    //    read-back; failures name the offending field).  The fd transport
+    //    applies a timeout and a hard size cap so a stuck or oversized
+    //    startup document cannot hang or silently truncate.
     let bytes = read_policy(&cli.policy).context("policy read failed")?;
-    sandlock_supervise::policy::validate(&bytes)
+    let sandbox = sandlock_supervise::policy::validate(&bytes)
         .map_err(|e| anyhow::anyhow!("policy rejected: {e}"))?;
 
     // 3. Control descriptor must be open.
@@ -110,19 +123,41 @@ fn run(cli: Cli) -> Result<()> {
         );
     }
 
-    // F2b.1: validated and standing ready; serve lands in F2b.2/F2b.3.
+    // F2b.2: single generation.  Serve the control channel (fd handoff
+    // transport) until shutdown; then the process exits 0.
+    if cli.serve {
+        let outcome = sandlock_supervise::serve::serve_control_fd(
+            cli.control_fd,
+            &sandbox,
+            cli.token.as_deref(),
+        );
+        if outcome == sandlock_core::control::ServeOutcome::Shutdown {
+            return Ok(());
+        }
+        bail!("control channel ended without a shutdown verb");
+    }
+
+    // F2b.1 validate-and-exit behaviour (kept for callers that only want the
+    // startup gate).
     Ok(())
 }
 
 fn read_policy(source: &PolicySource) -> Result<Vec<u8>> {
     match source {
         PolicySource::Fd(fd) => {
-            let file = unsafe { std::fs::File::from_raw_fd(*fd) };
-            let mut bytes = Vec::new();
-            file.take(16 * 1024 * 1024)
-                .read_to_end(&mut bytes)
-                .with_context(|| format!("read policy from fd {fd}"))?;
-            Ok(bytes)
+            // Test hook: the fd-policy deadline is overridable so the timeout
+            // path is exercised in milliseconds, not seconds.
+            let timeout_ms = std::env::var("SANDBOX_SUPERVISE_POLICY_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or_else(|| {
+                    sandlock_supervise::serve::POLICY_FD_TIMEOUT.as_millis() as u64
+                });
+            sandlock_supervise::serve::read_policy_fd(
+                *fd,
+                std::time::Duration::from_millis(timeout_ms),
+            )
+            .map_err(anyhow::Error::msg)
         }
         PolicySource::Path(path) => {
             let bytes = std::fs::read(path)
