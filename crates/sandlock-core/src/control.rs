@@ -101,8 +101,10 @@ pub(crate) fn runtime_dir_uid(uid: u32) -> PathBuf {
 
 /// Deterministic 64-bit FNV-1a hash of `name`, rendered as 16 lowercase hex
 /// digits (mirrors the sandlock-oci supervisor socket naming, which was
-/// measured to be sandbox-unreachable).
-fn fnv1a_hex(name: &str) -> String {
+/// measured to be sandbox-unreachable).  Public so the F2b.2 registered-path
+/// transport (and clients that need to locate a channel without the raw
+/// name) uses the same digest.
+pub fn fnv1a_hex(name: &str) -> String {
     const OFFSET: u64 = 0xcbf29ce484222325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut h = OFFSET;
@@ -194,7 +196,7 @@ fn read_token(dir: &Path) -> Option<String> {
 /// byte).  Length mismatch is inherently visible; the token is only one layer
 /// of the auth model (DAC 0700/0600 and the sandbox-unreachable root are the
 /// primary ones).
-fn token_eq(a: &str, b: &str) -> bool {
+pub fn token_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
     if a.len() != b.len() {
@@ -359,8 +361,8 @@ pub(crate) fn setup_runtime_dir_no_socket(
 }
 
 /// Generate a fresh random identity token (64 hex chars from 32 bytes of
-/// kernel entropy).
-fn generate_token() -> Result<String, std::io::Error> {
+/// kernel entropy).  Also used by the F2b.2 dual-transport channels.
+pub fn generate_token() -> Result<String, std::io::Error> {
     use rand::RngCore;
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
@@ -559,17 +561,16 @@ async fn control_loop(
 // Request handling
 // ============================================================
 
-#[derive(serde::Deserialize)]
-struct ControlRequest {
-    v: u32,
-    verb: String,
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
+pub struct ControlRequest {
+    pub v: u32,
+    pub verb: String,
     /// Identity token from the runtime dir's `token` file.  Optional on the
     /// wire so old clients still parse; sensitive verbs require it.
     #[serde(default)]
-    token: Option<String>,
+    pub token: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
-    args: serde_json::Value,
+    pub args: serde_json::Value,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -986,6 +987,526 @@ pub fn send_control_request(
 
     serde_json::from_slice(&resp_body)
         .map_err(|e| format!("parse response: {}", e))
+}
+
+// ============================================================
+// Dual-transport control channel (fork-plan-2026-09 F2b.2)
+// ============================================================
+//
+// Route B serves one supervise process per sandbox generation.  The worker
+// (host uid 65534) is no longer the same uid as the server, so the F1.3
+// auth model ("peer uid == mine, owner-only dir") must generalise to two
+// transports that share one verb/frame/auth session:
+//
+//  * fd handoff — a `socketpair()` created at generation-create time; one
+//    end is handed to the supervise process (`--control-fd N`, SCM_RIGHTS /
+//    exec-time descriptor).  There is no path, so the sandbox cannot
+//    enumerate or connect to the channel: the fd IS the credential.  A
+//    per-channel token is layered on top as a belt (a third party that
+//    somehow obtains the descriptor still cannot authenticate).
+//  * registered path — a pre-started slot binds a socket in a shared
+//    1777+sticky hashed registry dir and the worker connects by path.
+//    Authentication is `SO_PEERCRED` membership in an explicit allowlist
+//    PLUS the token.  The single-machine/CLI same-uid mode is the
+//    allowlist-only-self special case of this transport.
+//
+// Both transports use the same session as the historical `control.sock`
+// (4-byte big-endian length + JSON, `{"v":1,"verb":...}` with a token) and
+// the same 64 KiB body cap.  They deliberately do NOT use the sandlock-oci
+// init framing: that frame (SLKF magic/kind/length) is bound to the init
+// socketpair's `recvmsg`+SCM_RIGHTS semantics — an fd arrives attached to
+// specific bytes and init routes by frame kind before parsing — while the
+// control channel never carries fds and already versioned its JSON body.
+
+/// Largest accepted request/response body on a control frame (4-byte length
+/// prefix + JSON).  Mirrors the client/server caps used above.
+pub const MAX_FRAME_BYTES: usize = 65536;
+
+/// The shared registry root for registered-path control channels.
+///
+/// Route B slots run as uid X while the worker connects as a different uid
+/// (default 65534), so this root cannot be the historical owner-only
+/// per-user root: it must be traversable by the worker.  It is created
+/// 1777+sticky when the process can (the canonical privileged launcher /
+/// deployment layer), letting every uid publish its own hashed slot dir
+/// while nobody can delete another uid's dir.  Per-sandbox runtime dirs stay
+/// owner-only (0700/0600); only the socket a slot explicitly publishes is
+/// world-connectable, and it is additionally protected by the `SO_PEERCRED`
+/// allowlist + token.
+pub fn channel_registry_root() -> PathBuf {
+    if let Ok(root) = std::env::var(CTL_ROOT_ENV) {
+        if !root.is_empty() {
+            return PathBuf::from(root).join("registry");
+        }
+    }
+    PathBuf::from(format!(
+        "/tmp/sandlock-ctl-{}/registry",
+        unsafe { libc::getuid() }
+    ))
+}
+
+/// Ensure the shared registry root exists with 1777+sticky permissions and
+/// return its path.
+pub fn ensure_channel_registry() -> std::io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let root = channel_registry_root();
+        std::fs::create_dir_all(&root)?;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o1777))?;
+        Ok(root)
+    }
+    #[cfg(not(unix))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "control channels require unix sockets",
+        ))
+    }
+}
+
+/// Peer-credential gate for a registered-path connection: returns true when
+/// the peer's `SO_PEERCRED` uid is in `allow`.  An empty `allow` is the
+/// same-uid special case (peer uid == this process's uid), which is what the
+/// historical per-sandbox owner-only channel enforced.  The caller closes
+/// without serving when this returns false.
+pub fn peer_uid_allowed(stream: &std::os::unix::net::UnixStream, allow: &[u32]) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    } != 0
+    {
+        return false;
+    }
+    if allow.is_empty() {
+        cred.uid == (unsafe { libc::getuid() })
+    } else {
+        allow.contains(&cred.uid)
+    }
+}
+
+/// Read one length-prefixed request body (blocking) from a control stream.
+/// Returns `None` on EOF/error or when the declared body exceeds
+/// [`MAX_FRAME_BYTES`].
+pub fn read_request_body(stream: &mut std::os::unix::net::UnixStream) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).ok()?;
+    let body_len = u32::from_be_bytes(len_buf) as usize;
+    if body_len > MAX_FRAME_BYTES {
+        return None;
+    }
+    let mut body = vec![0u8; body_len];
+    stream.read_exact(&mut body).ok()?;
+    Some(body)
+}
+
+/// Write one length-prefixed JSON response body (blocking), capping
+/// oversized bodies the same way the async server does.
+pub fn write_response_frame(
+    stream: &mut std::os::unix::net::UnixStream,
+    resp: &ControlResponse,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let body = serde_json::to_vec(resp).unwrap_or_else(|_| {
+        serde_json::to_vec(&ControlResponse {
+            v: 1,
+            ok: false,
+            data: None,
+            err: Some("internal error".to_string()),
+        })
+        .unwrap_or_default()
+    });
+    let body = if body.len() > MAX_FRAME_BYTES {
+        serde_json::to_vec(&ControlResponse {
+            v: 1,
+            ok: false,
+            data: None,
+            err: Some(format!(
+                "response too large ({} bytes, max {})",
+                body.len(),
+                MAX_FRAME_BYTES
+            )),
+        })
+        .unwrap_or_default()
+    } else {
+        body
+    };
+    let len = (body.len() as u32).to_be_bytes();
+    stream.write_all(&len)?;
+    stream.write_all(&body)?;
+    Ok(())
+}
+
+/// Outcome of a served request: the session may keep the transport open for
+/// the next request, or the transport (and the process serving it — the
+/// supervise single-generation case) should now shut down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeOutcome {
+    /// Keep serving on this transport.
+    Continue,
+    /// Shut the transport (and, for a supervise generation, the process)
+    /// down after responding.
+    Shutdown,
+}
+
+/// Handles one authenticated control verb and writes its response.
+///
+/// Implementations receive the validated request and return whether the
+/// transport should keep serving.  The historical verbs (`config`, `ports`)
+/// are served by the async in-process loop; the dual-transport serve path
+/// serves the verbs the caller registered (probe `ping` in tests, supervise
+/// `config`/`shutdown` in the binary).
+pub trait ControlHandler: Send + 'static {
+    fn handle(
+        &mut self,
+        stream: &mut std::os::unix::net::UnixStream,
+        req: &ControlRequest,
+    ) -> ServeOutcome;
+}
+
+/// Serve one accepted connection on a registered-path listener.
+///
+/// The registered path is per-connection (like the historical per-sandbox
+/// `control.sock`): one request per connection, then the connection closes.
+/// `token` is the channel token every verb must carry; `allow` is the peer
+/// uid allowlist (empty = same-uid-only special case).  Returns `None` only
+/// when `accept` itself failed.
+pub fn serve_registered_once(
+    listener: &std::os::unix::net::UnixListener,
+    token: &str,
+    allow: &[u32],
+    handler: &mut dyn ControlHandler,
+) -> Option<ServeOutcome> {
+    let (stream, _) = listener.accept().ok()?;
+    Some(serve_connection(stream, Some(token), allow, handler))
+}
+
+/// Serve the handed-off end of an fd-handoff channel (transport 1).
+///
+/// The fd transport is a *persistent* peer stream — unlike the registered
+/// path's accept-per-connection model — so this serve loop reads frame after
+/// frame from the single stream until a handler asks for shutdown or the
+/// worker closes its end.  The fd itself is the credential (no
+/// `SO_PEERCRED` check: the descriptor proves the peer is the launcher's
+/// supervise child), so the only gate is the per-channel token — the belt
+/// against a third party that somehow obtained the descriptor.
+pub fn serve_fd_connection(
+    stream: std::os::unix::net::UnixStream,
+    expected_token: &str,
+    handler: &mut dyn ControlHandler,
+) -> ServeOutcome {
+    let mut stream = stream;
+    loop {
+        let Some(body) = read_request_body(&mut stream) else {
+            return ServeOutcome::Shutdown;
+        };
+        let req: ControlRequest = match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                let resp = ControlResponse {
+                    v: 1,
+                    ok: false,
+                    data: None,
+                    err: Some(format!("parse error: {}", e)),
+                };
+                let _ = write_response_frame(&mut stream, &resp);
+                return ServeOutcome::Shutdown;
+            }
+        };
+        if req.v != 1 {
+            let resp = ControlResponse {
+                v: 1,
+                ok: false,
+                data: None,
+                err: Some(format!("unsupported protocol version: {}", req.v)),
+            };
+            let _ = write_response_frame(&mut stream, &resp);
+            return ServeOutcome::Shutdown;
+        }
+        let authorized = match req.token.as_deref() {
+            Some(given) => token_eq(given, expected_token),
+            None => false,
+        };
+        if !authorized {
+            let resp = ControlResponse {
+                v: 1,
+                ok: false,
+                data: None,
+                err: Some(format!(
+                    "permission denied: verb '{}' requires a valid channel token \
+                     (missing or mismatched)",
+                    req.verb
+                )),
+            };
+            let _ = write_response_frame(&mut stream, &resp);
+            return ServeOutcome::Shutdown;
+        }
+        match handler.handle(&mut stream, &req) {
+            ServeOutcome::Continue => {}
+            ServeOutcome::Shutdown => return ServeOutcome::Shutdown,
+        }
+    }
+}
+
+/// Serve one request/response cycle on a connected stream (blocking).
+///
+/// Authentication order: (1) peer uid allowlist (registered path; an empty
+/// allowlist is the same-uid special case), (2) channel token on every verb.
+/// A peer outside the allowlist is closed without a response and without a
+/// log (the F1.3 posture); a token mismatch is refused explicitly and the
+/// connection is closed after the refusal.  The fd-handoff transport serves
+/// its single persistent stream in [`serve_fd_connection`], where the
+/// descriptor itself is the credential and the only gate is the token.
+pub fn serve_connection(
+    mut stream: std::os::unix::net::UnixStream,
+    expected_token: Option<&str>,
+    allowed_peer_uids: &[u32],
+    handler: &mut dyn ControlHandler,
+) -> ServeOutcome {
+    if allowed_peer_uids.is_empty() {
+        if !peer_uid_allowed(&stream, &[]) {
+            return ServeOutcome::Shutdown;
+        }
+    } else if !peer_uid_allowed(&stream, allowed_peer_uids) {
+        return ServeOutcome::Shutdown;
+    }
+
+    let Some(body) = read_request_body(&mut stream) else {
+        return ServeOutcome::Shutdown;
+    };
+
+    let req: ControlRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            let resp = ControlResponse {
+                v: 1,
+                ok: false,
+                data: None,
+                err: Some(format!("parse error: {}", e)),
+            };
+            let _ = write_response_frame(&mut stream, &resp);
+            return ServeOutcome::Shutdown;
+        }
+    };
+
+    if req.v != 1 {
+        let resp = ControlResponse {
+            v: 1,
+            ok: false,
+            data: None,
+            err: Some(format!("unsupported protocol version: {}", req.v)),
+        };
+        let _ = write_response_frame(&mut stream, &resp);
+        return ServeOutcome::Shutdown;
+    }
+
+    // Channel token: on the dual transports every verb carries the channel
+    // token (the fd handoff layers it over the fd credential; the registered
+    // path layers it over the peer allowlist).
+    if let Some(expected) = expected_token {
+        let authorized = match req.token.as_deref() {
+            Some(given) => token_eq(given, expected),
+            None => false,
+        };
+        if !authorized {
+            let resp = ControlResponse {
+                v: 1,
+                ok: false,
+                data: None,
+                err: Some(format!(
+                    "permission denied: verb '{}' requires a valid channel token \
+                     (missing or mismatched)",
+                    req.verb
+                )),
+            };
+            let _ = write_response_frame(&mut stream, &resp);
+            return ServeOutcome::Shutdown;
+        }
+    }
+
+    handler.handle(&mut stream, &req)
+}
+
+/// Worker/client side of a control channel: send one verb with the channel
+/// token attached and return the parsed response.  Sets 2-second read/write
+/// timeouts so a wedged server cannot hang the caller.
+pub fn channel_request(
+    stream: &mut std::os::unix::net::UnixStream,
+    token: &str,
+    verb: &str,
+    args: serde_json::Value,
+) -> Result<ControlResponse, String> {
+    use std::io::Write;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .map_err(|e| format!("set_read_timeout: {}", e))?;
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+        .map_err(|e| format!("set_write_timeout: {}", e))?;
+
+    let req = ControlRequest {
+        v: 1,
+        verb: verb.to_string(),
+        token: Some(token.to_string()),
+        args,
+    };
+    let body = serde_json::to_vec(&req).map_err(|e| format!("serialize request: {}", e))?;
+    let len = (body.len() as u32).to_be_bytes();
+    stream
+        .write_all(&len)
+        .and_then(|_| stream.write_all(&body))
+        .map_err(|e| format!("write request: {}", e))?;
+
+    let Some(resp_body) = read_request_body(stream) else {
+        return Err("server closed without a response".to_string());
+    };
+    serde_json::from_slice(&resp_body).map_err(|e| format!("parse response: {}", e))
+}
+
+/// Transport 1 — fd handoff.  Created with one `socketpair()` at
+/// generation-create time; the launcher hands [`FdHandoffChannel::server`]
+/// to the supervise process (`--control-fd N`) and keeps
+/// [`FdHandoffChannel::worker`].  No path ever exists; the fd is the
+/// credential and the token is layered on top.
+pub struct FdHandoffChannel {
+    /// Per-channel token both sides authenticate with.
+    pub token: String,
+    /// Worker end (the launcher keeps this; used with
+    /// [`channel_request`]).
+    pub worker: std::os::unix::net::UnixStream,
+    /// Server end handed to supervise.
+    pub server: std::os::unix::net::UnixStream,
+}
+
+impl FdHandoffChannel {
+    /// Create a fresh fd-handoff channel.
+    pub fn new() -> std::io::Result<FdHandoffChannel> {
+        let (worker, server) = std::os::unix::net::UnixStream::pair()?;
+        let token = generate_token()?;
+        Ok(FdHandoffChannel {
+            token,
+            worker,
+            server,
+        })
+    }
+
+}
+
+/// Transport 2 — registered path + token.  A slot binds a socket in the
+/// shared registry; the worker connects by the hashed path and authenticates
+/// with `SO_PEERCRED` allowlist membership + the channel token.  The
+/// single-machine/CLI same-uid mode passes an empty allowlist (= same uid).
+pub struct RegisteredPathChannel {
+    name: String,
+    token: String,
+    allowed_peer_uids: Vec<u32>,
+    listener: Arc<std::os::unix::net::UnixListener>,
+    sock_path: PathBuf,
+    dir: PathBuf,
+}
+
+impl RegisteredPathChannel {
+    /// Bind a registered channel for `name` under the shared registry.
+    ///
+    /// `allowed_peer_uids` is the worker allowlist (route B default: the
+    /// worker uid, conventionally 65534).  Empty = same-uid-only (the
+    /// single-machine special case), which the server enforces via
+    /// `SO_PEERCRED == getuid()`.
+    pub fn bind(name: &str, allowed_peer_uids: Vec<u32>) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let root = ensure_channel_registry()?;
+            let dir = root.join(format!("{}.d", fnv1a_hex(name)));
+            // Inside the shared registry, the hashed slot dir is
+            // world-traversable and sticky so a slot running as any uid can
+            // publish it and only the owner can remove it.  Cleanup happens
+            // on the slot's shutdown (Drop removes socket + dir).
+            std::fs::create_dir_all(&dir)?;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777))?;
+            let sock_path = dir.join("control.sock");
+            let listener = Arc::new(std::os::unix::net::UnixListener::bind(&sock_path)?);
+            // The worker uid must be able to connect() the socket inode even
+            // though it does not own the slot dir: make the socket
+            // world-connectable (auth is the allowlist + token, not DAC).
+            std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o666))?;
+            let token = generate_token()?;
+            Ok(RegisteredPathChannel {
+                name: name.to_string(),
+                token,
+                allowed_peer_uids,
+                listener,
+                sock_path,
+                dir,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (name, allowed_peer_uids);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "control channels require unix sockets",
+            ))
+        }
+    }
+
+    /// Path a worker connects to (hashed; never contains `name`).
+    pub fn socket_path(&self) -> &Path {
+        &self.sock_path
+    }
+
+    /// Channel token the worker must present on every verb.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Registration name (raw name kept out of the filesystem path).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Peer uid allowlist (empty = same-uid-only special case).
+    pub fn allowed_peer_uids(&self) -> &[u32] {
+        &self.allowed_peer_uids
+    }
+
+    /// Worker-side connect + one request (attaches the channel token).
+    pub fn connect_and_request(
+        &self,
+        verb: &str,
+        args: serde_json::Value,
+    ) -> Result<ControlResponse, String> {
+        let mut stream = std::os::unix::net::UnixStream::connect(&self.sock_path)
+            .map_err(|e| format!("connect to {:?}: {}", self.sock_path, e))?;
+        channel_request(&mut stream, &self.token, verb, args)
+    }
+
+    /// Share the accept side with a serving thread while the creator keeps
+    /// the channel metadata (token/path) for the worker side.
+    pub fn listener(&self) -> Arc<std::os::unix::net::UnixListener> {
+        Arc::clone(&self.listener)
+    }
+
+    /// Remove the socket and the hashed slot dir (best-effort).
+    pub fn cleanup(&self) {
+        let _ = std::fs::remove_file(&self.sock_path);
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
+impl Drop for RegisteredPathChannel {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
 }
 
 #[cfg(test)]

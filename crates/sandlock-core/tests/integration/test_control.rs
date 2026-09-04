@@ -1389,3 +1389,482 @@ fn test_name_conflict_refuses_preempt() {
     let _ = first.kill();
     let _ = first.wait();
 }
+
+// ============================================================
+// F2b.2 (fork-plan-2026-09 route B): dual-transport control channel
+// ============================================================
+//
+// Route B reverses the peer model: the worker (host uid 65534) connects to a
+// supervise process running as the sandbox's host uid X, so the F1.3
+// "peer uid == mine, owner-only dir" boundary must generalise to two
+// transports sharing one verb/frame/auth session:
+//
+//  * fd handoff — one `socketpair()` at generation-create time; the launcher
+//    hands one end to the supervise process (`--control-fd N`).  No path
+//    ever exists: the fd IS the credential and the per-channel token is the
+//    belt layered on top.
+//  * registered path — a slot binds a socket in the shared 1777+sticky
+//    hashed registry; the worker connects by path and is authenticated by
+//    `SO_PEERCRED` allowlist membership PLUS the token.  The single-machine
+//    same-uid mode is the allowlist-only-self special case.
+//
+// A genuine *cross-uid kernel peer* cannot be constructed inside the
+// non-root gate (a single-entry userns map can only cover the caller's own
+// euid — the F1.3 peer-uid test documents the same limitation), so the
+// allowlist tests pin the mechanism itself: a peer outside the allowlist is
+// closed without a response, an allowlisted peer is served only when it
+// presents the channel token, and a sibling sandbox cannot reach a
+// registered channel (the hashed registry lives outside its Landlock view).
+// Genuine cross-uid acceptance is F2b.3's foreign-uid suite.
+
+use sandlock_core::control::{
+    channel_request, serve_fd_connection, serve_registered_once, write_response_frame,
+    ControlHandler, ControlRequest, ControlResponse, FdHandoffChannel, RegisteredPathChannel,
+    ServeOutcome,
+};
+
+/// Minimal probe handler for transport tests: `ping` → pong (Continue),
+/// `shutdown` → ok (Shutdown), anything else → unknown-verb error.
+struct ProbeHandler;
+
+impl ControlHandler for ProbeHandler {
+    fn handle(
+        &mut self,
+        stream: &mut std::os::unix::net::UnixStream,
+        req: &ControlRequest,
+    ) -> ServeOutcome {
+        match req.verb.as_str() {
+            "ping" => {
+                let resp = ControlResponse {
+                    v: 1,
+                    ok: true,
+                    data: Some(serde_json::json!({"pong": true})),
+                    err: None,
+                };
+                let _ = write_response_frame(stream, &resp);
+                ServeOutcome::Continue
+            }
+            "shutdown" => {
+                let resp = ControlResponse {
+                    v: 1,
+                    ok: true,
+                    data: None,
+                    err: None,
+                };
+                let _ = write_response_frame(stream, &resp);
+                ServeOutcome::Shutdown
+            }
+            other => {
+                let resp = ControlResponse {
+                    v: 1,
+                    ok: false,
+                    data: None,
+                    err: Some(format!("unknown verb: {other}")),
+                };
+                let _ = write_response_frame(stream, &resp);
+                ServeOutcome::Continue
+            }
+        }
+    }
+}
+
+/// The socketpair channel (transport 1's foundation) has NO filesystem path:
+/// a third party that did not receive an end of the pair cannot address it,
+/// and the peer end is served only with the channel token (the belt over the
+/// fd credential).
+#[test]
+fn test_socketpair_channel_rejects_third_party() {
+    isolate_ctl_root();
+    let mut ch = FdHandoffChannel::new().expect("create fd-handoff channel");
+    let server_end = ch.server.try_clone().expect("clone server end");
+    let token = ch.token.clone();
+
+    // Serve the handed-off end through the real fd serve implementation.
+    let serve = std::thread::spawn(move || {
+        let mut handler = ProbeHandler;
+        serve_fd_connection(server_end, &token, &mut handler)
+    });
+
+    // Worker (launcher-held end): served with the token.
+    let resp = channel_request(&mut ch.worker, &ch.token, "ping", serde_json::json!({}))
+        .expect("worker ping");
+    assert!(resp.ok, "worker ping must succeed: {:?}", resp.err);
+
+    // No path exists: the registry is empty and the worker end cannot be
+    // reached by name.
+    let reg = sandlock_core::control::ensure_channel_registry().expect("registry root");
+    let entries: Vec<_> = std::fs::read_dir(&reg)
+        .expect("read registry")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(
+        entries.is_empty(),
+        "fd-handoff channel must not publish a registry entry, found: {:?}",
+        entries.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+    );
+    let ghost = reg.join("0123456789abcdef.d/control.sock");
+    assert!(
+        std::os::unix::net::UnixStream::connect(&ghost).is_err(),
+        "there is no addressable path for the socketpair channel"
+    );
+
+    // Clean single-generation shutdown.
+    let resp = channel_request(&mut ch.worker, &ch.token, "shutdown", serde_json::json!({}))
+        .expect("worker shutdown");
+    assert!(resp.ok, "shutdown: {:?}", resp.err);
+    let outcome = serve.join().expect("serve thread joins");
+    assert_eq!(outcome, ServeOutcome::Shutdown);
+}
+
+/// fd handoff: the serve side holds the end of the socketpair that was
+/// handed to it (the launcher's fd handoff); a peer that somehow obtained
+/// the descriptor but does not know the per-channel token is refused — the
+/// token is the belt over the fd credential.
+#[test]
+fn test_fd_handoff_channel_rejects_third_party() {
+    isolate_ctl_root();
+
+    // Channel A: correct-token worker served by the real fd serve loop.
+    let mut a = FdHandoffChannel::new().expect("channel A");
+    let a_server = a.server.try_clone().expect("clone A server end");
+    let a_token = a.token.clone();
+    let a_serve = std::thread::spawn(move || {
+        let mut handler = ProbeHandler;
+        serve_fd_connection(a_server, &a_token, &mut handler)
+    });
+
+    // Channel B: third party with the fd but not the token.
+    let mut b = FdHandoffChannel::new().expect("channel B");
+    let b_server = b.server.try_clone().expect("clone B server end");
+    let b_token = b.token.clone();
+    let b_serve = std::thread::spawn(move || {
+        let mut handler = ProbeHandler;
+        serve_fd_connection(b_server, &b_token, &mut handler)
+    });
+
+    // Positive control: A's worker is served.
+    let resp = channel_request(&mut a.worker, &a.token, "ping", serde_json::json!({}))
+        .expect("A ping");
+    assert!(resp.ok, "A ping: {:?}", resp.err);
+
+    // Third party with B's fd but a wrong token: refused explicitly, and the
+    // serve side stops rather than serving the imposter.
+    let wrong = "0".repeat(b.token.len());
+    let resp = channel_request(&mut b.worker, &wrong, "ping", serde_json::json!({}));
+    match resp {
+        Ok(r) => {
+            assert!(!r.ok, "wrong-token fd-holder must be refused, got: {:?}", r);
+            assert!(
+                r.err.as_deref().unwrap_or_default().contains("token"),
+                "refusal must name the token: {:?}",
+                r.err
+            );
+        }
+        Err(e) => {
+            assert!(
+                e.contains("closed") || e.contains("timed out"),
+                "wrong-token fd-holder must be refused or closed, got: {}",
+                e
+            );
+        }
+    }
+
+    // Clean shutdowns.
+    let resp = channel_request(&mut a.worker, &a.token, "shutdown", serde_json::json!({}))
+        .expect("A shutdown");
+    assert!(resp.ok, "A shutdown: {:?}", resp.err);
+    assert_eq!(a_serve.join().expect("A serve"), ServeOutcome::Shutdown);
+    drop(b.worker);
+    let _ = b_serve.join();
+}
+
+/// Path mode: the same-uid special case is the allowlist containing only the
+/// server's own uid.  A peer that is NOT on the allowlist is closed without
+/// a response — the SO_PEERCRED boundary.  (The kernel peer in this gate is
+/// always the test process's own uid, so the mismatch is pinned by excluding
+/// that uid from the allowlist; genuine cross-uid coverage is F2b.3.)
+#[test]
+fn test_path_mode_peer_uid_mismatch_closes() {
+    isolate_ctl_root();
+    let name = format!("test-ctrl-path-mismatch-{}", std::process::id());
+    let mine = unsafe { libc::getuid() };
+
+    // Bind with an allowlist that excludes the connecting peer (the only
+    // peer this gate can construct): the connection must be closed without
+    // any response bytes.
+    let excluded_peer = if mine == 0 { 1 } else { 0 };
+    let channel = RegisteredPathChannel::bind(&name, vec![excluded_peer])
+        .expect("bind registered channel with excluding allowlist");
+    assert!(
+        !channel.socket_path().to_string_lossy().contains(&name),
+        "registered path must be hashed, got {:?}",
+        channel.socket_path()
+    );
+
+    // The allowlist check happens at accept time: run the serve side so the
+    // connection is accepted, found outside the allowlist, and closed
+    // without a response.
+    let listener = channel.listener();
+    let token = channel.token().to_string();
+    let allow = channel.allowed_peer_uids().to_vec();
+    let serve = std::thread::spawn(move || {
+        let mut handler = ProbeHandler;
+        serve_registered_once(&listener, &token, &allow, &mut handler)
+            .expect("accept mismatched connection")
+    });
+
+    let mut stream = std::os::unix::net::UnixStream::connect(channel.socket_path())
+        .expect("connect to registered socket (0666)");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    {
+        use std::io::Write;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "v": 1,
+            "verb": "ping",
+            "args": {},
+            "token": channel.token(),
+        }))
+        .expect("serialize request");
+        // The server closes the mismatched peer without reading; depending
+        // on the race the write either lands (then the read below sees EOF /
+        // RST) or fails with EPIPE.  Both are "closed without a response".
+        let _ = stream
+            .write_all(&(body.len() as u32).to_be_bytes())
+            .and_then(|_| stream.write_all(&body));
+    }
+    {
+        use std::io::Read;
+        let mut buf = [0u8; 4];
+        match stream.read(&mut buf) {
+            Ok(0) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                // The server dropped the rejected peer with RST rather than a
+                // clean EOF; either way no response bytes were served.
+            }
+            Ok(n) => panic!(
+                "peer outside the allowlist must be closed without a response, read {n} bytes: \
+                 {buf:?}"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Nothing was served either way — the accept-side close won
+                // the race with our read timeout.
+            }
+            Err(e) => panic!("read after uid mismatch: {e}"),
+        }
+    }
+    let outcome = serve.join().expect("serve thread");
+    assert_eq!(outcome, ServeOutcome::Shutdown);
+
+    // Positive control: the same-uid special case (empty allowlist = self)
+    // serves the same peer.
+    let name2 = format!("{name}-same-uid");
+    let channel2 = RegisteredPathChannel::bind(&name2, Vec::new()).expect("bind same-uid channel");
+    let listener = channel2.listener();
+    let token2 = channel2.token().to_string();
+    let serve = std::thread::spawn(move || {
+        let mut handler = ProbeHandler;
+        serve_registered_once(&listener, &token2, &[], &mut handler).expect("accept once")
+    });
+    let resp = channel2
+        .connect_and_request("ping", serde_json::json!({}))
+        .expect("same-uid peer must be served");
+    assert!(resp.ok, "same-uid ping: {:?}", resp.err);
+    assert_eq!(serve.join().expect("serve thread"), ServeOutcome::Continue);
+}
+
+/// Registered path channel: an allowlisted peer with the channel token is
+/// served; without the token the request is refused explicitly and the
+/// connection is closed.
+#[test]
+fn test_registered_path_channel_accepts_allowlisted_peer_with_token() {
+    isolate_ctl_root();
+    let name = format!("test-ctrl-registered-{}", std::process::id());
+    let mine = unsafe { libc::getuid() };
+    let channel = RegisteredPathChannel::bind(&name, vec![mine]).expect("bind registered channel");
+    let listener = channel.listener();
+    let token = channel.token().to_string();
+    let allow = channel.allowed_peer_uids().to_vec();
+
+    // Serve two sequential connections (token-authenticated ping, then
+    // token-less refusal) on the same listener.
+    let serve = std::thread::spawn(move || {
+        let mut handler = ProbeHandler;
+        let first =
+            serve_registered_once(&listener, &token, &allow, &mut handler)
+                .expect("accept first connection");
+        let second = serve_registered_once(&listener, &token, &allow, &mut handler)
+            .expect("accept second connection");
+        (first, second)
+    });
+
+    // Allowlisted peer + correct token: served.
+    let resp = channel
+        .connect_and_request("ping", serde_json::json!({}))
+        .expect("allowlisted peer with token must be served");
+    assert!(resp.ok, "token ping: {:?}", resp.err);
+
+    // Allowlisted peer WITHOUT the token: explicit refusal.
+    let mut stream = std::os::unix::net::UnixStream::connect(channel.socket_path())
+        .expect("connect without token");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    {
+        use std::io::Write;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "v": 1,
+            "verb": "ping",
+            "args": {},
+        }))
+        .expect("serialize no-token request");
+        stream
+            .write_all(&(body.len() as u32).to_be_bytes())
+            .and_then(|_| stream.write_all(&body))
+            .expect("write no-token ping");
+    }
+    {
+        use std::io::Read;
+        let mut len_buf = [0u8; 4];
+        match stream.read_exact(&mut len_buf) {
+            Ok(()) => {
+                let body_len = u32::from_be_bytes(len_buf) as usize;
+                assert!(body_len <= 65536, "refusal body cap");
+                let mut body = vec![0u8; body_len];
+                stream.read_exact(&mut body).expect("read refusal body");
+                let resp: ControlResponse =
+                    serde_json::from_slice(&body).expect("refusal is a response frame");
+                assert!(!resp.ok, "no-token request must be refused: {resp:?}");
+                assert!(
+                    resp.err.as_deref().unwrap_or_default().contains("token"),
+                    "refusal must name the token: {:?}",
+                    resp.err
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // The server closes without a body after the explicit
+                // refusal — no data was served either way.
+            }
+            Err(e) => panic!("read after no-token request: {e}"),
+        }
+    }
+
+    let (first, second) = serve.join().expect("serve thread");
+    assert_eq!(first, ServeOutcome::Continue);
+    assert_eq!(second, ServeOutcome::Shutdown);
+}
+
+/// A sibling sandbox cannot reach a registered control channel: the hashed
+/// registry lives under the same control root the F1.3 sibling probe already
+/// proved unreachable from inside a sandbox, so enumeration and connect are
+/// EACCES/ENOENT/ECONNREFUSED — never a served response.
+#[test]
+fn test_sandbox_cannot_reach_sibling_channel() {
+    isolate_ctl_root();
+    let name_b = format!("test-ctrl-sibchan-b-{}", std::process::id());
+    let channel = RegisteredPathChannel::bind(&name_b, Vec::new()).expect("bind registered channel");
+
+    let root = isolate_ctl_root();
+    let name_a = format!("test-ctrl-sibchan-a-{}", std::process::id());
+    let script = r#"import os, socket, sys
+root = sys.argv[1]
+path = sys.argv[2]
+try:
+    names = os.listdir(root)
+    print("ENUM", root, "OK", repr(names))
+except PermissionError:
+    print("ENUM", root, "EACCES")
+except FileNotFoundError:
+    print("ENUM", root, "ENOENT")
+try:
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(2)
+    s.connect(path)
+except PermissionError:
+    print("CONNECT EACCES")
+except ConnectionRefusedError:
+    print("CONNECT ECONNREFUSED")
+except FileNotFoundError:
+    print("CONNECT ENOENT")
+except OSError as e:
+    print("CONNECT", repr(e))
+    sys.exit(2)
+else:
+    print("CONNECT OK")
+    sys.exit(3)
+print("PROBE PASS")
+"#
+    .to_string();
+
+    let has_lib64 = std::path::Path::new("/lib64").exists();
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--name".into(),
+        name_a.clone(),
+        "-r".into(),
+        "/usr".into(),
+    ];
+    if has_lib64 {
+        args.push("-r".into());
+        args.push("/lib64".into());
+    }
+    args.extend([
+        "-r".into(),
+        "/lib".into(),
+        "-r".into(),
+        "/bin".into(),
+        "-r".into(),
+        "/etc".into(),
+        "-r".into(),
+        "/proc".into(),
+        "-r".into(),
+        "/dev".into(),
+        "--".into(),
+        "python3".into(),
+        "-B".into(),
+        "-c".into(),
+        script,
+        root.join("registry").display().to_string(),
+        channel.socket_path().display().to_string(),
+    ]);
+
+    let out = sandlock_bin()
+        .args(&args)
+        .output()
+        .expect("run sibling probe sandbox");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "sibling probe must exit 0 (no channel reach); stdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("PROBE PASS"),
+        "sibling probe must complete cleanly; stdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("EACCES")
+            || stdout.contains("ENOENT")
+            || stdout.contains("ECONNREFUSED"),
+        "sibling probe must be stopped at the filesystem boundary; stdout:\n{}",
+        stdout
+    );
+
+    // Positive control: the channel still serves its same-uid owner.
+    let listener = channel.listener();
+    let token = channel.token().to_string();
+    let serve = std::thread::spawn(move || {
+        let mut handler = ProbeHandler;
+        serve_registered_once(&listener, &token, &[], &mut handler).expect("accept once")
+    });
+    let resp = channel
+        .connect_and_request("ping", serde_json::json!({}))
+        .expect("owner ping after sibling probe");
+    assert!(resp.ok, "owner ping: {:?}", resp.err);
+    assert_eq!(serve.join().expect("serve thread"), ServeOutcome::Continue);
+}
