@@ -17,7 +17,7 @@ core_integ = 477 # F1.4 (SL-8): +2 plan tests in test_resource.rs
                  # control-auth pair (471 -> 475) is included in this total
 ffi = 89
 cli = 95      # after F0.4 wiring (cli suite includes net_bind_map tests)
-oci = 140     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e2e
+oci = 144     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e2e
               # supervises OCI-default root containers; S1.2 fail-closes
               # RunAs(0,0) for non-root supervisors (tested feature). 140 = 55+67+18
               # (lib + bin + integration: the bin target recompiles the crate
@@ -36,6 +36,12 @@ oci = 140     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e
               # F1.8 (deadline): 138 -> 140, +2 net = +1 supervisor::tests::
               # test_request_timeout_returns_error_within_deadline unit test
               # (lib 54->55, bin 66->67); all three integration targets
-              # unchanged (18).
+              # unchanged (18). F1.6 (SL-5): 140 -> 144, +4 net = +1
+              # init::proto::tests::frame_decoder_rejects_oversize_and_truncated
+              # unit test (lib 55->56, bin 67->68) and +2 in tests/integration.rs
+              # (test_malformed_frames_do_not_leak_fds +
+              # test_eof_closes_received_fd; integration 18->20, now
+              # 56 lib + 68 bin + 15 integration.rs + 2 reaper + 3 process
+              # groups = 144).
 cli_build = 0 # workspace release build gate (no test binaries; 0 = build passed)
 python = 441  # fork S2.x-era python tests landed after the plan's 430/431 estimate

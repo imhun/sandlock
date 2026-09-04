@@ -64,22 +64,50 @@
 //! the child is already a fork of the supervisor, so this code is mapped, and
 //! nothing is exec'd for init itself, which sidesteps Landlock having to
 //! authorize an execve of a path-less image.
+//!
+//! The wire itself is the explicitly framed envelope in [`proto`] (length
+//! prefix + version + type, JSON payloads unchanged); every received
+//! SCM_RIGHTS fd is owned by a RAII guard and closed on every exit path
+//! (SL-5), see [`RecvFdGuard`].
 
 pub mod proto;
 mod fdrecv;
 
 pub use proto::{Req, Resp, CONTROL_FD};
+use proto::FrameKind;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 
+/// Send one framed `Resp` reply on the control socket (single-writer: only
+/// the main loop calls this). Best-effort: a dead peer or a failed write is
+/// ignored — the reap/loop logic never depends on delivery.
 fn send(fd: RawFd, resp: &Resp) {
-    if let Ok(mut v) = serde_json::to_vec(resp) {
-        v.push(b'\n');
-        unsafe {
-            libc::write(fd, v.as_ptr() as *const _, v.len());
+    let payload = match serde_json::to_vec(resp) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let frame = match proto::encode_frame(proto::FrameKind::Resp, &payload) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let mut off = 0usize;
+    while off < frame.len() {
+        let n = unsafe {
+            libc::write(
+                fd,
+                frame.as_ptr().add(off) as *const libc::c_void,
+                frame.len() - off,
+            )
+        };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
         }
+        off += n as usize;
     }
 }
 
@@ -302,6 +330,38 @@ fn signal_all_children(
 /// sit as a zombie when no control message is arriving (100 ms class).
 const REAP_POLL_MS: i32 = 100;
 
+/// RAII guard for the SCM_RIGHTS fds received in one control read (SL-5).
+///
+/// `fdrecv::recv` transfers ownership of every received fd into this guard at
+/// the recvmsg boundary, so **every** exit from the receive branch — EOF,
+/// frame/parse errors, `RunMain`/`Shutdown`/`Signal` carrying unexpected fds,
+/// `RunExec` with too few fds, a failed fork — closes them when the guard
+/// drops. Nothing is `mem::forget`ten and nothing escapes the guard except
+/// the three fds a successful `RunExec` dup's into its child, which `spawn`
+/// consumes inside the child before exec (tracked via `handed` so the parent
+/// still closes its own copies on drop).
+///
+/// Drop also records the guard-closed fds in `leaks`: the exact set the
+/// pre-F1.6 exits (parse error / EOF / `RunMain` / `Shutdown` / unexpected
+/// fds) used to leave open. The counter is deliberately local and never
+/// wire-exposed (the F1.5 `_reaped_unknown` precedent): the supervisor has no
+/// read for it, so the observable guarantee is fd-table flatness asserted by
+/// the root-mode leak tests, not a frame. The leading underscore marks the
+/// counter as unread.
+struct RecvFdGuard<'a> {
+    fds: Vec<OwnedFd>,
+    /// Fds a successful `RunExec` handed to its child (0 or 3).
+    handed: usize,
+    leaks: &'a mut u64,
+}
+
+impl Drop for RecvFdGuard<'_> {
+    fn drop(&mut self) {
+        *self.leaks += self.fds.len().saturating_sub(self.handed) as u64;
+        // The OwnedFds in `fds` close here, after the counter update.
+    }
+}
+
 /// Run the confined PID-1 control loop on [`CONTROL_FD`]. Returns when the
 /// daemon closes the channel or sends `Shutdown`. When the main workload
 /// exits, the loop reports its `Exited`, signals every registered child group
@@ -341,6 +401,10 @@ pub fn run_init() {
     // defunct-absence in the reaper integration tests, not as a frame. The
     // leading underscore marks the counter as deliberately unread.
     let mut _reaped_unknown: u64 = 0;
+    // SL-5 local leak counter (see [`RecvFdGuard`]): received fds the guard
+    // had to close because no branch consumed them. Never wire-exposed; the
+    // root-mode leak tests observe the fd table instead.
+    let mut _init_recv_fd_leaks: u64 = 0;
     loop {
         // Reap every exited child (known or adopted) before (re)blocking on
         // the control channel. Replies are only ever sent from this loop, so
@@ -419,93 +483,151 @@ pub fn run_init() {
             Ok(p) => p,
             Err(_) => break,
         };
-        if bytes.is_empty() {
-            break;
-        } // daemon closed the channel
-          // Trim trailing ASCII whitespace before parsing.
-        let trimmed = &bytes[..bytes.iter().rposition(|b| !b.is_ascii_whitespace()).map_or(0, |i| i + 1)];
-        let req: Req = match serde_json::from_slice(trimmed) {
-            Ok(r) => r,
-            Err(e) => {
-                send(ctl, &Resp::Err { msg: e.to_string() });
-                continue;
-            }
+        // SL-5: every fd received by this read is owned by the guard from
+        // this line on and is closed on drop — no exit branch may leak one.
+        let mut received = RecvFdGuard {
+            fds,
+            handed: 0,
+            leaks: &mut _init_recv_fd_leaks,
         };
-        match req {
-            Req::RunMain { argv, env, cwd } => {
-                if children.values().any(|c| c.kind == ChildKind::Main) {
-                    // Only one OCI start is legitimate; a second RunMain would
-                    // otherwise overwrite the table entry and orphan the first
-                    // main's exit routing.
-                    send(ctl, &Resp::Err { msg: "main already running".into() });
-                    continue;
+        if bytes.is_empty() {
+            // Daemon closed the channel: leave the loop; the guard closes
+            // (and counts) any fd a zero-byte read carried, defensively.
+            break;
+        }
+        // Decode every complete frame in this read unit (one sendmsg = one
+        // frame; several whole frames may coalesce into one recvmsg). Replies
+        // are deferred until the guard has dropped, so a reply can never be
+        // observed before its frame's fds are closed.
+        let mut replies: Vec<Resp> = Vec::new();
+        let mut shutdown = false;
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let frame = match proto::decode_frame(&bytes[off..]) {
+                Ok(f) => f,
+                Err(e) => {
+                    replies.push(Resp::Err {
+                        msg: format!("bad control frame: {e}"),
+                    });
+                    // A framing error means the following bytes may not start
+                    // at a frame boundary: stop consuming this read unit
+                    // rather than half-guessing. A serialized, well-formed
+                    // supervisor never produces one; a hostile peer degrades
+                    // only this unit — with no fd leak and no buffering.
+                    break;
                 }
-                let pid = spawn(&argv, &env, &cwd, None);
-                if pid < 0 {
-                    send(ctl, &Resp::Err { msg: "fork failed".into() });
-                    continue;
+            };
+            off += frame.consumed;
+            match frame.kind {
+                FrameKind::Resp => {
+                    // init only ever receives Req frames; a Resp-type frame is
+                    // a protocol violation.
+                    replies.push(Resp::Err {
+                        msg: "init received a resp-type control frame".into(),
+                    });
+                    break;
                 }
-                children.insert(
-                    pid,
-                    Child {
-                        kind: ChildKind::Main,
-                        pid,
-                        // spawn() setpgid(0,0)'d the child: pgid == child pid.
-                        pgid: pid,
-                        pidfd: open_child_pidfd(pid),
-                    },
-                );
-                send(ctl, &Resp::Started { pid });
-            }
-            Req::RunExec { argv, env, cwd, detach } => {
-                if fds.len() < 3 {
-                    for &fd in &fds {
-                        unsafe {
-                            libc::close(fd);
+                FrameKind::Req => {
+                    let req: Req = match serde_json::from_slice(frame.payload) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            replies.push(Resp::Err { msg: e.to_string() });
+                            continue; // frame boundary known: try the next frame
+                        }
+                    };
+                    match req {
+                        Req::RunMain { argv, env, cwd } => {
+                            if children.values().any(|c| c.kind == ChildKind::Main) {
+                                // Only one OCI start is legitimate; a second
+                                // RunMain would otherwise overwrite the table
+                                // entry and orphan the first main's exit
+                                // routing.
+                                replies.push(Resp::Err { msg: "main already running".into() });
+                                continue;
+                            }
+                            let pid = spawn(&argv, &env, &cwd, None);
+                            if pid < 0 {
+                                replies.push(Resp::Err { msg: "fork failed".into() });
+                                continue;
+                            }
+                            children.insert(
+                                pid,
+                                Child {
+                                    kind: ChildKind::Main,
+                                    pid,
+                                    // spawn() setpgid(0,0)'d the child: pgid
+                                    // == child pid.
+                                    pgid: pid,
+                                    pidfd: open_child_pidfd(pid),
+                                },
+                            );
+                            replies.push(Resp::Started { pid });
+                        }
+                        Req::RunExec { argv, env, cwd, detach } => {
+                            if received.fds.len() < 3 {
+                                replies.push(Resp::Err { msg: "exec needs 3 fds".into() });
+                                continue;
+                            }
+                            let stdio = [
+                                received.fds[0].as_raw_fd(),
+                                received.fds[1].as_raw_fd(),
+                                received.fds[2].as_raw_fd(),
+                            ];
+                            let pid = spawn(&argv, &env, &cwd, Some(stdio));
+                            if pid < 0 {
+                                replies.push(Resp::Err { msg: "fork failed".into() });
+                                continue;
+                            }
+                            // The fds were dup2'd into the child before exec;
+                            // the guard still closes the parent's copies on
+                            // drop but no longer counts them as guard-closed.
+                            received.handed = 3;
+                            children.insert(
+                                pid,
+                                Child {
+                                    kind: if detach {
+                                        ChildKind::ExecDetach
+                                    } else {
+                                        ChildKind::ExecAttach
+                                    },
+                                    pid,
+                                    pgid: pid,
+                                    pidfd: open_child_pidfd(pid),
+                                },
+                            );
+                            replies.push(Resp::Started { pid });
+                        }
+                        Req::Shutdown => {
+                            if children.values().any(|c| c.kind == ChildKind::Main) {
+                                // Teardown: instance-level SIGKILL over the
+                                // child-group set (live + retained dead
+                                // groups), then exit the loop (the sandbox
+                                // Drop reaps init).
+                                signal_all_children(&children, &mut dead_groups, libc::SIGKILL);
+                            }
+                            shutdown = true;
+                        }
+                        Req::Signal { signum } => {
+                            // Instance-level signal relayed by the supervisor:
+                            // traverse the registered child-group set plus
+                            // retained dead groups. No pid payload exists on
+                            // this verb, so even a forged frame cannot address
+                            // an arbitrary process (see the module docs,
+                            // SECE-6 boundary).
+                            signal_all_children(&children, &mut dead_groups, signum);
                         }
                     }
-                    send(ctl, &Resp::Err { msg: "exec needs 3 fds".into() });
-                    continue;
                 }
-                let stdio = [fds[0], fds[1], fds[2]];
-                let pid = spawn(&argv, &env, &cwd, Some(stdio));
-                for &fd in &fds {
-                    unsafe {
-                        libc::close(fd);
-                    }
-                } // parent drops its copies
-                if pid < 0 {
-                    send(ctl, &Resp::Err { msg: "fork failed".into() });
-                    continue;
-                }
-                children.insert(
-                    pid,
-                    Child {
-                        kind: if detach { ChildKind::ExecDetach } else { ChildKind::ExecAttach },
-                        pid,
-                        pgid: pid,
-                        pidfd: open_child_pidfd(pid),
-                    },
-                );
-                send(ctl, &Resp::Started { pid });
             }
-            Req::Shutdown => {
-                if children.values().any(|c| c.kind == ChildKind::Main) {
-                    // Teardown: instance-level SIGKILL over the child-group
-                    // set (live + retained dead groups), then exit the loop
-                    // (the sandbox Drop reaps init).
-                    signal_all_children(&children, &mut dead_groups, libc::SIGKILL);
-                }
-                break;
-            }
-            Req::Signal { signum } => {
-                // Instance-level signal relayed by the supervisor: traverse
-                // the registered child-group set plus retained dead groups.
-                // No pid payload exists on this verb, so even a forged frame
-                // cannot address an arbitrary process (see the module docs,
-                // SECE-6 boundary).
-                signal_all_children(&children, &mut dead_groups, signum);
-            }
+        }
+        // Release the receive guard (closing every unhanded fd) before any
+        // reply becomes observable, then answer in frame order.
+        drop(received);
+        for reply in replies {
+            send(ctl, &reply);
+        }
+        if shutdown {
+            break;
         }
     }
 

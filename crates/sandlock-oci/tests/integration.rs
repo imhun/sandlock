@@ -828,3 +828,327 @@ async fn oci_stop_collapses_process_group() {
         sample_a, sample_b
     );
 }
+
+// ── F1.6 (SL-5): run_init fd discipline over the framed control wire ──────
+//
+// Observation basis (root-mode oci gate, Linux):
+//
+// The leak defect lives in `run_init`'s receive exits (parse error / EOF /
+// RunMain / Shutdown / Signal branches did not close the SCM_RIGHTS fds a
+// frame carried), and the fix is a RAII receive guard plus an explicitly
+// framed wire (see tmp/sdd/f1.6-report.md). The most faithful probe is a
+// fork of the test process that dups one end of a real socketpair onto
+// CONTROL_FD (3) and calls the real `run_init` — the exact shape
+// supervisor_main wires (crates/sandlock-oci/src/supervisor.rs dup's the
+// child end onto fd 3 and runs `run_init` in-process). The parent owns the
+// other end, plays the supervisor, and reads `/proc/<child>/fd` — the fd
+// table is the observable that counts a leak.
+//
+// The frames below are crafted against the F1.6 wire constants, duplicated
+// here deliberately: the harness must compile and run against the pre-F1.6
+// init too (the RED phase), so it cannot depend on the crate's new framing
+// API; these constants are the black-box oracle for the actual bytes.
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
+
+/// F1.6 frame magic ("SLKF"), mirrored from `init::proto::FRAME_MAGIC`.
+const SLK_MAGIC: [u8; 4] = *b"SLKF";
+/// `init::proto::FRAME_VERSION`.
+const SLK_VERSION: u8 = 1;
+/// `init::proto::FRAME_TYPE_REQ`.
+const SLK_TYPE_REQ: u8 = 1;
+/// `init::proto::MAX_FRAME_PAYLOAD` (64 KiB).
+const SLK_MAX_PAYLOAD: usize = 64 * 1024;
+const SLK_HEADER_LEN: usize = 10;
+
+fn frame_bytes(kind: u8, payload: &[u8]) -> Vec<u8> {
+    let mut f = Vec::with_capacity(SLK_HEADER_LEN + payload.len());
+    f.extend_from_slice(&SLK_MAGIC);
+    f.push(SLK_VERSION);
+    f.push(kind);
+    f.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// Fork a child that maps `child` onto CONTROL_FD and enters the real
+/// `run_init` control loop (the supervisor_main wiring shape). Returns the
+/// child pid, the parent's control stream, and the read end of a ready pipe.
+/// The child writes `r` just before calling `run_init` and `e` once
+/// `run_init` has RETURNED (the EOF path), then parks until killed so the
+/// parent can sample `/proc/<pid>/fd` with the fd table final.
+fn spawn_run_init_probe() -> (i32, UnixStream, i32) {
+    let (daemon, child) = UnixStream::pair().unwrap();
+    let mut ready = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0, "ready pipe");
+    let (ready_r, ready_w) = (ready[0], ready[1]);
+    let child_raw = child.as_raw_fd();
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+    if pid == 0 {
+        // Child: hold only the dup'd control end (fd 3) and the ready-write
+        // end. Closing the daemon end here is what makes the parent's close a
+        // true EOF on the channel.
+        unsafe {
+            libc::close(daemon.as_raw_fd());
+            libc::dup2(child_raw, sandlock_oci::init::CONTROL_FD);
+            if child_raw != sandlock_oci::init::CONTROL_FD {
+                libc::close(child_raw);
+            }
+            libc::close(ready_r);
+            let _ = libc::write(ready_w, b"r".as_ptr() as *const _, 1);
+        }
+        sandlock_oci::init::run_init();
+        // run_init returned: the peer closed the channel. Signal the parent
+        // and park (fd table final) until killed.
+        unsafe {
+            let _ = libc::write(ready_w, b"e".as_ptr() as *const _, 1);
+            loop {
+                libc::pause();
+            }
+        }
+    }
+    drop(child); // parent drops its child-end copy
+    unsafe {
+        libc::close(ready_w);
+    }
+    (pid, daemon, ready_r)
+}
+
+/// Kills and reaps the probe child and closes the ready pipe; runs on panic
+/// too, so a failed assertion never leaves a parked init orphaned.
+struct RunInitProbeGuard {
+    pid: i32,
+    ready_r: i32,
+}
+
+impl Drop for RunInitProbeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(self.pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(self.pid, &mut status, 0);
+            libc::close(self.ready_r);
+        }
+    }
+}
+
+fn wait_ready_byte(ready_r: i32, deadline: Instant) -> Option<u8> {
+    let mut pfd = libc::pollfd {
+        fd: ready_r,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        let ms = ((deadline - now).as_millis() as i64).min(1000) as i32;
+        let pr = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if pr < 0 {
+            return None;
+        }
+        if pr > 0 && (pfd.revents & libc::POLLIN) != 0 {
+            let mut b = [0u8; 1];
+            let n = unsafe { libc::read(ready_r, b.as_mut_ptr() as *mut _, 1) };
+            if n == 1 {
+                return Some(b[0]);
+            }
+            if n == 0 {
+                return None;
+            }
+        }
+    }
+}
+
+/// Number of open fds in `/proc/<pid>/fd` — the SL-5 leak surface.
+fn open_fd_count(pid: i32) -> Option<usize> {
+    fs::read_dir(format!("/proc/{pid}/fd")).ok().map(|it| it.count())
+}
+
+/// Read one init reply, returning its JSON payload. Accepts both wire shapes:
+/// the F1.6 framed replies and the legacy newline-JSON shape — the RED phase
+/// runs this harness against the un-framed init, which answers in newline
+/// JSON until the fix lands.
+fn read_init_reply(ctl: &UnixStream, deadline: Instant) -> Option<Vec<u8>> {
+    let fd = ctl.as_raw_fd();
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        if buf.len() >= SLK_HEADER_LEN && buf[..4] == SLK_MAGIC {
+            let len = u32::from_le_bytes(buf[6..10].try_into().unwrap()) as usize;
+            if buf.len() >= SLK_HEADER_LEN + len {
+                return Some(buf[SLK_HEADER_LEN..SLK_HEADER_LEN + len].to_vec());
+            }
+        } else if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+            // Legacy newline-JSON reply (pre-F1.6 RED wire).
+            return Some(buf[..nl].to_vec());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        let ms = ((deadline - now).as_millis() as i64).min(200) as i32;
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let pr = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if pr <= 0 {
+            return None;
+        }
+        let mut chunk = [0u8; 4096];
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut _, chunk.len()) };
+        if n <= 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n as usize]);
+    }
+}
+
+fn is_err_resp(payload: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|v| {
+            v.get("resp")
+                .and_then(|t| t.as_str())
+                .map(|tag| tag == "err")
+        })
+        .unwrap_or(false)
+}
+
+/// One pipe write end is attached to every frame; the sender keeps its own
+/// copy, and init receives a fresh fd table entry per frame (an entry a leak
+/// leaves open).
+fn new_attach_fd() -> (i32, i32) {
+    let mut p = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0, "attach pipe");
+    (p[0], p[1])
+}
+
+/// 1000 malformed frames, each carrying one fd: bad JSON payload, oversize
+/// declared length, truncated declared length, and a bad type byte, cycled.
+/// init must answer every one with `Err` and keep its fd count flat; after
+/// the last frame the channel closes and init must still exit normally
+/// (`run_init` returns — the `e` byte) with no fd left open.
+#[test]
+fn test_malformed_frames_do_not_leak_fds() {
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipping: /proc fd counting is Linux-only");
+        return;
+    }
+    let (pid, ctl, ready_r) = spawn_run_init_probe();
+    let guard = RunInitProbeGuard { pid, ready_r };
+    assert_eq!(
+        wait_ready_byte(ready_r, Instant::now() + Duration::from_secs(5)),
+        Some(b'r'),
+        "probe child never entered run_init"
+    );
+    let baseline = open_fd_count(pid).expect("read child fd table before the storm");
+    let (attach_r, attach_w) = new_attach_fd();
+
+    const ROUNDS: usize = 1000;
+    let mut served = 0usize;
+    for round in 0..ROUNDS {
+        let frame = match round % 4 {
+            0 => frame_bytes(SLK_TYPE_REQ, b"this is not json {"),
+            1 => {
+                let mut f = frame_bytes(SLK_TYPE_REQ, b"x");
+                f[6..10].copy_from_slice(&((SLK_MAX_PAYLOAD + 1) as u32).to_le_bytes());
+                f
+            }
+            2 => {
+                let mut f = frame_bytes(SLK_TYPE_REQ, b"short");
+                f[6..10].copy_from_slice(&300u32.to_le_bytes());
+                f
+            }
+            _ => frame_bytes(9, b"bad type byte"),
+        };
+        sandlock_oci::fdpass::send_with_fds(&ctl, &frame, &[attach_w])
+            .expect("send malformed frame");
+        let reply =
+            read_init_reply(&ctl, Instant::now() + Duration::from_secs(5)).expect(
+                "init must answer every malformed frame with an Err reply \
+                 (did it stop serving?)",
+            );
+        assert!(
+            is_err_resp(&reply),
+            "round {round}: expected an Err reply, got {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+        served += 1;
+    }
+    let after_storm = open_fd_count(pid).expect("read child fd table after the storm");
+
+    // Host-side EOF semantics must survive the storm: closing the channel
+    // makes run_init return (and the harness child report `e`).
+    drop(ctl);
+    let eof_seen = wait_ready_byte(ready_r, Instant::now() + Duration::from_secs(5))
+        == Some(b'e');
+    drop(guard);
+    unsafe {
+        libc::close(attach_r);
+        libc::close(attach_w);
+    }
+
+    assert_eq!(
+        after_storm, baseline,
+        "init fd count must not grow across {served} malformed fd-bearing frames \
+         (baseline {baseline} -> after {after_storm})"
+    );
+    assert_eq!(
+        served, ROUNDS,
+        "init must answer every malformed frame and stay in service ({served}/{ROUNDS})"
+    );
+    assert!(
+        eof_seen,
+        "after 1000 malformed frames the channel close must still end run_init normally"
+    );
+}
+
+/// One well-formed frame carrying one fd (a `Signal` — a verb that never
+/// consumes fds), then the peer closes the channel. `run_init` must close the
+/// received fd before it returns: the probe child reports `e` only after
+/// `run_init` returned, and the parent then counts the fd table — under the
+/// pre-F1.6 code the frame is a parse error whose fd is left open, and the
+/// count is baseline + 1.
+#[test]
+fn test_eof_closes_received_fd() {
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipping: /proc fd counting is Linux-only");
+        return;
+    }
+    let (pid, ctl, ready_r) = spawn_run_init_probe();
+    let guard = RunInitProbeGuard { pid, ready_r };
+    assert_eq!(
+        wait_ready_byte(ready_r, Instant::now() + Duration::from_secs(5)),
+        Some(b'r'),
+        "probe child never entered run_init"
+    );
+    let baseline = open_fd_count(pid).expect("read child fd table before the frame");
+    let (attach_r, attach_w) = new_attach_fd();
+
+    let frame = frame_bytes(SLK_TYPE_REQ, br#"{"req":"signal","signum":9}"#);
+    sandlock_oci::fdpass::send_with_fds(&ctl, &frame, &[attach_w]).expect("send frame with fd");
+    drop(ctl); // EOF: init's run_init must return
+    let returned = wait_ready_byte(ready_r, Instant::now() + Duration::from_secs(5))
+        == Some(b'e');
+    let after_eof = open_fd_count(pid).expect("read child fd table after run_init returned");
+    drop(guard);
+    unsafe {
+        libc::close(attach_r);
+        libc::close(attach_w);
+    }
+
+    assert!(
+        returned,
+        "channel close must make run_init return (never hang or exit without a trace)"
+    );
+    assert_eq!(
+        after_eof, baseline,
+        "run_init must close the received fd before returning on EOF \
+         (baseline {baseline} -> after return {after_eof})"
+    );
+}

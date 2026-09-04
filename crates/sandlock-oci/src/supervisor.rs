@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
+use crate::init::proto::{self, FrameKind};
 use crate::init::{Req, Resp, CONTROL_FD};
 
 use crate::policy::OciPolicy;
@@ -178,8 +179,8 @@ impl InitLink {
         if self.is_dead() {
             return Err(dead_link_error());
         }
-        let mut bytes = serde_json::to_vec(req)?;
-        bytes.push(b'\n');
+        let payload = serde_json::to_vec(req)?;
+        let bytes = proto::encode_frame(FrameKind::Req, &payload)?;
         let writer = self.writer.lock().await;
         // Re-check under the writer lock: the only way the link turns Dead is
         // a timed-out request, which marks it while still holding this lock,
@@ -268,10 +269,11 @@ impl InitLink {
     /// instance-level `Signal` (init traverses its child-group set). Holding
     /// the writer lock keeps these serialized against request/reply traffic.
     async fn send(&self, req: &Req) {
-        if let Ok(mut bytes) = serde_json::to_vec(req) {
-            bytes.push(b'\n');
-            let writer = self.writer.lock().await;
-            let _ = crate::fdpass::send_with_fds(&writer, &bytes, &[]);
+        if let Ok(payload) = serde_json::to_vec(req) {
+            if let Ok(bytes) = proto::encode_frame(FrameKind::Req, &payload) {
+                let writer = self.writer.lock().await;
+                let _ = crate::fdpass::send_with_fds(&writer, &bytes, &[]);
+            }
         }
     }
 
@@ -306,17 +308,68 @@ fn dead_link_error() -> std::io::Error {
     )
 }
 
-/// Background reader: parse newline-delimited `Resp` from init and route each.
-/// init never sends fds to the daemon, so a plain line reader is sufficient.
-async fn reader_task(link: Arc<InitLink>, reader: tokio::net::UnixStream) {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    let mut lines = BufReader::new(reader).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+/// Read one framed `Resp` payload from init. `Ok(None)` is a clean EOF at a
+/// frame boundary. Frame-level corruption — bad magic/version/type, an
+/// oversize declaration, or EOF in the middle of a frame — is an
+/// `InvalidData` error: byte alignment is unrecoverable, so `reader_task`
+/// treats it like a channel close (a well-framed but unparseable payload is
+/// *not* an error; the caller skips it because its boundary is known).
+async fn read_resp_frame(
+    reader: &mut tokio::net::UnixStream,
+) -> std::io::Result<Option<Vec<u8>>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut header = [0u8; proto::FRAME_HEADER_LEN];
+    let mut got = 0usize;
+    while got < header.len() {
+        let n = reader.read(&mut header[got..]).await?;
+        if n == 0 {
+            if got == 0 {
+                return Ok(None); // clean EOF at a frame boundary
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "truncated control frame header from sandlock-init",
+            ));
         }
-        let resp: Resp = match serde_json::from_str(trimmed) {
+        got += n;
+    }
+    let kind = proto::decode_header(&header).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("bad control frame from sandlock-init: {e}"),
+        )
+    })?;
+    if kind != FrameKind::Resp {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "sandlock-init sent a req-type control frame to the daemon",
+        ));
+    }
+    let len = u32::from_le_bytes(header[6..10].try_into().expect("10-byte header")) as usize;
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload).await.map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "truncated control frame payload from sandlock-init",
+        )
+    })?;
+    Ok(Some(payload))
+}
+
+/// Background reader: decode framed `Resp` frames from init and route each.
+/// init never sends fds to the daemon, so a plain frame reader is sufficient.
+async fn reader_task(link: Arc<InitLink>, mut reader: tokio::net::UnixStream) {
+    loop {
+        let payload = match read_resp_frame(&mut reader).await {
+            Ok(Some(p)) => p,
+            // Clean EOF at a frame boundary or a framing violation: both end
+            // the loop, and the teardown below drops pending senders and
+            // waiters. A framing violation cannot be resynced byte-by-byte,
+            // so continuing would only misroute later frames.
+            Ok(None) | Err(_) => break,
+        };
+        let resp: Resp = match serde_json::from_slice(&payload) {
             Ok(r) => r,
             Err(_) => continue,
         };
@@ -1467,26 +1520,29 @@ mod tests {
         (InitLink::with_request_timeout(writer, reader, request_timeout), child)
     }
 
+    /// Write one framed `Resp` frame on the init -> daemon wire.
     async fn write_resp(peer: &mut tokio::net::UnixStream, resp: &Resp) {
         use tokio::io::AsyncWriteExt;
-        let mut line = serde_json::to_vec(resp).unwrap();
-        line.push(b'\n');
-        peer.write_all(&line).await.unwrap();
+        let payload = serde_json::to_vec(resp).unwrap();
+        let frame = proto::encode_frame(FrameKind::Resp, &payload).unwrap();
+        peer.write_all(&frame).await.unwrap();
     }
 
-    /// Read one newline-delimited `Req` frame from the child end.
-    async fn read_req_line(peer: &mut tokio::net::UnixStream) -> Vec<u8> {
+    /// Read one framed `Req` from the daemon end and return its JSON payload.
+    async fn read_req_frame(peer: &mut tokio::net::UnixStream) -> Vec<u8> {
         use tokio::io::AsyncReadExt;
-        let mut line = Vec::new();
-        let mut chunk = [0u8; 256];
-        loop {
-            let n = peer.read(&mut chunk).await.expect("read request frame");
-            assert!(n > 0, "daemon closed the channel mid-request");
-            line.extend_from_slice(&chunk[..n]);
-            if line.contains(&b'\n') {
-                return line;
-            }
-        }
+        let mut header = [0u8; proto::FRAME_HEADER_LEN];
+        peer.read_exact(&mut header)
+            .await
+            .expect("read request frame header");
+        let kind = proto::decode_header(&header).expect("valid request frame header");
+        assert_eq!(kind, FrameKind::Req, "fake init must read a Req frame");
+        let len = u32::from_le_bytes(header[6..10].try_into().unwrap()) as usize;
+        let mut payload = vec![0u8; len];
+        peer.read_exact(&mut payload)
+            .await
+            .expect("read request frame payload");
+        payload
     }
 
     /// Spawn a fake-sandlock-init task that answers the next `pids.len()`
@@ -1497,11 +1553,11 @@ mod tests {
     ) -> tokio::task::JoinHandle<tokio::net::UnixStream> {
         tokio::spawn(async move {
             for pid in pids {
-                let line = read_req_line(&mut child).await;
+                let payload = read_req_frame(&mut child).await;
                 assert!(
-                    String::from_utf8_lossy(&line).contains("req"),
+                    String::from_utf8_lossy(&payload).contains("req"),
                     "expected a request frame, got {:?}",
-                    line
+                    payload
                 );
                 write_resp(&mut child, &Resp::Started { pid }).await;
             }
@@ -1648,8 +1704,8 @@ mod tests {
         // the supervisor's request is already in flight.
         let mut child = child;
         let announcer = tokio::spawn(async move {
-            let line = read_req_line(&mut child).await;
-            assert!(String::from_utf8_lossy(&line).contains("req"));
+            let payload = read_req_frame(&mut child).await;
+            assert!(String::from_utf8_lossy(&payload).contains("req"));
             write_resp(
                 &mut child,
                 &Resp::Exited { pid: FORGED, code: Some(9), signal: None },
