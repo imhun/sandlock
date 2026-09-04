@@ -303,9 +303,15 @@ impl SandboxInstance {
         //    policy_fn worker, throttle, loadavg, control listener, and the
         //    DNS gateway (whose `:53` listener dies with its task).
         self.abort_session_tasks();
-        // 3. Nobody is left to collect capture drains; aborting closes the
-        //    read ends. A drain that already finished holds only bytes.
+        // 3. Nobody is left to collect captures after shutdown: abort drains
+        //    that are still reading (a finished drain holds only bytes), and
+        //    close capture/stdio pipe ends that were never handed to a drain
+        //    (a never-waited session). A drain that already finished holds
+        //    only bytes.
         self.abort_drains();
+        drop(self._stdout_read.take());
+        drop(self._stderr_read.take());
+        drop(self._stdin_write.take());
         // 4. Remove the F1.3 control directory (pid/token/name/mode/socket).
         if let Some(ref dir) = self.control_dir {
             crate::control::cleanup_runtime_dir(dir);
