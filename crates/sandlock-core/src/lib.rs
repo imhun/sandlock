@@ -34,6 +34,7 @@ pub(crate) mod ca_inject;
 pub(crate) mod chroot;
 pub mod dry_run;
 pub mod control;
+pub mod instance;
 mod transparent_proxy;
 
 pub use error::SandlockError;
@@ -43,6 +44,7 @@ pub use protection::{Protection, ProtectionState, ProtectionPolicy, ProtectionSt
 pub use sandbox::{
     BindPorts, Confinement, ConfinementBuilder, Process, Sandbox, SandboxBuilder, StdioMode,
 };
+pub use instance::{InstancePhase, SandboxInstance};
 pub use result::{RunResult, ExitStatus};
 pub use pipeline::{Stage, Pipeline, Gather};
 pub use transaction::{AbortReason, Transaction, TxnDisposition, TxnError, TxnOutcome};

@@ -6,11 +6,11 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
-use tokio::task::JoinHandle;
 
 use crate::context;
 use crate::error::SandboxError;
 pub use crate::http::{http_acl_check, normalize_path, prefix_or_exact_match, HttpRule};
+use crate::instance::{RuntimeState, SandboxInstance};
 pub use crate::network::{IpCidr, NetAllow, NetDeny, NetRule, NetTarget, Protocol};
 use crate::protection::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
 
@@ -233,7 +233,9 @@ pub enum BranchAction {
 }
 
 // ============================================================
-// Runtime — private heap-allocated state, present only while running
+// Session instance — the heap-allocated state behind a running sandbox now
+// lives in `crate::instance::SandboxInstance` (M0 lifecycle lift); this
+// module keeps the per-child stdio modes and the `Sandbox` config/API.
 // ============================================================
 
 /// How one of a child's standard streams (stdin/stdout/stderr) is wired.
@@ -285,77 +287,9 @@ impl StdioSpec {
     }
 }
 
-/// Private runtime state.  Only allocated after `start()` / `run()` is
-/// called; `None` for config-only `Sandbox` instances.
-struct Runtime {
-    name: String,
-    state: RuntimeState,
-    child_pid: Option<i32>,
-    /// Host PID of the sandbox's first process in its PID namespace (ns
-    /// pid 1). `Some` only when `Sandbox::pid_ns` is enabled; the process
-    /// group leader, and the pid `Sandbox::pid()` reports. The direct
-    /// child (`child_pid`) is then the intermediate process that created
-    /// the namespace, waits for the leader, and relays its exit status.
-    leader_pid: Option<i32>,
-    pidfd: Option<std::os::fd::OwnedFd>,
-    notif_handle: Option<JoinHandle<()>>,
-    policy_fn_worker: Option<crate::policy_fn::PolicyFnWorker>,
-    throttle_handle: Option<JoinHandle<()>>,
-    loadavg_handle: Option<JoinHandle<()>>,
-    control_handle: Option<JoinHandle<()>>,
-    control_dir: Option<PathBuf>,
-    _stdout_read: Option<std::os::fd::OwnedFd>,
-    _stderr_read: Option<std::os::fd::OwnedFd>,
-    // Drains of the capture pipes above, each holding either the task still
-    // reading or the bytes it finished with (see `wait`). Both states belong to
-    // the runtime rather than to the `wait()` that started them, so a cancelled
-    // `wait()` takes neither the reader nor what it has already produced.
-    stdout_drain: Option<ParkedDrain>,
-    stderr_drain: Option<ParkedDrain>,
-    // Parent-held write end of a piped stdin (popen). The caller takes it via
-    // `Process::take_stdin`; closing it signals EOF to the child.
-    _stdin_write: Option<std::os::fd::OwnedFd>,
-    seccomp_cow: Option<crate::cow::seccomp::SeccompCowBranch>,
-    supervisor_resource: Option<Arc<tokio::sync::Mutex<crate::seccomp::state::ResourceState>>>,
-    supervisor_processes: Option<Arc<crate::seccomp::state::ProcessIndex>>,
-    supervisor_cow: Option<Arc<tokio::sync::Mutex<crate::seccomp::state::CowState>>>,
-    supervisor_network: Option<Arc<tokio::sync::Mutex<crate::seccomp::state::NetworkState>>>,
-    ctrl_fd: Option<std::os::fd::OwnedFd>,
-    stdout_pipe: Option<std::os::fd::OwnedFd>,
-    io_overrides: Option<(Option<i32>, Option<i32>, Option<i32>)>,
-    extra_fds: Vec<(i32, i32)>,
-    http_acl_handle: Option<crate::transparent_proxy::HttpAclProxyHandle>,
-    dns_gateway_handle: Option<JoinHandle<()>>,
-    /// The sandbox's DNS gateway address — a per-sandbox loopback address
-    /// (``127.0.1.x``) in the default unprivileged shared-netns mode.
-    dns_gateway_addr: Option<std::net::Ipv4Addr>,
-    #[allow(clippy::type_complexity)]
-    on_bind: Option<Box<dyn Fn(&HashMap<u16, u16>) + Send + Sync>>,
-    handlers: Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>,
-    ready_w: Option<std::os::fd::OwnedFd>,
-    /// Set when this sandbox is a stage of a [`Transaction`](crate::transaction::Transaction)
-    /// that shares one COW upper across all stages. When present, `do_create_stdio`
-    /// reuses this `CowState` (instead of building its own branch), and neither
-    /// `wait()` nor `Drop` take/commit/abort the branch — the transaction
-    /// coordinator owns the single commit/abort. See [`SharedCow`].
-    shared_cow: Option<SharedCow>,
-    // The interactive child took the terminal's foreground process group at
-    // spawn; whoever reaps it must hand the foreground back to this process.
-    tty_foreground_taken: bool,
-}
-
-/// Abort the per-sandbox DNS gateway task (best-effort). The loopback
-/// `127.0.1.x:53` listener dies with it, so a sandbox teardown does not leak
-/// a stale nameserver.
-fn abort_dns_gateway(rt: &mut Runtime) {
-    if let Some(h) = rt.dns_gateway_handle.take() {
-        h.abort();
-    }
-}
-
 /// A COW branch (one `upper` over the workdir) shared by every stage of a
 /// [`Transaction`](crate::transaction::Transaction). Cloned into each stage's
-/// `Runtime` so sequential stages accumulate writes in the same upper
+/// `SandboxInstance` so sequential stages accumulate writes in the same upper
 /// (read-committed), while the coordinator retains the original to commit/abort
 /// once at the end.
 #[derive(Clone)]
@@ -367,14 +301,6 @@ pub(crate) struct SharedCow {
     /// EXECUTE against a file's real path, which for anything written inside the
     /// workdir is the upper. Cached here to avoid locking `state` to read it.
     pub(crate) upper_dir: PathBuf,
-}
-
-/// Lifecycle state for the runtime.
-enum RuntimeState {
-    Created,
-    Running,
-    Paused,
-    Stopped(crate::result::ExitStatus),
 }
 
 /// TCP bind allowlist (`--net-allow-bind`).
@@ -658,9 +584,13 @@ pub struct Sandbox {
     #[serde(skip)]
     work_fn: Option<Arc<dyn Fn(u32) + Send + Sync + 'static>>,
 
-    // Heap-allocated runtime state; `None` when not started.
+    // Heap-allocated session state (a `SandboxInstance`); `None` when not
+    // started. The sandbox drives a one-shot instance: run/popen/spawn and the
+    // create/start/wait lifecycle operate on this block, and `wait()` shuts it
+    // down (see `crate::instance`). Internal (crate-visible for the instance
+    // handover in `SandboxInstance::launch`), not serialized, not cloned.
     #[serde(skip)]
-    runtime: Option<Box<Runtime>>,
+    pub(crate) runtime: Option<Box<SandboxInstance>>,
 
     // Fds the last `restore_interactive` could not transparently recreate.
     // Runtime state: not serialized, not cloned.
@@ -844,11 +774,11 @@ impl Sandbox {
     // Runtime accessor helpers (private)
     // ================================================================
 
-    fn rt(&self) -> &Runtime {
+    fn rt(&self) -> &SandboxInstance {
         self.runtime.as_ref().expect("sandbox not started")
     }
 
-    fn rt_mut(&mut self) -> &mut Runtime {
+    fn rt_mut(&mut self) -> &mut SandboxInstance {
         self.runtime.as_mut().expect("sandbox not started")
     }
 
@@ -1017,143 +947,22 @@ impl Sandbox {
 
     /// Wait for the child process to exit.
     ///
+    /// One-shot session semantics (M0 lifecycle lift): the sandbox's runtime
+    /// *is* a [`SandboxInstance`], and this wait is that instance's
+    /// `wait_one_shot()` — wait for the child, then shut the session down
+    /// (supervisor tasks, control directory, DNS gateway). That is what keeps
+    /// `run`/`popen`/`spawn` one-shot with exactly the historical
+    /// reclamation behaviour: `run`/`popen`/`spawn` all end in this wait.
+    ///
     /// Dropping the returned future does not cost the captured output: the pipe
-    /// drains belong to the `Sandbox`, so a caller that cancels this `wait()`
+    /// drains belong to the instance, so a caller that cancels this `wait()`
     /// (a `timeout` or `select!` around it) and calls `wait()` again still gets
     /// what the child wrote. That holds wherever the cancellation lands —
     /// before the drains start, while the child is still running, or while the
     /// final join is blocked because a descendant is still holding the write
     /// end open past the child's own exit.
     pub async fn wait(&mut self) -> Result<crate::result::RunResult, crate::error::SandlockError> {
-        use crate::error::SandboxRuntimeError;
-        use crate::result::RunResult;
-
-        let pid = self.rt().child_pid.ok_or(SandboxRuntimeError::NotRunning)?;
-
-        // Already reaped: hand back the same status again, plus whatever the
-        // drains collected. They outlive the `wait()` that started them, so a
-        // second call still reports the output of a first one that was
-        // cancelled — including one cancelled while joining them here, since a
-        // join only unparks a drain once it has completed. A `wait()` that ran
-        // to the end took them with it, and both streams are then `None`.
-        let stopped = match self.rt().state {
-            RuntimeState::Stopped(ref es) => Some(es.clone()),
-            _ => None,
-        };
-        if let Some(exit_status) = stopped {
-            let (stdout, stderr) = self.collect_pipe_drains().await;
-            return Ok(RunResult { exit_status, stdout, stderr });
-        }
-
-        // Deliver EOF to a piped stdin the caller never took: otherwise a child
-        // that reads stdin (e.g. `cat`) blocks forever and this wait never
-        // returns. A taken stdin is already None here (the caller owns it).
-        drop(self.rt_mut()._stdin_write.take());
-
-        // Start draining the capture pipes BEFORE waiting for the child to exit.
-        //
-        // Reading them after the exit wait deadlocks the moment the child writes
-        // more than one pipe buffer (64 KiB by default): the pipe fills, the
-        // child blocks in `write()` and can never exit, while this function waits
-        // for exactly that exit. The run then hangs until the caller's timeout
-        // (forever if there is none) and the output is lost. Draining
-        // concurrently keeps the pipe moving, so the child can finish writing and
-        // exit, and the reads still end at EOF — which arrives once the child and
-        // every descendant holding the write end are gone.
-        //
-        // The drains are parked in the runtime rather than in this future: a
-        // caller that cancels `wait()` (a `timeout` or `select!` around it) must
-        // be able to `wait()` again and still be given the output. The
-        // `is_none()` guard is what makes that second call reuse them instead of
-        // starting a second reader. A stream the caller took through
-        // `Process::take_stdout`/`take_stderr` is `None` here and stays theirs.
-        if self.rt().stdout_drain.is_none() {
-            if let Some(fd) = self.rt_mut()._stdout_read.take() {
-                self.rt_mut().stdout_drain = sandbox_spawn_pipe_drain(fd);
-            }
-        }
-        if self.rt().stderr_drain.is_none() {
-            if let Some(fd) = self.rt_mut()._stderr_read.take() {
-                self.rt_mut().stderr_drain = sandbox_spawn_pipe_drain(fd);
-            }
-        }
-
-        // Wait for the top-level child to exit. Prefer the child's pidfd via
-        // `AsyncFd`: pidfd readiness fires only on *exit*, so — unlike a
-        // `waitpid` loop — it never consumes the child's ptrace-stops, which
-        // the `policy_fn` fork-tracking worker reaps (`waitpid` with any flags
-        // reaps a tracee's ptrace-stops, so a concurrent `waitpid` here would
-        // race the worker for fork events and hang it). Mirrors
-        // `spawn_pid_watcher`. Falls back to a blocking `waitpid` only when no
-        // pidfd is available (kernel without `pidfd_open`).
-        let exit_status = match self.rt_mut().pidfd.take() {
-            Some(pidfd) => wait_child_exit_via_pidfd(pidfd, pid).await,
-            None => wait_child_exit_blocking(pid).await,
-        };
-
-        self.rt_mut().state = RuntimeState::Stopped(exit_status.clone());
-
-        if self.rt().tty_foreground_taken {
-            // The foreground process group is the sandbox leader's (ns pid
-            // 1); with a PID namespace that is `leader_pid`, not the direct
-            // child we waited on.
-            let fg_pid = self.rt().leader_pid.unwrap_or(pid);
-            sandbox_restore_tty_foreground(fg_pid);
-            self.rt_mut().tty_foreground_taken = false;
-        }
-
-        let rt = self.rt_mut();
-        if let Some(h) = rt.notif_handle.take() { h.abort(); }
-        rt.policy_fn_worker = None;
-        if let Some(h) = rt.throttle_handle.take() { h.abort(); }
-        if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
-        if let Some(h) = rt.control_handle.take() { h.abort(); }
-
-        abort_dns_gateway(rt);
-
-        // Clean up the per-sandbox runtime dir on normal exit.
-        if let Some(ref dir) = rt.control_dir {
-            crate::control::cleanup_runtime_dir(dir);
-        }
-
-        // A transactional-pipeline stage leaves the branch in the shared COW
-        // state for the next stage / the coordinator's single commit — don't
-        // take it out (that would strip the upper from later stages) and don't
-        // let Drop commit/abort it (`seccomp_cow` stays None).
-        if self.rt().shared_cow.is_none() {
-            if let Some(ref cow_state) = self.rt().supervisor_cow.clone() {
-                let mut cow = cow_state.lock().await;
-                self.rt_mut().seccomp_cow = cow.branch.take();
-            }
-        }
-
-        let (stdout, stderr) = self.collect_pipe_drains().await;
-
-        Ok(RunResult { exit_status, stdout, stderr })
-    }
-
-    /// Join the capture-pipe drains, if this runtime still holds them.
-    ///
-    /// Only called once the child has been reaped, so the EOF each drain is
-    /// reading towards is already reachable — but not necessarily *reached*: a
-    /// descendant that inherited the write end keeps the join blocked for as
-    /// long as it lives, which is exactly when a caller's timeout fires. So
-    /// each handle is joined in place and only unparked once that join
-    /// completes; see `finish_parked_drain`.
-    ///
-    /// `None` means the stream was never piped, was taken by the caller, or was
-    /// already collected by an earlier `wait()`; a drain that panicked or was
-    /// aborted reports empty bytes rather than failing the run.
-    async fn collect_pipe_drains(&mut self) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-        // Finish both first — each stores its bytes into the runtime as it
-        // completes — and only then take them out. A cancellation between the
-        // two joins therefore loses nothing: whatever finished is parked.
-        // One statement per stream: each borrow of the runtime ends with it.
-        finish_parked_drain(&mut self.rt_mut().stdout_drain).await;
-        finish_parked_drain(&mut self.rt_mut().stderr_drain).await;
-        let stdout = take_drained(&mut self.rt_mut().stdout_drain);
-        let stderr = take_drained(&mut self.rt_mut().stderr_drain);
-        (stdout, stderr)
+        self.rt_mut().wait_one_shot().await
     }
 
     /// Fork the sandboxed child and install policy (seccomp + notif
@@ -1681,7 +1490,7 @@ impl Sandbox {
 
             let mut clone_sb = sandbox_cfg.clone();
             let clone_name = format!("{}-fork-{}", rt_name, clone_pid);
-            clone_sb.runtime = Some(Box::new(Runtime {
+            clone_sb.runtime = Some(Box::new(SandboxInstance {
                 name: clone_name,
                 state: RuntimeState::Stopped(if code == 0 {
                     crate::result::ExitStatus::Code(0)
@@ -1721,6 +1530,9 @@ impl Sandbox {
                 tty_foreground_taken: false,
                 control_handle: None,
                 control_dir: None,
+                phase: crate::instance::InstancePhase::Live,
+                on_exit: sandbox_cfg.on_exit.clone(),
+                on_error: sandbox_cfg.on_error.clone(),
             }));
             clones.push(clone_sb);
         }
@@ -1782,17 +1594,17 @@ impl Sandbox {
         !self.fs_readable.is_empty() || !self.fs_writable.is_empty()
     }
 
-    /// Lazily initialize the runtime block.
+    /// Lazily initialize the session instance block.
     ///
     /// Called by lifecycle methods (`spawn`, `run`, `fork`, etc.) on first
     /// use. Validates and resolves the sandbox name. Idempotent: returns
     /// immediately if runtime is already set.
-    fn ensure_runtime(&mut self) -> Result<(), crate::error::SandlockError> {
+    pub(crate) fn ensure_runtime(&mut self) -> Result<(), crate::error::SandlockError> {
         if self.runtime.is_some() {
             return Ok(());
         }
         let name = sandbox_resolve_name(self.name.as_deref())?;
-        self.runtime = Some(Box::new(Runtime {
+        self.runtime = Some(Box::new(SandboxInstance {
             name,
             state: RuntimeState::Created,
             child_pid: None,
@@ -1826,6 +1638,9 @@ impl Sandbox {
             ready_w: None,
             shared_cow: None,
             tty_foreground_taken: false,
+            phase: crate::instance::InstancePhase::Live,
+            on_exit: self.on_exit.clone(),
+            on_error: self.on_error.clone(),
         }));
         Ok(())
     }
@@ -1868,7 +1683,11 @@ impl Sandbox {
 
     /// Thin compatibility wrapper: `capture` selects between the capture stdio
     /// spec (stdin inherited, stdout/stderr piped-and-drained) and full inherit.
-    async fn do_create(&mut self, cmd: &[&str], capture: bool) -> Result<(), crate::error::SandlockError> {
+    pub(crate) async fn do_create(
+        &mut self,
+        cmd: &[&str],
+        capture: bool,
+    ) -> Result<(), crate::error::SandlockError> {
         let stdio = if capture { StdioSpec::capture() } else { StdioSpec::inherit() };
         self.do_create_stdio(cmd, stdio).await
     }
@@ -3053,7 +2872,7 @@ impl Sandbox {
     // Internal: do_start (release the parked child to execve)
     // ================================================================
 
-    fn do_start(&mut self) -> Result<(), crate::error::SandlockError> {
+    pub(crate) fn do_start(&mut self) -> Result<(), crate::error::SandlockError> {
         use std::os::fd::AsRawFd;
         use crate::context::write_u32_fd;
         use crate::error::SandboxRuntimeError;
@@ -3141,91 +2960,18 @@ impl Process<'_> {
     }
 }
 
-/// Hand the terminal's foreground process group back to this process after
-/// reaping an interactive child that took it. Restores only while the child's
-/// group still owns the terminal, so a foreground the caller has since given
-/// to someone else is left alone. SIGTTOU is blocked around `tcsetpgrp`:
-/// this process is a background group at that moment, and an unblocked
-/// SIGTTOU would stop it, which is the exact symptom being prevented.
-fn sandbox_restore_tty_foreground(child_pid: i32) {
-    unsafe {
-        if libc::isatty(0) != 1 || libc::tcgetpgrp(0) != child_pid {
-            return;
-        }
-        let mut block: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut block);
-        libc::sigaddset(&mut block, libc::SIGTTOU);
-        let mut old: libc::sigset_t = std::mem::zeroed();
-        libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
-        libc::tcsetpgrp(0, libc::getpgrp());
-        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
-    }
-}
-
 // ================================================================
-// Drop for Sandbox — kills and reaps child if still running
+// Drop for Sandbox — the embedded session instance owns the teardown
 // ================================================================
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
         if let Some(ref mut rt) = self.runtime {
-            if let Some(pid) = rt.child_pid {
-                if matches!(rt.state, RuntimeState::Created | RuntimeState::Running | RuntimeState::Paused) {
-                    // Signal the sandbox leader's process group (ns pid 1
-                    // with a PID namespace); the direct child then exits on
-                    // its own (it waits for the leader) and is reaped below.
-                    let group = rt.leader_pid.unwrap_or(pid);
-                    unsafe { libc::killpg(group, libc::SIGKILL) };
-                    let mut status: i32 = 0;
-                    unsafe { libc::waitpid(pid, &mut status, 0) };
-                }
-                if rt.tty_foreground_taken {
-                    let fg_pid = rt.leader_pid.unwrap_or(pid);
-                    sandbox_restore_tty_foreground(fg_pid);
-                    rt.tty_foreground_taken = false;
-                }
-            }
-
-            if let Some(h) = rt.notif_handle.take() { h.abort(); }
-            rt.policy_fn_worker = None;
-            if let Some(h) = rt.throttle_handle.take() { h.abort(); }
-            if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
-            if let Some(h) = rt.control_handle.take() { h.abort(); }
-
-            abort_dns_gateway(rt);
-
-            // Nobody is left to collect these; aborting closes the read ends.
-            // A drain that already finished holds only bytes, dropped with the
-            // runtime.
-            for slot in [rt.stdout_drain.take(), rt.stderr_drain.take()] {
-                if let Some(ParkedDrain::Running(h)) = slot { h.abort(); }
-            }
-
-            // Clean up the per-sandbox runtime dir on abnormal exit / Drop.
-            if let Some(ref dir) = rt.control_dir {
-                crate::control::cleanup_runtime_dir(dir);
-            }
-
-            let is_error = matches!(
-                rt.state,
-                RuntimeState::Stopped(ref s) if !matches!(s, crate::result::ExitStatus::Code(0))
-            );
-            let action = if is_error { &self.on_error } else { &self.on_exit };
-            let action = action.clone();
-
-            if let Some(ref mut cow) = rt.seccomp_cow {
-                match action {
-                    // NOTE: commit() is synchronous and blocks up to
-                    // DROP_COMMIT_LOCK_WAIT (5s) on a contended workdir before
-                    // deferring (bounded, no CPU spin). Do not drop a committing
-                    // Sandbox on an async runtime worker.
-                    BranchAction::Commit => { let _ = cow.commit(); }
-                    BranchAction::Abort => { let _ = cow.abort(); }
-                    // Mark kept so the branch's Drop backstop preserves the upper
-                    // instead of cleaning it as an undisposed leak.
-                    BranchAction::Keep => cow.keep(),
-                }
-            }
+            // M0 lift: the session state is a `SandboxInstance`; its Drop
+            // backstop reproduces the historical Sandbox drop exactly (kill +
+            // reap, abort supervisor tasks, remove the control dir, dispose the
+            // COW branch per the disposition captured at spawn).
+            rt.drop_teardown();
         }
     }
 }
@@ -3425,89 +3171,6 @@ unsafe fn wire_child_stdio(mode: StdioMode, target: i32, pipe_src: Option<i32>, 
     }
 }
 
-/// A capture pipe's drain, parked on the `Runtime`: the task while it reads,
-/// then the bytes it read.
-///
-/// Both states have to be parked, not just the first. Handing the finished
-/// bytes back to the `wait()` future and clearing the slot would leave them in
-/// a stack local of a cancellable future, and the sibling stream is joined
-/// after it, which is a suspension point whenever that one is still draining.
-/// A timeout landing there would then destroy a capture that had already been
-/// read in full, with nothing left on the runtime to recover it from.
-enum ParkedDrain {
-    Running(JoinHandle<Vec<u8>>),
-    Done(Vec<u8>),
-}
-
-/// Spawn a task that reads one capture pipe to EOF, for `wait` to join once the
-/// child has been reaped.
-///
-/// An ordinary task, not `spawn_blocking`: a blocking read would hold a thread
-/// of the shared blocking pool for the child's entire lifetime (even for a
-/// child that writes nothing), and that pool is also what the COW copier and
-/// the fork-tracking worker need *while* a child is alive, so a saturated pool
-/// is a deadlock rather than a slowdown.
-///
-/// `Receiver::from_owned_fd` sets O_NONBLOCK on this fd and registers it with
-/// the runtime's I/O driver (which `wait` needs anyway, for the pidfd). The
-/// flag belongs to the open file description behind the *read* end; the child
-/// writes to the write end, a separate description, so its `write()`s stay
-/// blocking, which is what keeps the pipe applying back-pressure rather than
-/// dropping output. The conversion can only fail if the fd is not a readable
-/// pipe, which cannot happen for the pipes `do_create_stdio` creates; if it
-/// somehow did, the stream is left uncaptured rather than the run failing.
-fn sandbox_spawn_pipe_drain(fd: std::os::fd::OwnedFd) -> Option<ParkedDrain> {
-    let mut rx = match tokio::net::unix::pipe::Receiver::from_owned_fd(fd) {
-        Ok(rx) => rx,
-        Err(_) => return None,
-    };
-    Some(ParkedDrain::Running(tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut buf = Vec::new();
-        let _ = rx.read_to_end(&mut buf).await;
-        buf
-    })))
-}
-
-/// Drive one parked drain to completion, leaving its bytes in the slot.
-///
-/// The handle is awaited *through* the slot, and the store happens in the same
-/// step as the await resolving, so there is no point at which the bytes exist
-/// only inside this future: cancelling it leaves either the still-running task
-/// or the finished bytes parked for the next `wait()`. Taking the handle out
-/// first would hand it to the awaiting future, so dropping that future (which
-/// is all a caller's `timeout` or `select!` does) would drop the handle with
-/// it and every later `wait()` would report no output.
-///
-/// This join is not instantaneous: the child is reaped by the time it runs,
-/// but a descendant still holding the write end keeps the read short of EOF,
-/// which is precisely the case a caller times out on. `JoinHandle` is `Unpin`,
-/// so it can be polled through `&mut`, and dropping this future does not abort
-/// the task: the drain left behind is still reading and a later `wait()` picks
-/// it up.
-///
-/// A drain that panicked or was aborted parks empty bytes, so the run reports
-/// an empty capture rather than failing.
-async fn finish_parked_drain(slot: &mut Option<ParkedDrain>) {
-    if let Some(ParkedDrain::Running(handle)) = slot.as_mut() {
-        let buf = handle.await.unwrap_or_default();
-        *slot = Some(ParkedDrain::Done(buf));
-    }
-}
-
-/// Unpark the bytes of a drain that has finished. Not async on purpose: it runs
-/// after every join, so no cancellation can land between the two streams.
-fn take_drained(slot: &mut Option<ParkedDrain>) -> Option<Vec<u8>> {
-    match slot.take() {
-        Some(ParkedDrain::Done(buf)) => Some(buf),
-        // Still running (nothing joined it) — leave it parked.
-        other => {
-            *slot = other;
-            None
-        }
-    }
-}
-
 fn sandbox_read_fd_to_end(fd: std::os::fd::OwnedFd) -> Vec<u8> {
     use std::io::Read;
     use std::os::fd::IntoRawFd;
@@ -3516,86 +3179,6 @@ fn sandbox_read_fd_to_end(fd: std::os::fd::OwnedFd) -> Vec<u8> {
     let mut buf = Vec::new();
     let _ = file.read_to_end(&mut buf);
     buf
-}
-
-fn sandbox_wait_status_to_exit(status: i32) -> crate::result::ExitStatus {
-    use crate::result::ExitStatus;
-    if libc::WIFEXITED(status) {
-        ExitStatus::Code(libc::WEXITSTATUS(status))
-    } else if libc::WIFSIGNALED(status) {
-        let sig = libc::WTERMSIG(status);
-        if sig == libc::SIGKILL {
-            ExitStatus::Killed
-        } else {
-            ExitStatus::Signal(sig)
-        }
-    } else {
-        ExitStatus::Killed
-    }
-}
-
-/// Await the top-level child's exit via its `pidfd` (readable on exit only),
-/// then reap the status. Because it never calls `waitpid` until the child has
-/// already exited, it does not consume the child's ptrace-stops the way a
-/// `waitpid`-loop would — so it doesn't race the `policy_fn` fork-tracking
-/// worker. Falls back to the blocking waiter on any pidfd/`AsyncFd` error.
-async fn wait_child_exit_via_pidfd(
-    pidfd: std::os::unix::io::OwnedFd,
-    pid: libc::pid_t,
-) -> crate::result::ExitStatus {
-    use crate::result::ExitStatus;
-
-    let async_fd = match tokio::io::unix::AsyncFd::with_interest(
-        pidfd,
-        tokio::io::Interest::READABLE,
-    ) {
-        Ok(fd) => fd,
-        Err(_) => return wait_child_exit_blocking(pid).await,
-    };
-
-    loop {
-        // pidfd becomes readable when the process exits; no data is read.
-        let mut guard = match async_fd.readable().await {
-            Ok(g) => g,
-            Err(_) => return ExitStatus::Killed,
-        };
-        let mut status: i32 = 0;
-        // The child has exited and is reapable now, so this never blocks.
-        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if r > 0 {
-            return sandbox_wait_status_to_exit(status);
-        }
-        if r == 0 {
-            // Spurious readiness (not yet reapable): clear and re-await.
-            guard.clear_ready();
-            continue;
-        }
-        // r < 0 (e.g. ECHILD): already reaped elsewhere. Status is unavailable.
-        return ExitStatus::Killed;
-    }
-}
-
-/// Blocking `waitpid` fallback for kernels without `pidfd_open`. Used only when
-/// no pidfd is available; on such kernels `policy_fn` fork-tracking is the only
-/// thing that could race it, and the lack of pidfd is itself rare.
-async fn wait_child_exit_blocking(pid: libc::pid_t) -> crate::result::ExitStatus {
-    use crate::result::ExitStatus;
-    tokio::task::spawn_blocking(move || -> ExitStatus {
-        let mut status: i32 = 0;
-        loop {
-            let ret = unsafe { libc::waitpid(pid, &mut status, 0) };
-            if ret < 0 {
-                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                return ExitStatus::Killed;
-            }
-            break;
-        }
-        sandbox_wait_status_to_exit(status)
-    })
-    .await
-    .unwrap_or(ExitStatus::Killed)
 }
 
 fn sandbox_collect_handlers<I, S, H>(
