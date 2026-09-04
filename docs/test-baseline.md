@@ -31,6 +31,10 @@ core_integ = 488 # F2.1 (M0 lifecycle lift): 477 -> 481 (+4 lifecycle tests);
                  # +4 F2.1.)
 ffi = 89
 cli = 95      # after F0.4 wiring (cli suite includes net_bind_map tests)
+supervise = 17 # F2b.1: new crates/sandlock-supervise (full-field policy entry +
+               # uid self-check; 13 lib unit + 4 integration tests, including
+               # test_supervise_refuses_wrong_uid and
+               # test_policy_roundtrip_covers_every_field)
 oci = 144     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e2e
               # supervises OCI-default root containers; S1.2 fail-closes
               # RunAs(0,0) for non-root supervisors (tested feature). 140 = 55+67+18

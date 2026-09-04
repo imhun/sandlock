@@ -1443,6 +1443,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sandlock-supervise"
+version = "0.9.0-beta"
+dependencies = [
+ "anyhow",
+ "clap",
+ "jiff",
+ "libc",
+ "sandlock-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "schannel"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"

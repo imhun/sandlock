@@ -111,6 +111,7 @@ run core_lib   cargo test -p sandlock-core --offline --lib
 run core_integ cargo test -p sandlock-core --offline --test integration -- --test-threads=1
 run ffi        cargo test -p sandlock-ffi --offline
 run cli        cargo test -p sandlock-cli --offline
+run supervise  cargo test -p sandlock-supervise --offline
 # Workspace release build gate (the F0.4 build-break class: a CLI face that
 # only `cargo test -p X` misses). No test binaries, so baseline count is 0.
 run cli_build  cargo build --release --workspace --locked
