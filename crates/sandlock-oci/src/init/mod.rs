@@ -5,7 +5,24 @@
 //! fork-execs the workload (`RunMain`) and additional `exec`'d commands
 //! (`RunExec`). Every child inherits this process's seccomp filter and Landlock
 //! ruleset, so they share the one supervisor. When the main workload exits, the
-//! container is done: the loop kills the process group and exits.
+//! container is done: the loop signals every registered child group and exits.
+//!
+//! # Per-child process groups (SECE-6 / F1.7)
+//!
+//! `spawn()` calls `setpgid(0,0)` in the child before exec, so every child is
+//! the leader of its **own** process group (pgid == child pid). A guest
+//! `killpg(getpgid(0), SIGKILL)` can therefore only reach that child's own
+//! subtree — never init or a sibling (docs `sandbox-exec-security.md` §4.6:
+//! before this change one command killed the whole container). Instance-level
+//! operations (main-exit teardown, `Shutdown`, `Signal`) traverse the
+//! registered child-group set: group-first `killpg` plus a per-child
+//! `pidfd_send_signal` complement, so a child that later `setsid()`s away
+//! from its group is still reached by its pidfd while siblings are never
+//! touched. There is deliberately **no** pid-addressed signal verb on the
+//! wire: a compromised control-channel holder can request instance-level
+//! delivery only, never a signal to an arbitrary pid (the same-uid direct
+//! `kill(2)` between sandbox processes is a kernel boundary sandlock does not
+//! mediate, §4.15).
 //!
 //! # Orphan reaping (SL-6)
 //!
@@ -81,9 +98,26 @@ fn spawn(
     }
     let pid = unsafe { libc::fork() };
     if pid != 0 {
+        // Belt alongside the child's own setpgid(0,0): close the fork→setpgid
+        // window so the pid is a valid pgid as soon as spawn returns. The
+        // child may already have setpgid'd (then this fails EACCES/ESRCH,
+        // which is fine — the outcome is the same pgid).
+        unsafe {
+            libc::setpgid(pid, pid);
+        }
         return pid;
     }
     // child
+    // SECE-6 (F1.7): every child becomes its own process-group leader before
+    // exec, so a killpg(getpgid(0), SIGKILL) inside one command can never
+    // reach init or a sibling. Fail closed if the kernel refuses: continuing
+    // in init's shared group would silently re-expose the whole-instance
+    // killpg. (The parent's setpgid above may win the race; that is fine.)
+    if unsafe { libc::setpgid(0, 0) } != 0 {
+        unsafe {
+            libc::_exit(126);
+        }
+    }
     if let Some(fds) = stdio {
         for (i, &fd) in fds.iter().enumerate() {
             unsafe {
@@ -159,12 +193,69 @@ fn try_reap_one() -> Option<(i32, Option<i32>, Option<i32>)> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ChildKind {
     /// The OCI main workload. Its exit ends the container: report `Exited`,
-    /// kill the process group, and `_exit` init.
+    /// signal every registered child group, and `_exit` init.
     Main,
     /// An attached `exec`: report `Exited` to the supervisor waiter.
     ExecAttach,
     /// A detached `exec`: reap silently (supervisor never registers a waiter).
     ExecDetach,
+}
+
+/// Per-child metadata recorded by init at spawn time.
+struct Child {
+    kind: ChildKind,
+    /// Process group id of this child. `spawn()` makes every child its own
+    /// group leader before exec, so pgid == child pid.
+    pgid: i32,
+    /// pidfd for this child, opened parent-side right after fork; the
+    /// escapee-resistant half of instance-level delivery (`pidfd_send_signal`
+    /// still reaches the child if it leaves its group/session). -1 when
+    /// `pidfd_open` is unavailable (kernels that old cannot run the sandlock
+    /// feature set anyway; group-first delivery still applies).
+    pidfd: i32,
+}
+
+/// Open a pidfd for `pid`, or -1 when the kernel refuses.
+fn open_child_pidfd(pid: i32) -> i32 {
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if raw < 0 {
+        -1
+    } else {
+        raw as i32
+    }
+}
+
+/// Deliver `signum` to one registered child. Group-first: `killpg` reaches
+/// every process the child forked that stayed in its group (its subtree),
+/// without touching any sibling's group. Then the pidfd complement: a child
+/// that escaped its group (e.g. `setsid()`) is still signaled directly via
+/// its pidfd, which never races on pid reuse. Both calls are best-effort:
+/// ESRCH/empty-group failures are expected once a child has exited.
+fn signal_child(child: &Child, signum: i32) {
+    unsafe {
+        libc::killpg(child.pgid, signum);
+    }
+    if child.pidfd >= 0 {
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal as libc::c_long,
+                child.pidfd,
+                signum,
+                std::ptr::null::<libc::c_void>(),
+                0u32, // flags
+            );
+        }
+    }
+}
+
+/// Deliver `signum` to every registered child group: the instance-level kill
+/// / teardown / supervisor-signal primitive. Iterates the exact set of
+/// children init spawned; adopted orphans and arbitrary pids are never
+/// addressed.
+fn signal_all_children(children: &HashMap<i32, Child>, signum: i32) {
+    for child in children.values() {
+        signal_child(child, signum);
+    }
 }
 
 /// Poll interval for the control channel: bounds how long a reaped child can
@@ -173,8 +264,9 @@ const REAP_POLL_MS: i32 = 100;
 
 /// Run the confined PID-1 control loop on [`CONTROL_FD`]. Returns when the
 /// daemon closes the channel or sends `Shutdown`. When the main workload
-/// exits, the loop reports its `Exited`, kills the process group, and `_exit`s
-/// the process from the reap sweep — the container ends with the workload.
+/// exits, the loop reports its `Exited`, signals every registered child group
+/// (main's own group first, then each exec sibling's), and `_exit`s the
+/// process from the reap sweep — the container ends with the workload.
 ///
 /// This runs in the confined fork created by
 /// `Sandbox::create_with_in_child_main`; it uses only `libc` + `serde_json`
@@ -194,7 +286,7 @@ pub fn run_init() {
     let ctl = CONTROL_FD;
     // Child table: pids init spawned, routed exactly-once on reap. A pid is
     // removed when it is reaped, so a recycled pid cannot double-report.
-    let mut children: HashMap<i32, ChildKind> = HashMap::new();
+    let mut children: HashMap<i32, Child> = HashMap::new();
     // Reconciler count for adopted orphans init did not spawn: reaped silently
     // and counted locally. The count is intentionally never wire-exposed: the
     // supervisor's F1.2 announced registry treats an `Exited` frame for a pid
@@ -208,24 +300,42 @@ pub fn run_init() {
         // the supervisor sees a strictly ordered Started -> Exited stream.
         while let Some((pid, code, signal)) = try_reap_one() {
             match children.remove(&pid) {
-                Some(ChildKind::Main) => {
-                    if code.is_some() || signal.is_some() {
-                        send(ctl, &Resp::Exited { pid, code, signal });
+                Some(child) => {
+                    // The child is reaped; its pidfd has no further purpose.
+                    if child.pidfd >= 0 {
                         unsafe {
-                            libc::killpg(libc::getpgrp(), libc::SIGKILL);
-                            // _exit rather than std::process::exit: this is a
-                            // fork of the supervisor, so atexit handlers would
-                            // run inherited (tokio/glibc) cleanup.
-                            libc::_exit(0);
+                            libc::close(child.pidfd);
                         }
                     }
-                }
-                Some(ChildKind::ExecAttach) => {
-                    send(ctl, &Resp::Exited { pid, code, signal });
-                }
-                Some(ChildKind::ExecDetach) => {
-                    // Detached execs are silent: the supervisor forgot the
-                    // pid and would count a late frame as unknown.
+                    match child.kind {
+                        ChildKind::Main => {
+                            if code.is_some() || signal.is_some() {
+                                send(ctl, &Resp::Exited { pid, code, signal });
+                                // Collapse the main child's own group first
+                                // (its forked descendants may outlive it), then
+                                // every remaining registered child group, so
+                                // no exec'd sibling survives the container.
+                                unsafe {
+                                    libc::killpg(child.pgid, libc::SIGKILL);
+                                }
+                                signal_all_children(&children, libc::SIGKILL);
+                                // _exit rather than std::process::exit: this
+                                // is a fork of the supervisor, so atexit
+                                // handlers would run inherited (tokio/glibc)
+                                // cleanup.
+                                unsafe {
+                                    libc::_exit(0);
+                                }
+                            }
+                        }
+                        ChildKind::ExecAttach => {
+                            send(ctl, &Resp::Exited { pid, code, signal });
+                        }
+                        ChildKind::ExecDetach => {
+                            // Detached execs are silent: the supervisor forgot
+                            // the pid and would count a late frame as unknown.
+                        }
+                    }
                 }
                 None => {
                     // Adopted orphan (double-fork descendant): reap, count,
@@ -274,7 +384,7 @@ pub fn run_init() {
         };
         match req {
             Req::RunMain { argv, env, cwd } => {
-                if children.values().any(|k| *k == ChildKind::Main) {
+                if children.values().any(|c| c.kind == ChildKind::Main) {
                     // Only one OCI start is legitimate; a second RunMain would
                     // otherwise overwrite the table entry and orphan the first
                     // main's exit routing.
@@ -286,8 +396,15 @@ pub fn run_init() {
                     send(ctl, &Resp::Err { msg: "fork failed".into() });
                     continue;
                 }
-                children.insert(pid, ChildKind::Main);
-                // main shares the process group already (init is the leader).
+                children.insert(
+                    pid,
+                    Child {
+                        kind: ChildKind::Main,
+                        // spawn() setpgid(0,0)'d the child: pgid == child pid.
+                        pgid: pid,
+                        pidfd: open_child_pidfd(pid),
+                    },
+                );
                 send(ctl, &Resp::Started { pid });
             }
             Req::RunExec { argv, env, cwd, detach } => {
@@ -313,17 +430,28 @@ pub fn run_init() {
                 }
                 children.insert(
                     pid,
-                    if detach { ChildKind::ExecDetach } else { ChildKind::ExecAttach },
+                    Child {
+                        kind: if detach { ChildKind::ExecDetach } else { ChildKind::ExecAttach },
+                        pgid: pid,
+                        pidfd: open_child_pidfd(pid),
+                    },
                 );
                 send(ctl, &Resp::Started { pid });
             }
             Req::Shutdown => {
-                if children.values().any(|k| *k == ChildKind::Main) {
-                    unsafe {
-                        libc::killpg(libc::getpgrp(), libc::SIGKILL);
-                    }
+                if children.values().any(|c| c.kind == ChildKind::Main) {
+                    // Teardown: instance-level SIGKILL over the child-group
+                    // set, then exit the loop (the sandbox Drop reaps init).
+                    signal_all_children(&children, libc::SIGKILL);
                 }
                 break;
+            }
+            Req::Signal { signum } => {
+                // Instance-level signal relayed by the supervisor: traverse
+                // the registered child-group set. No pid payload exists on
+                // this verb, so even a forged frame cannot address an
+                // arbitrary process (see the module docs, SECE-6 boundary).
+                signal_all_children(&children, signum);
             }
         }
     }

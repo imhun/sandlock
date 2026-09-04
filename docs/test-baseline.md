@@ -17,9 +17,9 @@ core_integ = 477 # F1.4 (SL-8): +2 plan tests in test_resource.rs
                  # control-auth pair (471 -> 475) is included in this total
 ffi = 89
 cli = 95      # after F0.4 wiring (cli suite includes net_bind_map tests)
-oci = 133     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e2e
+oci = 138     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e2e
               # supervises OCI-default root containers; S1.2 fail-closes
-              # RunAs(0,0) for non-root supervisors (tested feature). 133 = 53+65+15
+              # RunAs(0,0) for non-root supervisors (tested feature). 138 = 54+66+18
               # (lib + bin + integration: the bin target recompiles the crate
               # module tests, so the F1.2 pair supervisor::tests::
               # early_exits_cap_drops_overflow / test_unknown_pid_exit_frame_bounded
@@ -27,5 +27,11 @@ oci = 133     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e
               # 131 -> 133: +2 in the new tests/test_init_reaper.rs integration
               # target (test_adopted_orphan_is_reaped +
               # test_no_defunct_after_double_fork); lib/bin totals unchanged.
+              # F1.7 (SECE-6): 133 -> 138, +5 net = +1 init::proto
+              # signal_req_roundtrip unit test (lib 53->54, bin 65->66) and +3
+              # in the new tests/test_process_groups.rs integration target
+              # (test_child_killpg_does_not_hit_sibling,
+              # test_instance_kill_covers_all_child_groups,
+              # test_signal_to_sibling_pid_rejected); reaper target unchanged.
 cli_build = 0 # workspace release build gate (no test binaries; 0 = build passed)
 python = 441  # fork S2.x-era python tests landed after the plan's 430/431 estimate

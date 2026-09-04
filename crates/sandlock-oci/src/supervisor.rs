@@ -184,13 +184,21 @@ impl InitLink {
         }
     }
 
-    /// Send `Shutdown` to init. No reply is expected (init exits).
-    async fn shutdown(&self) {
-        if let Ok(mut bytes) = serde_json::to_vec(&Req::Shutdown) {
+    /// Send a request frame without expecting a reply (fire-and-forget). Used
+    /// for verbs init acts on without answering: `Shutdown` (init exits) and
+    /// instance-level `Signal` (init traverses its child-group set). Holding
+    /// the writer lock keeps these serialized against request/reply traffic.
+    async fn send(&self, req: &Req) {
+        if let Ok(mut bytes) = serde_json::to_vec(req) {
             bytes.push(b'\n');
             let writer = self.writer.lock().await;
             let _ = crate::fdpass::send_with_fds(&writer, &bytes, &[]);
         }
+    }
+
+    /// Send `Shutdown` to init. No reply is expected (init exits).
+    async fn shutdown(&self) {
+        self.send(&Req::Shutdown).await;
     }
 }
 
@@ -292,9 +300,11 @@ pub enum SupervisorCmd {
         cwd: Option<String>,
         detach: bool,
     },
-    /// Deliver `signum` to the container's entire process group (the group
-    /// whose leader is sandlock-init). Used by `kill --all` and `delete
-    /// --force` so the CLI does not need to know the pgid directly.
+    /// Deliver `signum` to the whole running container — every process group
+    /// `sandlock-init` registered for its children, not init's own group.
+    /// Used by `kill --all` and `delete --force`. The verb carries **no pid**:
+    /// there is no per-pid forwarding channel (SECE-6 / F1.7), so a caller can
+    /// only ever request instance-level delivery.
     Signal { signum: i32 },
 }
 
@@ -761,19 +771,18 @@ async fn serve_one_running_init(
             RunningCmd::Continue
         }
         SupervisorCmd::Signal { signum } => {
-            // killpg targets the process GROUP, whose leader is sandlock-init.
-            // sandbox.pid() is that group-leader pid (set by setpgid(0,0) in core).
-            let init_pgid = sandbox.pid().unwrap_or(0) as i32;
-            if init_pgid > 0 {
-                unsafe { libc::killpg(init_pgid, signum) };
-                let reply = serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default();
-                let _ = stream.write_all(&reply).await;
-                let _ = stream.write_all(b"\n").await;
-            } else {
-                let reply = serde_json::to_vec(&SupervisorReply::Err { msg: "no container process group".into() }).unwrap_or_default();
-                let _ = stream.write_all(&reply).await;
-                let _ = stream.write_all(b"\n").await;
-            }
+            // F1.7 (SECE-6): every exec'd child is now its own group leader,
+            // so a host-side killpg(sandbox.pid()) would reach only init's own
+            // group (init alone) and miss the workload entirely. Relay the
+            // instance-level request to init over the control channel; init
+            // traverses its registered child-group set (group-first killpg +
+            // pidfd_send_signal complement). Fire-and-forget like Shutdown:
+            // init acts on the frame without answering, and a SIGKILLed main
+            // workload reports its own Exited through the normal reaper path.
+            link.send(&Req::Signal { signum }).await;
+            let reply = serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default();
+            let _ = stream.write_all(&reply).await;
+            let _ = stream.write_all(b"\n").await;
             RunningCmd::Continue
         }
         SupervisorCmd::Shutdown => {
@@ -970,7 +979,11 @@ async fn serve_one_running(
             RunningCmd::Continue
         }
         SupervisorCmd::Signal { signum } => {
-            // child_pid is the group leader's pid (== pgid) in the restore path.
+            // Restore shape: one workload child (core's setpgid(0,0)), with no
+            // sandlock-init and therefore no per-child registry to traverse.
+            // child_pid is the workload's pid (== pgid), so a host-side killpg
+            // is the entire instance here — unlike the init path, where Signal
+            // is relayed to init to traverse the child-group set (F1.7/SECE-6).
             if child_pid > 0 {
                 unsafe { libc::killpg(child_pid, signum) };
                 let reply = serde_json::to_vec(&SupervisorReply::Ok).unwrap_or_default();
@@ -1038,16 +1051,19 @@ async fn serve_running(
     }
 }
 
-/// Collect the main process's exit status, then collapse its process group.
+/// Collect the main process's exit status, then collapse its process group
+/// (restore / single-child supervisor shape only).
 ///
 /// sandlock uses no PID namespace, so when the container's main process exits
 /// the kernel does not tear down the processes it spawned (background children,
-/// and exec'd siblings sharing the group). Send SIGKILL to the whole group so
-/// nothing outlives the container with a now-dead supervisor. `child_pid` is the
-/// group's pgid (core does `setpgid(0, 0)` in the child); `killpg` reaches any
-/// remaining members and is a harmless `ESRCH` when the group is already empty.
-/// The `Shutdown` path does not call this because `sandbox.kill()` already
-/// SIGKILLs the same process group.
+/// which share the workload's group). Send SIGKILL to the whole group so
+/// nothing outlives the container with a now-dead supervisor. `child_pid` is
+/// the group's pgid (core does `setpgid(0, 0)` in the child); `killpg` reaches
+/// any remaining members and is a harmless `ESRCH` when the group is already
+/// empty. In the init shape the equivalent collapse happens inside
+/// `sandlock-init` (main-exit/Shutdown traversal of the registered child-group
+/// set), not here; the `Shutdown` path does not call this because
+/// `sandbox.kill()` already SIGKILLs the same process group.
 async fn reap_and_collapse(
     sandbox: &mut sandlock_core::Sandbox,
     child_pid: i32,

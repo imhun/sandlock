@@ -718,9 +718,13 @@ fn cmd_kill(id: &str, signal: &str, all: bool) -> Result<()> {
     let signum = parse_signal(signal)?;
 
     if all {
-        // For group-wide signals, ask the daemon to killpg so it uses the
-        // correct pgid (sandlock-init's pid, not the workload's). Fall back
-        // to a direct killpg if the daemon is unreachable (already exited).
+        // Instance-wide signals go through the daemon so sandlock-init can
+        // traverse its registered per-child group set (every exec'd child is
+        // its own group leader; SECE-6/F1.7). Fall back to a direct killpg
+        // only when the daemon is unreachable (already exited) — that fallback
+        // is best-effort and semantically degraded: killpg(state.pid) reaches
+        // init's own group (usually just init), missing exec'd children in
+        // their own groups.
         let sent = supervisor::send_command(
             id,
             supervisor::SupervisorCmd::Signal { signum },
@@ -763,9 +767,11 @@ fn cmd_delete(id: &str, force: bool) -> Result<()> {
     }
 
     // If running with --force, ask the daemon to shutdown (it sends Shutdown to
-    // sandlock-init, which killpg's its group and exits). This correctly targets
-    // the process group even when state.pid is the workload (not the pgid).
-    // Fall back to a direct killpg if the daemon is already gone.
+    // sandlock-init, which SIGKILLs every registered child group and exits).
+    // This correctly targets the workload and all exec'd siblings even though
+    // state.pid is the main workload, not a pgid. Fall back to a direct killpg
+    // if the daemon is already gone; like the kill fallback this degrades to
+    // init's own group and may miss per-child groups (best effort only).
     if state.status == Status::Running && state.pid > 0 && state.is_alive() {
         let sent = supervisor::send_command(id, supervisor::SupervisorCmd::Shutdown);
         if sent.is_err() {
