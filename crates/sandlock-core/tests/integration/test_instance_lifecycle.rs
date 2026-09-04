@@ -19,7 +19,11 @@
 //!   the recorded COW disposition (B-3 branch handoff);
 //! * the legacy `Sandbox::run`/`popen`/`spawn` one-shot paths still reclaim
 //!   everything exactly as before (they drive a one-shot instance whose
-//!   `wait` runs `wait_child` + `shutdown`).
+//!   `wait` runs `wait_child` + `shutdown`);
+//! * (F2.3) the instance stats surface (`stats()`) reports the F1.4 process
+//!   reconciliation (`proc_count_vs_live`), the M0 single-child liveness
+//!   (`children_live`) and the lifecycle phase (`instance_state`) — live,
+//!   terminal-after-shutdown, and Draining-while-cancelled.
 
 use std::io::Read;
 use std::net::UdpSocket;
@@ -27,7 +31,7 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use sandlock_core::control;
-use sandlock_core::instance::{InstancePhase, SandboxInstance};
+use sandlock_core::instance::{InstancePhase, InstanceStats, SandboxInstance};
 use sandlock_core::sandbox::BranchAction;
 use sandlock_core::{Sandbox, StdioMode};
 
@@ -77,6 +81,26 @@ async fn poll_until(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// Poll the instance's stats surface until it equals `want` (or the deadline
+/// passes, returning the last snapshot for the exact assertion). Loop control
+/// only — assertions on the outcome are exact `assert_eq!`s in the callers.
+async fn wait_for_instance_stats(
+    inst: &SandboxInstance,
+    want: InstanceStats,
+    timeout: Duration,
+) -> InstanceStats {
+    let deadline = Instant::now() + timeout;
+    let mut last = inst.stats().await;
+    while Instant::now() < deadline {
+        last = inst.stats().await;
+        if last == want {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    last
 }
 
 /// A live session's control socket must accept a connection (the listener task
@@ -630,4 +654,193 @@ async fn test_legacy_run_still_reclaims_all_resources() {
         !control::sandbox_dir("inst-life-legacy-spawn").exists(),
         "spawn wait must remove its control dir"
     );
+}
+
+/// F2.3 (a): a live session's stats surface reconciles and reports the M0
+/// single-child truth — once the supervisor's pidfd watcher has registered
+/// the session's root process, `proc_count_vs_live` is 0 (bookkeeping matches
+/// live watchers), `children_live` is 1 (the session's one direct child is
+/// live and unreaped), and `instance_state` is `Live`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_instance_stats_live_reconciled() {
+    let mut inst = SandboxInstance::launch(
+        base_policy().build().unwrap().with_name("inst-f23-live-stats"),
+        &["sleep", "60"],
+    )
+    .await
+    .expect("launch");
+
+    let want = InstanceStats {
+        proc_count_vs_live: 0,
+        children_live: 1,
+        instance_state: InstancePhase::Live,
+    };
+    let settled = wait_for_instance_stats(&inst, want, Duration::from_secs(15)).await;
+    assert_eq!(
+        settled,
+        want,
+        "live session must reconcile proc_count against live watchers with \
+         its single child live and phase Live; got {settled:?}",
+    );
+
+    inst.shutdown_with_grace(Duration::from_millis(200))
+        .await
+        .expect("cleanup shutdown");
+}
+
+/// F2.3 (b): once a one-shot `Sandbox` run has ended (`wait()` runs
+/// `wait_child` + `shutdown`), the stats surface is terminal and internally
+/// consistent: `instance_state` is `ShutDown`, `children_live` is 0 (the
+/// direct child was reaped), and the supervisor accounting has quiesced — no
+/// live watcher remains, `proc_count` still holds the root baseline slot the
+/// session retains for legacy post-wait introspection, and the F2.3
+/// `proc_count_vs_live` deviation settles to +1, exactly the F1.4 `drift`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_one_shot_stats_terminal_after_shutdown() {
+    let mut sb = base_policy()
+        .build()
+        .unwrap()
+        .with_name("inst-f23-terminal-stats");
+    sb.create_interactive(&["sh", "-c", "exit 0"])
+        .await
+        .expect("create_interactive");
+    sb.start().expect("start");
+    let result = sb.wait().await.expect("one-shot wait");
+    assert!(result.success(), "one-shot run must exit 0");
+
+    // The instance side (phase/child) is terminal as soon as wait() returns;
+    // the exit watcher's index cleanup settles a moment later, so poll the
+    // reconciler until no live watcher remains.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut ps = sb.process_stats().await;
+    let mut st = sb
+        .stats()
+        .await
+        .expect("runtime must be present after a one-shot wait");
+    while Instant::now() < deadline
+        && (ps.live_watchers != 0 || st.proc_count_vs_live != 1)
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        ps = sb.process_stats().await;
+        st = sb
+            .stats()
+            .await
+            .expect("runtime must be present after a one-shot wait");
+    }
+
+    assert_eq!(
+        st.instance_state,
+        InstancePhase::ShutDown,
+        "one-shot wait must shut the session down; stats {st:?}, \
+         process_stats {ps:?}",
+    );
+    assert_eq!(
+        st.children_live,
+        0,
+        "the reaped direct child must report 0 live children; \
+         stats {st:?}, process_stats {ps:?}",
+    );
+    assert_eq!(
+        ps.live_watchers,
+        0,
+        "no pidfd watcher may survive a completed one-shot run; \
+         stats {st:?}, process_stats {ps:?}",
+    );
+    assert_eq!(
+        ps.proc_count,
+        1,
+        "the root baseline slot is retained for post-wait introspection; \
+         stats {st:?}, process_stats {ps:?}",
+    );
+    assert_eq!(
+        st.proc_count_vs_live,
+        ps.drift,
+        "the F2.3 reconciler field must agree with the F1.4 drift; \
+         stats {st:?}, process_stats {ps:?}",
+    );
+    assert_eq!(
+        st.proc_count_vs_live,
+        1,
+        "terminal deviation is the retained root baseline slot, not a live \
+         leak; stats {st:?}, process_stats {ps:?}",
+    );
+}
+
+/// F2.3 (c): `Draining` is observable on the stats surface while shutdown is
+/// in flight. `shutdown_with_grace` takes `&mut self` for the whole drain, so
+/// a test cannot sample `stats()` concurrently from a second task; instead it
+/// cancels the shutdown future mid-grace (the documented cancellation
+/// semantics: the phase stays `Draining` and the next call resumes from
+/// step 1) and samples afterwards. A TERM-ignoring child keeps the grace
+/// window open long enough for the cancel to land deterministically; it is a
+/// single process (`exec sleep` — no grandchildren), so the reconciler is
+/// free of fork-watcher bookkeeping skew while Draining.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_shutdown_draining_observable_on_cancelled_shutdown() {
+    let marker = std::env::temp_dir().join(format!(
+        "sandlock-f23-draining-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let marker_arg = marker.display().to_string();
+
+    let mut inst = SandboxInstance::launch(
+        base_policy().build().unwrap().with_name("inst-f23-draining"),
+        &[
+            "sh",
+            "-c",
+            &format!("trap '' TERM; touch {marker_arg}; exec sleep 1000"),
+        ],
+    )
+    .await
+    .expect("launch");
+    let child_pid = inst.pid().expect("launched process pid");
+    assert!(
+        poll_until(|| marker.exists(), Duration::from_secs(10)).await,
+        "the child must install its TERM trap before shutdown is tested"
+    );
+
+    // Start shutdown with a long grace and cancel it mid-wait: the timeout
+    // polls the shutdown future (advancing it through Draining into the grace
+    // wait) and drops it on expiry, leaving the phase at Draining.
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(500),
+        inst.shutdown_with_grace(Duration::from_secs(30)),
+    )
+    .await;
+    assert!(
+        cancelled.is_err(),
+        "shutdown with a 30 s grace must not finish inside 500 ms"
+    );
+
+    let draining = inst.stats().await;
+    assert_eq!(
+        draining,
+        InstanceStats {
+            proc_count_vs_live: 0,
+            children_live: 1,
+            instance_state: InstancePhase::Draining,
+        },
+        "a shutdown cancelled mid-grace must leave the session observable as \
+         Draining with its single child still live and reconciled",
+    );
+
+    // Resume: the next shutdown call picks up from Draining and escalates
+    // (zero grace), reaping the TERM-ignoring child.
+    inst.shutdown_with_grace(Duration::ZERO)
+        .await
+        .expect("resumed shutdown");
+    let terminal = inst.stats().await;
+    assert_eq!(terminal.instance_state, InstancePhase::ShutDown);
+    assert_eq!(terminal.children_live, 0);
+    assert!(
+        process_is_gone(child_pid),
+        "the resumed shutdown must kill the TERM-ignoring child"
+    );
+    assert!(
+        !inst.control_dir().unwrap().exists(),
+        "the resumed shutdown must remove the control dir"
+    );
+
+    let _ = std::fs::remove_file(&marker);
 }

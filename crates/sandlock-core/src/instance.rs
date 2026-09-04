@@ -71,6 +71,42 @@ pub enum InstancePhase {
     ShutDown,
 }
 
+/// M0 instance stats snapshot (fork-plan F2.3; the §5.6 subset expressible
+/// with one direct child).
+///
+/// [`SandboxInstance::stats`] builds this from the supervisor-side process
+/// accounting (F1.4) plus the instance's own child/phase bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstanceStats {
+    /// Signed deviation between the supervisor's bookkeeping process count
+    /// and its live pidfd-watcher count (`proc_count − live_watchers`).
+    ///
+    /// This is the F1.4 reconciler
+    /// [`ProcessStats::drift`](crate::sandbox::ProcessStats::drift) exposed
+    /// under the §5.6 name; the two fields are the same number and the F1.4
+    /// surface keeps the raw counts. Zero is the quiescent expectation while
+    /// the session is live (argv-safety mode); a persistent *positive* drift
+    /// is the SL-8 orphan-leak alarm. Drift is transiently *negative* during
+    /// exit cleanup: cleanup releases the `proc_count` slot before it
+    /// unregisters the exiting process's `ProcessIndex` entry, so a snapshot
+    /// in that window counts one fewer bookkeeping slot than live watchers —
+    /// it resolves to zero once the unregister lands. Reports 0 before the
+    /// supervisor state exists.
+    pub proc_count_vs_live: i64,
+    /// Live session-owned children, M0 record semantics: the session has one
+    /// direct child, so this is 0 or 1. The child counts as live from launch
+    /// until it is *reaped* (the session records `Stopped` on wait/shutdown);
+    /// a child that exited but has not been reaped still counts, because the
+    /// session still owns its slot — the supervisor's pidfd watchers may
+    /// observe the exit earlier. M1's per-child table generalizes this to N
+    /// children with per-child, watcher-observed exit state.
+    pub children_live: u32,
+    /// The session's lifecycle phase (see [`InstancePhase`]) — the readable
+    /// form of `Live` / `Draining` / `ShutDown`. M1 adds the exec-side states
+    /// and the `Dead` error state with reason counters (§5.6).
+    pub instance_state: InstancePhase,
+}
+
 /// Session-scoped runtime state, present only while the sandbox is running.
 ///
 /// M0 keeps the single-slot shape of the historical `Runtime` block
@@ -805,6 +841,37 @@ impl SandboxInstance {
     /// The session's lifecycle phase (see [`InstancePhase`]).
     pub fn phase(&self) -> InstancePhase {
         self.phase
+    }
+
+    /// Snapshot the session's M0 stats surface (fork-plan F2.3):
+    /// `proc_count_vs_live` (the F1.4 process reconciliation under the §5.6
+    /// name), `children_live` (M0 single-child record semantics), and
+    /// `instance_state` (the current [`InstancePhase`]).
+    ///
+    /// The process half is read from the supervisor's `ResourceState` /
+    /// `ProcessIndex` and is identical to
+    /// [`ProcessStats`](crate::sandbox::ProcessStats) `drift`; the
+    /// child/phase halves come from the instance's own bookkeeping and stay
+    /// exact even after the supervisor state is gone.
+    pub async fn stats(&self) -> InstanceStats {
+        let proc_count_vs_live = match (
+            self.supervisor_resource.as_ref(),
+            self.supervisor_processes.as_ref(),
+        ) {
+            (Some(res), Some(procs)) => {
+                let rs = res.lock().await;
+                rs.proc_count as i64 - procs.len() as i64
+            }
+            _ => 0,
+        };
+        let children_live = u32::from(
+            self.child_pid.is_some() && !matches!(self.state, RuntimeState::Stopped(_)),
+        );
+        InstanceStats {
+            proc_count_vs_live,
+            children_live,
+            instance_state: self.phase,
+        }
     }
 
     /// The session's (single, M0) process PID, or `None` before launch. Remains

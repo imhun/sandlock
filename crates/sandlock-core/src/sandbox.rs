@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::context;
 use crate::error::SandboxError;
 pub use crate::http::{http_acl_check, normalize_path, prefix_or_exact_match, HttpRule};
-use crate::instance::{RuntimeState, SandboxInstance};
+use crate::instance::{InstanceStats, RuntimeState, SandboxInstance};
 pub use crate::network::{IpCidr, NetAllow, NetDeny, NetRule, NetTarget, Protocol};
 use crate::protection::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
 
@@ -715,6 +715,14 @@ pub struct ProcessStats {
     /// Live pidfd-watcher-backed tracked processes (`ProcessIndex` size).
     pub live_watchers: u32,
     /// `proc_count − live_watchers` (signed; positive = leaked slots).
+    ///
+    /// F2.3 note: this is the same number the instance stats surface exposes
+    /// as [`InstanceStats::proc_count_vs_live`]. Drift is transiently
+    /// *negative* during exit cleanup: cleanup releases the `proc_count`
+    /// slot before it unregisters the exiting process's `ProcessIndex`
+    /// entry, so a snapshot in that window counts one fewer bookkeeping slot
+    /// than live watchers; it resolves to zero once the unregister lands.
+    /// Only a *persistent* positive drift is the orphan-leak alarm.
     pub drift: i64,
 }
 
@@ -929,6 +937,12 @@ impl Sandbox {
     /// In lazy mode registration coverage is partial, so the fields are
     /// diagnostic rather than exact (threads and never-notified children can
     /// legitimately differ).
+    ///
+    /// The drift is transiently negative during exit cleanup, which releases
+    /// the `proc_count` slot before unregistering the watcher entry (see the
+    /// [`ProcessStats::drift`] field docs); the instance stats surface
+    /// ([`Sandbox::stats`]) exposes the same reconciler as
+    /// `proc_count_vs_live`.
     pub async fn process_stats(&self) -> ProcessStats {
         if let Some(rt) = self.runtime.as_ref() {
             if let (Some(res), Some(procs)) = (
@@ -943,6 +957,18 @@ impl Sandbox {
             }
         }
         ProcessStats { proc_count: 0, live_watchers: 0, drift: 0 }
+    }
+
+    /// Return the embedded session's M0 stats surface
+    /// ([`SandboxInstance::stats`](crate::instance::SandboxInstance::stats)):
+    /// the F1.4 process reconciliation (`proc_count_vs_live`), the M0
+    /// single-child liveness (`children_live`), and the lifecycle phase
+    /// (`instance_state`). `None` before the sandbox has been spawned.
+    pub async fn stats(&self) -> Option<InstanceStats> {
+        match self.runtime.as_ref() {
+            Some(rt) => Some(rt.stats().await),
+            None => None,
+        }
     }
 
     /// The sandbox's DNS gateway address (only when wildcard-domain network

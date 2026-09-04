@@ -11,7 +11,7 @@
 #   2. root-mode phase: oci — `sh scripts/test-all.sh --oci-root` as root.
 core_lib = 791 # F1.4 (SL-8): +1 plan unit test pidfd_release_is_idempotent
                # in resource.rs
-core_integ = 485 # F2.1 (M0 lifecycle lift): 477 -> 481 (+4 lifecycle tests);
+core_integ = 488 # F2.1 (M0 lifecycle lift): 477 -> 481 (+4 lifecycle tests);
                  # F2.2 (shutdown seven-step order + idempotency): 481 -> 484,
                  # +3 in integration/test_instance_lifecycle.rs
                  # (test_shutdown_escalates_after_grace_for_term_ignoring_child,
@@ -21,6 +21,11 @@ core_integ = 485 # F2.1 (M0 lifecycle lift): 477 -> 481 (+4 lifecycle tests);
                  # control-dir/no-residue assertions (same count).
                  # F2.2 review fix I-1: 484 -> 485, +1
                  # (test_shutdown_group_sweep_after_compliant_grace_exit).
+                 # F2.3 (stats surface): 485 -> 488, +3 in
+                 # integration/test_instance_lifecycle.rs
+                 # (test_instance_stats_live_reconciled,
+                 # test_one_shot_stats_terminal_after_shutdown,
+                 # test_shutdown_draining_observable_on_cancelled_shutdown).
                  # All other suites unchanged. (481 = F1.4's +2 orphan tests
                  # on top of the F1.3 control-auth pair 471 -> 475, then
                  # +4 F2.1.)
