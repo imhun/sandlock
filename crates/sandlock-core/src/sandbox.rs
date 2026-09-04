@@ -2485,10 +2485,10 @@ impl Sandbox {
         // a supervisor exists (inside the if-let below).  Honour the
         // control_socket opt-out knob.
         //
-        // Use setup_runtime_dir_no_socket to get the liveness check — a
-        // no-supervisor sandbox with the same name as a live sandbox must
-        // refuse to start rather than unconditionally remove_dir_all the
-        // live one's pid file.
+        // Use setup_runtime_dir_no_socket for the conflict check — a
+        // no-supervisor sandbox with the same name as an existing sandbox
+        // must refuse to start rather than preempt its runtime dir (SL-7
+        // F1.3: an existing dir is only reclaimed when provably stale).
         //
         // This must stay after the notif-fd read above.  Any error return
         // from do_spawn relies on Drop's killpg to reap the child, which
@@ -2645,9 +2645,10 @@ impl Sandbox {
             // happen before the notif supervisor is spawned so the socket
             // exists when the child is released.
             //
-            // Best-effort: in nested sandboxes /dev/shm may be restricted by
-            // the outer sandlock's landlock policy.  Warn and continue without
-            // a control socket rather than failing the sandbox.
+            // Best-effort: in nested sandboxes the control state root
+            // (/tmp/sandlock-ctl-<uid> by default) may not be reachable from
+            // the outer sandlock's Landlock policy.  Warn and continue
+            // without a control socket rather than failing the sandbox.
             //
             // Honour the control_socket opt-out knob: when false, skip the
             // entire runtime dir + socket setup.
@@ -3205,9 +3206,9 @@ fn sandbox_resolve_name(name: Option<&str>) -> Result<String, crate::error::Sand
 }
 
 /// A `<pid>-<counter>` suffix that makes an internally generated sandbox name
-/// unique across processes and within one. The runtime dir under
-/// /dev/shm/sandlock-$UID/ is claimed per name and a live collision is a hard
-/// error, so no internal caller may use a fixed name.
+/// unique across processes and within one. The per-uid control state root is
+/// claimed per name (hashed dir) and a collision with a non-provable-stale
+/// dir is a hard error, so no internal caller may use a fixed name.
 pub(crate) fn unique_instance_id() -> String {
     format!(
         "{}-{}",
@@ -3227,8 +3228,9 @@ fn sandbox_validate_name(name: String) -> Result<String, crate::error::SandlockE
     if name.as_bytes().contains(&0) {
         return Err(SandboxRuntimeError::Child("sandbox name must not contain NUL bytes".into()).into());
     }
-    // The name becomes a path component under /dev/shm/sandlock-$UID/.
-    // Reject names that would escape that root.
+    // The name is a uid-wide key: it hashes to the state-dir slot and is
+    // written verbatim into the dir's `name` metadata and the ps display, so
+    // it must stay a single token that cannot be confused with path syntax.
     if name.contains('/') {
         return Err(SandboxRuntimeError::Child("sandbox name must not contain '/'".into()).into());
     }

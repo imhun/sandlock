@@ -10,7 +10,10 @@
 #      ffi, cli, cli_build, python — `sh scripts/test-all.sh`
 #   2. root-mode phase: oci — `sh scripts/test-all.sh --oci-root` as root.
 core_lib = 790
-core_integ = 471
+core_integ = 475 # F1.3 (SL-7): +4 plan tests in test_control.rs (peer-uid auth
+                 # closes, sibling cannot read policy, name conflict refuses
+                 # preempt, verb without token rejected); existing control
+                 # tests adapted in place (hashed state root + token protocol)
 ffi = 89
 cli = 95      # after F0.4 wiring (cli suite includes net_bind_map tests)
 oci = 131     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e2e

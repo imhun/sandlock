@@ -1,24 +1,43 @@
 //! Per-sandbox Unix control socket for introspection.
 //!
-//! Every sandbox (CLI, Python SDK, embedded) gets a runtime directory under
-//! `/dev/shm/sandlock-$UID/<name>/` containing:
+//! Every sandbox (CLI, Python SDK, embedded) gets a runtime directory under a
+//! per-uid, owner-only state root that is **not** part of a sandbox's
+//! Landlock filesystem view:
 //!
-//! * `pid` — two-line pid file (`child_pid\nsupervisor_pid\n`); lets
-//!   `sandlock ps` list and prune dead sandboxes without opening the
-//!   socket. The child PID is used for `/proc` introspection (UPTIME,
-//!   CMD); the supervisor PID owns the control socket and is used for
-//!   liveness checks.
+//! * default root: `/tmp/sandlock-ctl-$UID` (override with the
+//!   `SANDBOX_CTL_ROOT` environment variable — used by the integration tests
+//!   for isolation).  The old `/dev/shm/sandlock-$UID` root was visible to
+//!   sibling sandboxes that mount `/dev` (the SL-7 cross-sandbox read); the
+//!   new root is unreachable unless a config explicitly grants it.
+//! * per-sandbox dir: `<fnv1a16(name)>.d` — a 64-bit FNV-1a hash of the
+//!   sandbox name, so the raw name is never a path component (a sibling that
+//!   can enumerate the root still cannot map names to dirs without the hash,
+//!   and the dir the sandbox actually runs with is never an obvious target).
+//!
+//! Each runtime dir contains:
+//!
+//! * `pid` — three-line pid file (`child_pid\nsupervisor_pid\nstarttime\n`);
+//!   lets `sandlock ps` list and prune dead sandboxes without opening the
+//!   socket. The child PID is used for `/proc` introspection (UPTIME, CMD);
+//!   the supervisor PID owns the control socket; the third line records the
+//!   supervisor's `/proc/<pid>/stat` starttime (field 22), so liveness and
+//!   stale-reclaim decisions compare identities instead of trusting
+//!   `kill(pid, 0)` on a possibly reused pid.
+//! * `name` — the raw sandbox name (metadata for `sandlock ps` display).
+//! * `token` — random per-sandbox identity token (0600), read by the client
+//!   and required by the sensitive `config`/`ports` verbs.
 //! * `control.sock` — Unix stream socket bound by the supervisor before the
 //!   child is forked.  Serves the introspection wire protocol.
 //!
 //! ## Wire protocol
 //!
 //! 4-byte big-endian length prefix, then UTF-8 JSON.  One client at a time per
-//! socket.
+//! socket; the server closes the connection after serving (or refusing) one
+//! request.
 //!
 //! Request:
 //! ```json
-//! {"v": 1, "verb": "config", "args": {}}
+//! {"v": 1, "verb": "config", "args": {}, "token": "<identity token>"}
 //! ```
 //!
 //! Response:
@@ -29,6 +48,27 @@
 //! ```json
 //! {"v": 1, "ok": false, "err": "..."}
 //! ```
+//!
+//! ## Authentication model (SL-7, fork-plan-2026-09 F1.3)
+//!
+//! 1. The state root and every runtime dir are 0700 and the socket is 0600,
+//!    so the kernel DAC owner check stops other uids before the socket.
+//! 2. The root is outside the Landlock view of every sandbox this codebase
+//!    creates, so a sibling sandbox cannot even reach the socket (verified by
+//!    `integration/test_control.rs::test_sibling_sandbox_cannot_read_other_policy`).
+//! 3. As a belt for shared-directory / future fd-less transports, the server
+//!    reads `SO_PEERCRED` on every connection and **closes** the connection
+//!    (no response, no log) when the peer uid differs from the supervisor's.
+//! 4. Sensitive verbs (`config`, `ports`) require the runtime dir's identity
+//!    token; a missing or mismatched token is refused explicitly and the
+//!    connection is closed.
+//!
+//! Name collisions never preempt: when a runtime dir exists, setup refuses
+//! unless the recorded owner is provably gone (pid-file starttime no longer
+//! matches `/proc/<pid>/stat`, or the dir is old with no pid file).  A pid
+//! file that is merely unreadable/missing on a live sandbox therefore makes
+//! the second create fail with `AlreadyExists` instead of wiping the live
+//! dir.
 
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -41,20 +81,61 @@ use crate::seccomp::ctx::SupervisorCtx;
 // Public API — runtime dir helpers (used by core + CLI)
 // ============================================================
 
+/// Environment override for the per-user control state root.  The
+/// integration tests set this to a per-process root under `/tmp` so several
+/// suites can share a container without enumerating each other's sandboxes.
+pub const CTL_ROOT_ENV: &str = "SANDBOX_CTL_ROOT";
+
 /// Return the per-user runtime directory root.
 pub(crate) fn runtime_dir_uid(uid: u32) -> PathBuf {
-    PathBuf::from(format!("/dev/shm/sandlock-{}", uid))
+    if let Ok(root) = std::env::var(CTL_ROOT_ENV) {
+        if !root.is_empty() {
+            return PathBuf::from(root);
+        }
+    }
+    // /tmp is host-reachable for the same uid, writable by the unprivileged
+    // supervisor, and never granted to a sandbox by this codebase's default
+    // fs config (the sandbox would need an explicit -r/-w for it).
+    PathBuf::from(format!("/tmp/sandlock-ctl-{}", uid))
+}
+
+/// Deterministic 64-bit FNV-1a hash of `name`, rendered as 16 lowercase hex
+/// digits (mirrors the sandlock-oci supervisor socket naming, which was
+/// measured to be sandbox-unreachable).
+fn fnv1a_hex(name: &str) -> String {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    for b in name.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    format!("{:016x}", h)
 }
 
 /// Return the per-sandbox runtime directory for a given name.
+///
+/// The directory is `<state root>/<fnv1a16(name)>.d`: the raw name is never
+/// a path component (the caller still validates names so that the uid-wide
+/// name key and the `name` metadata stay single-token strings).
 pub fn sandbox_dir(name: &str) -> PathBuf {
     let uid = unsafe { libc::getuid() };
-    runtime_dir_uid(uid).join(name)
+    runtime_dir_uid(uid).join(format!("{}.d", fnv1a_hex(name)))
 }
 
 /// Return the pid file path inside a sandbox runtime dir.
 pub fn pid_path(dir: &Path) -> PathBuf {
     dir.join("pid")
+}
+
+/// Return the identity-token file path inside a sandbox runtime dir.
+pub fn token_path(dir: &Path) -> PathBuf {
+    dir.join("token")
+}
+
+/// Return the raw-name metadata file path inside a sandbox runtime dir.
+pub fn name_path(dir: &Path) -> PathBuf {
+    dir.join("name")
 }
 
 /// Return the control socket path inside a sandbox runtime dir.
@@ -70,27 +151,79 @@ pub fn sandbox_mode(name: &str) -> Option<String> {
     if s.is_empty() { None } else { Some(s.to_string()) }
 }
 
-/// Read the supervisor PID from a runtime dir's pid file.
-/// Returns `None` if the file is missing, unparseable, or does not
-/// contain two lines (child_pid\nsupervisor_pid\n).
-fn read_supervisor_pid(dir: &Path) -> Option<i32> {
+/// Read a runtime dir's pid file.
+///
+/// Format: `child_pid\nsupervisor_pid\nsupervisor_starttime\n`.  The
+/// starttime (field 22 of `/proc/<pid>/stat`, in clock ticks) is the
+/// recorded identity of the supervisor process that created the dir; it lets
+/// liveness/staleness checks detect pid reuse instead of trusting
+/// `kill(pid, 0)`.  Returns `None` if the file is missing or unparseable.
+/// A legacy two-line file (no starttime) parses with `starttime == None`.
+fn read_pid_file(dir: &Path) -> Option<(i32, i32, Option<u64>)> {
     let content = std::fs::read_to_string(pid_path(dir)).ok()?;
-    // Line 2 is the supervisor PID.
-    content.lines().nth(1)?.trim().parse().ok()
+    let mut lines = content.lines();
+    let child_pid: i32 = lines.next()?.trim().parse().ok()?;
+    let supervisor_pid: i32 = lines.next()?.trim().parse().ok()?;
+    let starttime: Option<u64> = lines.next().and_then(|l| l.trim().parse().ok());
+    Some((child_pid, supervisor_pid, starttime))
+}
+
+/// Read the raw-name metadata file from a runtime dir.
+fn read_name(dir: &Path) -> Option<String> {
+    let s = std::fs::read_to_string(name_path(dir)).ok()?;
+    let s = s.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// Read the identity token from a runtime dir's token file.
+fn read_token(dir: &Path) -> Option<String> {
+    let s = std::fs::read_to_string(token_path(dir)).ok()?;
+    let s = s.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// Constant-time-ish token comparison (no early exit on the first differing
+/// byte).  Length mismatch is inherently visible; the token is only one layer
+/// of the auth model (DAC 0700/0600 and the sandbox-unreachable root are the
+/// primary ones).
+fn token_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 // ============================================================
 // Runtime dir lifecycle — called from sandbox-core
 // ============================================================
 
-/// Create the per-sandbox runtime directory and write the pid file — shared
-/// by the supervisor and no_supervisor paths.  Returns the dir path.
+/// Create the per-sandbox runtime directory, write the identity files, and
+/// bind the control socket — shared by the supervisor and no_supervisor
+/// paths.  Returns the dir path.
 ///
 /// # Name collision
 ///
-/// If a runtime directory already exists for `name` and its supervisor is
-/// still alive, this returns `ErrorKind::AlreadyExists`.  Stale dirs (dead
-/// supervisor) are removed and recreated.
+/// If a runtime directory already exists for `name`, this returns
+/// `ErrorKind::AlreadyExists` unless the directory can be **proven** stale:
+/// the pid file's recorded supervisor starttime no longer matches
+/// `/proc/<pid>/stat` (the recorded owner is gone), or the dir is old with no
+/// pid file (abandoned mid-setup).  A pid file that is merely unreadable or
+/// missing on a live sandbox is never enough to `remove_dir_all` — that was
+/// the SL-7 directory-preemption bug.
 ///
 /// # no_supervisor callers
 ///
@@ -119,10 +252,10 @@ pub(crate) fn setup_runtime_dir(
     Ok((listener, dir))
 }
 
-/// Create the per-sandbox runtime directory and write the pid file, without
-/// binding a control socket.  Used by the `no_supervisor` path (no socket
-/// exists) and as the common prefix of `setup_runtime_dir` for the supervisor
-/// path.
+/// Create the per-sandbox runtime directory and write the identity files
+/// (token, name, mode, pid), without binding a control socket.  Used by the
+/// `no_supervisor` path (no socket exists) and as the common prefix of
+/// `setup_runtime_dir` for the supervisor path.
 pub(crate) fn setup_runtime_dir_no_socket(
     name: &str,
     child_pid: i32,
@@ -131,19 +264,41 @@ pub(crate) fn setup_runtime_dir_no_socket(
 ) -> Result<PathBuf, std::io::Error> {
     let dir = sandbox_dir(name);
 
-    // Check for name collision: if the dir exists and the sandbox is still
-    // alive, refuse to overwrite it.
+    // Refuse instead of preempting: an existing dir is a live candidate, and
+    // is only reclaimed when provably stale (see classify_existing_dir).
     if dir.exists() {
-        if let Some(pid) = read_supervisor_pid(&dir) {
-            if unsafe { libc::kill(pid, 0) } == 0 {
+        match classify_existing_dir(&dir, name)? {
+            ExistingDir::Live { supervisor_pid } => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
-                    format!("sandbox '{}' is already running (PID {})", name, pid),
+                    format!("sandbox '{}' is already running (PID {})", name, supervisor_pid),
                 ));
             }
+            ExistingDir::Ambiguous => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "sandbox '{}' state dir exists but cannot be proven stale; \
+                         refusing to preempt it",
+                        name
+                    ),
+                ));
+            }
+            ExistingDir::Stale => {
+                // Provably abandoned: recorded owner gone / old incomplete dir.
+                std::fs::remove_dir_all(&dir)?;
+            }
         }
-        // Dead or unparseable — safe to remove.
-        std::fs::remove_dir_all(&dir)?;
+    }
+
+    // Owner-only per-user root; created on demand so `sandlock ps` and the
+    // clients can rely on it existing once any sandbox has run.
+    let root = runtime_dir_uid(unsafe { libc::getuid() });
+    std::fs::create_dir_all(&root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
     }
     std::fs::create_dir_all(&dir)?;
 
@@ -154,8 +309,33 @@ pub(crate) fn setup_runtime_dir_no_socket(
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     }
 
+    // Identity token first: the dir is not complete without it, and a
+    // concurrent enumerator that sees the dir before the pid file must not
+    // mistake a mid-setup dir for a live sandbox.
+    let token = generate_token()?;
+    let token_file = token_path(&dir);
+    std::fs::write(&token_file, format!("{}\n", token))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    // Raw-name metadata (for `sandlock ps`; the dir name itself is hashed).
+    std::fs::write(name_path(&dir), format!("{}\n", name))?;
+
     // Write pid file atomically via temp + rename so list_live_sandboxes
-    // never sees a partially-written or empty pid file.
+    // never sees a partially-written or empty pid file.  The third line is
+    // the supervisor's starttime (see read_pid_file); recording the identity
+    // of the writing process is what lets later setup/list code detect pid
+    // reuse instead of trusting kill(pid, 0).
+    let starttime = crate::seccomp::state::read_pid_start_time(supervisor_pid).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("cannot read starttime of supervisor pid {}", supervisor_pid),
+        )
+    })?;
+
     // Operating-mode marker for the `sandlock ps` STATUS column. Written
     // before the pid file so a listing never sees the sandbox without it.
     if let Some(m) = mode {
@@ -164,18 +344,119 @@ pub(crate) fn setup_runtime_dir_no_socket(
 
     let pid_path = pid_path(&dir);
     let tmp_path = dir.join(".pid.tmp");
-    std::fs::write(&tmp_path, format!("{}\n{}\n", child_pid, supervisor_pid))?;
+    std::fs::write(
+        &tmp_path,
+        format!("{}\n{}\n{}\n", child_pid, supervisor_pid, starttime),
+    )?;
     std::fs::rename(&tmp_path, &pid_path)?;
 
     Ok(dir)
 }
 
+/// Generate a fresh random identity token (64 hex chars from 32 bytes of
+/// kernel entropy).
+fn generate_token() -> Result<String, std::io::Error> {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    Ok(bytes.iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+/// Classification of an existing runtime dir when a new sandbox wants the
+/// same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingDir {
+    /// The recorded supervisor process is alive and owns the dir.
+    Live { supervisor_pid: i32 },
+    /// The dir exists but staleness cannot be proven — refuse.
+    Ambiguous,
+    /// The dir is provably abandoned — safe to reclaim.
+    Stale,
+}
+
+/// Decide whether an existing runtime dir may be reclaimed.
+///
+/// Refusal is the default; only two cases reclaim:
+///
+/// * the pid file records a supervisor starttime that no longer matches
+///   `/proc/<pid>/stat` (the recorded owner is gone; if the pid was reused,
+///   the starttime mismatch proves this dir predates the current occupant).
+///   When `/proc` is unreadable, `kill(pid, 0)` is used only to distinguish
+///   "process provably gone" (ESRCH) from "cannot tell" — the latter refuses,
+/// * the pid file is missing/unparseable **and** the dir is not recent (an
+///   abandoned mid-setup dir; a recent pid-less dir may be a live sandbox
+///   whose setup is still in progress, or — as in the SL-7 regression test —
+///   a live sandbox whose pid file was lost, so it must not be touched).
+///
+/// `kill(pid, 0)` failure alone is never a reclaim reason, and neither is an
+/// unreadable pid file on its own.
+fn classify_existing_dir(dir: &Path, name: &str) -> Result<ExistingDir, std::io::Error> {
+    // A foreign dir squatting in this hash slot is never ours to reclaim.
+    if let Some(existing_name) = read_name(dir) {
+        if existing_name != name {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "sandbox '{}': state-dir hash slot is occupied by sandbox '{}'",
+                    name, existing_name
+                ),
+            ));
+        }
+    }
+
+    match read_pid_file(dir) {
+        Some((_, supervisor_pid, Some(recorded_starttime))) => {
+            match crate::seccomp::state::read_pid_start_time(supervisor_pid) {
+                Some(current) if current == recorded_starttime => {
+                    Ok(ExistingDir::Live { supervisor_pid })
+                }
+                Some(_) => {
+                    // Starttime mismatch: the recorded owner is gone and the
+                    // pid was reused — provably stale.
+                    Ok(ExistingDir::Stale)
+                }
+                None => {
+                    // /proc unreadable or the process is gone.  Fail closed:
+                    // reclaim only when kill(pid, 0) proves there is no such
+                    // process (ESRCH); an alive-but-unreadable process must
+                    // refuse.
+                    if (unsafe { libc::kill(supervisor_pid, 0) }) == 0 {
+                        Ok(ExistingDir::Ambiguous)
+                    } else {
+                        Ok(ExistingDir::Stale)
+                    }
+                }
+            }
+        }
+        Some((_, _, None)) => {
+            // Legacy two-line pid file with no recorded starttime: staleness
+            // cannot be proven (kill(pid,0) cannot detect pid reuse), so
+            // refuse; `sandlock ps` pruning handles such leftovers.
+            Ok(ExistingDir::Ambiguous)
+        }
+        None => {
+            let now = std::time::SystemTime::now();
+            if dir_is_recent(dir, &now) {
+                Ok(ExistingDir::Ambiguous)
+            } else {
+                Ok(ExistingDir::Stale)
+            }
+        }
+    }
+}
+
 /// Remove the per-sandbox runtime directory. Best-effort: failures are logged
 /// but never propagated (called from Drop paths).
 pub fn cleanup_runtime_dir(dir: &Path) {
-    let pid_file = pid_path(dir);
-    if pid_file.exists() {
-        let _ = std::fs::remove_file(&pid_file);
+    for file in [
+        pid_path(dir),
+        token_path(dir),
+        name_path(dir),
+        dir.join("mode"),
+    ] {
+        if file.exists() {
+            let _ = std::fs::remove_file(&file);
+        }
     }
     let sp = sock_path(dir);
     if sp.exists() {
@@ -213,11 +494,15 @@ pub(crate) fn spawn_control_loop(
 
 /// Accept connections on the control socket and serve one request per
 /// connection (single-client-at-a-time, no concurrency).
+///
+/// `dir` supplies the runtime-dir identity token used to authenticate the
+/// sensitive verbs (read once: the token never changes while the sandbox
+/// runs).
 async fn control_loop(
     listener: UnixListener,
     ctx: Arc<SupervisorCtx>,
     sandbox: Arc<tokio::sync::Mutex<Sandbox>>,
-    _dir: PathBuf,
+    dir: PathBuf,
 ) {
     // Convert std listener to tokio.
     listener.set_nonblocking(true).ok();
@@ -225,6 +510,7 @@ async fn control_loop(
         Ok(l) => l,
         Err(_) => return,
     };
+    let expected_token = read_token(&dir);
 
     loop {
         let (stream, _addr) = match listener.accept().await {
@@ -232,8 +518,12 @@ async fn control_loop(
             Err(_) => return,
         };
 
-        // Optional: audit peer credentials (same-UID trust boundary).
-        // SO_PEERCRED is cheap and surfaces unexpected mismatches.
+        // Peer-credential boundary (SL-7): SO_PEERCRED must match the
+        // supervisor's uid.  On mismatch the connection is closed immediately
+        // — no response, no warning eprintln (the old behavior logged and
+        // kept serving, which is exactly the cross-uid hole).  With the
+        // owner-only dir this is a belt, not the primary boundary; it becomes
+        // the primary one for future shared-directory transports (F2b.2).
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
@@ -252,17 +542,16 @@ async fn control_loop(
             {
                 let my_uid = unsafe { libc::getuid() };
                 if cred.uid != my_uid {
-                    eprintln!(
-                        "sandlock: control socket: peer uid {} != my uid {} — \
-                         unexpected; dir 0700 should prevent this",
-                        cred.uid, my_uid
-                    );
+                    // Close without serving: the peer has no business on this
+                    // socket regardless of what it sends next.
+                    drop(stream);
+                    continue;
                 }
             }
         }
 
         // Serve one request; close after.
-        serve_one(stream, &ctx, &sandbox).await;
+        serve_one(stream, &ctx, &sandbox, expected_token.as_deref()).await;
     }
 }
 
@@ -274,6 +563,10 @@ async fn control_loop(
 struct ControlRequest {
     v: u32,
     verb: String,
+    /// Identity token from the runtime dir's `token` file.  Optional on the
+    /// wire so old clients still parse; sensitive verbs require it.
+    #[serde(default)]
+    token: Option<String>,
     #[serde(default)]
     #[allow(dead_code)]
     args: serde_json::Value,
@@ -293,6 +586,7 @@ async fn serve_one(
     stream: tokio::net::UnixStream,
     ctx: &Arc<SupervisorCtx>,
     sandbox: &Arc<tokio::sync::Mutex<Sandbox>>,
+    expected_token: Option<&str>,
 ) {
     use tokio::io::AsyncReadExt;
 
@@ -336,7 +630,34 @@ async fn serve_one(
         return;
     }
 
-    match req.verb.as_str() {
+    let verb = req.verb.as_str();
+
+    // Verb-graded authentication: `config` and `ports` expose the sandbox's
+    // full policy/network state, so they require the runtime dir's identity
+    // token.  A missing or mismatched token is refused explicitly, then the
+    // connection is closed (the function returns and the stream drops).
+    if verb_requires_token(verb) {
+        let authorized = match (req.token.as_deref(), expected_token) {
+            (Some(given), Some(expected)) => token_eq(given, expected),
+            _ => false,
+        };
+        if !authorized {
+            let resp = ControlResponse {
+                v: 1,
+                ok: false,
+                data: None,
+                err: Some(format!(
+                    "permission denied: verb '{}' requires a valid control token \
+                     (missing or mismatched)",
+                    verb
+                )),
+            };
+            let _ = write_response(&mut stream, &resp).await;
+            return;
+        }
+    }
+
+    match verb {
         "config" => handle_config(&mut stream, ctx, sandbox).await,
         "ports" => handle_ports(&mut stream, ctx).await,
         _ => {
@@ -349,6 +670,12 @@ async fn serve_one(
             let _ = write_response(&mut stream, &resp).await;
         }
     }
+}
+
+/// Sensitive verbs need the identity token; future verbs choose their own
+/// grade here (e.g. an exec-class verb would need a per-session key).
+fn verb_requires_token(verb: &str) -> bool {
+    matches!(verb, "config" | "ports")
 }
 
 async fn handle_config(
@@ -473,15 +800,19 @@ async fn write_response(
 // Pruning — called by sandlock ps to clean up stale dirs
 // ============================================================
 
-/// Walk `/dev/shm/sandlock-$UID/` and return entries for every live sandbox.
-/// Dead sandboxes (supervisor process is gone) are pruned.
+/// Walk the per-user control state root and return entries for every live
+/// sandbox.  Dead sandboxes (recorded supervisor identity is gone) are
+/// pruned.
 ///
-/// Returns `(name, child_pid)` pairs for live sandboxes.  The child PID is
-/// used by `sandlock ps` for `/proc/<pid>/stat` and `/proc/<pid>/cmdline`.
+/// Returns `(name, child_pid)` pairs for live sandboxes; `name` is read from
+/// the dir's `name` metadata (the dir name itself is the name's FNV-1a hash).
+/// The child PID is used by `sandlock ps` for `/proc/<pid>/stat` and
+/// `/proc/<pid>/cmdline`.
 ///
 /// Directories younger than 2 seconds are never pruned, even if the pid
-/// file is missing or unparseable — this avoids a race with `setup_runtime_dir`
-/// which creates the dir before writing the pid file.
+/// file is missing or unparseable — this avoids a race with
+/// `setup_runtime_dir`, which creates the dir before writing the pid file,
+/// and (since F1.3) protects a live sandbox whose pid file was lost.
 pub fn list_live_sandboxes() -> Result<Vec<(String, i32)>, std::io::Error> {
     let uid = unsafe { libc::getuid() };
     let root = runtime_dir_uid(uid);
@@ -507,13 +838,13 @@ pub fn list_live_sandboxes() -> Result<Vec<(String, i32)>, std::io::Error> {
             continue;
         }
 
-        // Parse the pid file.  Format: child_pid\nsupervisor_pid\n
-        let pid_file = pid_path(&dir);
-        let pid_str = match std::fs::read_to_string(&pid_file) {
-            Ok(s) => s,
-            Err(_) => {
-                // No pid file — could be a dir being set up concurrently.
-                // Don't prune if the dir was modified less than 2 seconds ago.
+        // Parse the pid file.  Format: child_pid\nsupervisor_pid\nstarttime\n
+        let (child_pid, supervisor_pid, recorded_starttime) = match read_pid_file(&dir) {
+            Some(triple) => triple,
+            None => {
+                // No pid file — could be a dir being set up concurrently, or
+                // a live sandbox whose pid file was lost.  Don't prune if the
+                // dir was modified less than 2 seconds ago.
                 if !dir_is_recent(&dir, &now) {
                     let _ = std::fs::remove_dir_all(&dir);
                 }
@@ -521,18 +852,12 @@ pub fn list_live_sandboxes() -> Result<Vec<(String, i32)>, std::io::Error> {
             }
         };
 
-        let mut lines = pid_str.lines();
-        let child_pid: i32 = match lines.next().and_then(|l| l.trim().parse().ok()) {
-            Some(p) => p,
-            None => {
-                if !dir_is_recent(&dir, &now) {
-                    let _ = std::fs::remove_dir_all(&dir);
-                }
-                continue;
-            }
-        };
-        let supervisor_pid: i32 = match lines.next().and_then(|l| l.trim().parse().ok()) {
-            Some(p) => p,
+        // The dir name is hashed, so the display name comes from metadata.
+        // Metadata is written before the pid file, so a dir with a complete
+        // pid file normally has it; a name-less dir is inconsistent and is
+        // only pruned once it is no longer recent.
+        let name = match read_name(&dir) {
+            Some(n) => n,
             None => {
                 if !dir_is_recent(&dir, &now) {
                     let _ = std::fs::remove_dir_all(&dir);
@@ -543,12 +868,20 @@ pub fn list_live_sandboxes() -> Result<Vec<(String, i32)>, std::io::Error> {
 
         // Liveness check: use supervisor PID since the supervisor owns
         // the control socket.  If the supervisor is dead, the sandbox is
-        // effectively dead even if the child still runs.
-        if unsafe { libc::kill(supervisor_pid, 0) } == 0 {
-            let name = match dir.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
+        // effectively dead even if the child still runs.  When the pid file
+        // recorded the supervisor's starttime (F1.3 format), compare
+        // identities so a reused pid cannot masquerade as the owner; legacy
+        // two-line pid files fall back to kill(pid, 0).
+        let alive = match recorded_starttime {
+            Some(recorded) => match crate::seccomp::state::read_pid_start_time(supervisor_pid) {
+                Some(current) => current == recorded,
+                // /proc unreadable: fall back to kill(pid, 0) rather than
+                // pruning a live dir on a transient read failure.
+                None => (unsafe { libc::kill(supervisor_pid, 0) }) == 0,
+            },
+            None => (unsafe { libc::kill(supervisor_pid, 0) }) == 0,
+        };
+        if alive {
             live.push((name, child_pid));
         } else {
             // Dead: prune.
@@ -591,12 +924,21 @@ pub fn send_control_request(
 
     // Check supervisor liveness before attempting connect.  If the
     // supervisor is dead the socket is stale and connect() would fail
-    // with a confusing "No such file" — give a clearer message.
-    if let Some(pid) = read_supervisor_pid(&dir) {
-        if unsafe { libc::kill(pid, 0) } != 0 {
+    // with a confusing "No such file" — give a clearer message.  Uses the
+    // recorded starttime when available (pid-reuse-safe); falls back to
+    // kill(pid, 0) for legacy two-line pid files.
+    if let Some((_, supervisor_pid, recorded_starttime)) = read_pid_file(&dir) {
+        let alive = match recorded_starttime {
+            Some(recorded) => match crate::seccomp::state::read_pid_start_time(supervisor_pid) {
+                Some(current) => current == recorded,
+                None => (unsafe { libc::kill(supervisor_pid, 0) }) == 0,
+            },
+            None => (unsafe { libc::kill(supervisor_pid, 0) }) == 0,
+        };
+        if !alive {
             return Err(format!(
                 "sandbox '{}' supervisor (PID {}) is not running",
-                name, pid
+                name, supervisor_pid
             ));
         }
     }
@@ -614,10 +956,16 @@ pub fn send_control_request(
         .set_write_timeout(Some(std::time::Duration::from_secs(2)))
         .map_err(|e| format!("set_write_timeout: {}", e))?;
 
+    // Attach the runtime dir's identity token (read automatically, like the
+    // pid file): the sensitive verbs reject requests without a matching
+    // token.  `sandlock ps` never uses this function for its enumeration, so
+    // listing stays token-free (minimal auth surface).
+    let token = read_token(&dir);
     let req = serde_json::json!({
         "v": 1,
         "verb": verb,
         "args": args,
+        "token": token,
     });
     let body = serde_json::to_vec(&req)
         .map_err(|e| format!("serialize request: {}", e))?;
@@ -647,8 +995,37 @@ mod tests {
     #[test]
     fn test_runtime_dir_paths() {
         let dir = sandbox_dir("test-sandbox");
-        assert!(dir.to_string_lossy().contains("test-sandbox"));
-        assert!(dir.to_string_lossy().contains("sandlock-"));
+        let s = dir.to_string_lossy();
+        // The raw name must never be a path component (SL-7 hashed dirs).
+        assert!(
+            !s.contains("test-sandbox"),
+            "hashed dir must not contain the raw name: {}",
+            s
+        );
+        // <state root>/<16-hex>.d
+        let root = runtime_dir_uid(unsafe { libc::getuid() });
+        assert_eq!(dir.parent(), Some(root.as_path()));
+        let file_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        assert!(file_name.ends_with(".d"), "dir should end in .d: {}", file_name);
+        let stem = file_name.trim_end_matches(".d");
+        assert_eq!(stem.len(), 16, "hash stem should be 16 hex chars: {}", stem);
+        assert!(
+            stem.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash stem should be hex: {}",
+            stem
+        );
+
+        let pid_file = pid_path(&dir);
+        assert_eq!(pid_file.file_name().unwrap(), "pid");
+
+        let token_file = token_path(&dir);
+        assert_eq!(token_file.file_name().unwrap(), "token");
+
+        let name_file = name_path(&dir);
+        assert_eq!(name_file.file_name().unwrap(), "name");
+
+        let sock = sock_path(&dir);
+        assert_eq!(sock.file_name().unwrap(), "control.sock");
     }
 
     #[test]
@@ -659,7 +1036,19 @@ mod tests {
 
         let dir = setup_runtime_dir_no_socket(&name, pid, pid, Some("learn")).unwrap();
         assert_eq!(sandbox_mode(&name).as_deref(), Some("learn"));
+        // Identity files are written by setup and removed by cleanup.
+        let token_file = token_path(&dir);
+        assert!(token_file.exists(), "token file should exist after setup");
+        let token = std::fs::read_to_string(&token_file).unwrap();
+        assert!(!token.trim().is_empty(), "token must be non-empty");
+        assert_eq!(token.trim().len(), 64, "token should be 64 hex chars");
+        assert_eq!(
+            read_name(&dir).as_deref(),
+            Some(name.as_str()),
+            "name metadata should round-trip"
+        );
         cleanup_runtime_dir(&dir);
+        assert!(!dir.exists(), "cleanup should remove the runtime dir");
 
         let dir = setup_runtime_dir_no_socket(&name, pid, pid, None).unwrap();
         assert_eq!(sandbox_mode(&name), None);
