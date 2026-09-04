@@ -2315,8 +2315,22 @@ impl Sandbox {
             }
 
             let extra_fds_copy = self.rt().extra_fds.clone();
+            // SL-4: fds mapped for an in-process control entrypoint
+            // (`in_child_main`, e.g. the OCI sandlock-init control socket) are
+            // control channels — a user process the entrypoint later fork+execs
+            // must never inherit them. dup3 with O_CLOEXEC keeps the fd usable
+            // in the entrypoint itself (it never execs) while closing it at any
+            // descendant exec. Exec-path consumers that hand fds to the
+            // exec'd program on purpose (Gather's source pipes, the restore
+            // stub's CTRL/READY/GO fds) take the dup2 branch below, and
+            // targets 0/1/2 always stay inheritable stdio.
+            let control_entry = self.in_child_main.is_some();
             for &(target_fd, source_fd) in &extra_fds_copy {
-                unsafe { libc::dup2(source_fd, target_fd) };
+                if control_entry && target_fd >= 3 {
+                    unsafe { libc::dup3(source_fd, target_fd, libc::O_CLOEXEC) };
+                } else {
+                    unsafe { libc::dup2(source_fd, target_fd) };
+                }
             }
 
             // Wire stdin/stdout/stderr per their modes. This is a post-fork path

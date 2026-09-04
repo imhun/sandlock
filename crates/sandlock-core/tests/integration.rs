@@ -96,3 +96,6 @@ mod test_tty;
 
 #[path = "integration/test_pid_ns.rs"]
 mod test_pid_ns;
+
+#[path = "integration/test_fd_inherit.rs"]
+mod test_fd_inherit;

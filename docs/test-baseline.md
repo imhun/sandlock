@@ -10,7 +10,7 @@
 #      ffi, cli, cli_build, python — `sh scripts/test-all.sh`
 #   2. root-mode phase: oci — `sh scripts/test-all.sh --oci-root` as root.
 core_lib = 790
-core_integ = 468
+core_integ = 471
 ffi = 89
 cli = 95      # after F0.4 wiring (cli suite includes net_bind_map tests)
 oci = 127     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e2e

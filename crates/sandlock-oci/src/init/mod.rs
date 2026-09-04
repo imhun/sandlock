@@ -38,6 +38,17 @@ fn spawn(
     cwd: &Option<String>,
     stdio: Option<[RawFd; 3]>,
 ) -> i32 {
+    // SL-4 belt: the control socket must never survive the workload's execvp.
+    // fcntl is async-signal-safe and FD_CLOEXEC is per-fd-table state, so
+    // setting it here — in init, before the fork — provably covers every exec
+    // path through this spawner: fork copies the flag, init itself never
+    // execs, and a later spawn re-arms it even if the fd table was rebuilt.
+    // If CONTROL_FD is already closed (channel torn down) the fcntl fails with
+    // EBADF and there is nothing to protect, so the error is deliberately
+    // ignored.
+    unsafe {
+        libc::fcntl(CONTROL_FD, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
     let pid = unsafe { libc::fork() };
     if pid != 0 {
         return pid;
