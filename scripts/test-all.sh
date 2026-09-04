@@ -1,0 +1,130 @@
+#!/bin/sh
+# Run every sandlock suite in one shot and fail on ANY drift from the recorded
+# baseline -- including a suite that quietly runs fewer tests than last time.
+#
+# Usage: scripts/test-all.sh            (non-root suites; logs land in ./tmp/)
+#        scripts/test-all.sh --wheels   (also cross-build + verify wheel symbols)
+#        scripts/test-all.sh --oci-root (root-mode oci suite only; must run as root)
+#
+# Canonical full-gate procedure (sandlock-dev:latest, repo mounted at /src):
+#   chmod -R a+rwX tmp
+#   docker run --privileged --rm -v "$PWD":/src -w /src \
+#     sandlock-dev:latest sh scripts/test-all.sh
+#   docker run --privileged --rm -v "$PWD":/src -w /src --entrypoint bash \
+#     sandlock-dev:latest -c 'sh scripts/test-all.sh --oci-root'
+#
+# The oci suite is root-mode by design: sandlock-oci e2e supervises OCI-default
+# root containers, and S1.2 fail-closes RunAs(0,0) for non-root supervisors
+# (a tested feature, not a regression). The default (entrypoint drops to
+# uid 65534) run covers every other suite.
+set -eu
+cd "$(dirname "$0")/.."
+mkdir -p tmp
+BASELINE="docs/test-baseline.md"
+
+# The canonical image defaults CARGO_HOME to /opt/cargo, whose cache misses
+# crates (e.g. bincode). The repo-local rsproxy mirror cache is complete, so
+# pin CARGO_HOME here to make the --offline suites resolve.
+export CARGO_HOME="$PWD/tmp/cargo-home"
+
+# The canonical image runs as uid 65534 with HOME=/root (root-owned, 0700), so
+# tests that create ${HOME}/.config probes fail with EACCES. Fall back to a
+# writable repo-local home only when the caller's HOME is unusable.
+if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ] || [ ! -w "$HOME" ]; then
+    export HOME="$PWD/tmp/home"
+    mkdir -p "$HOME"
+fi
+
+expect() {  # exact expected pass count for a suite label
+    sed -n "s|^$1[[:space:]]*=[[:space:]]*\([0-9]\+\).*|\1|p" "$BASELINE" | head -1
+}
+rust_count() {  # sum "test result: ok. N passed" across all targets of a suite
+    sed -n "s/.*test result: ok\. \([0-9]\+\) passed.*/\1/p" "$1" | awk '{s+=$1} END {print s+0}'
+}
+py_count() {  # pytest -q summary is the last log line, e.g. "431 passed in 12.3s"
+    tail -1 "$1" | awk '{
+        for (i = 2; i <= NF; i++)
+            if ($i == "passed") { gsub(/[^0-9]/, "", $(i - 1)); print $(i - 1); exit }
+    }'
+}
+
+run() {  # run <label> <command...>
+    label="$1"; shift
+    log="tmp/test-all-$label.log"
+    rcfile="tmp/test-all-$label.rc"
+    printf '==> %s\n' "$label"
+    # sandlock's checkpoint/restore reopens a checkpointed child's stdio by
+    # path, so a suite whose stdout is a plain file would hand that file to the
+    # sandboxed child; the restored process then cannot reopen it (outside the
+    # sandbox fs policy) and dies in the restore stub. Tee the suite through an
+    # anonymous pipe so the child's stdio reads as pipe:[...] (skipped by the
+    # restore fd plan) while the exact bytes still land in the log file. POSIX
+    # sh cannot read a pipeline's first command status, so the suite records it
+    # in a temp file before the pipe closes.
+    rm -f "$rcfile"
+    { "$@" 2>&1; echo "$?" >"$rcfile"; } | tee "$log" >/dev/null
+    rc="$(cat "$rcfile" 2>/dev/null || echo 1)"
+    rm -f "$rcfile"
+    if [ "$rc" -ne 0 ]; then
+        printf '%s: suite FAILED (see %s)\n' "$label" "$log"; tail -40 "$log"; exit 1
+    fi
+    want="$(expect "$label")"
+    if [ -z "$want" ]; then
+        printf 'no baseline entry for %s in %s\n' "$label" "$BASELINE"; exit 1
+    fi
+    case "$label" in
+        python) got="$(py_count "$log")" ;;
+        *)      got="$(rust_count "$log")" ;;
+    esac
+    if [ "$want" != "$got" ]; then
+        printf '%s: baseline says %s passed, run produced %s\n' "$label" "$want" "$got"
+        tail -40 "$log"; exit 1
+    fi
+    # Cargo prints "0 ignored" on every passing target line, so the gate only
+    # fires on nonzero skipped/ignored counts.
+    if grep -Eq '[1-9][0-9]* (skipped|ignored)' "$log"; then
+        printf '%s: skipped/ignored tests are not allowed -- fix the environment or the test\n' "$label"
+        grep -En '[1-9][0-9]* (skipped|ignored)|^test .* ... SKIPPED' "$log" | head -20
+        exit 1
+    fi
+    printf '    %s passed -- matches baseline\n' "$got"
+}
+
+mode="${1:-}"
+case "$mode" in
+    ""|--wheels|--oci-root) ;;
+    *) printf 'usage: %s [--wheels|--oci-root]\n' "$0" >&2; exit 2 ;;
+esac
+
+if [ "$mode" = "--oci-root" ]; then
+    if [ "$(id -u)" -ne 0 ]; then
+        printf '%s\n' \
+            'oci is root-mode (sandlock-oci e2e supervises OCI-default root containers):' \
+            'run scripts/test-all.sh --oci-root as root in the same privileged container' >&2
+        exit 1
+    fi
+    run oci cargo test -p sandlock-oci --offline -- --test-threads=1
+    exit 0
+fi
+
+run core_lib   cargo test -p sandlock-core --offline --lib
+run core_integ cargo test -p sandlock-core --offline --test integration -- --test-threads=1
+run ffi        cargo test -p sandlock-ffi --offline
+run cli        cargo test -p sandlock-cli --offline
+# Workspace release build gate (the F0.4 build-break class: a CLI face that
+# only `cargo test -p X` misses). No test binaries, so baseline count is 0.
+run cli_build  cargo build --release --workspace --locked
+
+# Python needs the FFI debug lib built by the ffi suite above. The image's
+# site-packages are root-owned, so import via PYTHONPATH + LD_LIBRARY_PATH
+# (F0.3-proven path) instead of `pip install -e .`.
+export PYTHONPATH="$PWD/python/src${PYTHONPATH:+:$PYTHONPATH}"
+export LD_LIBRARY_PATH="$PWD/target-linux/debug${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+run python python3 -m pytest -p no:cacheprovider python/tests -q
+
+printf '%s\n' \
+    'oci is root-mode: run `sh scripts/test-all.sh --oci-root` as root to verify the oci baseline'
+
+if [ "$mode" = "--wheels" ]; then
+    ./python/build-wheels.sh && ./python/verify-wheel.sh
+fi

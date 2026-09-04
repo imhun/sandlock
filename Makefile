@@ -12,7 +12,7 @@ LIBDIR := $(DESTDIR)$(PREFIX)/lib
 INCLUDEDIR := $(DESTDIR)$(PREFIX)/include
 PCDIR := $(LIBDIR)/pkgconfig
 
-.PHONY: ffi install-go-lib uninstall-go-lib
+.PHONY: ffi install-go-lib uninstall-go-lib check
 
 # Build the native FFI shared library.
 ffi:
@@ -32,3 +32,8 @@ uninstall-go-lib:
 	rm -f $(LIBDIR)/libsandlock_ffi.so \
 		$(INCLUDEDIR)/sandlock.h \
 		$(PCDIR)/sandlock.pc
+
+# One-shot full-suite runner with exact baseline assertions (fork F0.1).
+# Canonical usage is inside the Linux container; see scripts/test-all.sh.
+check:
+	./scripts/test-all.sh
