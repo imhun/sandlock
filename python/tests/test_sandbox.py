@@ -15,6 +15,7 @@ import time
 import pytest
 
 from sandlock import Sandbox, Change, DryRunResult
+from sandlock._sdk import _NativePolicy
 
 
 _PYTHON_READABLE = list(dict.fromkeys([
@@ -895,6 +896,15 @@ class TestUnwiredFieldWarning:
 
         unwired = [x for x in w if "not wired through FFI" in str(x.message)]
         assert unwired == []
+
+    def test_notify_rate_limit_is_declared_handled(self):
+        """`notify_rate_limit` 经 FFI 生效，不得被当成未接线字段。"""
+        import warnings
+        assert "notify_rate_limit" in _NativePolicy._HANDLED_FIELDS
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _policy(notify_rate_limit=1000).run(["echo", "ok"])
+        assert [str(x.message) for x in w if "notify_rate_limit" in str(x.message)] == []
 
 
 class TestDiskQuota:

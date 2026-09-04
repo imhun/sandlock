@@ -1146,6 +1146,7 @@ class _NativePolicy:
         "http_allow", "http_deny", "http_ports", "http_ca", "http_key",
         "http_inject_ca", "http_ca_out", "http_inject", "host_mask",
         "egress_proxy", "uid", "gid",
+        "notify_rate_limit",
         "random_seed", "time_start", "clean_env", "env",
         "extra_deny_syscalls", "extra_allow_syscalls", "max_open_files",
         "no_randomize_memory", "no_huge_pages", "no_coredump", "deterministic_dirs",
