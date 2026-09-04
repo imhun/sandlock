@@ -208,6 +208,44 @@ project，限额是真加总的（这也是为什么只有内存/CPU/进程数�
 所以实例级超卖直接变成**节点超卖**：E9 的空闲检测/驱逐/自动扩缩看到的都是"预留值"，
 实际 RSS 可以远超，OOM 会先于准入判定发生。
 
+
+### 3.9 一沙箱一实例的安全前置：exec 复用新开的攻击面（2026-09-04）
+
+§8 的改造在**沙箱内部**新开一类回退（今天互不可见的兄弟命令，合并后同 uid、同 pid 空间、同一条
+宿主控制 socket），并把 `sandlock-oci` 现状实现与本文件既有的记账/鉴权问题合计**五条**变成放行门槛：
+
+| 编号 | 缺陷 | 严重度 |
+|---|---|---|
+| **SL-4** | `extra_fds` 用 `dup2` 落位（`sandbox.rs:2319`）⇒ 清掉 `FD_CLOEXEC`，**宿主↔init 控制 socket（fd 3）被每个沙箱进程继承**（实测 `3 -> socket:[同 inode]`、`fdinfo flags: 02`）。fd 3 是 init 那一端 ⇒ 沙箱可**向宿主 daemon 注入伪造应答**：**实测**一条假 `Exited` 让宿主 `exec` 返回退出码 0 而目标进程仍在跑；假 `Exited{未知 pid}` 进 `early_exits`（无上限）⇒ 60k 帧 supervisor RSS **+5.3 MB** 且功能照常。（原记"发 `Shutdown` 打死整箱"**已实测否证**、"抢读宿主请求偷 stdio fd"**未复现**） | High |
+| **SL-5** | `init/mod.rs:118-207` 在解析失败 / EOF / `RunMain` 分支不关闭收到的 fd + 帧边界按字节流猜。**可触达性修正**：能向 init 发帧的只有宿主 daemon ⇒ 属**正确性缺陷**，非沙箱可触发攻击 | Low-Medium |
+| **SL-7** | **控制协议无鉴权**：服务端 `SO_PEERCRED` 不匹配时**只 eprintln 不拒绝**（`control.rs:236-262`，注释假设"dir 0700 should prevent this"），帧协议仅"4 字节长度前缀 + JSON"、verb 不绑定租户。**实测**：整树 bind `/dev` 后（= E2B 镜像 rootfs 形态），沙箱内 python 枚举出 `['M','N','O','P']` 并对**别人的** control.sock 发 `config` ⇒ `ok=True` 返回对方 filesystem/limits/network 策略；不挂 /dev 时同一操作 EACCES ⇒ 配置相关。**`exec` verb 进这个协议 = 跨租户执行入口** | **High（exec 硬阻塞项）** |
+| **SL-8** | 进程数记账**没有退出兜底**：`proc_count` 唯一归还点是拦截到阻塞 `wait4/waitid`（`resource.rs:545-560`），没有 pidfd/`wait(-1)` 对账 ⇒ 孤儿/被收养进程**永久占用配额**。**实测**（`/proc/loadavg` 第 4 字段 = `proc_count`）：setsid 孤儿生灭一轮 `1/7→2/8→2/5`，第二轮 `2/5→3/6→3/5` ⇒ 可累加泄漏 | **High（已实测）** |
+| **SL-6** | `run_init` 只按特定 pid `wait_exit`，无 `waitpid(-1, WNOHANG)` 兜底 ⇒ 被收养的孤儿无人回收。**实测修正**：oci **没有 pid namespace**（容器与沙箱 `ns/pid` 相同）⇒ 孤儿归**外层 PID 1**（E2B worker 的 python 不 reap ⇒ 仍堆积）；开 `pid_ns` 后才归 init。**两档下 `proc_count` 都泄漏**（唯一归还点是 `wait4` 通知） | Medium-High |
+
+另有两条**合并语义**的实测确认（不新增 SL 编号，属设计后果）：沙箱内 `os.killpg(os.getpgid(0), SIGKILL)` 可打死整个实例（所有 child 共享 `pgid`=init，实测三条命令全灭）；`delete --force` 后 setsid 孤儿仍存活且能 `write()` 已打开的 fd（新 `open` 因监听者消失返回 ENOSYS ⇒ fail closed 但收尾不可靠）。
+
+第三批实测又改了两条判断（详见 `sandbox-exec-security.md` §10.3 / §4.15）：
+**沙箱内是"可打扰、不可窥探"** —— 兄弟进程的 `/proc/<pid>/{cmdline,stat,maps,environ,mem}` 全 EACCES、
+`ptrace` EPERM、`/proc` 不可枚举，但 `kill(pid)` 同 uid 可投递 ⇒ 原 SECE-4（"root 替你读兄弟元数据"）
+**在无 `pid_ns` 的当前形态不成立**，只在按 S8 打开 `pid_ns` 后成立（届时 on-behalf 白名单含 `cmdline`）
+⇒ 开 `pid_ns` 必须同步把白名单按 `PidKey` 收窄到本 child 子树。
+另实测到两条收尾事实：`delete --force` 后 setsid 孤儿仍存活且能 `write()` 已打开的 fd（新 `open` 返回 ENOSYS）；
+child 退出但其孙子持有 stdout 时，attached `exec` 被吊住约 30 s ⇒ 收尾必须按 **fd 持有者**判定。
+
+结构性约束：Landlock 与 seccomp 只能加严 ⇒ **per-exec 只能收窄**；放宽必须在实例创建时定死上限、
+越界的 exec 请求**显式拒绝**（on-behalf 注 fd 是 `fs_denied` 的旁路，必须走同一套检查）。
+归属口径：`sandlock-oci` **今天不在本项目部署路径上**（fork wheel 只含 `libsandlock_ffi.so` + Python 绑定，
+发布 Makefile 只 `build -p sandlock-ffi`，envd 走 `Sandbox.popen()`）⇒ SL-4/5/6 这三条是**潜在**缺陷，
+真正的风险是 §8 M1 把这套 init 下沉进 core 时原样带过来（哪些条目属于 OCI-live、
+哪些只在 E2B 才成立，见 `sandbox-exec-security.md` §4.0 的归属分级表）。
+
+以下有**本机实测**支撑（OrbStack `7.0.14-orbstack` + Landlock ABI **8** ⇒ macOS 也能做 exec 面
+验收，README 的"macOS 不得作为 Sandlock 验收环境"只对 Docker Desktop 成立；XFS prjquota 类用例仍不可用）：
+命令、输出与被否证项见 `sandbox-exec-security.md` §10。
+
+完整分析（13 条攻击面、归属分级、会话生命周期状态机、`shutdown()` 顺序、放行门槛与测试矩阵）见
+[`sandbox-exec-security.md`](sandbox-exec-security.md)。
+
 ## 4. E2B 侧当前缓解（不改 fork）
 
 - 纯 sandlock（无 chroot）形态**不再下发** `fs_denied`：这些路径本就不在 Landlock 可读白名单内，
@@ -266,6 +304,7 @@ fork 侧复跑命令（非 root 全程，入口脚本做一次性 root 准备）
 | 冻结是**整棵树**：`hold_forks` 挂起 fork，checkpoint freeze 已按沙箱设计 | `state.rs` 注释、`resource.rs:119` |
 | 内存记账按地址空间归属、exec/exit 会**自动归还有效额度**（多进程已经是对的） | `resource.rs:693` 注释、`604/610/625/658` |
 | 活沙箱有**控制通道**（unix socket + JSON 帧，带 `args` 字段，目前 `dead_code`） | `control.rs:274 ControlRequest`、`:340 "config"`、`:341 "ports"` |
+| **一实例多进程 + exec 的完整骨架**（stdio fd 传递、按 pid 退出回报、Shutdown） | `sandlock-oci`：`supervisor.rs:341-364`、`init/mod.rs:118-207`、`init/proto.rs`、`fdpass.rs` |
 | 宿主可拿到 pid、kill、wait、pause/resume、port mappings、checkpoint | FFI `sandlock_handle_{pid,kill,wait,wait_timeout,checkpoint,free,port_mappings}` |
 
 ⇒ **不需要**三层重写（我上一版 §8 写重了）。真正缺的是"从宿主再往活沙箱里塞一个根进程并把 stdio 交出来"，
@@ -273,11 +312,11 @@ fork 侧复跑命令（非 root 全程，入口脚本做一次性 root 准备）
 
 ### 7.2 缺口（这才是改造面）
 
-1. **`exec` verb + fd 传递**：控制协议现在只有 `config`/`ports`，且**全仓库没有 SCM_RIGHTS/sendfd**
-   ⇒ 新增 `exec`（args: argv、cwd、env、额外可写、bind 端口、pty 请求）并用
-   `sendmsg/recvmsg + SCM_RIGHTS` 把 stdin/stdout/stderr（或 pty master）三个 fd 传回宿主。
+1. **`exec` verb + fd 传递**：机制**已在 `crates/sandlock-oci` 跑通**（受限 PID-1 `sandlock-init`
+   + `RunMain`/`RunExec`/`Shutdown` + `fdpass.rs`/`init/fdrecv.rs` 的 SCM_RIGHTS + 按 pid 路由 `Exited`）；
+   确实只有 `control.rs` 侧没有 exec verb。⇒ 改造是**下沉复用**，不是新写，见 `sandbox-exec-security.md` §1。
 2. **实例生命周期解耦**：`wait()` 的收尾会 abort notif/throttle/loadavg/**control listener**、
-   清控制目录、关 DNS 网关（`sandbox.rs:1050-1086`，`control_handle` 见 :1065/:3123）
+   清控制目录、关 DNS 网关（`sandbox.rs:1061-1072`，`control_handle` 见 :1065/:3123）
    ⇒ 要变成"最后一个被 exec 出来的进程退出"或显式 `instance.shutdown()` 才做这些。
 3. **child id 与退出回报**：`sandlock_handle_wait` 等全部锚在单槽 `leader_pid.or(child_pid)`
    （:1375/:1389/:1404）⇒ 需要 `exec` 返回 child id、按 id wait/kill、退出码经控制通道回报；
@@ -334,3 +373,19 @@ instance 持有与释放时机（delete/kill/migrate/evict/worker 重启）；`_
 字段改走 `exec` 参数；`max_processes` 默认与容量联动（S1）；`update_network` 按 S2 落地并改契约测试；
 `command-logs.jsonl` 与 SL-1 复测（S6）；`docs/SCALING.md`、`resource-contention.md` 里
 "按沙箱预留 = 按实例核算"的一致性说明随之关闭 §3.8。
+
+### 7.65 已评估的替代入口：直接把 `sandlock-oci` 当主入口（2026-09-04）
+
+结论：**可行但不推荐做长期主入口**（完整评估见 `sandbox-exec-security.md` §11）。
+实测支撑：envd 可用纯 Python `sendmsg + SCM_RIGHTS` 直连 `state_dir/<fnv1a16(id)>.sock`
+驱动 `exec`（CPython 3.14 无 `send_fds`）；`/bin/sh -c true` 的每命令成本
+基线 1.24 ms → 沙箱内直连 exec **5.85 ms** → 走 CLI **11.57 ms**（必须绕开 CLI）；
+共享预算（本方案主收益）在 oci 路径上**今天就成立**（§10.2 V5）。
+不推荐的理由：E2B 的策略字段（网络 / header 注入 / host_mask / bind 端口 / `max_open_files` /
+`clean_env` / protection）在 OCI spec 里没有入口，要往 `policy.rs` 塞 E2B 专有扩展；
+且只有组级 `Signal`（实测一发打死整箱）、无 `pause/resume/stats/update_network` verb、无 PTY、
+**Exit 帧可丢**（直连 12 次丢 2 次）、每沙箱常驻 ≈25 MB（`E2B_MAX_SANDBOXES=100` ⇒ ≈2.5 GB/节点）。
+反过来该抄的两样：**exec 通道不要落 `/dev/shm`、目录名要哈希**（oci 的通道在沙箱内实测全 EACCES，
+而 §8 原计划落 `/dev/shm/sandlock-<uid>/<明文 id>` ⇒ 正是 §3.9 SL-7 的可枚举可连面）。
+唯一值得重评 §8 决策的分支：fork 侧愿意把"策略扩展 + per-child verb + stats/pause/resume"
+做成 oci 一等能力（可先探上游意愿）。
