@@ -1,0 +1,18 @@
+#!/bin/sh
+# rustc and the cc crate invoke the target compiler/linker as a plain
+# program. cc-rs additionally passes a rust-style `--target=<triple>` (e.g.
+# x86_64-unknown-linux-gnu) which zig rejects — drop it and inject our own
+# `-target $ZIG_TARGET` (x86_64-linux-gnu.2.34 / aarch64-linux-gnu.2.34; the
+# .2.34 pins glibc so wheels pass the manylinux_2_34 policy).
+args=""
+for arg in "$@"; do
+    case "$arg" in
+        # rustc's aarch64 target spec passes --fix-cortex-a53-843419 (a
+        # GNU-ld-only erratum workaround) to the linker, either bare or
+        # wrapped in -Wl,; zig's lld rejects it and it is not required.
+        --target=* | --fix-cortex-a53-843419 | -Wl,--fix-cortex-a53-843419) ;;
+        *) args="$args $arg" ;;
+    esac
+done
+# shellcheck disable=SC2086
+exec zig cc -target "$ZIG_TARGET" $args

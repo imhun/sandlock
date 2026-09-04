@@ -125,12 +125,24 @@ print(subprocess.run(["ls","-n",str(shared)],capture_output=True,text=True).stdo
 `net_isolation` + 镜像 rootfs 组合下，MCP 网关监听起不来（宿主侧映射端口整段连不上）；
 纯 sandlock 形态同一套件 3/3 通过。E2B 侧 `net_isolation` + chroot 用例标 `xfail(strict=True)`。
 
-### 3.4 wheel 与 tip 的一致性只能靠重跑自证
+### 3.4 wheel 与 tip 的一致性：fork 侧符号级自证（已落地，F0.2）
 
-wheel 产物时间戳早于 tip 提交，无法从文件本身判定。已用符号核对佐证其**包含** fork 侧能力：
-`sandlock_sandbox_builder_{egress_proxy,http_auth,credential,host_mask,notify_rate_limit,pid_ns,net_isolation,fd_inject_connect}`
-均在 `.so` 中导出（`port_mappings` 走 `net_bind_map`，本就不是独立符号）。发布前仍应重跑
-`scripts/build-sandlock-wheels.sh` 并重建 worker/测试镜像。
+wheel 产物时间戳早于 tip 提交，无法从文件本身判定；F0.2 起 fork 自己拥有 wheel 构建，产物与 tip 的
+一致性由 fork 侧脚本**符号级自证**，不再依赖外部仓库重跑：
+
+- `python/build-wheels.sh`：zig + manylinux_2_34 + auditwheel 双架构单 builder（builder 资产随仓库放
+  在 `python/wheel-builder/`；`Dockerfile`/`zigcc`/`cargo-config.toml`），构建上下文 = fork 工作树的
+  精简镜像（`Cargo.toml`/`Cargo.lock`/`crates`/`python`），一次构建产出 amd64 + arm64 两个
+  manylinux_2_34 cp314 wheel 到 git-ignored 的 `wheels/`。
+- `python/verify-wheel.sh`：解包 wheel → `nm -D --defined-only` 读 `libsandlock_ffi*.so` 的导出符号 →
+  与当前 tip 的 `target/release/libsandlock_ffi.so`（容器内构建）双向对比。规则是**符号集必须等于当前
+  tip 的符号集**：tip 有而 wheel 缺的符号逐个点名并以非零退出（新增 FFI 符号后 wheel 未重建 ⇒ 立刻红），
+  wheel 多出的符号同样点名失败；同时打印 `git rev-parse HEAD` 与 wheel 内 `sandlock/_version.py`。
+
+符号核对佐证 fork 侧能力（`sandlock_sandbox_builder_{egress_proxy,http_auth,credential,host_mask,
+notify_rate_limit,pid_ns,net_isolation,fd_inject_connect}`，`port_mappings` 走 `net_bind_map`，本就不是
+独立符号）仍成立。发布前重跑 `python/build-wheels.sh && python/verify-wheel.sh`（
+`scripts/test-all.sh --wheels` 已把两者串起来）并重建 worker/测试镜像。
 
 ### 3.5 非 root supervisor 无法映射任意 host uid（S1.2 约束，结构性）
 
