@@ -11,7 +11,7 @@
 #   2. root-mode phase: oci — `sh scripts/test-all.sh --oci-root` as root.
 core_lib = 791 # F1.4 (SL-8): +1 plan unit test pidfd_release_is_idempotent
                # in resource.rs
-core_integ = 488 # F2.1 (M0 lifecycle lift): 477 -> 481 (+4 lifecycle tests);
+core_integ = 493 # F2.1 (M0 lifecycle lift): 477 -> 481 (+4 lifecycle tests);
                  # F2.2 (shutdown seven-step order + idempotency): 481 -> 484,
                  # +3 in integration/test_instance_lifecycle.rs
                  # (test_shutdown_escalates_after_grace_for_term_ignoring_child,
@@ -29,12 +29,23 @@ core_integ = 488 # F2.1 (M0 lifecycle lift): 477 -> 481 (+4 lifecycle tests);
                  # All other suites unchanged. (481 = F1.4's +2 orphan tests
                  # on top of the F1.3 control-auth pair 471 -> 475, then
                  # +4 F2.1.)
+                 # F2b.2 (dual transport): 488 -> 493, +5 in
+                 # integration/test_control.rs
+                 # (test_socketpair_channel_rejects_third_party,
+                 # test_fd_handoff_channel_rejects_third_party,
+                 # test_path_mode_peer_uid_mismatch_closes,
+                 # test_registered_path_channel_accepts_allowlisted_peer_with_token,
+                 # test_sandbox_cannot_reach_sibling_channel).
 ffi = 89
 cli = 95      # after F0.4 wiring (cli suite includes net_bind_map tests)
-supervise = 17 # F2b.1: new crates/sandlock-supervise (full-field policy entry +
+supervise = 22 # F2b.1: new crates/sandlock-supervise (full-field policy entry +
                # uid self-check; 13 lib unit + 4 integration tests, including
                # test_supervise_refuses_wrong_uid and
-               # test_policy_roundtrip_covers_every_field)
+               # test_policy_roundtrip_covers_every_field).
+               # F2b.2: 17 -> 22 (+1 lib unit egress_proxy_full_config_reads_back_equal,
+               # +4 integration: real --policy <fd> happy path + timeout +
+               # oversize-limit semantics, and single-generation fd-serve
+               # lifecycle test_supervise_serves_control_fd_until_shutdown).
 oci = 144     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e2e
               # supervises OCI-default root containers; S1.2 fail-closes
               # RunAs(0,0) for non-root supervisors (tested feature). 140 = 55+67+18
