@@ -11,10 +11,14 @@
 #   2. root-mode phase: oci — `sh scripts/test-all.sh --oci-root` as root.
 core_lib = 791 # F1.4 (SL-8): +1 plan unit test pidfd_release_is_idempotent
                # in resource.rs
-core_integ = 477 # F1.4 (SL-8): +2 plan tests in test_resource.rs
-                 # (test_setsid_orphan_returns_proc_count,
-                 # test_proc_count_matches_live_after_orphan_storm); the F1.3
-                 # control-auth pair (471 -> 475) is included in this total
+core_integ = 481 # F2.1 (M0 lifecycle lift): 477 -> 481, +4 in the new
+                 # integration/test_instance_lifecycle.rs
+                 # (test_instance_outlives_first_process,
+                 # test_shutdown_is_idempotent,
+                 # test_shutdown_releases_control_dir_and_dns_gateway,
+                 # test_legacy_run_still_reclaims_all_resources); all other
+                 # suites unchanged. (477 = F1.4's +2 orphan tests on top of
+                 # the F1.3 control-auth pair 471 -> 475.)
 ffi = 89
 cli = 95      # after F0.4 wiring (cli suite includes net_bind_map tests)
 oci = 144     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e2e
