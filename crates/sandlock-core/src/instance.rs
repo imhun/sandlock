@@ -294,8 +294,11 @@ impl SandboxInstance {
         }
 
         // 1. Kill + reap a live first process (full §5.3 escalation is F2.2),
-        //    so the control-dir removal below is final.
-        self.kill_and_reap();
+        //    so the control-dir removal below is final. Record the reaped
+        //    status so a later `wait_child` stays well-defined.
+        if let Some(exit) = self.kill_and_reap() {
+            self.state = RuntimeState::Stopped(exit);
+        }
         // 2. Abort the supervisor-side session tasks: notif supervisor,
         //    policy_fn worker, throttle, loadavg, control listener, and the
         //    DNS gateway (whose `:53` listener dies with its task).
@@ -334,8 +337,14 @@ impl SandboxInstance {
 
     /// Kill and reap the session's process if it is still running (the Drop /
     /// pre-shutdown backstop; mirrors the historical `Sandbox::drop` steps).
-    fn kill_and_reap(&mut self) {
+    /// Returns the reaped status when this call actually reaped the child
+    /// (`None` when nothing was running, or when the child was already
+    /// reaped). Like the historical `Drop`, this does *not* mutate `state`;
+    /// callers decide whether to record the status (`shutdown` does, `Drop`
+    /// deliberately does not, preserving the old drop-time disposition).
+    fn kill_and_reap(&mut self) -> Option<ExitStatus> {
         if let Some(pid) = self.child_pid {
+            let mut reaped: Option<ExitStatus> = None;
             if matches!(
                 self.state,
                 RuntimeState::Created | RuntimeState::Running | RuntimeState::Paused
@@ -347,9 +356,7 @@ impl SandboxInstance {
                 unsafe { libc::killpg(group, libc::SIGKILL) };
                 let mut status: i32 = 0;
                 if unsafe { libc::waitpid(pid, &mut status, 0) } > 0 {
-                    // A shutdown that kills a never-waited child records the
-                    // reaped status so a later `wait_child` stays well-defined.
-                    self.state = RuntimeState::Stopped(sandbox_wait_status_to_exit(status));
+                    reaped = Some(sandbox_wait_status_to_exit(status));
                 }
             }
             if self.tty_foreground_taken {
@@ -357,7 +364,9 @@ impl SandboxInstance {
                 restore_tty_foreground(fg_pid);
                 self.tty_foreground_taken = false;
             }
+            return reaped;
         }
+        None
     }
 
     /// Abort every supervisor-side session task (best-effort; each handle is

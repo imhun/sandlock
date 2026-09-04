@@ -945,6 +945,14 @@ impl Sandbox {
         ProcessStats { proc_count: 0, live_watchers: 0, drift: 0 }
     }
 
+    /// The sandbox's DNS gateway address (only when wildcard-domain network
+    /// rules made a gateway necessary). The one-shot session releases the
+    /// gateway — and with it this address's `:53` listener — when `run`/
+    /// `popen`/`spawn`'s wait tears the session down.
+    pub fn dns_gateway_addr(&self) -> Option<std::net::Ipv4Addr> {
+        self.runtime.as_ref().and_then(|rt| rt.dns_gateway_addr)
+    }
+
     /// Wait for the child process to exit.
     ///
     /// One-shot session semantics (M0 lifecycle lift): the sandbox's runtime

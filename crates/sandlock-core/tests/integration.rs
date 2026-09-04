@@ -85,6 +85,9 @@ mod test_protection;
 #[path = "integration/test_http_inject_ca.rs"]
 mod test_http_inject_ca;
 
+#[path = "integration/test_instance_lifecycle.rs"]
+mod test_instance_lifecycle;
+
 #[path = "integration/test_restore.rs"]
 mod test_restore;
 

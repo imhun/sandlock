@@ -1,0 +1,345 @@
+//! M0 lifecycle tests for the explicit session instance (fork-plan F2.1).
+//!
+//! A `SandboxInstance` is the explicit owner of a sandbox session's
+//! resources (supervisor tasks, F1.3 control directory + token, DNS gateway,
+//! supervisor state). These tests pin the M0 contract:
+//!
+//! * the session outlives its first process — `wait_child` returns the
+//!   process's result but leaves the session (control dir, DNS gateway,
+//!   runtime) alive;
+//! * `shutdown` is idempotent;
+//! * `shutdown` releases the control directory and the DNS gateway with no
+//!   leftover process or fd;
+//! * the legacy `Sandbox::run`/`popen`/`spawn` one-shot paths still reclaim
+//!   everything exactly as before (they drive a one-shot instance whose
+//!   `wait` runs `wait_child` + `shutdown`).
+
+use std::io::Read;
+use std::net::UdpSocket;
+use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
+
+use sandlock_core::control;
+use sandlock_core::instance::{InstancePhase, SandboxInstance};
+use sandlock_core::{Sandbox, StdioMode};
+
+fn base_policy() -> sandlock_core::SandboxBuilder {
+    Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write("/tmp")
+}
+
+/// A wildcard-domain network rule forces the session DNS gateway (a
+/// per-sandbox `127.0.1.x` loopback `:53` listener) to exist.
+fn base_policy_with_gateway() -> sandlock_core::SandboxBuilder {
+    base_policy().net_allow("*.lifecycle.example:443")
+}
+
+/// Count this process's open fds (`/proc/self/fd`), used to pin "no leftover
+/// fd" after a session shutdown. The counting test runs on a multi-thread
+/// tokio runtime whose worker fds exist before the baseline is taken, so the
+/// count is stable while the session is alive and must return to baseline once
+/// the session's tasks (notif/control/DNS/drains) are gone.
+fn open_fd_count() -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .expect("/proc/self/fd must be readable")
+        .count()
+}
+
+fn process_is_gone(pid: i32) -> bool {
+    let r = unsafe { libc::kill(pid, 0) };
+    r != 0
+}
+
+/// Poll `cond` until it is true or `timeout` elapses; returns the last value.
+async fn poll_until(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cond() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A live session's control socket must accept a connection (the listener task
+/// is still serving) and its DNS gateway must still own `:53`.
+fn assert_session_resources_live(inst: &SandboxInstance) {
+    let dir = inst.control_dir().expect("session control dir");
+    assert!(
+        dir.exists(),
+        "session control dir must still exist after the first process exits: {:?}",
+        dir
+    );
+    let sock = control::sock_path(dir);
+    UnixStream::connect(&sock).unwrap_or_else(|e| {
+        panic!(
+            "session control socket must still accept connections after the \
+             first process exits ({}): {e}",
+            sock.display()
+        )
+    });
+    let gw = inst
+        .dns_gateway_addr()
+        .expect("wildcard rules must allocate a session DNS gateway");
+    let rebound = UdpSocket::bind((gw, 53));
+    assert!(
+        rebound.is_err(),
+        "session DNS gateway must still own {gw}:53 after the first process exits"
+    );
+}
+
+/// The first process exits but the session stays alive: runtime, control
+/// directory + socket, and the DNS gateway are all still present, and the
+/// session can then be shut down on demand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_instance_outlives_first_process() {
+    let name = "inst-life-outlive";
+    let mut inst = SandboxInstance::launch(
+        base_policy_with_gateway().build().unwrap().with_name(name),
+        &["sh", "-c", "printf first; exit 0"],
+    )
+    .await
+    .expect("launch");
+    let child_pid = inst.pid().expect("launched process pid");
+    assert_eq!(inst.phase(), InstancePhase::Live);
+
+    let result = inst.wait_child().await.expect("wait for first process");
+    assert!(result.success(), "first process must exit 0");
+    assert_eq!(
+        result.stdout.as_deref(),
+        Some(&b"first"[..]),
+        "capture must survive the session, not be tied to the process wait"
+    );
+
+    // Process is reaped — but the session must be fully alive.
+    assert!(
+        process_is_gone(child_pid),
+        "the first process must be reaped after wait_child"
+    );
+    assert_eq!(
+        inst.phase(),
+        InstancePhase::Live,
+        "the session must not die with its first process"
+    );
+    assert_session_resources_live(&inst);
+
+    inst.shutdown().await.expect("controlled shutdown");
+    assert_eq!(inst.phase(), InstancePhase::ShutDown);
+    assert!(
+        !inst.control_dir().unwrap().exists(),
+        "shutdown must remove the session control dir"
+    );
+}
+
+/// `shutdown` is idempotent: repeated calls do not panic, return the same
+/// `Ok`, and leave the session in the terminal `ShutDown` phase — both after a
+/// completed first process and when a live process has to be killed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_shutdown_is_idempotent() {
+    // Path 1: the first process already exited.
+    let mut inst = SandboxInstance::launch(
+        base_policy().build().unwrap().with_name("inst-life-idem-exited"),
+        &["sh", "-c", "exit 0"],
+    )
+    .await
+    .expect("launch");
+    inst.wait_child().await.expect("wait for first process");
+
+    inst.shutdown().await.expect("first shutdown");
+    assert_eq!(inst.phase(), InstancePhase::ShutDown);
+    inst.shutdown().await.expect("second shutdown must be Ok, not panic");
+    inst.shutdown().await.expect("third shutdown must be Ok, not panic");
+    assert_eq!(
+        inst.phase(),
+        InstancePhase::ShutDown,
+        "phase must stay terminal across repeated shutdowns"
+    );
+
+    // Path 2: shutdown lands while the first process is still running — it is
+    // killed and reaped, and repeated shutdowns stay no-ops.
+    let mut inst = SandboxInstance::launch(
+        base_policy().build().unwrap().with_name("inst-life-idem-live"),
+        &["sleep", "100"],
+    )
+    .await
+    .expect("launch");
+    let child_pid = inst.pid().expect("launched process pid");
+
+    inst.shutdown().await.expect("shutdown with a live process");
+    assert_eq!(inst.phase(), InstancePhase::ShutDown);
+    assert!(
+        process_is_gone(child_pid),
+        "a live process must not survive its session's shutdown"
+    );
+    inst.shutdown().await.expect("repeat shutdown after live kill");
+    inst.shutdown().await.expect("repeat shutdown after live kill");
+    assert_eq!(inst.phase(), InstancePhase::ShutDown);
+}
+
+/// `shutdown` releases the F1.3 control directory (hashed dir + token +
+/// socket) and the DNS gateway, and leaves no leftover process or fd behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_shutdown_releases_control_dir_and_dns_gateway() {
+    let name = "inst-life-release";
+    let fd_baseline = open_fd_count();
+    let mut inst = SandboxInstance::launch(
+        base_policy_with_gateway().build().unwrap().with_name(name),
+        &["sh", "-c", "exit 0"],
+    )
+    .await
+    .expect("launch");
+    let child_pid = inst.pid().expect("launched process pid");
+    let dir = inst.control_dir().expect("session control dir").clone();
+    let gw = inst
+        .dns_gateway_addr()
+        .expect("wildcard rules must allocate a session DNS gateway");
+
+    assert_eq!(dir, control::sandbox_dir(name));
+    assert!(dir.exists(), "control dir must exist while the session is live");
+    inst.wait_child().await.expect("wait for first process");
+    assert_session_resources_live(&inst);
+
+    inst.shutdown().await.expect("shutdown");
+    assert_eq!(inst.phase(), InstancePhase::ShutDown);
+
+    // Control directory: files (token/pid/name/mode/control.sock) removed and
+    // the dir itself gone; the socket no longer accepts connections.
+    assert!(
+        !dir.exists(),
+        "shutdown must remove the session control dir: {:?}",
+        dir
+    );
+    assert!(!control::sock_path(&dir).exists(), "control.sock must be removed");
+    assert!(
+        UnixStream::connect(control::sock_path(&dir)).is_err(),
+        "the control socket must refuse connections after shutdown"
+    );
+
+    // No leftover process (wait_child reaped it; shutdown must not re-create
+    // anything).
+    assert!(
+        process_is_gone(child_pid),
+        "no session process may survive shutdown"
+    );
+
+    // No leftover fd: the gateway socket, notif fd, control listener and drain
+    // fds close once their tasks are aborted (abort is asynchronous, so poll).
+    assert!(
+        poll_until(
+            || open_fd_count() == fd_baseline,
+            Duration::from_secs(10)
+        )
+        .await,
+        "shutdown must release every session fd (baseline {fd_baseline}, \
+         final {})",
+        open_fd_count()
+    );
+
+    // DNS gateway: the `:53` listener is gone, so the address is bindable
+    // again (UDP has no TIME_WAIT).
+    let rebound = UdpSocket::bind((gw, 53));
+    assert!(
+        rebound.is_ok(),
+        "shutdown must release the DNS gateway address {gw}:53 (err: {:?})",
+        rebound.err()
+    );
+}
+
+/// The legacy one-shot paths (`run` / `popen` / `spawn`+`wait`) drive a
+/// one-shot instance and must reclaim every resource exactly as before: the
+/// control dir disappears, the child is reaped, and a wildcard-configured run
+/// releases its DNS gateway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_legacy_run_still_reclaims_all_resources() {
+    // run (capture) with a DNS gateway: after run returns, the session the
+    // sandbox drove is already shut down.
+    let mut run_sb = base_policy_with_gateway()
+        .build()
+        .unwrap()
+        .with_name("inst-life-legacy-run");
+    let result = run_sb.run(&["echo", "legacy"]).await.expect("run");
+    assert!(result.success());
+    assert_eq!(result.stdout_str(), Some("legacy"));
+    let gw = run_sb
+        .dns_gateway_addr()
+        .expect("wildcard run must allocate a gateway");
+    let run_pid = run_sb.pid().expect("run pid");
+    assert!(
+        poll_until(
+            || UdpSocket::bind((gw, 53)).is_ok(),
+            Duration::from_secs(10)
+        )
+        .await,
+        "legacy run must release its DNS gateway address {gw}:53"
+    );
+    assert!(
+        process_is_gone(run_pid),
+        "legacy run must reap its child"
+    );
+    assert!(
+        !control::sandbox_dir("inst-life-legacy-run").exists(),
+        "legacy run must remove its control dir"
+    );
+    drop(run_sb);
+    assert!(
+        !control::sandbox_dir("inst-life-legacy-run").exists(),
+        "dropping the spent sandbox must leave no control dir behind"
+    );
+
+    // popen: streaming stdio, then Process::wait drives the one-shot teardown.
+    let mut popen_sb = base_policy()
+        .build()
+        .unwrap()
+        .with_name("inst-life-legacy-popen");
+    let mut child = popen_sb
+        .popen(
+            &["echo", "p"],
+            StdioMode::Inherit,
+            StdioMode::Piped,
+            StdioMode::Inherit,
+        )
+        .await
+        .expect("popen");
+    let mut stdout = String::new();
+    std::fs::File::from(child.take_stdout().expect("stdout pipe"))
+        .read_to_string(&mut stdout)
+        .expect("read stdout");
+    assert_eq!(stdout, "p\n");
+    let result = child.wait().await.expect("popen wait");
+    assert!(result.success());
+    let popen_pid = popen_sb.pid().expect("popen pid");
+    assert!(process_is_gone(popen_pid), "popen wait must reap its child");
+    assert!(
+        !control::sandbox_dir("inst-life-legacy-popen").exists(),
+        "popen wait must remove its control dir"
+    );
+
+    // spawn + kill + wait: the kill path must also reclaim everything.
+    let mut spawn_sb = base_policy()
+        .build()
+        .unwrap()
+        .with_name("inst-life-legacy-spawn");
+    spawn_sb
+        .spawn(&["sh", "-c", "sleep 60"])
+        .await
+        .expect("spawn");
+    let spawn_pid = spawn_sb.pid().expect("spawn pid");
+    spawn_sb.kill().expect("kill");
+    let result = spawn_sb.wait().await.expect("spawn wait");
+    assert!(!result.success(), "a killed child must not report success");
+    assert!(process_is_gone(spawn_pid), "spawn wait must reap its child");
+    assert!(
+        !control::sandbox_dir("inst-life-legacy-spawn").exists(),
+        "spawn wait must remove its control dir"
+    );
+}
