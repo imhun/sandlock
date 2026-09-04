@@ -7,9 +7,16 @@
 //! * the session outlives its first process — `wait_child` returns the
 //!   process's result but leaves the session (control dir, DNS gateway,
 //!   runtime) alive;
-//! * `shutdown` is idempotent;
+//! * `shutdown` is idempotent across repeated calls (three-call acceptance),
+//!   removes the control directory, and leaves no process or fd behind;
 //! * `shutdown` releases the control directory and the DNS gateway with no
 //!   leftover process or fd;
+//! * the F2.2 escalation ladder kills a live child that ignores the graceful
+//!   shutdown request once its grace window elapses;
+//! * the F2.1 review minors are pinned where they are observable: a session
+//!   shut down without `wait_child` closes its pidfd and HTTP ACL proxy
+//!   (B-5), and dropping an instance right after `wait_child` still applies
+//!   the recorded COW disposition (B-3 branch handoff);
 //! * the legacy `Sandbox::run`/`popen`/`spawn` one-shot paths still reclaim
 //!   everything exactly as before (they drive a one-shot instance whose
 //!   `wait` runs `wait_child` + `shutdown`).
@@ -21,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use sandlock_core::control;
 use sandlock_core::instance::{InstancePhase, SandboxInstance};
+use sandlock_core::sandbox::BranchAction;
 use sandlock_core::{Sandbox, StdioMode};
 
 fn base_policy() -> sandlock_core::SandboxBuilder {
@@ -143,7 +151,9 @@ async fn test_instance_outlives_first_process() {
 
 /// `shutdown` is idempotent: repeated calls do not panic, return the same
 /// `Ok`, and leave the session in the terminal `ShutDown` phase — both after a
-/// completed first process and when a live process has to be killed.
+/// completed first process and when a live process has to be killed. The
+/// three-call acceptance also asserts the control directory is gone and stays
+/// gone across the repeats (F2.2: shutdown × 3, no panic, no residue).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_shutdown_is_idempotent() {
     // Path 1: the first process already exited.
@@ -153,16 +163,29 @@ async fn test_shutdown_is_idempotent() {
     )
     .await
     .expect("launch");
+    let dir = inst
+        .control_dir()
+        .expect("session control dir")
+        .clone();
+    assert!(dir.exists(), "control dir must exist while the session is live");
     inst.wait_child().await.expect("wait for first process");
 
     inst.shutdown().await.expect("first shutdown");
     assert_eq!(inst.phase(), InstancePhase::ShutDown);
+    assert!(
+        !dir.exists(),
+        "shutdown must remove the control dir (path 1)"
+    );
     inst.shutdown().await.expect("second shutdown must be Ok, not panic");
     inst.shutdown().await.expect("third shutdown must be Ok, not panic");
     assert_eq!(
         inst.phase(),
         InstancePhase::ShutDown,
         "phase must stay terminal across repeated shutdowns"
+    );
+    assert!(
+        !dir.exists(),
+        "control dir must stay gone across repeated shutdowns (path 1)"
     );
 
     // Path 2: shutdown lands while the first process is still running — it is
@@ -174,6 +197,11 @@ async fn test_shutdown_is_idempotent() {
     .await
     .expect("launch");
     let child_pid = inst.pid().expect("launched process pid");
+    let dir = inst
+        .control_dir()
+        .expect("session control dir")
+        .clone();
+    assert!(dir.exists(), "control dir must exist while the session is live");
 
     inst.shutdown().await.expect("shutdown with a live process");
     assert_eq!(inst.phase(), InstancePhase::ShutDown);
@@ -181,9 +209,187 @@ async fn test_shutdown_is_idempotent() {
         process_is_gone(child_pid),
         "a live process must not survive its session's shutdown"
     );
+    assert!(
+        !dir.exists(),
+        "shutdown must remove the control dir (path 2)"
+    );
     inst.shutdown().await.expect("repeat shutdown after live kill");
     inst.shutdown().await.expect("repeat shutdown after live kill");
     assert_eq!(inst.phase(), InstancePhase::ShutDown);
+    assert!(
+        process_is_gone(child_pid),
+        "repeated shutdowns must not re-create a process"
+    );
+    assert!(
+        !dir.exists(),
+        "control dir must stay gone across repeated shutdowns (path 2)"
+    );
+}
+
+/// A session shut down *without* `wait_child` still closes every
+/// session-owned handle while the instance is alive (F2.1 review B-5): the
+/// direct child's pidfd and the HTTP ACL proxy handle used to survive until
+/// `Drop`, contradicting `shutdown`'s "every session-owned resource released"
+/// contract. The pidfd and the proxy's loopback listener both show up in the
+/// process fd count, so the count must return to its baseline right after
+/// `shutdown` — before the instance is dropped. Two more shutdown calls stay
+/// no-ops and leave no residue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_shutdown_without_wait_closes_pidfd_and_http_acl() {
+    let name = "inst-life-live-b5";
+    let fd_baseline = open_fd_count();
+    let mut inst = SandboxInstance::launch(
+        base_policy()
+            .http_allow("GET 127.0.0.1/anything")
+            .build()
+            .unwrap()
+            .with_name(name),
+        &["sleep", "60"],
+    )
+    .await
+    .expect("launch");
+    let child_pid = inst.pid().expect("launched process pid");
+    let dir = inst
+        .control_dir()
+        .expect("session control dir")
+        .clone();
+
+    inst.shutdown().await.expect("shutdown with a live process");
+    assert_eq!(inst.phase(), InstancePhase::ShutDown);
+    assert!(
+        process_is_gone(child_pid),
+        "a live process must not survive its session's shutdown"
+    );
+    assert!(!dir.exists(), "shutdown must remove the session control dir");
+    assert!(
+        poll_until(
+            || open_fd_count() == fd_baseline,
+            Duration::from_secs(10)
+        )
+        .await,
+        "shutdown must close the session pidfd and HTTP ACL listener while \
+         the instance is still alive (baseline {fd_baseline}, final {})",
+        open_fd_count()
+    );
+
+    inst.shutdown().await.expect("repeat shutdown");
+    inst.shutdown().await.expect("repeat shutdown");
+    assert_eq!(inst.phase(), InstancePhase::ShutDown);
+    assert!(
+        process_is_gone(child_pid),
+        "repeated shutdowns must not re-create a process"
+    );
+    assert!(!dir.exists(), "control dir must stay gone");
+    assert_eq!(
+        open_fd_count(),
+        fd_baseline,
+        "repeated shutdowns must not re-create session fds"
+    );
+}
+
+/// Dropping an instance immediately after `wait_child` must still apply the
+/// recorded COW disposition (F2.1 review B-3 semantics). `wait_child` hands
+/// the COW branch to the instance before it returns, so the instance's `Drop`
+/// backstop commits it exactly once — the same behavior the historical
+/// `Sandbox::wait`-then-drop path had before the M0 lift.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_drop_after_wait_child_disposes_cow_branch() {
+    let workdir = std::env::temp_dir().join(format!(
+        "sandlock-inst-life-cow-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&workdir);
+    std::fs::create_dir_all(&workdir).expect("create COW workdir");
+    let new_file = workdir.join("waited.txt");
+
+    let mut inst = SandboxInstance::launch(
+        base_policy()
+            .fs_write(&workdir)
+            .workdir(&workdir)
+            .on_exit(BranchAction::Commit)
+            .build()
+            .unwrap()
+            .with_name("inst-life-cow-b3"),
+        &["sh", "-c", &format!("touch {}", new_file.display())],
+    )
+    .await
+    .expect("launch");
+    let result = inst.wait_child().await.expect("wait for first process");
+    assert!(result.success(), "touch must succeed");
+    assert_eq!(
+        inst.phase(),
+        InstancePhase::Live,
+        "wait_child must leave the session alive"
+    );
+
+    // The branch was handed to the instance by wait_child; Drop's backstop
+    // commits it. Before the B-3 fix the branch still sat in the shared
+    // supervisor state, so Drop cleaned it up instead of committing.
+    drop(inst);
+    assert!(
+        new_file.exists(),
+        "dropping after wait_child must apply the recorded Commit disposition"
+    );
+
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+/// F2.2 escalation: a child that ignores the graceful shutdown request (TERM)
+/// stays alive through the grace window and is then SIGKILLed by the §5.3
+/// escalation ladder, after which shutdown completes normally — control dir
+/// gone, process gone, terminal phase.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_shutdown_escalates_after_grace_for_term_ignoring_child() {
+    let name = "inst-life-escalate";
+    let marker = std::env::temp_dir().join(format!(
+        "sandlock-f22-escalate-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let marker_arg = marker.display().to_string();
+
+    // The shell ignores TERM and keeps looping (each `sleep` child may or may
+    // not inherit the ignore; the direct child is what shutdown waits on, and
+    // it survives TERM either way), so only the escalation SIGKILL ends it.
+    let mut inst = SandboxInstance::launch(
+        base_policy().build().unwrap().with_name(name),
+        &[
+            "sh",
+            "-c",
+            &format!("trap '' TERM; touch {marker_arg}; while :; do sleep 1; done"),
+        ],
+    )
+    .await
+    .expect("launch");
+    let child_pid = inst.pid().expect("launched process pid");
+    assert!(
+        poll_until(|| marker.exists(), Duration::from_secs(10)).await,
+        "the child must install its TERM trap before shutdown is tested"
+    );
+
+    let grace = Duration::from_millis(800);
+    let started = Instant::now();
+    inst.shutdown_with_grace(grace)
+        .await
+        .expect("shutdown with escalation");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_millis(600),
+        "shutdown must honor the grace window before escalating \
+         (grace {grace:?}, elapsed {elapsed:?})"
+    );
+    assert_eq!(inst.phase(), InstancePhase::ShutDown);
+    assert!(
+        process_is_gone(child_pid),
+        "escalation must kill the TERM-ignoring child"
+    );
+    assert!(
+        !inst.control_dir().unwrap().exists(),
+        "escalation shutdown must still remove the control dir"
+    );
+
+    let _ = std::fs::remove_file(&marker);
 }
 
 /// `shutdown` releases the F1.3 control directory (hashed dir + token +

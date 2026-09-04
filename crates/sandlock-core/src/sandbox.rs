@@ -2974,13 +2974,14 @@ impl Process<'_> {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
-        if let Some(ref mut rt) = self.runtime {
-            // M0 lift: the session state is a `SandboxInstance`; its Drop
-            // backstop reproduces the historical Sandbox drop exactly (kill +
-            // reap, abort supervisor tasks, remove the control dir, dispose the
-            // COW branch per the disposition captured at spawn).
-            rt.drop_teardown();
-        }
+        // M0 lift (F2.1 review B-2): the session state is a `Box<SandboxInstance>`
+        // field, and its own `Drop` runs `drop_teardown()` exactly once when
+        // the box is dropped after this body. Historically this impl called
+        // `drop_teardown()` inline *and* the box's `Drop` ran it again — a
+        // double teardown that re-killed an already-dead group and re-disposed
+        // the COW branch on the abandoned path. Delegating to the box's single
+        // `Drop` preserves the historical kill + reap, task abort, control-dir
+        // removal and disposition semantics with exactly one pass.
     }
 }
 

@@ -1,5 +1,5 @@
 //! Sandbox session instance — the explicit owner of a sandbox session's
-//! lifecycle (M0 lifecycle lift, fork-plan F2.1).
+//! lifecycle (M0 lifecycle lift, fork-plan F2.1/F2.2).
 //!
 //! Before M0 the per-sandbox runtime block lived privately inside
 //! [`Sandbox`](crate::sandbox::Sandbox): `do_create_stdio` assembled it
@@ -24,11 +24,18 @@
 //! The standalone entry point ([`SandboxInstance::launch`]) hands the
 //! session to the caller so it can outlive its first process; M1 adds
 //! multi-process `exec`/`wait_child`/`kill_child` on top of this same owner.
+//!
+//! F2.2 formalizes [`SandboxInstance::shutdown`] as the seven-step §5.3
+//! sequence (Draining → graceful request + grace → per-child pidfd SIGKILL →
+//! group killpg → host-side stdio close → task aborts → token-verified
+//! control-dir removal → port/budget/log return), fully idempotent and with
+//! a configurable grace window.
 
 use std::collections::HashMap;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::task::JoinHandle;
 
@@ -36,13 +43,14 @@ use crate::error::{SandboxRuntimeError, SandlockError};
 use crate::result::{ExitStatus, RunResult};
 use crate::sandbox::{BranchAction, SharedCow};
 
-/// Lifecycle phase of a sandbox session (M0 skeleton).
+/// Lifecycle phase of a sandbox session (M0 shutdown skeleton).
 ///
 /// The full [`docs/sandbox-exec-security.md` §5.2] state machine
 /// (Provisioning/Ready/Active/Frozen/Draining/Dead) lands with F2.2/F2.3;
-/// M0 only distinguishes a live session from a shut-down one, which is all
-/// `shutdown` has to make idempotent and everything the four lifecycle
-/// tests need to observe.
+/// M0 models the shutdown half of it: a session is `Live`, `Draining` while
+/// [`SandboxInstance::shutdown`] is in flight, or `ShutDown` once shutdown
+/// has completed. The exec-side states (Ready/Active/Frozen and the Dead
+/// error state) arrive with M1's multi-process API.
 ///
 /// [`docs/sandbox-exec-security.md` §5.2]: ../../docs/sandbox-exec-security.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +59,12 @@ pub enum InstancePhase {
     /// (when configured) DNS gateway; its single (M0) process may be running
     /// or may already have exited.
     Live,
+    /// §5.2 `Draining`: [`SandboxInstance::shutdown`] has begun. New work is
+    /// refused (M0 has no `exec` verb to refuse — the phase is the M1 hook),
+    /// and the fixed seven-step teardown is running. A shutdown future that is
+    /// cancelled mid-flight leaves the instance here; the next `shutdown`
+    /// call resumes from step 1 and each step is safe to re-run.
+    Draining,
     /// [`SandboxInstance::shutdown`] has run to completion. Every
     /// session-owned resource has been released. Calling `shutdown` again is
     /// a no-op (idempotent).
@@ -155,10 +169,19 @@ impl SandboxInstance {
 
     /// Launch a session from a config `Sandbox`: spawn the first process with
     /// capture stdio (stdin inherited; stdout/stderr piped and drained into
-    /// the [`RunResult`] `wait_child` returns) and release it to `execve`,
-    /// like `Sandbox::spawn` — except the assembled session state is handed
-    /// to the returned instance instead of remaining inside the (consumed)
-    /// policy `Sandbox`.
+    /// the [`RunResult`] `wait_child` returns) and release it to `execve`.
+    /// The assembled session state is handed to the returned instance instead
+    /// of remaining inside the (consumed) policy `Sandbox`.
+    ///
+    /// Unlike [`Sandbox::spawn`](crate::sandbox::Sandbox::spawn) — which is
+    /// `create` + `start` **plus** `wait_until_exec` — this returns as soon
+    /// as the child has been released, without the exec-completion barrier.
+    /// `spawn` adds that barrier because its caller immediately inspects
+    /// post-exec state (e.g. `checkpoint()` reads `/proc/<pid>/exe`); a
+    /// session handed to the caller outlives its process, so exec completion
+    /// is observable through `wait_child`/`shutdown` and M1 exposes an
+    /// explicit release verb. `Sandbox::popen` has the same no-barrier
+    /// shape.
     ///
     /// M0 semantics: the instance owns exactly one process. The process can
     /// exit and the session stays alive — its runtime, control directory and
@@ -196,6 +219,17 @@ impl SandboxInstance {
     /// [`SandboxInstance::shutdown`]'s job. Like the historical `Sandbox::wait`,
     /// this is cancellation-safe: a cancelled `wait_child` parks any output it
     /// had already drained and a later call (or `shutdown`) picks it up.
+    ///
+    /// Once the child has been reaped, a completed `wait_child` also hands the
+    /// COW branch from the shared supervisor state to the instance (see
+    /// `take_cow_branch`) — that handoff is the *last* await of the wait,
+    /// ordered after both drains have finished and before their bytes are
+    /// taken out, so there is no point where captured output exists only in a
+    /// cancellable future (F2.1 review B-3). The branch then stays owned by
+    /// the instance and `Drop`'s backstop applies the recorded disposition
+    /// using the reaped exit status exactly once — dropping right after
+    /// `wait_child` commits/aborts/keeps exactly like the historical
+    /// `Sandbox::wait`-then-drop path.
     pub async fn wait_child(&mut self) -> Result<RunResult, SandlockError> {
         let pid = self.child_pid.ok_or(SandboxRuntimeError::NotRunning)?;
 
@@ -210,7 +244,7 @@ impl SandboxInstance {
             _ => None,
         };
         if let Some(exit_status) = stopped {
-            let (stdout, stderr) = self.collect_pipe_drains().await;
+            let (stdout, stderr) = self.collect_drained_output_and_branch().await;
             return Ok(RunResult { exit_status, stdout, stderr });
         }
 
@@ -270,65 +304,312 @@ impl SandboxInstance {
             self.tty_foreground_taken = false;
         }
 
-        let (stdout, stderr) = self.collect_pipe_drains().await;
+        let (stdout, stderr) = self.collect_drained_output_and_branch().await;
 
         Ok(RunResult { exit_status, stdout, stderr })
     }
 
-    /// Shut the session down: release every session-owned resource.
+    /// Default grace window between the §5.3 step-2 shutdown request and the
+    /// step-3 SIGKILL escalation.
+    pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+    /// Shut the session down: release every session-owned resource, in the
+    /// fixed seven-step order of [`docs/sandbox-exec-security.md` §5.3]
+    /// (each step is commented with its §5.3 number in
+    /// [`SandboxInstance::shutdown_with_grace`]).
+    ///
+    /// A session with a still-running first process is asked to shut down
+    /// (SIGTERM to its process group) and killed by the escalation ladder
+    /// once the grace window elapses; the process never survives its session.
+    /// `Drop` remains the final backstop for an instance destroyed without an
+    /// explicit shutdown (immediate SIGKILL there — a `Drop` must never
+    /// hang).
+    ///
+    /// [`docs/sandbox-exec-security.md` §5.3]: ../../docs/sandbox-exec-security.md
+    pub async fn shutdown(&mut self) -> Result<(), SandlockError> {
+        self.shutdown_with_grace(Self::DEFAULT_SHUTDOWN_GRACE).await
+    }
+
+    /// Shut the session down with an explicit grace window.
+    ///
+    /// [`SandboxInstance::shutdown`] with a caller-chosen `grace`.
     ///
     /// Idempotent — calling it again (or after the instance was already
-    /// dropped) is a no-op. M0 ordering is the pragmatic subset of §5.3's
-    /// fixed shutdown sequence needed to make teardown complete and leak-free;
-    /// F2.2 formalizes the full seven-step order (Draining → init `Shutdown`
-    /// frame + grace → per-child pidfd SIGKILL → group killpg sweep → host-side
-    /// stdio close → task aborts → token-verified control-dir removal → port/
-    /// budget/log return) and its escalation knobs.
+    /// dropped) is a no-op: repeated calls never re-kill, never re-remove the
+    /// control directory, and leave the session in the terminal `ShutDown`
+    /// phase. A shutdown future cancelled mid-flight leaves the phase at
+    /// `Draining`; the next call resumes from step 1 and every step is safe
+    /// to re-run because it takes its resources out of the instance.
     ///
-    /// A session with a still-running first process is killed and reaped here,
-    /// exactly like dropping an un-waited `Sandbox`; the process never
-    /// survives its session.
-    pub async fn shutdown(&mut self) -> Result<(), SandlockError> {
+    /// `grace` is the §5.3 step-2 window between the shutdown request and the
+    /// step-3 SIGKILL escalation; a child that exits within the window is
+    /// reaped with its real exit status and never escalated.
+    pub async fn shutdown_with_grace(&mut self, grace: Duration) -> Result<(), SandlockError> {
         if self.phase == InstancePhase::ShutDown {
             return Ok(());
         }
 
-        // 1. Kill + reap a live first process (full §5.3 escalation is F2.2),
-        //    so the control-dir removal below is final. Record the reaped
-        //    status so a later `wait_child` stays well-defined.
-        if let Some(exit) = self.kill_and_reap() {
+        // §5.3 step 1 — Draining: refuse new work. M0 has no `exec` verb, so
+        // the phase is the refusal hook M1 consults; it also makes a
+        // cancelled shutdown future observable and resumable.
+        self.phase = InstancePhase::Draining;
+
+        // §5.3 steps 2–3 — graceful shutdown request + grace, then escalation.
+        // Only a child this session has not yet reaped is drained; a child
+        // `wait_child` already reaped (state `Stopped`) is left alone, so
+        // repeated shutdowns never re-kill.
+        if self.child_pid.is_some() && !matches!(self.state, RuntimeState::Stopped(_)) {
+            let exit = self.shutdown_child_after_grace(grace).await;
             self.state = RuntimeState::Stopped(exit);
         }
-        // 2. Abort the supervisor-side session tasks: notif supervisor,
-        //    policy_fn worker, throttle, loadavg, control listener, and the
-        //    DNS gateway (whose `:53` listener dies with its task).
-        self.abort_session_tasks();
-        // 3. Nobody is left to collect captures after shutdown: abort drains
-        //    that are still reading (a finished drain holds only bytes), and
-        //    close capture/stdio pipe ends that were never handed to a drain
-        //    (a never-waited session). A drain that already finished holds
-        //    only bytes.
-        self.abort_drains();
+
+        // §5.3 step 4 — close the host side of the stdio pipes: capture read
+        // ends that were never handed to a drain, an untaken piped stdin, and
+        // the release pipe of a child that never reached `start()`. Subscribers
+        // therefore see EOF instead of waiting on a session that is gone.
         drop(self._stdout_read.take());
         drop(self._stderr_read.take());
         drop(self._stdin_write.take());
-        // 4. Remove the F1.3 control directory (pid/token/name/mode/socket).
-        if let Some(ref dir) = self.control_dir {
-            crate::control::cleanup_runtime_dir(dir);
+        drop(self.ready_w.take());
+
+        // §5.3 step 5 — abort the supervisor-side background tasks: notif
+        // supervisor, policy_fn worker, CPU throttle, loadavg sampler, control
+        // listener, DNS gateway (`:53` dies with its task), the HTTP ACL
+        // proxy (B-5: dropping its handle sends the proxy its shutdown frame,
+        // releasing the loopback listener), and capture drains still reading.
+        self.abort_session_tasks();
+        self.abort_drains();
+
+        // Close the direct child's pidfd now that every task that could hold
+        // its raw fd number (the notif supervisor's `SupervisorCtx`) has been
+        // aborted. `wait_child` consumes the pidfd when it reaps; when
+        // shutdown is the reaper (or the child was never waited), the fd would
+        // otherwise stay open until Drop (F2.1 review B-5).
+        drop(self.pidfd.take());
+
+        // §5.3 step 6 — close the control socket and remove the F1.3 control
+        // directory (pid/token/name/mode/control.sock), but only after
+        // verifying the directory is still owned by this session: the pid
+        // file's recorded supervisor identity (pid + `/proc/<pid>/stat`
+        // starttime) must match this process. That is the same identity proof
+        // F1.3 uses to refuse stale-dir preemption — a dir we cannot prove is
+        // ours is never deleted (a recycled hash slot could belong to a live
+        // sibling). The control channel's token check (sensitive verbs) is
+        // F1.3's separately.
+        self.remove_control_dir_owned();
+
+        // §5.3 step 7 — return ports / budgets / logs. M0 core equivalents:
+        // every host-side port-bearing listener (DNS `:53`, HTTP ACL proxy,
+        // control socket, inbound map listeners) died with its task in steps
+        // 4–5; supervisor-side accounting (`ResourceState`/`ProcessIndex`,
+        // the COW/network state) is released by `Drop` as the final backstop
+        // so legacy post-wait introspection keeps working until the owning
+        // `Sandbox` drops; command-logs finalization lives on the E2B side,
+        // not in this crate.
+
+        // M0-specific tail — take the COW branch out of the shared supervisor
+        // state so the instance's `Drop` applies Commit/Abort/Keep exactly
+        // once (a transactional-pipeline stage leaves its shared branch
+        // untouched — the coordinator owns that commit/abort). For a session
+        // `wait_child` already reaped, this is a no-op: the branch was handed
+        // over at the end of that wait (B-3). It is the last await of
+        // shutdown, after which no output-bearing state exists in this future.
+        self.take_cow_branch().await;
+
+        self.phase = InstancePhase::ShutDown;
+        Ok(())
+    }
+
+    /// §5.3 steps 2–3 for the M0 child set.
+    ///
+    /// Step 2: ask the session's process to shut down and give it `grace`.
+    /// There is no separate init in the M0 core — the confined first process
+    /// *is* the session's group leader, so signalling its process group with
+    /// SIGTERM is the core equivalent of the §5.3 "init `Shutdown` frame +
+    /// grace" rung (the OCI crate's init receives the frame and killpg's its
+    /// own tree; core has no frame protocol). A paused group is resumed
+    /// first so the request can be acted on.
+    ///
+    /// Step 3 (only when the grace window expires with the child alive): the
+    /// escalation ladder — per-child pidfd SIGKILL, then the group sweep, then
+    /// the instance-group fallback (see [`SandboxInstance::escalate_kill`]).
+    /// Returns the reaped exit status (`Killed` if the status was already
+    /// reaped elsewhere by the time we escalated).
+    async fn shutdown_child_after_grace(&mut self, grace: Duration) -> ExitStatus {
+        let pid = self.child_pid.expect("guarded by the shutdown caller");
+        let group = self.leader_pid.unwrap_or(pid);
+
+        // §5.3 step 2 — shutdown request + grace.
+        if matches!(self.state, RuntimeState::Paused) {
+            unsafe { libc::killpg(group, libc::SIGCONT) };
         }
-        // 5. Take the COW branch out of the shared supervisor state so the
-        //    instance's Drop applies Commit/Abort/Keep exactly once (the
-        //    transactional-pipeline stage leaves its shared branch untouched —
-        //    the coordinator owns that commit/abort).
-        if self.shared_cow.is_none() {
+        unsafe { libc::killpg(group, libc::SIGTERM) };
+
+        if let Some(reaped) = self.wait_direct_child_exit(pid, grace).await {
+            // The child (or its relayed status) exited within the grace
+            // window; no escalation was needed.
+            if self.tty_foreground_taken {
+                let fg_pid = self.leader_pid.unwrap_or(pid);
+                restore_tty_foreground(fg_pid);
+                self.tty_foreground_taken = false;
+            }
+            return reaped;
+        }
+
+        // §5.3 step 3 — escalation: the child ignored the shutdown request.
+        self.escalate_kill(pid, group);
+
+        // The direct child is dead or dying after the SIGKILL ladder; reap it.
+        // (A `None` here means a concurrent reaper already took the status —
+        // e.g. the fork-tracking worker — in which case `Killed` is recorded
+        // so a later `wait_child` stays well-defined.)
+        let reaped = reap_direct_child(pid).unwrap_or(ExitStatus::Killed);
+        if self.tty_foreground_taken {
+            let fg_pid = self.leader_pid.unwrap_or(pid);
+            restore_tty_foreground(fg_pid);
+            self.tty_foreground_taken = false;
+        }
+        reaped
+    }
+
+    /// §5.3 step 3 — the SIGKILL escalation ladder, reached only after the
+    /// grace window expired with the child still alive:
+    ///
+    /// 3a. per-child pidfd SIGKILL — targets the direct child through its
+    ///     pidfd (no pid-reuse race); `kill(pid)` when no pidfd exists;
+    /// 3b. group-set sweep — `killpg` the direct child's own process group,
+    ///     covering every descendant that stayed in it. In M0's single-child
+    ///     topology this group is the child's own (`pgid == child pid` after
+    ///     `confine_child`'s `setpgid(0, 0)`); with a PID namespace the
+    ///     direct child is the unconfined intermediate, which never created a
+    ///     group, so this rung is an ESRCH no-op and the leader's group is the
+    ///     real target of 3c. M1's per-child group table (the F1.7 OCI shape)
+    ///     generalizes this rung to a sweep over every registered group;
+    /// 3c. instance-group fallback — `killpg` the sandbox leader's group
+    ///     (`leader_pid`, or the direct child without a PID namespace), so a
+    ///     child that escaped its own group mid-escalation is still covered
+    ///     by the instance-level kill.
+    ///
+    /// In M0's single-group topology rungs 3b and 3c address the same group
+    /// (the second call returns ESRCH once the first emptied it), which is
+    /// fine — both are best-effort and ESRCH after an earlier rung is the
+    /// expected outcome, not an error.
+    fn escalate_kill(&self, pid: i32, group: i32) {
+        // 3a. Per-child pidfd SIGKILL.
+        match self.pidfd.as_ref() {
+            Some(pidfd) => {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal as libc::c_long,
+                        pidfd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::c_void>(),
+                        0u32,
+                    );
+                }
+            }
+            None => {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+        // 3b. Direct child's own group.
+        unsafe { libc::killpg(pid, libc::SIGKILL) };
+        // 3c. Instance-group fallback.
+        unsafe { libc::killpg(group, libc::SIGKILL) };
+    }
+
+    /// Wait up to `grace` for the direct child to exit and be reaped.
+    ///
+    /// Prefers pidfd readiness (opened fresh so the instance keeps its own
+    /// pidfd for the step-3 escalation): pidfd never consumes ptrace-stops
+    /// the `policy_fn` fork-tracking worker owns. Falls back to a blocking
+    /// `waitpid` only when no pidfd can be opened (the process is already
+    /// reaped elsewhere, or the kernel has no pidfd support). Returns `None`
+    /// when the grace window elapsed with the child still alive.
+    async fn wait_direct_child_exit(&self, pid: i32, grace: Duration) -> Option<ExitStatus> {
+        let waiter = async {
+            match crate::sys::syscall::pidfd_open(pid as u32, 0) {
+                Ok(pidfd) => wait_child_exit_via_pidfd(pidfd, pid).await,
+                Err(_) => wait_child_exit_blocking(pid).await,
+            }
+        };
+        match tokio::time::timeout(grace, waiter).await {
+            Ok(exit) => Some(exit),
+            Err(_) => None,
+        }
+    }
+
+    /// §5.3 step 6 — remove the control directory only when its recorded
+    /// supervisor identity still matches this process.
+    fn remove_control_dir_owned(&mut self) {
+        let Some(dir) = self.control_dir.clone() else {
+            return;
+        };
+        let supervisor_pid = std::process::id() as i32;
+        let content = match std::fs::read_to_string(crate::control::pid_path(&dir)) {
+            Ok(content) => content,
+            Err(_) => {
+                eprintln!(
+                    "sandlock: not removing control dir {:?}: pid file unreadable, \
+                     identity cannot be verified",
+                    dir
+                );
+                return;
+            }
+        };
+        let mut lines = content.lines();
+        let _child_pid: i32 = match lines.next().and_then(|l| l.trim().parse().ok()) {
+            Some(v) => v,
+            None => {
+                eprintln!(
+                    "sandlock: not removing control dir {:?}: malformed pid file",
+                    dir
+                );
+                return;
+            }
+        };
+        let recorded_supervisor: i32 = match lines.next().and_then(|l| l.trim().parse().ok()) {
+            Some(v) => v,
+            None => {
+                eprintln!(
+                    "sandlock: not removing control dir {:?}: malformed pid file",
+                    dir
+                );
+                return;
+            }
+        };
+        let recorded_starttime: Option<u64> =
+            lines.next().and_then(|l| l.trim().parse().ok());
+        let owned = recorded_supervisor == supervisor_pid
+            && recorded_starttime.is_some()
+            && crate::seccomp::state::read_pid_start_time(supervisor_pid)
+                == recorded_starttime;
+        if !owned {
+            eprintln!(
+                "sandlock: not removing control dir {:?}: recorded supervisor \
+                 identity does not match this process",
+                dir
+            );
+            return;
+        }
+        crate::control::cleanup_runtime_dir(&dir);
+    }
+
+    /// Hand the COW branch from the shared supervisor state to the instance.
+    ///
+    /// Only a non-shared session takes the branch (a transactional-pipeline
+    /// stage's `shared_cow` is owned by the coordinator). Taking it out does
+    /// not dispose it: the instance's `Drop` backstop applies Commit/Abort/
+    /// Keep using the recorded disposition and the exit status captured in
+    /// `state`. Calling this after the branch was already taken is a no-op
+    /// that performs no await.
+    async fn take_cow_branch(&mut self) {
+        if self.shared_cow.is_none() && self.seccomp_cow.is_none() {
             if let Some(ref cow_state) = self.supervisor_cow.clone() {
                 let mut cow = cow_state.lock().await;
                 self.seccomp_cow = cow.branch.take();
             }
         }
-
-        self.phase = InstancePhase::ShutDown;
-        Ok(())
     }
 
     /// One-shot session wait: `Sandbox::wait`'s implementation. Waits for the
@@ -341,13 +622,15 @@ impl SandboxInstance {
         Ok(result)
     }
 
-    /// Kill and reap the session's process if it is still running (the Drop /
-    /// pre-shutdown backstop; mirrors the historical `Sandbox::drop` steps).
+    /// Kill and reap the session's process if it is still running — the `Drop`
+    /// backstop, mirroring the historical `Sandbox::drop` steps (SIGKILL,
+    /// no grace: dropping must never hang). `shutdown` uses the §5.3
+    /// grace-then-escalation ladder instead ([`SandboxInstance::escalate_kill`]).
     /// Returns the reaped status when this call actually reaped the child
     /// (`None` when nothing was running, or when the child was already
     /// reaped). Like the historical `Drop`, this does *not* mutate `state`;
-    /// callers decide whether to record the status (`shutdown` does, `Drop`
-    /// deliberately does not, preserving the old drop-time disposition).
+    /// callers decide whether to record the status (`Drop` deliberately does
+    /// not, preserving the old drop-time disposition).
     fn kill_and_reap(&mut self) -> Option<ExitStatus> {
         if let Some(pid) = self.child_pid {
             let mut reaped: Option<ExitStatus> = None;
@@ -360,10 +643,7 @@ impl SandboxInstance {
                 // waits for the leader) and is reaped below.
                 let group = self.leader_pid.unwrap_or(pid);
                 unsafe { libc::killpg(group, libc::SIGKILL) };
-                let mut status: i32 = 0;
-                if unsafe { libc::waitpid(pid, &mut status, 0) } > 0 {
-                    reaped = Some(sandbox_wait_status_to_exit(status));
-                }
+                reaped = reap_direct_child(pid);
             }
             if self.tty_foreground_taken {
                 let fg_pid = self.leader_pid.unwrap_or(pid);
@@ -376,7 +656,7 @@ impl SandboxInstance {
     }
 
     /// Abort every supervisor-side session task (best-effort; each handle is
-    /// taken so repeated calls are no-ops).
+    /// taken so repeated calls are no-ops). §5.3 step 5.
     fn abort_session_tasks(&mut self) {
         if let Some(h) = self.notif_handle.take() {
             h.abort();
@@ -396,6 +676,11 @@ impl SandboxInstance {
         if let Some(h) = self.dns_gateway_handle.take() {
             h.abort();
         }
+        // The HTTP ACL proxy task dies when its handle drops (the handle's
+        // Drop sends the proxy's shutdown frame), releasing the loopback
+        // listener it bound — close it here rather than leaving it until the
+        // instance's Drop (F2.1 review B-5).
+        drop(self.http_acl_handle.take());
     }
 
     /// Abort capture drains that are still reading (shutdown / Drop only).
@@ -407,10 +692,13 @@ impl SandboxInstance {
         }
     }
 
-    /// Synchronous teardown used by `Drop` (both the `Sandbox` that embeds a
-    /// session and a standalone instance): kill + reap, abort session tasks,
-    /// abort drains, remove the control directory, and dispose a taken COW
-    /// branch per the recorded disposition and exit status.
+    /// Synchronous teardown used by `Drop` — the single backstop shared by a
+    /// `Sandbox`-embedded session and a standalone instance: kill + reap,
+    /// abort session tasks, abort drains, remove the control directory, and
+    /// dispose a taken COW branch per the recorded disposition and exit
+    /// status. F2.1 review B-2: `Sandbox::drop` no longer calls this inline —
+    /// the embedded `Box<SandboxInstance>`'s own `Drop` is the one and only
+    /// invocation, so the historical steps run exactly once per session.
     pub(crate) fn drop_teardown(&mut self) {
         self.kill_and_reap();
         self.abort_session_tasks();
@@ -447,7 +735,9 @@ impl SandboxInstance {
         }
     }
 
-    /// Join the capture-pipe drains, if this session still holds them.
+    /// Join the capture-pipe drains (if this session still holds them), hand
+    /// the COW branch to the instance, and only then take the drained bytes
+    /// out — the ordered tail of `wait_child`.
     ///
     /// Only called once the child has been reaped, so the EOF each drain is
     /// reading towards is already reachable — but not necessarily *reached*: a
@@ -456,16 +746,29 @@ impl SandboxInstance {
     /// each handle is joined in place and only unparked once that join
     /// completes; see `finish_parked_drain`.
     ///
+    /// Cancellation ordering (F2.1 review B-3): both drains are finished first
+    /// with their bytes still parked in the instance; the COW-branch handoff
+    /// is the *last* await; and the bytes are taken out only afterwards, with
+    /// no further await in between. A cancellation therefore never finds the
+    /// captured output only inside this future — it is either parked in the
+    /// instance (drains unfinished or branch handoff in flight) or already in
+    /// the caller's hands.
+    ///
     /// `None` means the stream was never piped, was taken by the caller, or was
     /// already collected by an earlier wait; a drain that panicked or was
     /// aborted reports empty bytes rather than failing the run.
-    async fn collect_pipe_drains(&mut self) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    async fn collect_drained_output_and_branch(&mut self) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
         // Finish both first — each stores its bytes into the instance as it
-        // completes — and only then take them out. A cancellation between the
-        // two joins therefore loses nothing: whatever finished is parked.
-        // One statement per stream: each borrow of the instance ends with it.
+        // completes. A cancellation between the two joins loses nothing:
+        // whatever finished is parked. One statement per stream: each borrow
+        // of the instance ends with it.
         finish_parked_drain(&mut self.stdout_drain).await;
         finish_parked_drain(&mut self.stderr_drain).await;
+        // The final await: hand the branch over while the bytes are still
+        // parked (see the ordering note above).
+        self.take_cow_branch().await;
+        // Synchronous tail: no cancellation can land between here and the
+        // returned `RunResult`.
         let stdout = take_drained(&mut self.stdout_drain);
         let stderr = take_drained(&mut self.stderr_drain);
         (stdout, stderr)
@@ -593,6 +896,22 @@ pub(crate) fn take_drained(slot: &mut Option<ParkedDrain>) -> Option<Vec<u8>> {
 // ================================================================
 // Exit-status helpers
 // ================================================================
+
+/// Blocking `waitpid` of the direct child, mapping the raw status.
+///
+/// Only called once the child is already dead (the Drop backstop and the
+/// shutdown escalation both SIGKILL first), so this never blocks on a live
+/// child and never races the `policy_fn` fork-tracking worker for
+/// ptrace-stops. Returns `None` when nothing was reaped here (e.g. `ECHILD`
+/// because a concurrent reaper already took the status).
+fn reap_direct_child(pid: libc::pid_t) -> Option<ExitStatus> {
+    let mut status: i32 = 0;
+    if unsafe { libc::waitpid(pid, &mut status, 0) } > 0 {
+        Some(sandbox_wait_status_to_exit(status))
+    } else {
+        None
+    }
+}
 
 fn sandbox_wait_status_to_exit(status: i32) -> ExitStatus {
     if libc::WIFEXITED(status) {
