@@ -47,23 +47,30 @@
   描述：`early_exit_cap=1024`、`request` 默认 5 s、`T_idle`/`T_max` 目前只走
   constructor/私有 API，未接 CLI/profile。
   为什么留：配置面是产品决策；测试已 pin 默认行为，接线留部署面任务。
-- **FUP-09 F1.7 逃逸盲区 / dead_groups 重叠建议** — 来源：F1.7 review residual
+- **FUP-09 egress flake 证据留存流程** — 来源：F2.1 ⚠️ / F5 gate / F8 gate
+  （`8e22c5d`..`c8f76d4` 多轮观察；本 F9 终局一次即绿，未触发重试）。
+  描述：`cli learn`（curl https://example.com）等外部 egress 用例与本环境偶发的
+  control-dir 时序用例偶见抖动，历史做法是"重试到真实绿并留日志"，但没有脚本化的
+  证据留存/重试策略（首轮红日志 vs 最终绿日志如何归档）。
+  为什么留：属 runner/发布流程纪律（可选加固），非行为缺陷；F9 终局全绿无重试，
+  相关观察继续记录在后续 gate 报告。
+- **FUP-10 F1.7 逃逸盲区 / dead_groups 重叠建议** — 来源：F1.7 review residual
   （`4b7f7d0`/`d2bd459`）。
   描述：两步逃逸（setpgid 移组 → setsid 后 pgid==pid 伪装组内）建议 getsid 会话比较
   或注释；dead_groups 与活 child pgid 复用重叠可能双 killpg（建议遍历前先去重）。
   为什么留：加固建议需 core 改动 + 新测试；现行形态 fail-safe 且无实际触发证据。
-- **FUP-10 F2b/F3 测试与日志硬化小项** — 来源：F2b.1（`3339c12`）与 F2b.3
+- **FUP-11 F2b/F3 测试与日志硬化小项** — 来源：F2b.1（`3339c12`）与 F2b.3
   （`3afc9dd`）review。
   描述：error-path contains 断言收敛（建议整串/结构化）；registered slot 拒绝
   eprintln 无速率上限；`--program`+validate-exit 模式无测试；registered worker 首
   verb 30 s recv 超时与 120 s connect 重试不对称；非 root path stats settle 断言弱于
   姊妹用例；`FORBIDDEN` 常量无测试引用。
   为什么留：断言/日志/测试强度收尾，非行为缺陷；逐项改需要各自对应文件的小改动。
-- **FUP-11 F1.8 call-site 错误路径与 send 失败语义** — 来源：F1.8 review（`df5d77a`）。
+- **FUP-12 F1.8 call-site 错误路径与 send 失败语义** — 来源：F1.8 review（`df5d77a`）。
   描述：Start/Exec 的 Err 中继已显式化但 call-site Err 未单测；send 失败不标 Dead
   （pre-existing、文档化）。
   为什么留：e2e deadline 用例绿；send 失败无消费者影响，直测收益低。
-- **FUP-12 F5 语义观察缺口** — 来源：F5 review（`b56fcbe`..`1321ba0`）。
+- **FUP-13 F5 语义观察缺口** — 来源：F5 review（`b56fcbe`..`1321ba0`）。
   描述：supervise `max_lifetime: None` 无运行时测试（24 h 不可观）；pid_ns 下 init 被
   kill（`InstanceDead`）未测；F4 dead-leader pgid entry 在组空后 linger 至 session
   结束（security-neutral、bounded）与 kill-probe 交错未 stress。
@@ -72,44 +79,44 @@
 
 ## B. 性能 / 构建 / 发布面
 
-- **FUP-13 REAP_POLL_MS=100 事件化** — 来源：F2b.4（`799fc8f`，capacity doc §6）。
+- **FUP-14 REAP_POLL_MS=100 事件化** — 来源：F2b.4（`799fc8f`，capacity doc §6）。
   描述：exec 往返 ~102 ms 有 ~100 ms 轮询地板；SIGCHLD self-pipe / pidfd 就绪通知可
   降到个位数 ms。
   为什么留：性能改动需核心行为变更 + 成本/延迟复测，F2b.4 明确留给后续。
-- **FUP-14 release profile `panic=abort` + `strip`** — 来源：F2b.4（`799fc8f`）/
+- **FUP-15 release profile `panic=abort` + `strip`** — 来源：F2b.4（`799fc8f`）/
   F2b.5（`51b64ad`）。
   描述：仓库 release profile 即 cargo 默认（panic=unwind、未 strip），release
   supervise 二进制 ≈6.3–6.9 MB/arch、FFI cdylib 亦未 strip；plan 协议写的历史
   `panic=abort+strip` 未落地。
   为什么留：profile 决策影响发布面；加上只会更小，现有预算已按实测保留余量。
-- **FUP-15 wheel 管线加固** — 来源：F2b.5 review（`51b64ad`）。
+- **FUP-16 wheel 管线加固** — 来源：F2b.5 review（`51b64ad`）。
   描述：verify 不校验 RECORD 行；manifest 目录取 `dirname $1` 在跨目录 verify 时会
   错配；uid 冒烟 grep 未显式含 euid；旧版 supervise 已注入时再注入会追加第二条
   RECORD 行（建议 replace-in-place）；pip 真机落 0755 未直接执行验证。
   为什么留：本次 F9 rebuild 用默认 `wheels/` 流程全绿；上述为发布管线的防御性收尾。
-- **FUP-16 runner 硬化（可选）** — 来源：F0.1 review。
+- **FUP-17 runner 硬化（可选）** — 来源：F0.1 review。
   描述：`scripts/test-all.sh` 无参模式不拒 root（对称守卫可选）；root 与 uid 65534
   共享增量缓存有脏缓存隐患（建议 root 档 `CARGO_INCREMENTAL=0` 或独立 target）。
   为什么留：规范入口已由容器 entrypoint 控 uid；守卫属可选加固，不改测试数。
-- **FUP-17 容量表 §4.1 区间/采样标注精度** — 来源：F2b.4 review（`799fc8f`）。
+- **FUP-18 容量表 §4.1 区间/采样标注精度** — 来源：F2b.4 review（`799fc8f`）。
   描述：§4.1 的跨轮区间上界略低估、中位数采样标注不精确；预算余量仍 ≥28–37%。
   为什么留：需回放原始逐轮采样才可精确化；预算有效性不受影响。
 
 ## C. 架构 seam / 设计候补
 
-- **FUP-18 per-child 正向 fs/bind 收窄不可内核强制** — 来源：F4 review
+- **FUP-19 per-child 正向 fs/bind 收窄不可内核强制** — 来源：F4 review
   （`b58b634`..`e5c7214`）。
   描述：exec child 从共享 Landlock 域 fork，ceiling 内 grant 是实例级的；要做"child A
   可写 X、child B 不可"的**强制**边界，须像 connect/send 那样按 pgid 中介 open/bind。
   为什么留：设计级；per-exec params 已携带记录，未来层可直接消费。
-- **FUP-19 credential/HTTP-ACL per-child 归因** — 来源：F4 review（同 FUP-18）。
+- **FUP-20 credential/HTTP-ACL per-child 归因** — 来源：F4 review（同 FUP-19）。
   描述：代理连接无 child 归因；同 IP 不同凭据的兄弟规则需要把 pid 穿进 proxy hand-off。
   为什么留：destination 级泄漏已被 connect verdict 关闭；凭据级归因属下一设计层。
-- **FUP-20 port-aware `update_network` payload** — 来源：F4 review。
+- **FUP-21 port-aware `update_network` payload** — 来源：F4 review。
   描述：IP-any-port 是当前可表达单位；端口级 ceiling 不能被 IP-any-port update 收窄
   （拒绝而非静默放宽）。E2B 若需端口级收窄要加 port-aware payload。
   为什么留：需要扩展 wire/verdict 结构 + 测试；E2B 尚未要求。
-- **FUP-21 non-root-but-CAP_SETUID launcher 形态** — 来源：F6.1 concern
+- **FUP-22 non-root-but-CAP_SETUID launcher 形态** — 来源：F6.1 concern
   （`b62e201`）。
   描述：C 档 gate 只按 `euid==0` 触发；file-cap launcher（cap_setuid/cap_setgid ③）
   若出现，同类错位可绕过该 gate。

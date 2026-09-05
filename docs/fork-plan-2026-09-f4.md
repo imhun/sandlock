@@ -6,7 +6,7 @@ Branch: `upstream-pr/netns-free-clean`（本地，不推送）。进度：`.supe
 > params + S9 `b58b634`；update_network/per-child 网络 `9f959f1`；FFI/Python/supervise
 > 面 `c5d1108`；review fixes `902e522`（I1–I4）与 `e5c7214`（C1/R2）。架构 seam
 > （per-child 正向收窄、credential 归因、port-aware update_network）见
-> `docs/fork-plan-followups.md` FUP-16。
+> `docs/fork-plan-followups.md` FUP-19/20/21。
 
 ## 总纲（plan §F4 + sandbox-exec-security §7 M2）
 
