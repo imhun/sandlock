@@ -12,7 +12,167 @@ use std::os::unix::io::FromRawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
+use sandlock_core::instance::{ExecStdio, InstancePhase, SandboxInstance};
 use sandlock_core::Sandbox;
+
+fn exec_base_policy() -> sandlock_core::SandboxBuilder {
+    Sandbox::builder()
+        .pid_ns(true)
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write("/tmp")
+}
+
+fn defunct_children_of(parent: i32) -> Vec<i32> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let Some(pid) = e.file_name().to_string_lossy().parse::<i32>().ok() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some(after) = stat.rsplit_once(") ") else {
+            continue;
+        };
+        let mut fields = after.1.split_whitespace();
+        let state = fields.next();
+        let ppid = fields.next().and_then(|v| v.parse::<i32>().ok());
+        if state == Some("Z") && ppid == Some(parent) {
+            out.push(pid);
+        }
+    }
+    out
+}
+
+fn poll_until_async(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cond() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// F5.3 (M3 S4): pid_ns + exec-instance coexistence — the confined
+/// `sandlock-init` is namespace PID 1 (the S4 "internal reaper"). A
+/// workload's exit is reaped by PID 1 and must **not** take the instance
+/// tree: the session stays Live, adopted orphans (backgrounded descendants
+/// of an exited child) are reaped by PID 1 without defunct accumulation,
+/// new execs keep working, and only `shutdown` ends the box.
+///
+/// The instance-facing child pids must be the children's **host** pids
+/// (each child's `/proc/<pid>/stat` ppid is the init host pid), so the
+/// host-side registry/pidfd/killpg machinery — which lives outside the
+/// namespace — can address them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_init_reaps_ns_pid_1_exit() {
+    let seq = std::process::id() as u64 * 1000 + 9;
+    let marker_a = format!("/tmp/sandlock-f5-reap-a-{seq}");
+    let marker_g = format!("/tmp/sandlock-f5-reap-g-{seq}");
+
+    let mut inst = SandboxInstance::launch_exec_only(
+        exec_base_policy().build().unwrap().with_name("f5-init-reaps"),
+    )
+    .await
+    .expect("launch pid-ns exec-only session");
+
+    // A is the session's first workload (in a legacy per-command pid-ns
+    // sandbox it would have been ns PID 1 and its exit would have taken the
+    // tree down). It records its namespace pid, then exits after 2 s.
+    let a = inst
+        .exec(
+            &[
+                "sh",
+                "-c",
+                &format!("echo $$ > {marker_a}; exec sleep 2"),
+            ],
+            ExecStdio::Piped,
+        )
+        .await
+        .expect("exec A (first workload)");
+
+    let init_pid = inst
+        .control_pid()
+        .expect("exec session exposes the confined init host pid");
+    assert!(
+        poll_until_async(|| std::path::Path::new(&marker_a).exists(), Duration::from_secs(10)),
+        "A must record its namespace pid"
+    );
+    // The announced pid must be a live host process whose parent is init —
+    // host-side pids, not namespace pids (RED before F5.3 translation).
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", a.pid)).expect(
+        "the exec handle must carry a live host pid (namespace pids are not \
+         addressable from the host)",
+    );
+    let after = stat.rsplit_once(") ").expect("stat format").1;
+    let ppid: i32 = after
+        .split_whitespace()
+        .nth(1)
+        .expect("ppid field")
+        .parse()
+        .expect("ppid numeric");
+    assert_eq!(
+        ppid, init_pid,
+        "A's host pid must be a direct child of the confined init (ns PID 1)"
+    );
+    assert_eq!(inst.phase(), InstancePhase::Live);
+
+    // B: exits immediately, leaving a backgrounded grandchild behind — the
+    // kernel reparents it to ns PID 1 (init), which must reap it.
+    let b = inst
+        .exec(
+            &["sh", "-c", &format!("sleep 2 & echo $! > {marker_g}; exit 0")],
+            ExecStdio::Piped,
+        )
+        .await
+        .expect("exec B (leaves an adopted orphan)");
+
+    let a_status = inst.wait_child(a.child_id).await.expect("wait A");
+    assert_eq!(a_status, sandlock_core::result::ExitStatus::Code(0));
+    let b_status = inst.wait_child(b.child_id).await.expect("wait B");
+    assert_eq!(b_status, sandlock_core::result::ExitStatus::Code(0));
+
+    // A and B are reaped by init: no defunct may remain under ns PID 1 once
+    // their exits settle, and the backgrounded grandchild is adopted and
+    // reaped the same way (bounded by the grandchild's own 2 s lifetime).
+    assert!(
+        poll_until_async(
+            || defunct_children_of(init_pid).is_empty(),
+            Duration::from_secs(10),
+        ),
+        "init (ns PID 1) must reap every exited child; defuncts under it: {:?}",
+        defunct_children_of(init_pid)
+    );
+    let _ = std::fs::read_to_string(&marker_g); // grandchild ns pid observed by B
+
+    // The tree survives both exits: the session is Live, a new exec works,
+    // and only shutdown ends the box.
+    assert_eq!(inst.phase(), InstancePhase::Live);
+    let c = inst
+        .exec(&["sh", "-c", "exit 0"], ExecStdio::Piped)
+        .await
+        .expect("exec C after A and B exited (tree not taken)");
+    let c_status = inst.wait_child(c.child_id).await.expect("wait C");
+    assert_eq!(c_status, sandlock_core::result::ExitStatus::Code(0));
+
+    inst.shutdown().await.expect("shutdown");
+    assert_eq!(inst.phase(), InstancePhase::ShutDown);
+    let _ = std::fs::remove_file(&marker_a);
+    let _ = std::fs::remove_file(&marker_g);
+}
 
 /// Runs inside the sandbox after confinement. `PROBE_HOST_PID` names a host
 /// process outside the sandbox (the test process or another sandbox's

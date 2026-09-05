@@ -85,6 +85,94 @@ fn marker_path(tag: &str) -> PathBuf {
     ))
 }
 
+/// F5.3 (M3 S4): with `pid_ns` on, the on-behalf `/proc` whitelist serves a
+/// child only its **own subtree** — reading a sibling's `cmdline` must fail
+/// with EACCES instead of leaking the sibling's command line through the
+/// supervisor's credentials.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_pid_ns_procfs_scope_narrows_to_child() {
+    let seq = MARKER_SEQ.fetch_add(1, Ordering::Relaxed);
+    let base = format!("/tmp/sandlock-f5-scope-{}-{seq}", std::process::id());
+    let marker_b = format!("{base}.b");
+    let out_self = format!("{base}.self.out");
+    let out_other = format!("{base}.other.out");
+    let err_self = format!("{base}.self.err");
+    let err_other = format!("{base}.other.err");
+    let result = format!("{base}.rc");
+
+    let policy = base_policy().pid_ns(true);
+    let mut inst = SandboxInstance::launch_exec_only(
+        policy.build().unwrap().with_name("f5-procfs-scope"),
+    )
+    .await
+    .expect("launch pid-ns exec session");
+
+    // A: waits for B's marker, then reads its own /proc/<self>/status and
+    // B's /proc/<other>/cmdline, recording each cat's exact exit code.
+    let a_script = format!(
+        "self=$$; \
+         while [ ! -f {marker_b} ]; do sleep 0.05; done; \
+         other=$(cat {marker_b}); \
+         cat /proc/$self/status > {out_self} 2> {err_self}; \
+         echo self_rc=$? > {result}; \
+         cat /proc/$other/cmdline > {out_other} 2> {err_other}; \
+         echo other_rc=$? >> {result}; \
+         exit 0"
+    );
+    let a = inst
+        .exec(&["sh", "-c", &a_script], ExecStdio::Piped)
+        .await
+        .expect("exec child A (probe)");
+
+    // B: records its namespace pid, then stays alive so A has something to
+    // probe.
+    let b_script = format!(
+        "echo $$ > {marker_b}; \
+         exec sleep 60"
+    );
+    let b = inst
+        .exec(&["sh", "-c", &b_script], ExecStdio::Piped)
+        .await
+        .expect("exec child B (sibling)");
+
+    let a_status = tokio::time::timeout(Duration::from_secs(15), inst.wait_child(a.child_id))
+        .await
+        .expect("A must finish its probes")
+        .expect("wait A");
+    assert_eq!(a_status, sandlock_core::result::ExitStatus::Code(0));
+
+    let rc = std::fs::read_to_string(&result).unwrap_or_default();
+    let err_self_text = std::fs::read_to_string(&err_self).unwrap_or_default();
+    let err_other_text = std::fs::read_to_string(&err_other).unwrap_or_default();
+    assert!(
+        rc == "self_rc=0\nother_rc=1\n",
+        "A must read its own /proc metadata (rc 0) and fail on B's cmdline \
+         (rc 1, EACCES): {rc:?} (self stderr: {err_self_text:?}, other stderr: {err_other_text:?})"
+    );
+    assert!(
+        std::fs::read_to_string(&out_self)
+            .map(|s| s.len() > 0)
+            .unwrap_or(false),
+        "A's own status must be readable"
+    );
+    assert_eq!(
+        std::fs::read(&out_other).unwrap_or_default().len(),
+        0,
+        "B's cmdline bytes must never reach A (empty output)"
+    );
+
+    // B survives and the session stays live.
+    assert!(process_is_alive(b.pid));
+    assert_eq!(inst.phase(), InstancePhase::Live);
+    inst.kill_child(b.child_id, libc::SIGKILL).expect("kill B");
+    let _ = inst.wait_child(b.child_id).await;
+    inst.shutdown().await.expect("shutdown");
+
+    for p in [&marker_b, &out_self, &out_other, &err_self, &err_other, &result] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 /// F5.1 (Q10): `max_processes` bounds the **whole box** — every exec child
 /// of one session shares the accounting, so command N+1 is refused while
 /// earlier commands still hold their process slots, and a slot released by a

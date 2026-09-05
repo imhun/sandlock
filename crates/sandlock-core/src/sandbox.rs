@@ -1583,6 +1583,7 @@ impl Sandbox {
                 exec_ceiling: None,
                 exec_session: None,
                 policy_image: None,
+                pid_ns_map: None,
             }));
             clones.push(clone_sb);
         }
@@ -1694,6 +1695,7 @@ impl Sandbox {
             exec_ceiling: None,
             exec_session: None,
             policy_image: None,
+            pid_ns_map: None,
         }));
         Ok(())
     }

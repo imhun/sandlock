@@ -665,6 +665,20 @@ pub(crate) async fn handle_proc_open(
             let Some(host_pid) = map.host_pid(pid as u32).map(|h| h as i32) else {
                 return NotifAction::Errno(EACCES);
             };
+            // F5.3 (M3 S4): the on-behalf whitelist is narrowed to the
+            // caller's own subtree. Every confined process is its own
+            // process-group leader or stays in its command's group (F1.7
+            // per-child groups; the one-shot leader's descendants share its
+            // group), so "own subtree" is exactly "own process group": the
+            // caller may read metadata of itself and its descendants, never
+            // of a sibling command or of `sandlock-init`. Without this a
+            // sibling's `cmdline`/`status` would leak through the
+            // supervisor's on-behalf open.
+            let caller_pgid = unsafe { libc::getpgid(notif.pid as i32) };
+            let target_pgid = unsafe { libc::getpgid(host_pid) };
+            if caller_pgid <= 0 || target_pgid <= 0 || caller_pgid != target_pgid {
+                return NotifAction::Errno(EACCES);
+            }
             let prefix = format!("/proc/{}", pid);
             let rest = path.strip_prefix(&prefix).unwrap_or("");
             // `strip_prefix` leaves the leading `/` ("/proc/1/status" →

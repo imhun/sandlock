@@ -37,6 +37,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
@@ -312,6 +313,16 @@ pub struct SandboxInstance {
     /// surface stays on the live `Sandbox`, unchanged) or if the snapshot
     /// failed to encode.
     pub(crate) policy_image: Option<Vec<u8>>,
+    /// F5.3: namespace-pid → host-pid translation for a pid-ns exec session.
+    /// `sandlock-init` runs inside the sandbox's PID namespace (it *is* ns
+    /// PID 1), so the pids it announces over the control channel
+    /// (`Resp::Started`) are namespace pids. The host-side registry — pidfd,
+    /// per-child group signals, teardown sweeps, checkpoint capture, network
+    /// pgid binding — lives outside the namespace and must address children
+    /// by host pid, so announced pids are translated here before they enter
+    /// the registry. `None` for non-pid-ns sessions (announced pids are
+    /// already host pids).
+    pub(crate) pid_ns_map: Option<Arc<RwLock<crate::procfs::PidNsMap>>>,
 }
 
 /// Lifecycle state of the session's single (M0) child.
@@ -495,6 +506,14 @@ impl SandboxInstance {
         // block) encoded with bincode — see `policy_image` for why the
         // snapshot is serialized rather than held live.
         rt.policy_image = bincode::serialize(&policy).ok();
+        // F5.3: a pid-ns exec session announces namespace pids over the
+        // control channel; keep the ns→host map the instance needs to
+        // register announced children host-side.
+        if let Some(leader) = rt.leader_pid {
+            rt.pid_ns_map = Some(Arc::new(RwLock::new(crate::procfs::PidNsMap::new(
+                leader,
+            ))));
+        }
         rt.exec_session = Some(Box::new(ExecSession {
             link: link.clone(),
             next_child_id: 1,
@@ -541,6 +560,7 @@ impl SandboxInstance {
                     .into());
                 }
             };
+            let pid = rt.translate_announced_pid(pid)?;
             let session = rt
                 .exec_session
                 .as_mut()
@@ -606,6 +626,26 @@ impl SandboxInstance {
                 .into(),
         )
         .into()
+    }
+
+    /// F5.3: translate a pid announced by the confined `sandlock-init` from
+    /// the sandbox's PID namespace into the host pid the supervisor-side
+    /// registry must use. No-op for non-pid-ns sessions.
+    fn translate_announced_pid(&self, pid: i32) -> Result<i32, SandlockError> {
+        let Some(map) = self.pid_ns_map.as_ref() else {
+            return Ok(pid);
+        };
+        let mut map = map
+            .write()
+            .expect("instance pid-ns map lock poisoned");
+        match map.host_pid(pid as u32) {
+            Some(host) => Ok(host as i32),
+            None => Err(SandboxRuntimeError::Child(format!(
+                "init announced child pid {pid}, which is not a live process \
+                 of this sandbox's pid namespace"
+            ))
+            .into()),
+        }
     }
 
     /// Whether this session is exec mode (launched with `launch_exec` /
@@ -809,6 +849,7 @@ impl SandboxInstance {
                 .into());
             }
         };
+        let pid = self.translate_announced_pid(pid)?;
         // F4.3/F4.4: attribute the announced child to the session network
         // policy current at exec time (an `update_network` in flight between
         // the request and the announcement applies to this exec — the
@@ -1549,6 +1590,17 @@ impl SandboxInstance {
             }
         }
         for stray_pid in session.link.stray_pids() {
+            // F5.3: stray pids are init-announced namespace pids in a pid-ns
+            // session; translate before the host-side group sweep.
+            let stray_pid = match self.pid_ns_map.as_ref() {
+                Some(map) => map
+                    .write()
+                    .ok()
+                    .and_then(|mut m| m.host_pid(stray_pid as u32))
+                    .map(|h| h as i32)
+                    .unwrap_or(stray_pid),
+                None => stray_pid,
+            };
             unsafe {
                 libc::killpg(stray_pid, libc::SIGKILL);
             }
@@ -2073,6 +2125,17 @@ impl SandboxInstance {
             // not the confined `sandlock-init` direct child.
             return session.children.get(&0).map(|child| child.pid);
         }
+        self.leader_pid.or(self.child_pid)
+    }
+
+    /// Host pid of the confined control process of the session.
+    ///
+    /// Exec sessions: the `sandlock-init` control loop (ns PID 1 when
+    /// `pid_ns` is on; the direct confined child otherwise). One-shot
+    /// sessions: the confined first process. This is the process that forks
+    /// and reaps every exec child — the F5.3 "internal reaper" — not a
+    /// workload, so `pid()` never reports it.
+    pub fn control_pid(&self) -> Option<i32> {
         self.leader_pid.or(self.child_pid)
     }
 
