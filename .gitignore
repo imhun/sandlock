@@ -13,3 +13,5 @@ build/
 *.so
 .venv/
 tests/rootfs-helper
+
+.DS_Store
