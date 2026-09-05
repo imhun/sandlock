@@ -9,6 +9,7 @@ use std::os::fd::FromRawFd;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_sandlock-supervise")
@@ -78,6 +79,118 @@ fn stderr(output: &Output) -> String {
 /// Current euid of the test process (the gate runs this suite as uid 65534).
 fn euid() -> u32 {
     unsafe { libc::geteuid() }
+}
+
+/// Per-process control-root override shared by every supervise test in this
+/// binary (spawned supervise processes inherit it), so instance runtime dirs
+/// and the registered-path registry never collide with another suite's.
+fn isolate_ctl_root() -> PathBuf {
+    static SET: std::sync::Once = std::sync::Once::new();
+    let root = repo_tmp_dir().join(format!("supervise-ctl-{}", std::process::id()));
+    SET.call_once(|| {
+        let _ = std::fs::remove_dir_all(&root);
+        std::env::set_var("SANDBOX_CTL_ROOT", &root);
+    });
+    root
+}
+
+/// Base filesystem grant set for launching real system programs (python3,
+/// /bin/sh) under a sandbox, mirroring the core integration suites.
+fn base_read_paths() -> Vec<String> {
+    let mut paths = vec![
+        "/usr".to_string(),
+        "/lib".to_string(),
+        "/bin".to_string(),
+        "/etc".to_string(),
+        "/proc".to_string(),
+        "/dev".to_string(),
+    ];
+    if std::path::Path::new("/lib64").exists() {
+        paths.push("/lib64".to_string());
+    }
+    paths
+}
+
+/// A minimal instance-launchable policy: real programs need the base read
+/// grants plus a writable evidence directory inside the repo tmp.
+fn instance_policy(evidence_dir: &str) -> String {
+    let mut readable = base_read_paths();
+    readable.push(evidence_dir.to_string());
+    serde_json::json!({
+        "fs_readable": readable,
+        "fs_writable": [evidence_dir],
+    })
+    .to_string()
+}
+
+/// Wait (polling) until `predicate` is true or the deadline passes.
+fn wait_until(deadline: Instant, what: &str, mut predicate: impl FnMut() -> bool) {
+    while !predicate() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// One verb over the registered path (one connection per verb).
+fn registered_verb(sock_path: &std::path::Path, token: &str, verb: &str) -> serde_json::Value {
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(sock_path).expect("connect registered socket");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .expect("read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .expect("write timeout");
+    roundtrip_frame(
+        &mut stream,
+        &serde_json::json!({
+            "v": 1,
+            "verb": verb,
+            "token": token,
+            "args": {},
+        }),
+    )
+}
+
+/// Spawn `sandlock-supervise --serve` (fd handoff) with an instance-launching
+/// program and return the child plus the worker end the test drives.
+fn spawn_serve_supervisor_with_program(
+    policy: &PathBuf,
+    program: &PathBuf,
+    extra_args: &[&str],
+) -> (std::process::Child, std::os::unix::net::UnixStream) {
+    use std::os::unix::process::CommandExt;
+
+    let (worker, server) = std::os::unix::net::UnixStream::pair().expect("control socketpair");
+    let control_fd = server.as_raw_fd();
+    let mut cmd = Command::new(bin());
+    cmd.arg("--policy")
+        .arg(policy.to_str().unwrap())
+        .arg("--uid")
+        .arg(euid().to_string())
+        .arg("--control-fd")
+        .arg(control_fd.to_string())
+        .arg("--program")
+        .arg(program.to_str().unwrap())
+        .arg("--serve")
+        .args(extra_args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    unsafe {
+        cmd.pre_exec(move || {
+            let flags = libc::fcntl(control_fd, libc::F_GETFD);
+            if flags < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(control_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().expect("spawn serve supervise");
+    drop(server);
+    (child, worker)
 }
 
 #[test]
@@ -530,4 +643,370 @@ fn test_supervise_rejects_non_socket_control_fd() {
         "the refusal must name the fd and the socket requirement, got: {err}"
     );
     let _ = std::fs::remove_file(&policy);
+}
+
+/// F2b.3 residual: a SOCK_STREAM socket in the WRONG DOMAIN (AF_INET) must
+/// also be refused — SO_TYPE alone would let a TCP stream masquerade as the
+/// unix control channel.
+#[test]
+fn test_supervise_rejects_non_unix_socket_control_fd() {
+    let policy = write_policy("control-fd-not-unix", "{}");
+    // A connected TCP stream: open, SOCK_STREAM, but AF_INET.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind tcp listener");
+    let addr = listener.local_addr().expect("listener addr");
+    let client = std::net::TcpStream::connect(addr).expect("connect tcp");
+    let (server, _) = listener.accept().expect("accept tcp");
+    drop(client);
+    let tcp_fd = server.as_raw_fd();
+
+    let mut cmd = Command::new(bin());
+    cmd.args([
+        "--policy",
+        policy.to_str().unwrap(),
+        "--uid",
+        &euid().to_string(),
+        "--control-fd",
+        &tcp_fd.to_string(),
+        "--serve",
+    ]);
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(move || {
+            let flags = libc::fcntl(tcp_fd, libc::F_GETFD);
+            if flags < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(tcp_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = cmd.output().expect("run supervise with tcp control fd");
+    assert!(!out.status.success(), "an AF_INET control fd must be refused");
+    let err = stderr(&out);
+    assert!(
+        err.contains("not AF_UNIX") && err.contains("AF_INET"),
+        "the refusal must name the domain mismatch, got: {err}"
+    );
+    drop(server);
+    let _ = std::fs::remove_file(&policy);
+}
+
+// ============================================================
+// F2b.3: instance wiring — SandboxInstance built from the policy,
+// workload launched, instance-level verbs served (both transports)
+// ============================================================
+
+/// fd transport, full instance verbs: config / run / stats / ports / exec
+/// skeleton / shutdown against a live SandboxInstance whose workload writes
+/// an evidence file before parking.
+#[test]
+fn test_supervise_fd_serve_launches_instance_and_serves_instance_verbs() {
+    isolate_ctl_root();
+    let workdir = repo_tmp_dir().join(format!("supervise-fd-verbs-{}", std::process::id()));
+    std::fs::create_dir_all(&workdir).expect("create fd-verbs workdir");
+    let evidence = workdir.join("evidence.txt");
+    let policy = write_policy(
+        "fd-instance-verbs",
+        &instance_policy(workdir.to_str().expect("workdir utf8")),
+    );
+    let script = format!(
+        "printf 'hello-from-workload\\n' > {} && exec sleep 30",
+        evidence.display()
+    );
+    let program = write_policy(
+        "fd-instance-program",
+        &serde_json::json!({ "argv": ["/bin/sh", "-c", script] }).to_string(),
+    );
+
+    let (child, mut worker) = spawn_serve_supervisor_with_program(&policy, &program, &[]);
+
+    // config: policy snapshot served against the live generation.
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "config", "args": {} }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "config: {resp:?}");
+
+    // run: launch-first already launched the workload; the verb is an
+    // idempotent state query with the instance pid.
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "run", "args": {} }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "run: {resp:?}");
+    assert_eq!(
+        resp["data"]["launched"],
+        serde_json::Value::Bool(true),
+        "run must report the launched instance: {resp:?}"
+    );
+    let pid = resp["data"]["pid"].as_i64().expect("run reports a pid");
+
+    // stats: live instance, M0 child running, reconciler quiescent. The
+    // pidfd-watcher registration settles a moment after launch, so poll the
+    // verb until the exact live snapshot holds (assertions stay exact).
+    let stats_deadline = Instant::now() + Duration::from_secs(15);
+    let mut settled = false;
+    while Instant::now() < stats_deadline {
+        let resp = roundtrip_frame(
+            &mut worker,
+            &serde_json::json!({ "v": 1, "verb": "stats", "args": {} }),
+        );
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "stats: {resp:?}");
+        if resp["data"]["instance_state"] == "Live"
+            && resp["data"]["children_live"] == 1
+            && resp["data"]["proc_count_vs_live"] == 0
+            && resp["data"]["pid"].as_i64() == Some(pid)
+        {
+            settled = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        settled,
+        "stats must settle to the live reconciled snapshot (Live, one live \
+         child, drift 0, pid {pid})"
+    );
+
+    // ports: no inbound mapping configured; empty but live-shaped response.
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "ports", "args": {} }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "ports: {resp:?}");
+    assert_eq!(resp["data"]["launched"], serde_json::Value::Bool(true));
+    assert_eq!(resp["data"]["inbound"], serde_json::json!([]));
+
+    // exec: explicit F3 skeleton error — never a silent no-op.
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "exec", "args": {} }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(false), "exec: {resp:?}");
+    assert!(
+        resp["err"].as_str().unwrap_or_default().contains("F3"),
+        "exec skeleton must name the F3 boundary: {resp:?}"
+    );
+
+    // The workload really ran and wrote its evidence.
+    wait_until(
+        Instant::now() + Duration::from_secs(15),
+        "workload evidence file",
+        || {
+            std::fs::read_to_string(&evidence)
+                .map(|s| s == "hello-from-workload\n")
+                .unwrap_or(false)
+        },
+    );
+
+    // shutdown: instance teardown, clean exit 0.
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "shutdown", "args": {} }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "shutdown: {resp:?}");
+    let out = child.wait_with_output().expect("wait supervise fd verbs");
+    assert!(
+        out.status.success(),
+        "generation must exit 0 after shutdown; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The workload process must not survive its generation.
+    wait_until(
+        Instant::now() + Duration::from_secs(10),
+        "workload process reap",
+        || !process_alive(pid as i32),
+    );
+    let _ = std::fs::remove_file(&policy);
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+/// Registered path (transport 2), full instance verbs: a refused connection
+/// must not kill the slot, and the generation ends only via a shutdown verb
+/// served to a token-authenticated worker.
+#[test]
+fn test_supervise_path_serve_launches_instance_and_serves_verbs_until_shutdown() {
+    let ctl_root = isolate_ctl_root();
+    let workdir = repo_tmp_dir().join(format!("supervise-path-verbs-{}", std::process::id()));
+    std::fs::create_dir_all(&workdir).expect("create path-verbs workdir");
+    let evidence = workdir.join("evidence.txt");
+    let policy = write_policy(
+        "path-instance-verbs",
+        &instance_policy(workdir.to_str().expect("workdir utf8")),
+    );
+    let script = format!(
+        "printf 'hello-from-path-workload\\n' > {} && exec sleep 30",
+        evidence.display()
+    );
+    let program = write_policy(
+        "path-instance-program",
+        &serde_json::json!({ "argv": ["/bin/sh", "-c", script] }).to_string(),
+    );
+    let name = format!("supervise-path-verbs-{}", std::process::id());
+    let token = "path-verbs-token-0123456789abcdef";
+
+    let mut cmd = Command::new(bin());
+    cmd.args([
+        "--policy",
+        policy.to_str().unwrap(),
+        "--uid",
+        &euid().to_string(),
+        "--serve-path",
+        &name,
+        "--token",
+        token,
+        "--program",
+        program.to_str().unwrap(),
+    ])
+    .env("SANDBOX_CTL_ROOT", &ctl_root)
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+    let child = cmd.spawn().expect("spawn path supervise");
+
+    // The worker computes the hashed socket path exactly like the slot
+    // (registry root + fnv1a_hex(name) + ".d/control.sock").
+    let registry = ctl_root.as_path().join(format!(
+        "{}-registry",
+        ctl_root.to_string_lossy().trim_end_matches('/')
+    ));
+    let sock_path = registry
+        .join(format!("{}.d", sandlock_core::control::fnv1a_hex(&name)))
+        .join("control.sock");
+    wait_until(
+        Instant::now() + Duration::from_secs(15),
+        "registered socket to appear",
+        || sock_path.exists(),
+    );
+
+    // A refused connection (wrong token) must NOT kill the slot: the next
+    // valid worker is still served.
+    {
+        let mut stream = std::os::unix::net::UnixStream::connect(&sock_path)
+            .expect("connect refused socket");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        use std::io::Write;
+        let body = serde_json::json!({
+            "v": 1, "verb": "config", "token": "wrong-token", "args": {},
+        });
+        let bytes = serde_json::to_vec(&body).expect("serialize refused frame");
+        let _ = stream
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .and_then(|_| stream.write_all(&bytes));
+    }
+
+    // config / run / stats / ports through the registered path.
+    let resp = registered_verb(&sock_path, token, "config");
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "config: {resp:?}");
+    let resp = registered_verb(&sock_path, token, "run");
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "run: {resp:?}");
+    assert_eq!(
+        resp["data"]["launched"],
+        serde_json::Value::Bool(true),
+        "run: {resp:?}"
+    );
+    let pid = resp["data"]["pid"].as_i64().expect("path run pid");
+    let stats_deadline = Instant::now() + Duration::from_secs(15);
+    let mut settled = false;
+    while Instant::now() < stats_deadline {
+        let resp = registered_verb(&sock_path, token, "stats");
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "stats: {resp:?}");
+        if resp["data"]["instance_state"] == "Live"
+            && resp["data"]["children_live"] == 1
+            && resp["data"]["pid"].as_i64() == Some(pid)
+        {
+            settled = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        settled,
+        "path stats must settle to the live snapshot (Live, one live child, \
+         pid {pid})"
+    );
+    let resp = registered_verb(&sock_path, token, "ports");
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "ports: {resp:?}");
+    assert_eq!(resp["data"]["inbound"], serde_json::json!([]));
+
+    wait_until(
+        Instant::now() + Duration::from_secs(15),
+        "path workload evidence file",
+        || {
+            std::fs::read_to_string(&evidence)
+                .map(|s| s == "hello-from-path-workload\n")
+                .unwrap_or(false)
+        },
+    );
+
+    // shutdown ends the generation; the slot exits 0.
+    let resp = registered_verb(&sock_path, token, "shutdown");
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "shutdown: {resp:?}");
+    let out = child.wait_with_output().expect("wait path supervise");
+    assert!(
+        out.status.success(),
+        "path generation must exit 0 after shutdown; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !sock_path.exists(),
+        "the registered socket must be cleaned up on exit"
+    );
+    let _ = std::fs::remove_file(&policy);
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+/// Route-B invariant pin (fork-plan F2b.3): the wire surface exposes NO
+/// runtime mediator re-map verb.  The forbidden "give this generation a new
+/// host uid" path must not exist under any name — a `map-uid`-class request
+/// is refused as an unknown verb and the generation still ends cleanly.
+#[test]
+fn test_supervise_refuses_runtime_uid_map_verbs() {
+    isolate_ctl_root();
+    let policy = write_policy("no-uid-map", "{}");
+    let (child, mut worker) = spawn_serve_supervisor(&policy, &[]);
+
+    for verb in ["map-uid", "remap-mediator", "setuid-host"] {
+        let resp = roundtrip_frame(
+            &mut worker,
+            &serde_json::json!({
+                "v": 1, "verb": verb, "args": {"uid": 65533},
+            }),
+        );
+        assert_eq!(
+            resp["ok"],
+            serde_json::Value::Bool(false),
+            "{verb} must be refused: {resp:?}"
+        );
+        assert!(
+            resp["err"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown verb"),
+            "{verb} must be refused as an unknown verb (no remap surface): {resp:?}"
+        );
+    }
+
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "shutdown", "args": {} }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true));
+    let out = child.wait_with_output().expect("wait no-uid-map supervise");
+    assert!(
+        out.status.success(),
+        "generation must still end cleanly after refused verbs; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_file(&policy);
+}
+
+/// Process-liveness probe used for post-shutdown residue assertions.
+fn process_alive(pid: i32) -> bool {
+    (unsafe { libc::kill(pid, 0) }) == 0
 }
