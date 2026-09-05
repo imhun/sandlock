@@ -64,11 +64,14 @@
 //!    connection is closed.
 //!
 //! Name collisions never preempt: when a runtime dir exists, setup refuses
-//! unless the recorded owner is provably gone (pid-file starttime no longer
-//! matches `/proc/<pid>/stat`, or the dir is old with no pid file).  A pid
-//! file that is merely unreadable/missing on a live sandbox therefore makes
-//! the second create fail with `AlreadyExists` instead of wiping the live
-//! dir.
+//! unless the recorded owner is provably gone (a valid pid file whose
+//! recorded supervisor starttime no longer matches `/proc/<pid>/stat`).  A
+//! pid file that is missing, unreadable, or carries no starttime is
+//! `Ambiguous` **regardless of the dir's age** (F1.3: create time must never
+//! `remove_dir_all` a pid-less dir — it may be a live sandbox whose pid file
+//! was lost); genuinely dead pid-less debris is reclaimed only by the
+//! explicit `list_live_sandboxes`/`sandlock ps` pruning path with its own
+//! recency guard.
 
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -222,11 +225,13 @@ pub fn token_eq(a: &str, b: &str) -> bool {
 ///
 /// If a runtime directory already exists for `name`, this returns
 /// `ErrorKind::AlreadyExists` unless the directory can be **proven** stale:
-/// the pid file's recorded supervisor starttime no longer matches
-/// `/proc/<pid>/stat` (the recorded owner is gone), or the dir is old with no
-/// pid file (abandoned mid-setup).  A pid file that is merely unreadable or
-/// missing on a live sandbox is never enough to `remove_dir_all` — that was
-/// the SL-7 directory-preemption bug.
+/// a valid pid file exists AND its recorded supervisor starttime is readable
+/// and no longer matches `/proc/<pid>/stat` (the recorded owner is gone).
+/// Every other state — including a missing/unreadable pid file or a legacy
+/// two-line pid file with no starttime, **regardless of the dir's age** —
+/// refuses with `Ambiguous`; create time never `remove_dir_all`s a pid-less
+/// dir (the SL-7 regression test pins both fresh and backdated pid-less
+/// dirs).
 ///
 /// # no_supervisor callers
 ///
