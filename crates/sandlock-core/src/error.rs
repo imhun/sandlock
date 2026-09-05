@@ -71,6 +71,11 @@ pub enum SandboxRuntimeError {
     #[error("instance has no child with id {0}")]
     UnknownChild(u64),
 
+    /// `resize_child` addressed a registered child that has no pty (it was
+    /// not exec'd with `ExecStdio::Pty`).
+    #[error("child {0} has no pty master (exec without ExecStdio::Pty)")]
+    NoPtyMaster(u64),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

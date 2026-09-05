@@ -11,7 +11,7 @@
 #   2. root-mode phases: oci (`--oci-root`) and the supervise foreign-uid
 #      acceptance (`--supervise-root`), both as root in the same privileged
 #      container.
-core_lib = 797 # F1.4 (SL-8): +1 plan unit test pidfd_release_is_idempotent
+core_lib = 799 # F1.4 (SL-8): +1 plan unit test pidfd_release_is_idempotent
                # in resource.rs.
                # F3.1 (exec machinery lift): 791 -> 797, +6 unit tests moved
                # verbatim with their code from sandlock-oci into
@@ -19,7 +19,12 @@ core_lib = 797 # F1.4 (SL-8): +1 plan unit test pidfd_release_is_idempotent
                # Signal round-trips + two SCM_RIGHTS round-trips). oci keeps
                # the same tests re-hosted against the re-export seam, so its
                # 144 stays exactly unchanged (relocation, not rewrite).
-core_integ = 502 # F2.1 (M0 lifecycle lift): 477 -> 481 (+4 lifecycle tests);
+               # F3.2/3.3 review follow-up (deadline-orphan teardown): 797 ->
+               # 799, +2 executor unit tests exercising the discard-late-
+               # Started branches directly through the reader
+               # (late_started_without_pending_is_recorded_for_teardown,
+               # started_with_dropped_receiver_is_recorded_for_teardown).
+core_integ = 503 # F2.1 (M0 lifecycle lift): 477 -> 481 (+4 lifecycle tests);
                  # F2.2 (shutdown seven-step order + idempotency): 481 -> 484,
                  # +3 in integration/test_instance_lifecycle.rs
                  # (test_shutdown_escalates_after_grace_for_term_ignoring_child,
@@ -59,6 +64,11 @@ core_integ = 502 # F2.1 (M0 lifecycle lift): 477 -> 481 (+4 lifecycle tests);
                  # The M0 no-arg wait_child became wait_main (per-child
                  # wait_child(child_id) is the F3.2 surface); no M0 test was
                  # removed or weakened.
+                 # F3.2/3.3 review follow-up (exec-mode terminal semantics):
+                 # 502 -> 503, +1 in test_instance_exec.rs
+                 # (test_exec_mode_main_exit_is_terminal_and_verbs_close);
+                 # one-shot outlives regression stays green in
+                 # test_instance_lifecycle.rs.
 ffi = 92 # F3.3 (instance exec FFI): 89 -> 92, +3 in the new
          # tests/instance_exec.rs (instance_exec_streams_stdio_and_waits_
          # by_child_id, instance_exec_rejects_unknown_stdio_mode,
@@ -67,7 +77,7 @@ ffi = 92 # F3.3 (instance exec FFI): 89 -> 92, +3 in the new
          # header regeneration also picks up pre-existing drift at HEAD
          # (missing sandlock_sandbox_builder_notify_rate_limit declaration).
 cli = 95      # after F0.4 wiring (cli suite includes net_bind_map tests)
-supervise = 34 # Non-root targets only (--lib --test supervise): the
+supervise = 35 # Non-root targets only (--lib --test supervise): the
                # root-mode foreign-uid target supervise_root is separate.
                # F2b.1: new crates/sandlock-supervise (full-field policy entry +
                # uid self-check; 13 lib unit + 4 integration tests, including
@@ -97,6 +107,9 @@ supervise = 34 # Non-root targets only (--lib --test supervise): the
                # on the F2b.2 control channel) with wait_child/kill_child
                # round-trips instead of the F3 skeleton error; supervise
                # generations now launch exec-capable sessions (launch_exec).
+               # F3.2/3.3 review follow-up (main-exit generation end): 34 ->
+               # 35, +1 integration
+               # (test_supervise_main_exit_ends_generation_cleanly).
 supervise_root = 2 # ROOT-MODE: run via scripts/test-all.sh
                    # --supervise-root as root (same privileged container as
                    # oci). F2b.3 foreign-uid acceptance in
@@ -134,9 +147,11 @@ oci = 144     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e
               # 56 lib + 68 bin + 15 integration.rs + 2 reaper + 3 process
               # groups = 144).
 cli_build = 0 # workspace release build gate (no test binaries; 0 = build passed)
-python = 445  # fork S2.x-era python tests landed after the plan's 430/431
+python = 446  # fork S2.x-era python tests landed after the plan's 430/431
               # estimate. F3.3: 441 -> 445, +4 in tests/test_instance_exec.py
               # (test_exec_returns_self_owned_process,
               # test_exec_after_close_returns_same_error,
               # test_exec_process_context_manager_reaps_on_error,
               # test_exec_pty_returns_master_and_resize).
+              # F3.2/3.3 review follow-up (drop contract): 445 -> 446, +1
+              # (test_dropped_exec_process_is_reaped_on_del).

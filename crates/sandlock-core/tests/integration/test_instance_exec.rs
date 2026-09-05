@@ -22,6 +22,7 @@
 
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use sandlock_core::error::SandboxRuntimeError;
@@ -99,6 +100,21 @@ async fn poll_until(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+/// True when `pid` no longer exists or is a zombie (`/proc/<pid>/stat` state
+/// `Z`): a process init collapsed but never reaped sits as a zombie until the
+/// outer reaper collects it, so "collapsed" must accept the zombie state.
+fn process_collapsed(pid: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return true; // ENOENT: fully gone
+    };
+    let mut fields = stat.split_whitespace();
+    let _pid = fields.next();
+    let _comm = fields.next();
+    matches!(fields.next(), Some("Z"))
+}
+
+static MARKER_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Matrix case 1: two concurrent exec children each write a large, distinct
 /// payload to their own stdout; neither child's bytes may leak into the
@@ -359,4 +375,93 @@ async fn test_exec_pty_returns_master_and_resize_works() {
     assert_eq!(status, ExitStatus::Code(0));
     drop(pty);
     inst.shutdown().await.expect("shutdown");
+}
+
+/// Reviewer I2: exec-mode sessions are terminal when the main child (id 0)
+/// exits — init collapses every group and exits, so the session is over.
+/// The phase reads `Exited`, stats reconcile to zero, every per-child verb
+/// returns the unified closed-instance error, and a later `shutdown` only
+/// performs the resource cleanup. One-shot mode keeps its documented
+/// outlives-first-process semantics (pinned by
+/// `test_instance_lifecycle::test_instance_outlives_first_process`, which
+/// must stay green).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_exec_mode_main_exit_is_terminal_and_verbs_close() {
+    use sandlock_core::error::SandboxRuntimeError;
+
+    let seq = MARKER_SEQ.fetch_add(1, Ordering::Relaxed);
+    let marker = std::path::PathBuf::from(format!(
+        "/tmp/sandlock-f323-main-exit-{}-{seq}",
+        std::process::id()
+    ));
+    let script = format!(
+        "while [ ! -f {} ]; do sleep 0.05; done; exit 0",
+        marker.display()
+    );
+    let mut inst = SandboxInstance::launch_exec(
+        base_policy().build().unwrap().with_name("exec-mode-main-exit"),
+        &["sh", "-c", &script],
+    )
+    .await
+    .expect("launch exec session");
+
+    let child = inst
+        .exec(&["sh", "-c", "exec sleep 30"], ExecStdio::Null)
+        .await
+        .expect("exec a second child while the main is alive");
+    let child_pid = child.pid;
+    assert_eq!(inst.phase(), InstancePhase::Live);
+    let live = inst.stats().await;
+    assert_eq!(live.instance_state, InstancePhase::Live);
+    assert_eq!(live.children_live, 2, "main + exec child both announced");
+
+    // Release the main: it exits, init collapses the container and exits.
+    std::fs::write(&marker, b"go").expect("write main-exit marker");
+    let terminal = poll_until(
+        || inst.phase() == InstancePhase::Exited,
+        Duration::from_secs(15),
+    )
+    .await;
+    assert!(terminal, "exec-mode phase must become Exited on main exit");
+    assert!(
+        poll_until(|| process_collapsed(child_pid), Duration::from_secs(15)).await,
+        "the exec child's group must be collapsed by init's main-exit teardown"
+    );
+
+    // Stats reconcile: terminal state, zero children.
+    let stats = inst.stats().await;
+    assert_eq!(stats.instance_state, InstancePhase::Exited);
+    assert_eq!(stats.children_live, 0);
+
+    // Every verb returns the same unified closed-instance error.
+    let exec_err = inst
+        .exec(&["true"], ExecStdio::Null)
+        .await
+        .expect_err("exec after main exit must fail");
+    let wait_err = inst
+        .wait_child(child.child_id)
+        .await
+        .expect_err("wait_child after main exit must fail");
+    let kill_err = inst
+        .kill_child(child.child_id, libc::SIGKILL)
+        .expect_err("kill_child after main exit must fail");
+    let resize_err = inst
+        .resize_child(child.child_id, 40, 120)
+        .expect_err("resize_child after main exit must fail");
+    for e in [&exec_err, &wait_err, &kill_err, &resize_err] {
+        assert!(
+            matches!(e, SandlockError::Runtime(SandboxRuntimeError::InstanceClosed)),
+            "terminal exec-mode verbs must return the unified closed error, got: {e:?}"
+        );
+    }
+
+    // shutdown still performs the resource-cleanup tail.
+    let dir = inst
+        .control_dir()
+        .expect("session control dir")
+        .clone();
+    inst.shutdown().await.expect("shutdown after main exit");
+    assert_eq!(inst.phase(), InstancePhase::ShutDown);
+    assert!(!dir.exists(), "shutdown must still remove the control dir");
+    let _ = std::fs::remove_file(&marker);
 }

@@ -67,6 +67,14 @@ struct ExecLinkState {
     /// waiter. Inserted when a `Started` is routed; removed when its
     /// `Exited` is consumed.
     pid_to_child: HashMap<i32, u64>,
+    /// Pids init announced in a `Started` whose reply could never be
+    /// delivered: the request's deadline already discarded `pending` (late
+    /// reply) or the requesting task was cancelled, so the host never
+    /// registered the child. The child is real (init spawned it), so it must
+    /// still be collapsed at teardown — otherwise a deadline-orphaned child
+    /// would escape the Drop backstop (reviewer I1). Bounded by
+    /// `early_exit_cap`; an overflow is counted in `overflow_drops`.
+    stray_pids: Vec<i32>,
     /// `Exited` frames dropped because the pid was never announced.
     unknown_exits: u64,
     /// `Exited` frames dropped because `early_exits` was full.
@@ -104,6 +112,7 @@ impl ExecLink {
                 exit_waiters: HashMap::new(),
                 early_exits: HashMap::new(),
                 pid_to_child: HashMap::new(),
+                stray_pids: Vec::new(),
                 unknown_exits: 0,
                 overflow_drops: 0,
                 early_exit_cap: DEFAULT_EARLY_EXIT_CAP,
@@ -214,6 +223,13 @@ impl ExecLink {
         st.dead || st.terminated
     }
 
+    /// Whether the init channel terminated (init exited / the reader saw
+    /// EOF) as opposed to the link merely being marked Dead by a timed-out
+    /// request. Used by the instance to observe the exec-mode terminal state.
+    pub(crate) fn is_terminated(&self) -> bool {
+        self.state.lock().unwrap().terminated
+    }
+
     /// Drain every buffered early exit into `out` (used by shutdown so real
     /// exit statuses are preserved before the session closes).
     pub(crate) fn drain_early_exits(&self, out: &mut HashMap<u64, ExitStatus>) {
@@ -233,6 +249,39 @@ impl ExecLink {
             let _ = tx.send(ExitStatus::Killed);
         }
         st.pid_to_child.clear();
+    }
+
+    /// Snapshot of the deadline-orphaned/stray pids recorded by the reader
+    /// (children init announced but the host never registered). Teardown
+    /// sweeps their process groups before clearing.
+    pub(crate) fn stray_pids(&self) -> Vec<i32> {
+        self.state.lock().unwrap().stray_pids.clone()
+    }
+
+    /// Drop the stray-pid record after the teardown sweep has signalled them.
+    pub(crate) fn clear_strays(&self) {
+        self.state.lock().unwrap().stray_pids.clear();
+    }
+
+    /// Best-effort synchronous `Shutdown` frame for the Drop backstop:
+    /// init collapses **all** of its children (registered, stray and
+    /// grandchild groups) before the host reaps it. `try_lock` means this
+    /// never blocks an in-flight async request; if the writer is busy the
+    /// caller's registered+stray group sweep below is the deterministic
+    /// fallback.
+    pub(crate) fn send_shutdown_sync(&self) {
+        let Ok(writer) = self.writer.try_lock() else {
+            return;
+        };
+        let payload = match serde_json::to_vec(&Req::Shutdown) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let bytes = match proto::encode_frame(FrameKind::Req, &payload) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let _ = fdpass::send_with_fds(&writer, &bytes, &[]);
     }
 }
 
@@ -309,19 +358,27 @@ async fn reader_task(link: &std::sync::Arc<ExecLink>, mut reader: tokio::net::Un
         match resp {
             Resp::Started { pid } => {
                 // A `Started` is only legitimate as the reply to the in-flight
-                // request. A stray one (no pending request) is forged: ignore
-                // it entirely rather than announcing a child that never
-                // existed.
+                // request. A stray one (no pending request) means either a
+                // forged frame or — the real case this guard exists for — a
+                // late reply whose request deadline already discarded
+                // `pending` (F1.8). Either way the pid is **not** announced;
+                // but when the frame is real, init has spawned a live child
+                // the host never registered. Record it so teardown collapses
+                // it (reviewer I1); it never resolves a waiter either way.
                 if let Some(pending) = st.pending.take() {
                     st.pid_to_child.insert(pid, pending.child_id);
                     if pending.tx.send(Resp::Started { pid }).is_err() {
                         // The requesting task is gone (deadline exceeded —
                         // link Dead — or the task was canceled), so its
                         // receiver was dropped before this reply was routed.
-                        // A Started that was never delivered must leave no
-                        // registry entry.
+                        // The child is real but was never registered
+                        // host-side: remove the announcement and keep the pid
+                        // for the teardown sweep.
                         st.pid_to_child.remove(&pid);
+                        record_stray(&mut st, pid);
                     }
+                } else {
+                    record_stray(&mut st, pid);
                 }
             }
             Resp::Err { .. } => {
@@ -364,10 +421,105 @@ async fn reader_task(link: &std::sync::Arc<ExecLink>, mut reader: tokio::net::Un
     st.terminated = true;
 }
 
+/// Record a pid init announced but the host never registered (deadline-
+/// orphaned child or forged frame), bounded by the early-exit cap.
+fn record_stray(st: &mut ExecLinkState, pid: i32) {
+    if st.stray_pids.len() < st.early_exit_cap {
+        st.stray_pids.push(pid);
+    } else {
+        st.overflow_drops += 1;
+    }
+}
+
 /// Open a host-side pidfd for an announced child (`-1` when the kernel or the
 /// child's liveness refuses). This is the per-child signal handle: kill_child
 /// never sends a pid-addressed signal verb to init (F1.7) — the registry
 /// resolves the child token to this fd.
 pub(crate) fn open_child_pidfd(pid: i32) -> Option<std::os::fd::OwnedFd> {
     crate::sys::syscall::pidfd_open(pid as u32, 0).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    fn started_frame(pid: i32) -> Vec<u8> {
+        let payload = serde_json::to_vec(&Resp::Started { pid }).unwrap();
+        proto::encode_frame(FrameKind::Resp, &payload).unwrap()
+    }
+
+    async fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if cond() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Reviewer I1 branch (a): a `Started` that arrives after its request's
+    /// deadline discarded `pending` is a **real child init spawned** but one
+    /// the host never registered. The reader must record the pid for the
+    /// teardown sweep instead of silently dropping it — otherwise a
+    /// deadline-orphaned child escapes the Drop backstop. (A forged frame is
+    /// treated the same way; the host may sweep a same-uid pid its sandbox
+    /// could already signal itself.)
+    #[tokio::test]
+    async fn late_started_without_pending_is_recorded_for_teardown() {
+        let (daemon, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let writer = daemon.try_clone().unwrap();
+        daemon.set_nonblocking(true).unwrap();
+        let reader = tokio::net::UnixStream::from_std(daemon).unwrap();
+        let link = ExecLink::new(writer, reader);
+
+        // No request in flight: the F1.8 deadline already took `pending`.
+        peer.write_all(&started_frame(4242)).unwrap();
+        assert!(
+            wait_until(|| link.stray_pids().contains(&4242)).await,
+            "late Started must be recorded as a teardown stray"
+        );
+        assert!(
+            link.state.lock().unwrap().pid_to_child.is_empty(),
+            "a stray Started is never announced"
+        );
+
+        peer.write_all(&started_frame(4243)).unwrap();
+        assert!(wait_until(|| link.stray_pids().contains(&4243)).await);
+        assert_eq!(link.stray_pids(), vec![4242, 4243]);
+        assert!(!link.is_closed(), "recording strays must not close the link");
+    }
+
+    /// Reviewer I1 branch (b): the reader routed the `Started` (announced the
+    /// pid) but the requesting task's receiver was already dropped (deadline
+    /// fired / caller cancelled). The announcement must be retracted **and**
+    /// the pid kept for the teardown sweep — same orphan risk as branch (a).
+    #[tokio::test]
+    async fn started_with_dropped_receiver_is_recorded_for_teardown() {
+        let (daemon, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let writer = daemon.try_clone().unwrap();
+        daemon.set_nonblocking(true).unwrap();
+        let reader = tokio::net::UnixStream::from_std(daemon).unwrap();
+        let link = ExecLink::new(writer, reader);
+
+        let (tx, rx) = oneshot::channel();
+        drop(rx); // the deadline/cancel dropped the reply receiver
+        link.state.lock().unwrap().pending =
+            Some(PendingReply { child_id: 9, tx });
+
+        peer.write_all(&started_frame(5555)).unwrap();
+        assert!(
+            wait_until(|| link.stray_pids().contains(&5555)).await,
+            "a Started whose receiver was dropped must be recorded as a stray"
+        );
+        assert!(
+            link.state.lock().unwrap().pid_to_child.is_empty(),
+            "an undeliverable Started must not stay announced"
+        );
+    }
 }

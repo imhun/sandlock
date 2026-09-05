@@ -46,16 +46,24 @@ use crate::init::{Req, Resp, CONTROL_FD};
 use crate::result::{ExitStatus, RunResult};
 use crate::sandbox::{BranchAction, SharedCow};
 
-/// Lifecycle phase of a sandbox session (M0 shutdown skeleton).
+/// Lifecycle phase of a sandbox session (M0 shutdown skeleton + M1 exec-mode
+/// terminal semantics).
 ///
-/// The full [`docs/sandbox-exec-security.md` §5.2] state machine
-/// (Provisioning/Ready/Active/Frozen/Draining/Dead) lands with F2.2/F2.3;
-/// M0 models the shutdown half of it: a session is `Live`, `Draining` while
-/// [`SandboxInstance::shutdown`] is in flight, or `ShutDown` once shutdown
-/// has completed. The exec-side states (Ready/Active/Frozen and the Dead
-/// error state) arrive with M1's multi-process API.
+/// A `SandboxInstance` runs in one of two explicit modes:
 ///
-/// [`docs/sandbox-exec-security.md` §5.2]: ../../docs/sandbox-exec-security.md
+/// * **one-shot mode** — created with [`SandboxInstance::launch`] (and every
+///   `Sandbox::run`/`popen`/`spawn` session): its single M0 process may exit
+///   while the session stays `Live` (outlives-first-process semantics) until
+///   [`SandboxInstance::shutdown`] or drop;
+/// * **exec mode** — created with [`SandboxInstance::launch_exec`] /
+///   [`SandboxInstance::launch_exec_only`]: the confined direct child is
+///   `sandlock-init`. In exec mode the session is **terminal when init
+///   exits**: with a main child (id 0) that means the main workload's exit
+///   ended the container (init collapses every group and exits); without a
+///   main it means init died unexpectedly. The phase then reads `Exited` and
+///   every exec/wait/kill/resize verb returns the unified
+///   [`SandboxRuntimeError::InstanceClosed`] error; `shutdown` still cleans
+///   the session up and ends at `ShutDown`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstancePhase {
     /// Session live: it owns its supervisor tasks, control directory and
@@ -72,6 +80,12 @@ pub enum InstancePhase {
     /// session-owned resource has been released. Calling `shutdown` again is
     /// a no-op (idempotent).
     ShutDown,
+    /// Exec mode only: the confined `sandlock-init` control link terminated
+    /// on its own (the main child exited and init collapsed the container, or
+    /// init died unexpectedly). The session is over — every exec-mode verb
+    /// returns the unified closed-instance error, `children_live` reads 0,
+    /// and a later `shutdown` only performs the resource cleanup tail.
+    Exited,
 }
 
 /// M0 instance stats snapshot (fork-plan F2.3; the §5.6 subset expressible
@@ -96,17 +110,17 @@ pub struct InstanceStats {
     /// it resolves to zero once the unregister lands. Reports 0 before the
     /// supervisor state exists.
     pub proc_count_vs_live: i64,
-    /// Live session-owned children, M0 record semantics: the session has one
-    /// direct child, so this is 0 or 1. The child counts as live from launch
-    /// until it is *reaped* (the session records `Stopped` on wait/shutdown);
-    /// a child that exited but has not been reaped still counts, because the
-    /// session still owns its slot — the supervisor's pidfd watchers may
-    /// observe the exit earlier. M1's per-child table generalizes this to N
-    /// children with per-child, watcher-observed exit state.
+    /// Live session-owned children.
+    ///
+    /// One-shot mode: the session has one direct child, so this is 0 or 1
+    /// (the child counts from launch until reaped). Exec mode: announced
+    /// children whose exit a wait has not consumed (N children with
+    /// per-child exit state). Reads 0 once an exec-mode session is terminal
+    /// (`Exited`) even before a verb re-synchronizes the stored phase.
     pub children_live: u32,
-    /// The session's lifecycle phase (see [`InstancePhase`]) — the readable
-    /// form of `Live` / `Draining` / `ShutDown`. M1 adds the exec-side states
-    /// and the `Dead` error state with reason counters (§5.6).
+    /// The session's lifecycle phase (see [`InstancePhase`]) — `Live` /
+    /// `Draining` / `ShutDown`, plus exec-mode `Exited` (terminal on init
+    /// exit). The `Dead` error state with reason counters remains §5.6/F5.
     pub instance_state: InstancePhase,
 }
 
@@ -259,10 +273,13 @@ pub struct SandboxInstance {
     /// fields before spawn, which is exactly when the snapshot is taken.
     pub(crate) on_exit: BranchAction,
     pub(crate) on_error: BranchAction,
-    /// F3.2 exec-capable session state. `Some` only for sessions launched
-    /// with [`SandboxInstance::launch_exec`]; the M0 single-child fields
+    /// F3.2 exec-mode session state. `Some` only for sessions launched with
+    /// [`SandboxInstance::launch_exec`] /
+    /// [`SandboxInstance::launch_exec_only`]; the M0 single-child fields
     /// above then describe the confined `sandlock-init` direct child and the
-    /// per-child table lives here.
+    /// per-child table lives here. `None` = one-shot mode (legacy `launch`
+    /// / `Sandbox`-embedded sessions), whose outlives-first-process
+    /// semantics are unchanged.
     pub(crate) exec_session: Option<Box<ExecSession>>,
 }
 
@@ -494,8 +511,9 @@ impl SandboxInstance {
     }
 
     /// Launch an exec-only session (no main process; see
-    /// [`SandboxInstance::launch_exec`] for the distinction). `pid()` reports
-    /// `None` until the first `exec`.
+    /// [`SandboxInstance::launch_exec`] for the distinction). `pid()` is
+    /// always `None` for a mainless session — there is no single "process
+    /// pid"; every exec child's pid lives on its [`ExecHandle`].
     pub async fn launch_exec_only(
         policy: crate::sandbox::Sandbox,
     ) -> Result<SandboxInstance, SandlockError> {
@@ -512,13 +530,56 @@ impl SandboxInstance {
         .into()
     }
 
+    /// Whether this session is exec mode (launched with `launch_exec` /
+    /// `launch_exec_only`) rather than one-shot mode (`launch`).
+    fn is_exec_mode(&self) -> bool {
+        self.exec_session.is_some()
+    }
+
+    /// Reconcile the stored phase/children when the exec-mode init control
+    /// link terminated on its own (main child exit collapsed the container,
+    /// or init died): drain any real buffered exit statuses into the child
+    /// caches, mark every remaining child `Killed` (children_live → 0), and
+    /// set the terminal `Exited` phase. Called at the entry of every
+    /// exec-mode verb; read-only surfaces (`phase`, `stats`) observe the
+    /// terminal state through the effective-phase check instead.
+    fn enter_exec_terminal_if_needed(&mut self) {
+        if self.phase != InstancePhase::Live || !self.is_exec_mode() {
+            return;
+        }
+        let terminated = self
+            .exec_session
+            .as_ref()
+            .map(|s| s.link.is_terminated())
+            .unwrap_or(false);
+        if !terminated {
+            return;
+        }
+        let mut early: HashMap<u64, ExitStatus> = HashMap::new();
+        if let Some(session) = self.exec_session.as_ref() {
+            session.link.drain_early_exits(&mut early);
+        }
+        if let Some(session) = self.exec_session.as_mut() {
+            for (child_id, child) in session.children.iter_mut() {
+                if child.status.is_none() {
+                    let status = early.remove(child_id).unwrap_or(ExitStatus::Killed);
+                    child.status = Some(status);
+                }
+            }
+        }
+        self.phase = InstancePhase::Exited;
+    }
+
     /// Borrow the exec session, mapping a missing session to the unified
     /// closed-instance error once the instance left `Live` (a legacy session
-    /// is only "not exec-capable" while it is live).
+    /// is only "not exec-capable" while it is live). An exec-mode session
+    /// whose init link terminated reads as closed (`Exited` ⇒ every verb
+    /// fails with the same `InstanceClosed` error).
     fn exec_ref(&self) -> Result<&ExecSession, SandlockError> {
         match self.exec_session.as_ref() {
-            Some(session) => Ok(session),
-            None if matches!(self.phase, InstancePhase::Live) => Err(Self::not_exec_capable()),
+            Some(session) if matches!(self.phase(), InstancePhase::Live) => Ok(session),
+            Some(_) => Err(SandboxRuntimeError::InstanceClosed.into()),
+            None if matches!(self.phase(), InstancePhase::Live) => Err(Self::not_exec_capable()),
             None => Err(SandboxRuntimeError::InstanceClosed.into()),
         }
     }
@@ -539,6 +600,7 @@ impl SandboxInstance {
         argv: &[&str],
         stdio: ExecStdio,
     ) -> Result<ExecHandle, SandlockError> {
+        self.enter_exec_terminal_if_needed();
         if self.phase != InstancePhase::Live {
             return Err(SandboxRuntimeError::InstanceClosed.into());
         }
@@ -565,6 +627,7 @@ impl SandboxInstance {
         argv: &[&str],
         fds: [OwnedFd; 3],
     ) -> Result<ExecHandle, SandlockError> {
+        self.enter_exec_terminal_if_needed();
         if self.phase != InstancePhase::Live {
             return Err(SandboxRuntimeError::InstanceClosed.into());
         }
@@ -653,6 +716,7 @@ impl SandboxInstance {
     /// while a wait is pending, the child is reported `Killed` rather than
     /// the waiter hanging.
     pub async fn wait_child(&mut self, child_id: ChildId) -> Result<ExitStatus, SandlockError> {
+        self.enter_exec_terminal_if_needed();
         let session = self.exec_ref()?;
         let child = session
             .children
@@ -720,9 +784,7 @@ impl SandboxInstance {
         let master = child
             .pty
             .as_ref()
-            .ok_or_else(|| SandboxRuntimeError::Child(format!(
-                "child {child_id} has no pty master (exec without ExecStdio::Pty)"
-            )))?;
+            .ok_or(SandboxRuntimeError::NoPtyMaster(child_id))?;
         let ws = libc::winsize {
             ws_row: rows,
             ws_col: cols,
@@ -1112,9 +1174,12 @@ impl SandboxInstance {
         reaped
     }
 
-    /// Best-effort SIGKILL sweep over every registered exec child group
-    /// (escalation and belt paths; ESRCH after init already collapsed the
-    /// groups is expected and harmless).
+    /// Best-effort SIGKILL sweep over every registered exec child group plus
+    /// every deadline-orphaned/stray pid the reader recorded (I1: a child
+    /// init announced after the request deadline discarded the reply is real
+    /// but was never registered host-side — its group must still be
+    /// collapsed). Used on escalation and belt paths; ESRCH after init
+    /// already collapsed the groups is expected and harmless.
     fn sweep_exec_child_groups(&self) {
         let Some(session) = self.exec_session.as_ref() else {
             return;
@@ -1122,6 +1187,11 @@ impl SandboxInstance {
         for child in session.children.values() {
             unsafe {
                 libc::killpg(child.pid, libc::SIGKILL);
+            }
+        }
+        for stray_pid in session.link.stray_pids() {
+            unsafe {
+                libc::killpg(stray_pid, libc::SIGKILL);
             }
         }
     }
@@ -1343,16 +1413,24 @@ impl SandboxInstance {
         None
     }
 
-    /// Drop-backstop variant for exec-capable sessions. No frame dance and no
-    /// grace: SIGKILL every registered child group (pidfd direct complement
-    /// covers an escaped child), SIGKILL init's own group, reap init, and
-    /// mark the link terminated so pending waiters resolve instead of
-    /// hanging. Best-effort like the M0 backstop — dropping must never hang.
+    /// Drop-backstop variant for exec-mode sessions. No grace: first ask a
+    /// still-alive init to collapse **everything** it spawned (the best
+    /// effort sync `Shutdown` frame covers children the host never
+    /// registered — reviewer I1; F1.8's shutdown is deliberately not gated by
+    /// Dead), then SIGKILL every registered child group (pidfd direct
+    /// complement covers an escaped child) plus every recorded stray group,
+    /// SIGKILL init's own group, reap init, and mark the link terminated so
+    /// pending waiters resolve instead of hanging. Best-effort like the M0
+    /// backstop — dropping must never hang.
     fn kill_and_reap_exec(&mut self) -> Option<ExitStatus> {
         // First resolve every pending waiter (nothing may hang on a dropped
         // session) and fail fast any later request.
         if let Some(session) = self.exec_session.as_ref() {
             session.link.mark_terminated();
+            // Belt: init's own registry knows every child it spawned
+            // (registered, stray, and their retained dead groups). Ask it to
+            // collapse them before we reap it.
+            session.link.send_shutdown_sync();
         }
         // Per-child SIGKILL: pidfd direct (escapee-proof) plus group killpg
         // (in-group descendants).
@@ -1376,6 +1454,10 @@ impl SandboxInstance {
                     libc::killpg(child.pid, libc::SIGKILL);
                 }
             }
+        }
+        self.sweep_exec_child_groups();
+        if let Some(session) = self.exec_session.as_ref() {
+            session.link.clear_strays();
         }
         let mut reaped: Option<ExitStatus> = None;
         if let Some(pid) = self.child_pid {
@@ -1516,12 +1598,23 @@ impl SandboxInstance {
 
     /// The session's lifecycle phase (see [`InstancePhase`]).
     pub fn phase(&self) -> InstancePhase {
+        // Exec mode: an init control link that terminated on its own (main
+        // child exit collapsed the container, or init died) means the session
+        // is over even before a &mut verb re-synchronizes the stored phase —
+        // read-only surfaces observe the terminal `Exited` state directly.
+        if self.phase == InstancePhase::Live {
+            if let Some(session) = self.exec_session.as_ref() {
+                if session.link.is_terminated() {
+                    return InstancePhase::Exited;
+                }
+            }
+        }
         self.phase
     }
 
-    /// Snapshot the session's M0 stats surface (fork-plan F2.3):
+    /// Snapshot the session's stats surface (fork-plan F2.3):
     /// `proc_count_vs_live` (the F1.4 process reconciliation under the §5.6
-    /// name), `children_live` (M0 single-child record semantics), and
+    /// name), `children_live` (per-mode record semantics), and
     /// `instance_state` (the current [`InstancePhase`]).
     ///
     /// The process half is read from the supervisor's `ResourceState` /
@@ -1540,23 +1633,35 @@ impl SandboxInstance {
             }
             _ => 0,
         };
-        let children_live = match self.exec_session.as_ref() {
-            // Exec-capable session: announced children whose exit has not
-            // been consumed by a wait (the F3.1 report's announced-minus-
-            // reaped generalization of the M0 record).
-            Some(session) => session
-                .children
-                .values()
-                .filter(|c| c.status.is_none())
-                .count() as u32,
-            None => u32::from(
+        let effective_phase = self.phase();
+        let children_live = if self.is_exec_mode() {
+            if effective_phase == InstancePhase::Exited {
+                // Terminal: init collapsed every group; children reconcile to
+                // zero even before a verb drains the caches.
+                0
+            } else {
+                // Exec session: announced children whose exit has not been
+                // consumed by a wait (the F3.1 report's announced-minus-reaped
+                // generalization of the M0 record).
+                self.exec_session
+                    .as_ref()
+                    .map(|s| {
+                        s.children
+                            .values()
+                            .filter(|c| c.status.is_none())
+                            .count() as u32
+                    })
+                    .unwrap_or(0)
+            }
+        } else {
+            u32::from(
                 self.child_pid.is_some() && !matches!(self.state, RuntimeState::Stopped(_)),
-            ),
+            )
         };
         InstanceStats {
             proc_count_vs_live,
             children_live,
-            instance_state: self.phase,
+            instance_state: effective_phase,
         }
     }
 
@@ -1595,18 +1700,19 @@ impl SandboxInstance {
         InstancePorts { inbound, port_remap }
     }
 
-    /// The session's (single, M0) process PID, or `None` before launch. Remains
-    /// `Some` after the process exits, until the instance is dropped.
+    /// The session's process PID.
+    ///
+    /// One-shot mode: the direct child's pid (remains `Some` after exit until
+    /// drop). Exec mode with a main child (`launch_exec`): the main workload's
+    /// pid (child id 0). Exec mode without a main (`launch_exec_only`):
+    /// `None` — the session has no single "process pid"; each exec child's
+    /// pid lives on its [`ExecHandle`]. Never reports the confined
+    /// `sandlock-init` pid.
     pub fn pid(&self) -> Option<i32> {
         if let Some(session) = self.exec_session.as_ref() {
             // Exec-capable session: report the main workload (child id 0),
             // not the confined `sandlock-init` direct child.
-            return session
-                .children
-                .get(&0)
-                .map(|child| child.pid)
-                .or(self.leader_pid)
-                .or(self.child_pid);
+            return session.children.get(&0).map(|child| child.pid);
         }
         self.leader_pid.or(self.child_pid)
     }

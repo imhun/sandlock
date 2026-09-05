@@ -1134,6 +1134,60 @@ fn test_supervise_path_serve_launches_instance_and_serves_verbs_until_shutdown()
     let _ = std::fs::remove_dir_all(&workdir);
 }
 
+/// Reviewer I2 (supervise): when the generation's main process exits,
+/// `sandlock-init` collapses the container and the instance reads `Exited`
+/// through the stats verb; the worker then closing the channel is the
+/// generation's *natural* end and must exit 0 (not the abnormal non-zero path
+/// reserved for a vanished/refused peer). A main exit alone cannot end the
+/// single-threaded serve loop while the worker keeps its end open — the
+/// worker observes `Exited` via stats and closes, exactly the E2B flow.
+#[test]
+fn test_supervise_main_exit_ends_generation_cleanly() {
+    isolate_ctl_root();
+    let workdir = repo_tmp_dir().join(format!("supervise-main-exit-{}", std::process::id()));
+    std::fs::create_dir_all(&workdir).expect("create main-exit workdir");
+    let policy = write_policy(
+        "main-exit",
+        &instance_policy(workdir.to_str().expect("workdir utf8")),
+    );
+    let program = write_policy(
+        "main-exit-program",
+        &serde_json::json!({ "argv": ["/bin/sh", "-c", "exit 0"] }).to_string(),
+    );
+    let (child, mut worker) = spawn_serve_supervisor_with_program(&policy, &program, &[]);
+
+    // Poll stats until the instance reports the terminal Exited state (main
+    // exit collapsed init; the serve loop stays responsive to worker verbs).
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut exited = false;
+    while Instant::now() < deadline {
+        let resp = roundtrip_frame(
+            &mut worker,
+            &serde_json::json!({ "v": 1, "verb": "stats", "args": {} }),
+        );
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "stats: {resp:?}");
+        if resp["data"]["instance_state"] == "Exited" {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(exited, "stats must report Exited after the main process exits");
+
+    // The worker closing the channel after main exit is the natural end.
+    drop(worker);
+    let out = child.wait_with_output().expect("wait supervise main exit");
+    assert!(
+        out.status.success(),
+        "a generation whose main exited must end cleanly; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_file(&policy);
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
 /// Route-B invariant pin (fork-plan F2b.3): the wire surface exposes NO
 /// runtime mediator re-map verb.  The forbidden "give this generation a new
 /// host uid" path must not exist under any name — a `map-uid`-class request

@@ -5,6 +5,7 @@ child handles of an exec-capable session)."""
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 
@@ -89,3 +90,36 @@ def test_exec_pty_returns_master_and_resize():
             proc.resize(40, 120)
             result = proc.wait()
         assert result.exit_code == 0
+
+
+def test_dropped_exec_process_is_reaped_on_del():
+    """Drop contract pin: an ExecProcess dropped without wait()/context is
+    killed and reaped by __del__ immediately (CPython refcounting), mirroring
+    the one-shot Process — a discarded handle never leaves a running child."""
+    import gc
+    import warnings
+
+    inst = SandboxInstance(_policy())
+    proc = inst.exec(["sleep", "30"])
+    pid = proc.pid
+    assert pid is not None
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ResourceWarning)
+        del proc
+        gc.collect()
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError(f"dropped ExecProcess child {pid} was not reaped")
+
+    # The instance itself is still usable for another exec.
+    with inst.exec(["sh", "-c", "exit 0"]) as proc2:
+        result = proc2.wait()
+    assert result.exit_code == 0
+    inst.close()

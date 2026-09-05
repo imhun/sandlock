@@ -214,6 +214,26 @@ impl Generation {
                 // Abnormal end: the instance field drops first (declaration
                 // order), running its synchronous kill-and-clean backstop
                 // while the runtime is still alive.
+                // Exec-mode exception: when the generation's main process
+                // (child id 0) exits, `sandlock-init` collapses every group
+                // and exits — the channel EOF that follows is the container's
+                // *natural* end, matching init semantics, not an abnormal
+                // peer end. The instance's effective phase reads `Exited`;
+                // run the cleanup tail and exit 0.
+                if self
+                    .instance
+                    .as_ref()
+                    .map(|i| i.phase() == InstancePhase::Exited)
+                    .unwrap_or(false)
+                {
+                    if let Some(mut instance) = self.instance.take() {
+                        if let Err(e) = self.rt.block_on(instance.shutdown()) {
+                            drop(instance);
+                            return Err(format!("instance cleanup after main exit failed: {e}"));
+                        }
+                    }
+                    return Ok(());
+                }
                 drop(self.instance.take());
                 Err(format!(
                     "control channel ended abnormally (outcome {other:?}); \
@@ -231,6 +251,7 @@ impl Generation {
                     InstancePhase::Live => "Live",
                     InstancePhase::Draining => "Draining",
                     InstancePhase::ShutDown => "ShutDown",
+                    InstancePhase::Exited => "Exited",
                 };
                 serde_json::json!({
                     "launched": true,
@@ -298,9 +319,12 @@ impl Generation {
              (provision --program at slot start)"
                 .to_string()
         })?;
-        let mut raw_fds = [0i32; 3];
-        for (i, dst) in raw_fds.iter_mut().enumerate() {
-            let dup = unsafe { libc::fcntl(fds[i].as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        // Dup all three fds into owned handles first: if a mid-loop dup fails,
+        // the Vec's Drop closes the earlier dups (no fd leak on the error
+        // path), and only then do we form the fixed-size array.
+        let mut owned = Vec::with_capacity(3);
+        for (i, fd) in fds.iter().take(3).enumerate() {
+            let dup = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
             if dup < 0 {
                 return Err(format!(
                     "dup stdio fd {} for exec: {}",
@@ -308,9 +332,11 @@ impl Generation {
                     std::io::Error::last_os_error()
                 ));
             }
-            *dst = dup;
+            owned.push(unsafe { OwnedFd::from_raw_fd(dup) });
         }
-        let child_fds = raw_fds.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+        let child_fds: [OwnedFd; 3] = owned
+            .try_into()
+            .map_err(|_| "exec requires exactly 3 stdio fds".to_string())?;
         let arg_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         let handle = self
             .rt

@@ -1972,12 +1972,17 @@ class ExecProcess:
     ``kill()``, context manager), but ownership differs by design:
 
     * the process is *not* a borrow of the instance — the instance can exec
-      more children while this one runs, and dropping the returned process
-      leaves the child running until the instance closes;
+      more children while this one runs;
     * ``kill()`` signals through the session registry (per-child pidfd /
       group delivery), not a raw ``os.killpg`` on a pid the SDK cached;
     * ``wait()`` frees nothing — the registration is the instance's — and is
       idempotent via a cached :class:`Result`.
+
+    Drop contract (pinned by ``test_dropped_exec_process_is_reaped_on_del``):
+    like the one-shot :class:`Process`, an ``ExecProcess`` that is dropped
+    without :meth:`wait` (and not used as a context manager) is killed and
+    reaped by ``__del__`` immediately under CPython refcounting — a child is
+    never left running just because its handle was discarded.
     """
 
     def __init__(
@@ -1999,30 +2004,40 @@ class ExecProcess:
         self._lock = threading.Lock()
         self._result: "Result | None" = None
         self.stdin = self.stdout = self.stderr = self.pty = None
-        specs = ((stdin_fd, "wb"), (stdout_fd, "rb"), (stderr_fd, "rb"))
-        opened = []
+        specs = [
+            ("stdin", stdin_fd, "wb"),
+            ("stdout", stdout_fd, "rb"),
+            ("stderr", stderr_fd, "rb"),
+            ("pty", pty_fd, "r+b"),
+        ]
+        opened = {}
         try:
-            for fd, mode in specs:
-                opened.append(os.fdopen(fd, mode, buffering=0) if fd >= 0 else None)
-            if pty_fd >= 0:
-                opened.append(os.fdopen(pty_fd, "rb", buffering=0))
-            else:
-                opened.append(None)
+            for name, fd, mode in specs:
+                if fd >= 0:
+                    opened[name] = os.fdopen(fd, mode, buffering=0)
+                else:
+                    opened[name] = None
         except BaseException:
-            for stream in opened:
+            for stream in opened.values():
                 if stream is not None:
                     try:
                         stream.close()
                     except OSError:
                         pass
-            for fd, _mode in specs[len(opened):]:
+            # Close any raw fd whose os.fdopen never ran (e.g. the pty master
+            # when a later stream's fdopen raised).
+            for name, fd, _mode in specs:
                 if fd >= 0:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
+                    if opened.get(name) is None:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
             raise
-        self.stdin, self.stdout, self.stderr, self.pty = opened
+        self.stdin = opened["stdin"]
+        self.stdout = opened["stdout"]
+        self.stderr = opened["stderr"]
+        self.pty = opened["pty"]
 
     @property
     def pid(self) -> int | None:

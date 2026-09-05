@@ -3321,8 +3321,8 @@ pub unsafe extern "C" fn sandlock_instance_resize_child(
     match h.instance.resize_child(child_id, rows, cols) {
         Ok(()) => SANDLOCK_INSTANCE_OK,
         Err(sandlock_core::SandlockError::Runtime(
-            sandlock_core::error::SandboxRuntimeError::Child(ref msg),
-        )) if msg.contains("has no pty master") => SANDLOCK_INSTANCE_ERR_NO_PTY,
+            sandlock_core::error::SandboxRuntimeError::NoPtyMaster(_),
+        )) => SANDLOCK_INSTANCE_ERR_NO_PTY,
         Err(e) => instance_error_code(&e),
     }
 }
