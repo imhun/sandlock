@@ -17,6 +17,17 @@ use crate::protection::{Protection, ProtectionPolicy, ProtectionState, Protectio
 mod builder;
 pub use builder::SandboxBuilder;
 
+/// Default `max_processes`: the whole-box concurrent-process ceiling for a
+/// sandbox session (fork-plan F5.1 / M3 S1).
+///
+/// Historically the value meant "64 per command" because every command ran in
+/// its own sandbox instance, each with its own supervisor accounting block.
+/// An exec-capable `SandboxInstance` shares **one** supervisor block across
+/// every command, so the same knob now bounds the whole box; the default is
+/// raised to 256 so switching from per-command to whole-box accounting does
+/// not silently turn previously-fine workloads into EAGAIN victims (Q10).
+pub const DEFAULT_MAX_PROCESSES: u32 = 256;
+
 /// A byte size value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ByteSize(pub u64);
@@ -184,7 +195,9 @@ impl TryFrom<&Sandbox> for Confinement {
         if sandbox.host_mask.is_some() { unsupported.push("host_mask"); }
         if sandbox.egress_proxy.is_some() { unsupported.push("egress_proxy"); }
         if sandbox.max_memory.is_some() { unsupported.push("max_memory"); }
-        if sandbox.max_processes != 64 { unsupported.push("max_processes"); }
+        if sandbox.max_processes != super::DEFAULT_MAX_PROCESSES {
+            unsupported.push("max_processes");
+        }
         if sandbox.max_open_files.is_some() { unsupported.push("max_open_files"); }
         if sandbox.max_cpu.is_some() { unsupported.push("max_cpu"); }
         if sandbox.random_seed.is_some() { unsupported.push("random_seed"); }

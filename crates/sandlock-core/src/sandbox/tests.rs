@@ -95,6 +95,16 @@ fn builder_invalid_http_deny_returns_error() {
 }
 
 #[test]
+fn default_max_processes_is_whole_box_256() {
+    // F5.1 (Q10): `max_processes` is a whole-box ceiling — every process an
+    // exec session forks shares one supervisor accounting block — so the
+    // default is 256, not the legacy 64-per-command value.
+    let policy = Sandbox::builder().build().unwrap();
+    assert_eq!(policy.max_processes, 256);
+    assert_eq!(policy.max_processes, crate::sandbox::DEFAULT_MAX_PROCESSES);
+}
+
+#[test]
 fn builder_http_ca_without_key_returns_error() {
     let result = Sandbox::builder()
         .http_ca("/tmp/ca.pem")

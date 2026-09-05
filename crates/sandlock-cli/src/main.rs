@@ -915,7 +915,9 @@ fn validate_no_supervisor_profile(profile: &Sandbox, source: &str) -> Result<()>
     if profile.http_ca.is_some() { bad.push("[config].http_ca"); }
     if profile.http_key.is_some() { bad.push("[config].http_key"); }
     if profile.max_memory.is_some() { bad.push("[limits].memory"); }
-    if profile.max_processes != 64 { bad.push("[limits].processes"); }
+    if profile.max_processes != sandlock_core::DEFAULT_MAX_PROCESSES {
+        bad.push("[limits].processes");
+    }
     if profile.max_open_files.is_some() { bad.push("[limits].open_files"); }
     if profile.max_cpu.is_some() { bad.push("[limits].cpu"); }
     if profile.max_disk.is_some() { bad.push("[limits].disk"); }

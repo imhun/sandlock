@@ -108,3 +108,6 @@ mod test_pid_ns;
 
 #[path = "integration/test_fd_inherit.rs"]
 mod test_fd_inherit;
+
+#[path = "integration/test_instance_semantics.rs"]
+mod test_instance_semantics;

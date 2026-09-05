@@ -45,6 +45,7 @@ pub use checkpoint::{Checkpoint, SkippedFd};
 pub use protection::{Protection, ProtectionState, ProtectionPolicy, ProtectionStatus};
 pub use sandbox::{
     BindPorts, Confinement, ConfinementBuilder, Process, Sandbox, SandboxBuilder, StdioMode,
+    DEFAULT_MAX_PROCESSES,
 };
 pub use instance::{InstancePhase, SandboxInstance};
 pub use result::{RunResult, ExitStatus};

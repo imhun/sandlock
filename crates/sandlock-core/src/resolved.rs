@@ -89,7 +89,19 @@ impl SandboxFeatures {
             net_isolation: sandbox.net_isolation,
             inbound_port_map: !sandbox.net_bind_map.is_empty(),
             http_acl,
-            argv_safety_required: sandbox.policy_fn.is_some() || exec_handler,
+            // F5.1 (M3 S1): an in-child-main control session (the confined
+            // `sandlock-init` of an exec-capable `SandboxInstance`, and every
+            // other `create_with_in_child_main` entry) forks workloads whose
+            // exits are reaped with WNOHANG by the control loop — the wait4
+            // path lazy mode relies on never fires. Fork-tracking/birth
+            // registration makes the pidfd watcher the authoritative
+            // `proc_count` releaser, which is what makes whole-box
+            // `max_processes` honest across exec children and their
+            // descendants (F1.4's argv-safety mechanism; same shape as the
+            // E2B/OCI handler mode).
+            argv_safety_required: sandbox.policy_fn.is_some()
+                || exec_handler
+                || sandbox.in_child_main.is_some(),
             sysv_ipc_allowed: sandbox.allows_sysv_ipc(),
             net_allow_present: !sandbox.net_allow.is_empty(),
             net_deny: !sandbox.net_deny.is_empty(),

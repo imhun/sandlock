@@ -3,7 +3,10 @@ use sandlock_core::sandbox::{ByteSize, BranchAction, Sandbox};
 #[test]
 fn test_default_policy() {
     let policy = Sandbox::builder().build().unwrap();
-    assert_eq!(policy.max_processes, 64);
+    // F5.1 (Q10): `max_processes` counts the whole box (one exec session /
+    // sandbox supervisor), so the default rises from 64 (the old per-command
+    // ceiling) to 256.
+    assert_eq!(policy.max_processes, 256);
     assert!(policy.extra_deny_syscalls.is_empty());
     // UDP, ICMP, and raw ICMP are denied by default — there are no rules
     // for those protocols in `net_allow`, which is what the BPF filter

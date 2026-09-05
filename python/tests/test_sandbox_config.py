@@ -135,7 +135,9 @@ class TestPolicy:
         assert p.net_allow_bind == []
         assert p.net_allow == []
         assert p.max_memory is None
-        assert p.max_processes == 64
+        # F5.1 (Q10): max_processes is a whole-box ceiling; the default rose
+        # from the legacy per-command 64 to 256.
+        assert p.max_processes == 256
         assert p.max_cpu is None
 
     def test_mutable_config(self):
