@@ -445,16 +445,28 @@ async fn test_update_network_applies_to_new_exec_only_and_reports_staleness() {
         .await
         .expect("exec pre-update child A");
 
-    // Session-level update: new execs only. A is still running under the old
-    // policy, so the API must report A as stale.
+    // A second concurrent pre-update child strengthens the exact-staleness
+    // assertion (both running children are reported, in child-id order).
+    let a2 = inst
+        .exec_params(
+            &["/usr/bin/python3", "-c", "import time; time.sleep(60)"],
+            &ExecParams::default(),
+            ExecStdio::Null,
+        )
+        .await
+        .expect("exec second pre-update child A2");
+
+    // Session-level update: new execs only. A and A2 are still running under
+    // the old policy, so the API must report both as stale.
     let stale = inst
         .update_network(&["127.0.0.1".parse::<IpAddr>().unwrap()])
         .await
         .expect("update_network narrows the session to loopback-low");
+    let mut expected_stale = vec![a.child_id, a2.child_id];
+    expected_stale.sort_unstable();
     assert_eq!(
-        stale.stale_child_ids,
-        vec![a.child_id],
-        "the only running pre-update child must be reported stale exactly"
+        stale.stale_child_ids, expected_stale,
+        "every running pre-update child must be reported stale exactly"
     );
 
     // An identical update is a no-op: no generation bump, no stale report.
@@ -746,5 +758,332 @@ async fn test_live_policy_tightening_denies_bound_child() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+    inst.shutdown().await.expect("shutdown");
+}
+
+/// Reviewer C1: a bound child's pgid entry must survive its leader's exit
+/// while an in-group descendant lives. The helper's *first* mediated syscall
+/// happens after the leader is reaped (and after the exit-cleanup prune ran),
+/// so it must still resolve the bound policy — never the wide default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_bound_child_pgid_entry_survives_leader_exit() {
+    let (port_lo, _log_lo) = spawn_sink_listener("127.0.0.1".parse().unwrap());
+    let (port_hi, log_hi) = spawn_sink_listener("127.0.0.2".parse().unwrap());
+    let dir = scratch("pgid-survive");
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).expect("create pgid-survive out dir");
+    let go = dir.join("go");
+    let out = out_dir.join("helper");
+
+    // No policy_fn: the bound child lazily registers itself in ProcessIndex
+    // with its first mediated syscall (the loopback connect below), which
+    // spawns the pidfd watcher whose exit cleanup runs the prune C1
+    // exercises.
+    let policy = base_policy()
+        .net_allow("127.0.0.1")
+        .net_allow("127.0.0.2");
+    let mut inst = launch_exec_only_tmp(policy).await;
+    inst.update_network(&["127.0.0.1".parse::<IpAddr>().unwrap()])
+        .await
+        .expect("narrow the session to 127.0.0.1");
+
+    let helper_code = format!(
+        concat!(
+            "import os, socket, time\n",
+            "while not os.path.exists('{go}'):\n",
+            "    time.sleep(0.05)\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.settimeout(3)\n",
+            "try:\n",
+            "    s.connect(('127.0.0.2', {port}))\n",
+            "    open('{out}', 'w').write('OK')\n",
+            "except OSError as e:\n",
+            "    open('{out}', 'w').write('ERR%d' % e.errno)\n",
+            "finally:\n",
+            "    s.close()\n",
+        ),
+        go = go.display(),
+        port = port_hi,
+        out = out.display(),
+    );
+    let root_code = format!(
+        concat!(
+            "import os, socket, subprocess, sys\n",
+            "# First mediated syscall: register this child (and its pidfd watcher)\n",
+            "# in the supervisor's ProcessIndex.\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.settimeout(3)\n",
+            "try:\n",
+            "    s.connect(('127.0.0.1', {p_lo}))\n",
+            "except OSError:\n",
+            "    pass\n",
+            "finally:\n",
+            "    s.close()\n",
+            "p = subprocess.Popen([sys.executable, '-c', os.environ['F4_HELPER_CODE']])\n",
+            "# Exit immediately: the leader dies while the in-group helper lives.\n",
+            "sys.exit(0)\n",
+        ),
+        p_lo = port_lo,
+    );
+    let params = ExecParams {
+        env: vec![("F4_HELPER_CODE".to_string(), helper_code)],
+        ..Default::default()
+    };
+    let h = inst
+        .exec_params(&["/usr/bin/python3", "-c", &root_code], &params, ExecStdio::Null)
+        .await
+        .expect("exec bound leader child");
+    let status = inst.wait_child(h.child_id).await.expect("wait bound leader");
+    assert_eq!(status, ExitStatus::Code(0));
+
+    // Give the leader's exit cleanup (pidfd watcher -> prune_pid) time to
+    // run before the helper's first mediated syscall.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    std::fs::write(&go, b"go").expect("release in-group helper");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut content = String::new();
+    while Instant::now() < deadline {
+        content = std::fs::read_to_string(&out).unwrap_or_default();
+        if !content.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        content, "ERR111",
+        "the in-group helper after leader exit must stay under the bound policy"
+    );
+    assert!(
+        log_hi.lock().unwrap().is_empty(),
+        "the helper must never reach the sibling-wide destination"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    inst.shutdown().await.expect("shutdown");
+}
+
+/// Reviewer R2: the main workload (child id 0) must stay network-attributed
+/// after exec-child announcements. Its lineage keeps the shared live/static
+/// policy (F4.3: running children are never rebound), so egress after an
+/// exec child announcement keeps working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_main_workload_egress_survives_exec_child_announcement() {
+    let (port_hi, log_hi) = spawn_sink_listener("127.0.0.2".parse().unwrap());
+    let dir = scratch("main-attributed");
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).expect("create main out dir");
+    let go = dir.join("go");
+    let out = out_dir.join("main");
+
+    let policy = base_policy()
+        .net_allow("127.0.0.1")
+        .net_allow("127.0.0.2");
+    let main_script = format!(
+        concat!(
+            "import os, socket, time\n",
+            "while not os.path.exists('{go}'):\n",
+            "    time.sleep(0.05)\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.settimeout(3)\n",
+            "try:\n",
+            "    s.connect(('127.0.0.2', {port}))\n",
+            "    open('{out}', 'w').write('OK')\n",
+            "except OSError as e:\n",
+            "    open('{out}', 'w').write('ERR%d' % e.errno)\n",
+            "finally:\n",
+            "    s.close()\n",
+        ),
+        go = go.display(),
+        port = port_hi,
+        out = out.display(),
+    );
+    let mut inst = SandboxInstance::launch_exec(
+        policy.build().unwrap().with_name("f4-main-attributed"),
+        &["/usr/bin/python3", "-c", &main_script],
+    )
+    .await
+    .expect("launch exec session with main workload");
+
+    // Announce (and reap) an exec child: this flips has_exec_bindings on.
+    let child = inst
+        .exec(&["true"], ExecStdio::Null)
+        .await
+        .expect("exec additional child");
+    let status = inst.wait_child(child.child_id).await.expect("wait child");
+    assert_eq!(status, ExitStatus::Code(0));
+
+    // The main (child 0) is attributed-default, so its egress stays on the
+    // shared live/static policy and reaches the listener.
+    std::fs::write(&go, b"go").expect("release main workload");
+    let status = inst.wait_child(0).await.expect("wait main workload");
+    assert_eq!(status, ExitStatus::Code(0));
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap_or_default(),
+        "OK",
+        "the main workload must keep egress after an exec child announcement"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if log_hi.lock().unwrap().len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(log_hi.lock().unwrap().len(), 1, "the main's connect must land");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    inst.shutdown().await.expect("shutdown");
+}
+
+/// End-to-end fail-closed pin: a helper that becomes truly unattributed (its
+/// attributed-default parent exits and the orphan reparents away before its
+/// first mediated syscall) is denied rather than regaining the wide shared
+/// default. A running *bound* child keeps `has_exec_bindings()` true, which
+/// is exactly the state where an unattributed pid must fail closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_unattributed_orphan_is_denied_end_to_end() {
+    let (port_hi, log_hi) = spawn_sink_listener("127.0.0.2".parse().unwrap());
+    let dir = scratch("unattributed");
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).expect("create unattributed out dir");
+    let go = dir.join("go");
+    let out = out_dir.join("orphan");
+
+    let policy = base_policy()
+        .net_allow("127.0.0.1")
+        .net_allow("127.0.0.2");
+    let mut inst = launch_exec_only_tmp(policy).await;
+
+    // A running bound child keeps attribution on for the session.
+    inst.update_network(&["127.0.0.1".parse::<IpAddr>().unwrap()])
+        .await
+        .expect("bind the session to 127.0.0.1");
+    let bound = inst
+        .exec_params(
+            &["/usr/bin/python3", "-c", "import time; time.sleep(60)"],
+            &ExecParams::default(),
+            ExecStdio::Null,
+        )
+        .await
+        .expect("exec running bound child");
+    let _ = bound;
+
+    let helper_code = format!(
+        concat!(
+            "import os, socket, time\n",
+            "while not os.path.exists('{go}'):\n",
+            "    time.sleep(0.05)\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.settimeout(3)\n",
+            "try:\n",
+            "    s.connect(('127.0.0.2', {port}))\n",
+            "    open('{out}', 'w').write('OK')\n",
+            "except OSError as e:\n",
+            "    open('{out}', 'w').write('ERR%d' % e.errno)\n",
+            "finally:\n",
+            "    s.close()\n",
+        ),
+        go = go.display(),
+        port = port_hi,
+        out = out.display(),
+    );
+    let root_code = concat!(
+        "import os, subprocess, sys\n",
+        "p = subprocess.Popen([sys.executable, '-c', os.environ['F4_HELPER_CODE']])\n",
+        "sys.exit(0)\n",
+    );
+    let params = ExecParams {
+        env: vec![("F4_HELPER_CODE".to_string(), helper_code)],
+        ..Default::default()
+    };
+    let h = inst
+        .exec_params(&["/usr/bin/python3", "-c", root_code], &params, ExecStdio::Null)
+        .await
+        .expect("exec attributed-default parent");
+    let status = inst.wait_child(h.child_id).await.expect("wait parent");
+    assert_eq!(status, ExitStatus::Code(0));
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::fs::write(&go, b"go").expect("release orphan");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut content = String::new();
+    while Instant::now() < deadline {
+        content = std::fs::read_to_string(&out).unwrap_or_default();
+        if !content.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        content, "ERR111",
+        "a truly unattributed pid must fail closed, not regain the wide default"
+    );
+    assert!(log_hi.lock().unwrap().is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    inst.shutdown().await.expect("shutdown");
+}
+
+/// Minor: a failing per-exec chdir is loud — the child reports the errno on
+/// its stderr and exits 125, so `wait_child` surfaces it instead of the
+/// workload silently running in the wrong cwd.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_failed_chdir_is_loud_exit_125() {
+    let missing = scratch("missing-cwd");
+    assert!(!missing.exists(), "scratch cwd must not exist");
+    let mut inst = launch_exec_only_tmp(base_policy()).await;
+
+    let params = ExecParams {
+        cwd: Some(missing),
+        ..Default::default()
+    };
+    let h = inst
+        .exec_params(&["sh", "-c", "exit 0"], &params, ExecStdio::Piped)
+        .await
+        .expect("exec with missing cwd");
+    drop(h.stdin);
+    let status = inst.wait_child(h.child_id).await.expect("wait child");
+    assert_eq!(
+        status,
+        ExitStatus::Code(125),
+        "a failed pre-exec chdir must exit with the setup-failure code 125"
+    );
+    let err = read_all_stdout(h.stderr.expect("piped stderr"));
+    let text = String::from_utf8_lossy(&err);
+    assert!(
+        text.contains("chdir") && text.contains("errno"),
+        "the child must report the chdir errno on stderr: {text}"
+    );
+    inst.shutdown().await.expect("shutdown");
+}
+
+/// Minor: an instance built with a DenyList policy refuses an update that
+/// names an explicitly denied destination (S9, from the instance verb).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_update_network_refuses_static_denylist_destination() {
+    // net_allow and net_deny are mutually exclusive at build time: a pure
+    // DenyList instance is default-allow except the explicit denies.
+    let policy = base_policy().net_deny("127.0.0.2");
+    let mut inst = launch_exec_only_tmp(policy).await;
+
+    let err = inst
+        .update_network(&["127.0.0.2".parse::<IpAddr>().unwrap()])
+        .await
+        .expect_err("a statically denied destination must be refused");
+    match err {
+        SandlockError::Runtime(SandboxRuntimeError::PolicyTooWide {
+            field: "update_network",
+            value,
+        }) => assert_eq!(value, "127.0.0.2"),
+        other => panic!("expected update_network PolicyTooWide, got {other:?}"),
+    }
+
+    // A destination outside the static denies can still be narrowed to.
+    let report = inst
+        .update_network(&["127.0.0.1".parse::<IpAddr>().unwrap()])
+        .await
+        .expect("non-denied destination update must succeed");
+    assert!(report.stale_child_ids.is_empty());
     inst.shutdown().await.expect("shutdown");
 }

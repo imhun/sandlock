@@ -542,6 +542,16 @@ impl SandboxInstance {
                     net_gen: 0,
                 },
             );
+            // Reviewer R2: the main workload (child id 0) is an exec child
+            // too — attribute it as attributed-default so its lineage stays on
+            // the shared live/static policy after later exec-child
+            // announcements flip `has_exec_bindings()` on. Without this the
+            // main's next connect/send would hit the unattributed fail-closed
+            // arm (deny-all), silently contradicting the F4.3 contract that
+            // running children keep their exec-time policy.
+            if let Some(network) = rt.supervisor_network.as_ref() {
+                network.lock().await.bind_exec_child(pid, None);
+            }
         }
         Ok(rt)
     }

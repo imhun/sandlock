@@ -523,8 +523,12 @@ pub struct NetworkState {
     /// to its exec-time policy; siblings and later updates can never change
     /// it. Processes with no entry (pre-update exec children and legacy M0
     /// sessions) fall through to the instance default path. Entries live for
-    /// the session — a pgid may outlive its direct child while descendants
-    /// stay in the group, and the map is bounded by the exec registry.
+    /// as long as the group has any member — a pgid must outlive its direct
+    /// child while descendants stay in the group — and are removed only when
+    /// a group-emptiness probe (`kill(-pgid, 0)`) reports ESRCH
+    /// ([`NetworkState::prune_pid`]). Reviewer C1: `getpgid(leader)` would
+    /// report the *leader* gone even while in-group descendants live, so it
+    /// must never gate removal.
     pub child_policies: HashMap<i32, crate::seccomp::notif::NetworkPolicy>,
     /// F4.4 follow-up (reviewer I2): per-**pid** lineage bindings. `Some(p)`
     /// marks a pid in the lineage of a child bound by a session
@@ -738,18 +742,25 @@ impl NetworkState {
         }
     }
 
-    /// Prune one pid's per-pid binding on process exit, and drop its pgid
-    /// entry when the process group is empty (the direct child and every
-    /// descendant that stayed in the group are gone). Keeps both maps
-    /// bounded by live processes / non-empty groups.
+    /// Prune one pid's per-pid binding on process exit. The pgid entry is
+    /// dropped only when the **group** is empty: `kill(-pgid, 0)` probes the
+    /// group's membership, so an entry survives a reaped leader whose
+    /// descendants still live in the group (reviewer C1). An uncached
+    /// in-group descendant's first mediated syscall after the leader's exit
+    /// must still resolve the bound policy, never the wide default.
     pub fn prune_pid(&mut self, pid: i32) {
         if let Ok(mut m) = self.pid_policies.write() {
             m.remove(&pid);
         }
-        if self.child_policies.contains_key(&pid) {
-            let pg = unsafe { libc::getpgid(pid) };
-            if pg < 0 {
-                // ESRCH: no process is a member of this group anymore.
+        if pid > 1 && self.child_policies.contains_key(&pid) {
+            let mut group_alive = unsafe { libc::kill(-pid, 0) } == 0;
+            if !group_alive {
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                // Any error other than ESRCH means the probe could not prove
+                // emptiness (EPERM etc.) — keep the entry (fail safe).
+                group_alive = errno != Some(libc::ESRCH);
+            }
+            if !group_alive {
                 self.child_policies.remove(&pid);
             }
         }
@@ -1573,5 +1584,90 @@ mod tests {
             !ns.has_exec_bindings(),
             "pruning the last attributed child ends fail-closed attribution"
         );
+    }
+
+    /// Reviewer C1: a pgid entry is removed only when the **group** is empty.
+    /// With the leader reaped and no live member, `kill(-pgid, 0)` reports
+    /// ESRCH and the entry can go.
+    #[test]
+    fn pgid_entry_pruned_once_group_is_empty() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork for empty-group prune test");
+        if pid == 0 {
+            unsafe {
+                libc::setpgid(0, 0);
+                libc::_exit(0);
+            }
+        }
+        let mut ns = NetworkState::new();
+        ns.bind_child_policy(pid, tcp_allow(&["10.0.0.1"]));
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(pid, &mut status, 0);
+        }
+        ns.prune_pid(pid);
+        assert!(
+            ns.child_policy_for_pgid(pid).is_none(),
+            "an empty process group's pgid entry must be pruned"
+        );
+        assert!(ns.pid_binding_for(pid as u32).is_none());
+    }
+
+    /// Reviewer C1: a pgid entry must **survive** a reaped leader while an
+    /// in-group descendant still lives — `getpgid(leader)` would wrongly
+    /// report the group gone; `kill(-pgid, 0)` probes real membership.
+    #[test]
+    fn pgid_entry_survives_leader_exit_with_live_member() {
+        let leader = unsafe { libc::fork() };
+        assert!(leader >= 0, "fork for group-survival test");
+        if leader == 0 {
+            // Leader: create its own group, spawn one in-group descendant,
+            // and exit immediately — the descendant outlives the leader.
+            unsafe {
+                libc::setpgid(0, 0);
+            }
+            let member = unsafe { libc::fork() };
+            if member == 0 {
+                let ts = libc::timespec { tv_sec: 1, tv_nsec: 0 };
+                unsafe {
+                    libc::nanosleep(&ts, std::ptr::null_mut());
+                    libc::_exit(0);
+                }
+            }
+            unsafe {
+                libc::_exit(0);
+            }
+        }
+        let mut ns = NetworkState::new();
+        ns.bind_child_policy(leader, tcp_allow(&["10.0.0.1"]));
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(leader, &mut status, 0);
+        }
+        // The leader is reaped but its group still has the sleeping member:
+        // pruning must keep the pgid entry.
+        ns.prune_pid(leader);
+        assert!(
+            ns.child_policy_for_pgid(leader).is_some(),
+            "a live in-group member must keep the pgid entry after leader exit"
+        );
+        // Once the member exits and the group empties, the entry is pruned.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let alive = unsafe { libc::kill(-leader, 0) } == 0;
+            if !alive {
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                if errno == Some(libc::ESRCH) {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "in-group member never exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        ns.prune_pid(leader);
+        assert!(ns.child_policy_for_pgid(leader).is_none());
     }
 }

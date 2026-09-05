@@ -11,7 +11,12 @@
 #   2. root-mode phases: oci (`--oci-root`) and the supervise foreign-uid
 #      acceptance (`--supervise-root`), both as root in the same privileged
 #      container.
-core_lib = 810 # F4 review follow-up (I1/I2 + minors): 805 -> 810, +1
+core_lib = 812 # F4 re-review (C1): 810 -> 812, +2 fork-based seccomp/state.rs
+               # unit tests (pgid_entry_pruned_once_group_is_empty,
+               # pgid_entry_survives_leader_exit_with_live_member) pinning
+               # group-emptiness probing with kill(-pgid, 0) instead of
+               # getpgid(leader). F4 review follow-up (I1/I2 + minors):
+               # 805 -> 810, +1
                # exec_params S9 unit test (fs_deny'd cwd refused) and +4
                # seccomp/state.rs unit tests (DenyList-covered IP refused,
                # deny-all refused, per-protocol composition never widens a
@@ -38,7 +43,16 @@ core_lib = 810 # F4 review follow-up (I1/I2 + minors): 805 -> 810, +1
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 509 # F4 review follow-up (I2/I4): 507 -> 509, +2 in
+core_integ = 514 # F4 re-review (C1/R2 + minors): 509 -> 514, +5 in
+                 # integration/test_instance_exec_params.rs
+                 # (test_bound_child_pgid_entry_survives_leader_exit,
+                 # test_main_workload_egress_survives_exec_child_announcement,
+                 # test_unattributed_orphan_is_denied_end_to_end,
+                 # test_failed_chdir_is_loud_exit_125,
+                 # test_update_network_refuses_static_denylist_destination);
+                 # the update_network staleness test now runs a second
+                 # concurrent pre-update child and asserts the exact stale
+                 # list. F4 review follow-up (I2/I4): 507 -> 509, +2 in
                  # integration/test_instance_exec_params.rs
                  # (test_bound_lineage_escapee_is_denied_sibling_wide_
                  # destination, test_live_policy_tightening_denies_bound_
