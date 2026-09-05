@@ -21,6 +21,7 @@
 use sandlock_core::Sandbox;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -29,6 +30,28 @@ use crate::net_fixture::WorkerLocalHost;
 
 fn temp_file(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("sandlock-test-netisol-{}-{}", name, std::process::id()))
+}
+
+/// Minimal rootfs for the F7 chroot+net_isolation inbound-mapping shape. The
+/// probes used by the chroot S2.5 tests are in-process (they bind/listen/
+/// accept inside the confined child), so the rootfs only needs the directory
+/// skeleton the chroot resolver and Landlock path grants expect; no binaries
+/// are exec'd by these probes.
+fn build_net_chroot_rootfs(name: &str) -> PathBuf {
+    let base = option_env!("CARGO_TARGET_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let rootfs = base.join(format!("sandlock-test-netisol-chroot-{}-{}", name, std::process::id()));
+    let _ = std::fs::remove_dir_all(&rootfs);
+    for dir in ["usr", "lib", "lib64", "bin", "etc", "proc", "dev", "tmp"] {
+        std::fs::create_dir_all(rootfs.join(dir)).unwrap();
+    }
+    let _ = std::fs::set_permissions(rootfs.join("tmp"), std::fs::Permissions::from_mode(0o1777));
+    rootfs
+}
+
+fn cleanup_net_chroot_rootfs(rootfs: &PathBuf) {
+    let _ = std::fs::remove_dir_all(rootfs);
 }
 
 /// Allocate a free ephemeral TCP port on the host loopback.
@@ -1815,6 +1838,127 @@ fn inbound_plus_egress_probe() {
     unsafe { libc::_exit(0) };
 }
 
+/// In-process epoll event-loop probe (E7.1 mirror) for the F7 chroot shape:
+/// bind+listen on the mapped sandbox port, register the listener with epoll,
+/// wait for EPOLLIN, accept exactly one connection and echo four bytes back.
+/// The supervisor's epoll readiness synthesis is what makes the epoll_wait
+/// return when the host-side connection is queued by the inbound worker.
+fn inbound_epoll_event_loop_probe() {
+    let mut out = unsafe { std::fs::File::from_raw_fd(3) };
+    let mut line = String::new();
+    let sandbox_port =
+        match std::env::var("INBOUND_SANDBOX_PORT").ok().and_then(|v| v.parse::<u16>().ok()) {
+            Some(p) => p,
+            None => {
+                let _ = out.write_all(b"no_port\n");
+                let _ = out.flush();
+                unsafe { libc::_exit(0) };
+            }
+        };
+    match TcpListener::bind(("127.0.0.1", sandbox_port)) {
+        Ok(listener) => {
+            let fd = listener.as_raw_fd();
+            let ep = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+            if ep < 0 {
+                line.push_str(&format!(
+                    "external=epoll_create_errno={}\n",
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+                ));
+            } else {
+                let mut ev = libc::epoll_event {
+                    events: libc::EPOLLIN as u32,
+                    u64: fd as u64,
+                };
+                let added = unsafe { libc::epoll_ctl(ep, libc::EPOLL_CTL_ADD, fd, &mut ev) };
+                if added != 0 {
+                    line.push_str(&format!(
+                        "external=epoll_ctl_errno={}\n",
+                        std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+                    ));
+                } else {
+                    let mut evs = [libc::epoll_event { events: 0, u64: 0 }];
+                    let n = unsafe { libc::epoll_wait(ep, evs.as_mut_ptr(), 1, 15000) };
+                    if n <= 0 {
+                        line.push_str(&format!(
+                            "external=epoll_wait_errno={}\n",
+                            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+                        ));
+                    } else if let Ok((mut conn, _)) = listener.accept() {
+                        let mut buf = [0u8; 4];
+                        let read_ok = conn.read_exact(&mut buf).is_ok();
+                        let echo_ok = conn.write_all(&buf).is_ok();
+                        line.push_str(&format!(
+                            "external={}\n",
+                            if read_ok && echo_ok { "epoll-echo-ok" } else { "bad" }
+                        ));
+                    } else {
+                        line.push_str("external=accept_failed\n");
+                    }
+                }
+                unsafe { libc::close(ep) };
+            }
+        }
+        Err(e) => line.push_str(&format!(
+            "external=bind_errno={}\n",
+            e.raw_os_error().unwrap_or(-1)
+        )),
+    }
+    let _ = out.write_all(line.as_bytes());
+    let _ = out.flush();
+    unsafe { libc::_exit(0) };
+}
+
+/// In-process poll event-loop probe (E7.1 mirror) for the F7 chroot shape:
+/// bind+listen on the mapped sandbox port, poll(2) the listener, accept one
+/// connection and echo four bytes back.
+fn inbound_poll_event_loop_probe() {
+    let mut out = unsafe { std::fs::File::from_raw_fd(3) };
+    let mut line = String::new();
+    let sandbox_port =
+        match std::env::var("INBOUND_SANDBOX_PORT").ok().and_then(|v| v.parse::<u16>().ok()) {
+            Some(p) => p,
+            None => {
+                let _ = out.write_all(b"no_port\n");
+                let _ = out.flush();
+                unsafe { libc::_exit(0) };
+            }
+        };
+    match TcpListener::bind(("127.0.0.1", sandbox_port)) {
+        Ok(listener) => {
+            let fd = listener.as_raw_fd();
+            let mut fds = [libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, 15000) };
+            if n <= 0 {
+                line.push_str(&format!(
+                    "external=poll_errno={}\n",
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+                ));
+            } else if let Ok((mut conn, _)) = listener.accept() {
+                let mut buf = [0u8; 4];
+                let read_ok = conn.read_exact(&mut buf).is_ok();
+                let echo_ok = conn.write_all(&buf).is_ok();
+                line.push_str(&format!(
+                    "external={}\n",
+                    if read_ok && echo_ok { "poll-echo-ok" } else { "bad" }
+                ));
+            } else {
+                line.push_str("external=accept_failed\n");
+            }
+        }
+        Err(e) => line.push_str(&format!(
+            "external=bind_errno={}\n",
+            e.raw_os_error().unwrap_or(-1)
+        )),
+    }
+    let _ = out.write_all(line.as_bytes());
+    let _ = out.flush();
+    unsafe { libc::_exit(0) };
+}
+
 /// Build and start a sandbox running `entry` in-process with a result pipe on
 /// fd 3, configured with `net_bind_map(host_port, sandbox_port)`. Returns
 /// (full probe output, sandbox). The pipe is read to EOF, so `entry` must
@@ -2299,5 +2443,231 @@ async fn test_net_isolation_inbound_mapping_poll_event_loop_serves_external() {
         "poll server sandbox failed: exit={:?} stderr={:?}",
         result.code(),
         result.stderr
+    );
+}
+
+// ============================================================
+// F7 (P4): inbound port mapping under chroot + net_isolation
+// ============================================================
+//
+// Matrix F7 row: `chroot` + `net_isolation` + `net_bind_map` must behave like
+// the pure sandlock shape — the listener comes up, the host-side mapped port
+// accepts, and the poll/epoll readiness synthesis wakes the sandbox's
+// event-loop accept. The pure-shape tests above stay as the control set.
+
+/// `run_inbound_sandbox` with a virtual chroot rootfs added (the F7 shape).
+/// The probes are in-process, so the rootfs only needs the skeleton built by
+/// `build_net_chroot_rootfs`; no workload binaries live in it.
+async fn run_inbound_sandbox_chroot(
+    entry: fn(),
+    name: &str,
+    rootfs: &PathBuf,
+    host_port: u16,
+    sandbox_port: u16,
+) -> (String, Sandbox) {
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
+    let (r, w) = (fds[0], fds[1]);
+    let mut sb = base_policy()
+        .chroot(rootfs)
+        .net_isolation(true)
+        .net_bind_map(host_port, sandbox_port)
+        .net_allow(format!("127.0.0.1:{}", sandbox_port))
+        .net_allow_bind_port(sandbox_port)
+        .env_var("INBOUND_SANDBOX_PORT", &sandbox_port.to_string())
+        .build()
+        .unwrap();
+    sb.create_with_in_child_main(name, vec![(3, w)], entry)
+        .await
+        .unwrap();
+    unsafe { libc::close(w) };
+    sb.start().unwrap();
+    let buf = tokio::task::spawn_blocking(move || {
+        let mut buf = String::new();
+        let mut f = unsafe { std::fs::File::from_raw_fd(r) };
+        f.read_to_string(&mut buf).unwrap();
+        buf
+    })
+    .await
+    .unwrap();
+    (buf, sb)
+}
+
+/// F7: the mapped host port serves an MCP round-trip when the sandbox also
+/// runs under a chroot rootfs (blocking accept path).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_net_isolation_inbound_mapping_under_chroot_mcp_roundtrip() {
+    let sandbox_port = alloc_ephemeral_port();
+    let host_port = alloc_host_port_in_range(50005);
+    let rootfs = build_net_chroot_rootfs("inbound-chroot-mcp");
+
+    let client = tokio::task::spawn_blocking(move || mcp_client(host_port));
+    let run = run_inbound_sandbox_chroot(
+        inbound_mcp_server_probe,
+        "inbound-chroot-mcp",
+        &rootfs,
+        host_port,
+        sandbox_port,
+    );
+    let (output, mut sb) = match tokio::time::timeout(Duration::from_secs(40), run).await {
+        Ok(v) => v,
+        Err(_) => panic!(
+            "chroot sandbox did not serve the external MCP connection within 40s \
+             (host_port={host_port} sandbox_port={sandbox_port})"
+        ),
+    };
+
+    let resp = client
+        .await
+        .unwrap()
+        .expect("external MCP client must reach the chroot sandbox");
+    assert_eq!(resp, MCP_RESP.to_vec(), "MCP response must be exact");
+
+    let result = sb.wait().await.unwrap();
+    cleanup_net_chroot_rootfs(&rootfs);
+    assert!(
+        result.success(),
+        "chroot sandbox failed: {:?}\nprobe output:\n{}",
+        result.exit_status,
+        output
+    );
+    assert_eq!(
+        output,
+        "external=mcp-echo-ok\n",
+        "chroot probe must report a served external round-trip, got:\n{}",
+        output
+    );
+}
+
+/// F7 + E7.1: an epoll-driven event loop inside a chroot + net_isolation
+/// sandbox must serve host-side connections queued by the S2.5 eager worker
+/// (epoll readability synthesis).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_net_isolation_inbound_mapping_under_chroot_epoll_event_loop_serves_external() {
+    let host_port = alloc_host_port_in_range(50005);
+    let sandbox_port = host_port;
+    let rootfs = build_net_chroot_rootfs("inbound-chroot-epoll");
+
+    let client = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut conn = loop {
+            match TcpStream::connect(("127.0.0.1", host_port)) {
+                Ok(s) => break s,
+                Err(_) => {
+                    if Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "external client never reached the mapped host port",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        conn.set_read_timeout(Some(Duration::from_secs(10)))?;
+        conn.write_all(b"ping")?;
+        let mut buf = [0u8; 4];
+        conn.read_exact(&mut buf)?;
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    });
+    let run = run_inbound_sandbox_chroot(
+        inbound_epoll_event_loop_probe,
+        "inbound-chroot-epoll",
+        &rootfs,
+        host_port,
+        sandbox_port,
+    );
+    let (output, mut sb) = match tokio::time::timeout(Duration::from_secs(40), run).await {
+        Ok(v) => v,
+        Err(_) => panic!(
+            "chroot epoll sandbox did not serve a connection within 40s \
+             (host_port={host_port})"
+        ),
+    };
+    let result = sb.wait().await.unwrap();
+    cleanup_net_chroot_rootfs(&rootfs);
+    let echoed = client.await.unwrap();
+    assert!(
+        result.success(),
+        "chroot epoll sandbox failed: {:?}\nprobe output:\n{}",
+        result.exit_status,
+        output
+    );
+    assert_eq!(
+        echoed.expect("epoll client exchange failed"),
+        "ping",
+        "epoll server must echo over the mapped port"
+    );
+    assert_eq!(
+        output,
+        "external=epoll-echo-ok\n",
+        "chroot epoll probe must report a served echo, got:\n{}",
+        output
+    );
+}
+
+/// F7 + E7.1 poll path: a select.poll()-style loop (no epoll) inside a chroot
+/// + net_isolation sandbox must serve the host-side mapped connection too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_net_isolation_inbound_mapping_under_chroot_poll_event_loop_serves_external() {
+    let host_port = alloc_host_port_in_range(50005);
+    let sandbox_port = host_port;
+    let rootfs = build_net_chroot_rootfs("inbound-chroot-poll");
+
+    let client = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut conn = loop {
+            match TcpStream::connect(("127.0.0.1", host_port)) {
+                Ok(s) => break s,
+                Err(_) => {
+                    if Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "external client never reached the mapped host port",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        conn.set_read_timeout(Some(Duration::from_secs(10)))?;
+        conn.write_all(b"pong")?;
+        let mut buf = [0u8; 4];
+        conn.read_exact(&mut buf)?;
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    });
+    let run = run_inbound_sandbox_chroot(
+        inbound_poll_event_loop_probe,
+        "inbound-chroot-poll",
+        &rootfs,
+        host_port,
+        sandbox_port,
+    );
+    let (output, mut sb) = match tokio::time::timeout(Duration::from_secs(40), run).await {
+        Ok(v) => v,
+        Err(_) => panic!(
+            "chroot poll sandbox did not serve a connection within 40s \
+             (host_port={host_port})"
+        ),
+    };
+    let result = sb.wait().await.unwrap();
+    cleanup_net_chroot_rootfs(&rootfs);
+    let echoed = client.await.unwrap();
+    assert!(
+        result.success(),
+        "chroot poll sandbox failed: {:?}\nprobe output:\n{}",
+        result.exit_status,
+        output
+    );
+    assert_eq!(
+        echoed.expect("poll client exchange failed"),
+        "pong",
+        "poll server must echo over the mapped port"
+    );
+    assert_eq!(
+        output,
+        "external=poll-echo-ok\n",
+        "chroot poll probe must report a served echo, got:\n{}",
+        output
     );
 }

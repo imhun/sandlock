@@ -58,7 +58,13 @@ core_lib = 822 # F6.2 review I1/I2: 821 -> 822, +1 unit test
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 526 # F6.2 (P5): count unchanged — the F6.1 chroot-form A档
+core_integ = 529 # F7 (P4): 526 -> 529, +3 chroot + net_isolation +
+                 # net_bind_map mirror tests in integration/test_net_isolate.rs
+                 # (mcp roundtrip / epoll loop / poll loop under chroot). The
+                 # P4 "combined shape fails" premise was refuted by exhaustive
+                 # reproduction (HEAD and the T4-era commit both green); the
+                 # +3 pin the verified shape as regression coverage, not a fix.
+                 # F6.2 (P5): count unchanged — the F6.1 chroot-form A档
                  # test now constructs /dev via the minimal_dev single-node
                  # helper (no whole-tree /dev mount, no fs_denied) and writes
                  # to /dev/null through it.
