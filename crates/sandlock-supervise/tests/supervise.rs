@@ -975,6 +975,24 @@ fn test_supervise_fd_serve_launches_instance_and_serves_instance_verbs() {
         "cross-process S9 error must name the field: {err}"
     );
 
+    // update_network verb (F4.3): the main workload (child id 0) is still
+    // running under the pre-update policy, so the verb reports it stale;
+    // the update itself applies to new execs only.
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({
+            "v": 1,
+            "verb": "update_network",
+            "args": { "ips": ["127.0.0.1"] },
+        }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "update_network: {resp:?}");
+    assert_eq!(
+        resp["data"]["stale_child_ids"],
+        serde_json::json!([0]),
+        "the running main child must be the stale pre-update child: {resp:?}"
+    );
+
     // The workload really ran and wrote its evidence.
     wait_until(
         Instant::now() + Duration::from_secs(15),

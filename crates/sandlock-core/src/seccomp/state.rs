@@ -526,6 +526,19 @@ pub struct NetworkState {
     /// the session — a pgid may outlive its direct child while descendants
     /// stay in the group, and the map is bounded by the exec registry.
     pub child_policies: HashMap<i32, crate::seccomp::notif::NetworkPolicy>,
+    /// F4.4 follow-up (reviewer I2): per-**pid** lineage bindings. `Some(p)`
+    /// marks a pid in the lineage of a child bound by a session
+    /// `update_network`; `None` marks a pid in the lineage of an exec child
+    /// that runs the instance default (attributed, but not narrowed). Unlike
+    /// the pgid map, entries survive `setsid`/`setpgid` escapes: a descendant
+    /// that leaves its child's process group inherits the binding through its
+    /// ancestor chain, so it can never silently fall back to a wider
+    /// sibling's shared default (missing-entry fail-closed once any exec
+    /// binding exists). Interior-mutable so the lookup path can cache an
+    /// ancestor-resolved binding; entries are pruned when the pid exits
+    /// ([`NetworkState::prune_pid`]).
+    pub pid_policies:
+        std::sync::Arc<std::sync::RwLock<HashMap<i32, Option<crate::seccomp::notif::NetworkPolicy>>>>,
     /// Port binding and remapping tracker.
     pub port_map: crate::port_remap::PortMap,
     /// `--net-deny-bind`: TCP ports the sandbox may NOT bind (default-allow
@@ -585,6 +598,7 @@ impl NetworkState {
             udp_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
             icmp_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
             child_policies: HashMap::new(),
+            pid_policies: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
             port_map: crate::port_remap::PortMap::new(),
             bind_deny_ports: HashSet::new(),
             pid_ip_overrides: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -623,33 +637,122 @@ impl NetworkState {
         protocol: crate::sandbox::Protocol,
         live_policy: Option<&std::sync::Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>>>,
     ) -> crate::seccomp::notif::NetworkPolicy {
-        use crate::sandbox::Protocol;
         if let Ok(overrides) = self.pid_ip_overrides.read() {
             if let Some(ips) = overrides.get(&pid) {
                 return ip_only_allow_policy(ips);
             }
         }
-        if let Some(lp) = live_policy {
-            if let Ok(live) = lp.read() {
-                if !live.allowed_ips.is_empty() {
-                    return ip_only_allow_policy(&live.allowed_ips);
-                }
-            }
+        self.live_or_static(protocol, live_policy)
+    }
+
+    /// F4.4: attribute one announced exec child. `binding == Some(policy)`
+    /// marks a child exec'd under a session `update_network` (both the pgid
+    /// map and the per-pid map get the policy, so in-group descendants and
+    /// the root pid itself resolve it); `binding == None` marks an exec child
+    /// running the instance default, so its lineage is attributed and a later
+    /// fail-closed lookup can distinguish it from an unattributed escapee.
+    pub fn bind_exec_child(
+        &mut self,
+        pid: i32,
+        binding: Option<crate::seccomp::notif::NetworkPolicy>,
+    ) {
+        let pid_entry = binding.clone();
+        if let Some(policy) = binding {
+            self.child_policies.insert(pid, policy);
         }
-        match protocol {
-            Protocol::Tcp => self.tcp_policy.clone(),
-            Protocol::Udp => self.udp_policy.clone(),
-            Protocol::Icmp => self.icmp_policy.clone(),
+        if let Ok(mut m) = self.pid_policies.write() {
+            m.insert(pid, pid_entry);
         }
     }
 
     /// F4.4: bind `policy` to the exec child whose process group is `pgid`.
-    /// Called by the instance when an exec child is announced (the child's
-    /// pid == its pgid). Only children exec'd under a session `update_network`
-    /// get an entry — a later update cannot reach them, and a sibling in
-    /// another group never shares the entry.
+    /// Same attribution as [`NetworkState::bind_exec_child`] with a bound
+    /// policy; kept for the pgid-level unit tests.
     pub fn bind_child_policy(&mut self, pgid: i32, policy: crate::seccomp::notif::NetworkPolicy) {
-        self.child_policies.insert(pgid, policy);
+        self.bind_exec_child(pgid, Some(policy));
+    }
+
+    /// Whether any exec child of this session has been attributed (bound or
+    /// explicitly default). When true, an unattributed pid — one with no
+    /// per-pid entry, no pgid entry and no bound ancestor — fails closed
+    /// rather than falling back to the shared wide default (fork-plan §4.5;
+    /// reviewer I2).
+    pub fn has_exec_bindings(&self) -> bool {
+        if !self.child_policies.is_empty() {
+            return true;
+        }
+        self.pid_policies
+            .read()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Resolve the per-pid binding for `pid`, walking the ancestor chain when
+    /// the pid itself is not attributed (an escapee whose parent stayed in
+    /// the bound child's lineage). The resolved binding is cached under
+    /// `pid` so repeat syscalls do not re-read `/proc`.
+    ///
+    /// Returns `Some(Some(policy))` for a bound lineage, `Some(None)` for an
+    /// attributed-default lineage, and `None` when no ancestor is attributed.
+    fn resolve_pid_binding(
+        &self,
+        pid: u32,
+    ) -> Option<Option<crate::seccomp::notif::NetworkPolicy>> {
+        if let Some(binding) = self.pid_binding_for(pid) {
+            return Some(binding);
+        }
+        // Ancestor walk: `/proc/<pid>/stat` parent chain, bounded. The bound
+        // exec child is a process-group leader and can never setsid itself,
+        // so it is always an ancestor of its subtree while the chain is
+        // intact; orphans that escaped before their first attributed syscall
+        // are caught by the missing-entry fail-closed arm instead.
+        let mut ancestor = pid as i32;
+        for _ in 0..32 {
+            match read_ppid(ancestor) {
+                Some(pp) if pp > 1 => {
+                    if let Some(binding) = self.pid_binding_for(pp as u32) {
+                        self.cache_pid_binding(pid, binding.clone());
+                        return Some(binding);
+                    }
+                    ancestor = pp;
+                }
+                _ => break,
+            }
+        }
+        None
+    }
+
+    fn pid_binding_for(
+        &self,
+        pid: u32,
+    ) -> Option<Option<crate::seccomp::notif::NetworkPolicy>> {
+        self.pid_policies
+            .read()
+            .ok()
+            .and_then(|m| m.get(&(pid as i32)).cloned())
+    }
+
+    fn cache_pid_binding(&self, pid: u32, binding: Option<crate::seccomp::notif::NetworkPolicy>) {
+        if let Ok(mut m) = self.pid_policies.write() {
+            m.insert(pid as i32, binding);
+        }
+    }
+
+    /// Prune one pid's per-pid binding on process exit, and drop its pgid
+    /// entry when the process group is empty (the direct child and every
+    /// descendant that stayed in the group are gone). Keeps both maps
+    /// bounded by live processes / non-empty groups.
+    pub fn prune_pid(&mut self, pid: i32) {
+        if let Ok(mut m) = self.pid_policies.write() {
+            m.remove(&pid);
+        }
+        if self.child_policies.contains_key(&pid) {
+            let pg = unsafe { libc::getpgid(pid) };
+            if pg < 0 {
+                // ESRCH: no process is a member of this group anymore.
+                self.child_policies.remove(&pid);
+            }
+        }
     }
 
     /// Resolve the notif pid's process group (the pid of the exec child whose
@@ -692,13 +795,92 @@ impl NetworkState {
                 return ip_only_allow_policy(ips);
             }
         }
+        // F4.4 follow-up (reviewer I2/I4): per-pid lineage binding first, then
+        // the pgid map for in-group processes that have not made a syscall
+        // yet. A bound lineage applies its exec-time policy; live-policy
+        // tightening (policy_fn `restrict_network`) still narrows it on top
+        // (deny wins — the live set can never widen past the instance
+        // ceiling). An unattributed pid in a session that has attributed
+        // children fails closed (deny all) instead of regaining a wide
+        // sibling's shared default.
+        if let Some(binding) = self.resolve_pid_binding(pid) {
+            return self.apply_live_tightening(binding, protocol, live_policy);
+        }
         let pgid = unsafe { libc::getpgid(pid as i32) };
         if pgid > 0 {
             if let Some(bound) = self.child_policy_for_pgid(pgid) {
-                return bound;
+                self.cache_pid_binding(pid, Some(bound.clone()));
+                return self.apply_live_tightening(Some(bound), protocol, live_policy);
             }
         }
+        if self.has_exec_bindings() {
+            return deny_all_policy();
+        }
         self.effective_network_policy(pid, protocol, live_policy)
+    }
+
+    /// Apply the policy-fn live-policy tightening on top of a bound child's
+    /// exec-time policy: the effective allow set is the intersection (deny
+    /// wins). `live_policy` is seeded from the instance ceiling and can only
+    /// shrink at runtime, so this never widens the bound policy.
+    fn apply_live_tightening(
+        &self,
+        binding: Option<crate::seccomp::notif::NetworkPolicy>,
+        protocol: crate::sandbox::Protocol,
+        live_policy: Option<&std::sync::Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>>>,
+    ) -> crate::seccomp::notif::NetworkPolicy {
+        let Some(bound) = binding else {
+            // Attributed-default lineage: the shared live/static instance
+            // policy applies unchanged.
+            return self.live_or_static(protocol, live_policy);
+        };
+        let Some(lp) = live_policy else {
+            return intersect_ceiling_grant(&bound, &self.protocol_ceiling(protocol));
+        };
+        let Ok(live) = lp.read() else {
+            return intersect_ceiling_grant(&bound, &self.protocol_ceiling(protocol));
+        };
+        let within = intersect_ceiling_grant(&bound, &self.protocol_ceiling(protocol));
+        if live.allowed_ips.is_empty() {
+            return within;
+        }
+        let bound_ips = allowlist_any_port_ips(&within);
+        let effective: HashSet<std::net::IpAddr> = live
+            .allowed_ips
+            .iter()
+            .copied()
+            .filter(|ip| bound_ips.contains(ip))
+            .collect();
+        ip_only_allow_policy(&effective)
+    }
+
+    fn protocol_ceiling(&self, protocol: crate::sandbox::Protocol) -> &crate::seccomp::notif::NetworkPolicy {
+        match protocol {
+            crate::sandbox::Protocol::Tcp => &self.tcp_policy,
+            crate::sandbox::Protocol::Udp => &self.udp_policy,
+            crate::sandbox::Protocol::Icmp => &self.icmp_policy,
+        }
+    }
+
+    /// Live policy (when restricting) over the instance per-protocol static
+    /// policy — the shared default path for attributed-default lineages.
+    fn live_or_static(
+        &self,
+        protocol: crate::sandbox::Protocol,
+        live_policy: Option<&std::sync::Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>>>,
+    ) -> crate::seccomp::notif::NetworkPolicy {
+        if let Some(lp) = live_policy {
+            if let Ok(live) = lp.read() {
+                if !live.allowed_ips.is_empty() {
+                    return ip_only_allow_policy(&live.allowed_ips);
+                }
+            }
+        }
+        match protocol {
+            crate::sandbox::Protocol::Tcp => self.tcp_policy.clone(),
+            crate::sandbox::Protocol::Udp => self.udp_policy.clone(),
+            crate::sandbox::Protocol::Icmp => self.icmp_policy.clone(),
+        }
     }
 
     /// Effective policy for a whole process group (the exec-child subtree):
@@ -734,6 +916,103 @@ fn ip_only_allow_policy(
         cidrs: Vec::new(),
         any_ip_ports: HashSet::new(),
         wildcard_domains: Vec::new(),
+    }
+}
+
+/// Deny-all policy used for unattributed pids in sessions that have
+/// attributed exec children (fail closed, §4.5).
+fn deny_all_policy() -> crate::seccomp::notif::NetworkPolicy {
+    ip_only_allow_policy(&HashSet::new())
+}
+
+/// The IPs an ip-only allowlist policy grants at any-port granularity.
+/// Update bindings are built this way, so only the `per_ip` entries matter.
+fn allowlist_any_port_ips(policy: &crate::seccomp::notif::NetworkPolicy) -> HashSet<std::net::IpAddr> {
+    use crate::seccomp::notif::NetworkPolicy;
+    match policy {
+        NetworkPolicy::AllowList { per_ip, .. } => per_ip
+            .iter()
+            .filter(|(_, allow)| matches!(allow, crate::seccomp::notif::PortAllow::Any))
+            .map(|(ip, _)| *ip)
+            .collect(),
+        // An Unrestricted bound policy grants every IP; the live set then
+        // supplies the restriction (caller never reaches here with one).
+        _ => HashSet::new(),
+    }
+}
+
+/// S9 ceiling check for an `update_network` request (reviewer I1): does the
+/// static per-protocol ceiling **explicitly deny** this destination? A
+/// DenyList rule covering the IP (any deny entry, an any-IP port deny, or a
+/// deny-all) refuses the request — the binding must never override an
+/// explicit instance deny. Grant-based AllowList ceilings never refuse here:
+/// the bound policy is intersected with the ceiling per protocol at verdict
+/// time (see [`intersect_ceiling_grant`]), so a protocol that does not grant
+/// the IP simply keeps denying it instead of being widened.
+pub(crate) fn update_network_denied_by_ceiling(
+    ceiling: &crate::seccomp::notif::NetworkPolicy,
+    ip: std::net::IpAddr,
+) -> bool {
+    use crate::seccomp::notif::NetworkPolicy;
+    match ceiling {
+        NetworkPolicy::Unrestricted => false,
+        NetworkPolicy::DenyList {
+            cidrs,
+            any_ip_ports,
+            deny_all,
+        } => {
+            if *deny_all {
+                return true;
+            }
+            if !any_ip_ports.is_empty() {
+                return true;
+            }
+            cidrs.iter().any(|(net, _)| net.contains(ip))
+        }
+        NetworkPolicy::AllowList { .. } => false,
+    }
+}
+
+/// Intersect an update binding (an IP-any-port allowlist) with one protocol's
+/// static ceiling, so the bound child's effective policy for that protocol is
+/// never wider than the ceiling:
+///
+/// * `Unrestricted` ceilings keep the binding;
+/// * `DenyList` ceilings keep the binding (a requested IP the ceiling
+///   explicitly denies was already refused at update time, and the binding
+///   only narrows the default-allow remainder);
+/// * `AllowList` ceilings keep only the requested IPs the ceiling grants at
+///   any-port granularity (per-IP or covering CIDR `PortAllow::Any`); a
+///   port-scoped grant or an any-IP-port rule cannot express an IP-any-port
+///   subset, so the binding contributes nothing for that protocol and the
+///   static policy (typically deny-all) governs — never a widened one.
+pub(crate) fn intersect_ceiling_grant(
+    binding: &crate::seccomp::notif::NetworkPolicy,
+    ceiling: &crate::seccomp::notif::NetworkPolicy,
+) -> crate::seccomp::notif::NetworkPolicy {
+    use crate::seccomp::notif::{NetworkPolicy, PortAllow};
+    match ceiling {
+        NetworkPolicy::Unrestricted | NetworkPolicy::DenyList { .. } => binding.clone(),
+        NetworkPolicy::AllowList {
+            per_ip,
+            cidrs,
+            any_ip_ports,
+            ..
+        } => {
+            if !any_ip_ports.is_empty() {
+                return deny_all_policy();
+            }
+            let allowed: HashSet<std::net::IpAddr> = allowlist_any_port_ips(binding)
+                .into_iter()
+                .filter(|ip| {
+                    matches!(per_ip.get(&ip.to_canonical()), Some(PortAllow::Any))
+                        || cidrs.iter().any(|(net, allow)| {
+                            net.contains(*ip) && matches!(allow, PortAllow::Any)
+                        })
+                })
+                .collect();
+            ip_only_allow_policy(&allowed)
+        }
     }
 }
 
@@ -1182,5 +1461,117 @@ mod tests {
             ns.effective_network_policy_for_pgid(4243, crate::sandbox::Protocol::Tcp);
         assert!(sibling.allows("10.0.0.2".parse().unwrap(), 443));
         assert!(ns.child_policy_for_pgid(4243).is_none());
+    }
+
+    // ============================================================
+    // F4 follow-up I1: update_network ceiling checks honor deny
+    // semantics and per-protocol composition never widens
+    // ============================================================
+
+    fn deny_list(cidrs: Vec<(crate::network::IpCidr, crate::seccomp::notif::PortAllow)>) -> crate::seccomp::notif::NetworkPolicy {
+        crate::seccomp::notif::NetworkPolicy::DenyList {
+            cidrs,
+            any_ip_ports: HashSet::new(),
+            deny_all: false,
+        }
+    }
+
+    #[test]
+    fn update_ceiling_denylist_refuses_ip_covered_by_static_deny() {
+        use crate::seccomp::notif::PortAllow;
+        let ceiling = deny_list(vec![(
+            crate::network::IpCidr::parse("10.0.0.0/8").unwrap(),
+            PortAllow::Any,
+        )]);
+        assert!(
+            update_network_denied_by_ceiling(&ceiling, "10.1.2.3".parse().unwrap()),
+            "an IP the static DenyList denies must not be grantable any-port"
+        );
+        assert!(
+            !update_network_denied_by_ceiling(&ceiling, "8.8.8.8".parse().unwrap()),
+            "an IP outside the static denies stays grantable"
+        );
+    }
+
+    #[test]
+    fn update_ceiling_deny_all_refuses_every_request() {
+        use crate::seccomp::notif::NetworkPolicy;
+        let ceiling = NetworkPolicy::DenyList {
+            cidrs: Vec::new(),
+            any_ip_ports: HashSet::new(),
+            deny_all: true,
+        };
+        assert!(
+            update_network_denied_by_ceiling(&ceiling, "127.0.0.1".parse().unwrap()),
+            "deny-all instance must refuse every non-empty update"
+        );
+    }
+
+    #[test]
+    fn update_binding_never_widens_a_deny_all_protocol_ceiling() {
+        // UDP ceiling that grants nothing (deny-all AllowList): a TCP-scoped
+        // update request must not widen UDP — the per-protocol composition
+        // keeps UDP denying the requested IP.
+        let udp_deny_all = crate::seccomp::notif::NetworkPolicy::AllowList {
+            per_ip: HashMap::new(),
+            cidrs: Vec::new(),
+            any_ip_ports: HashSet::new(),
+            wildcard_domains: Vec::new(),
+        };
+        let binding = tcp_allow(&["10.0.0.1"]);
+        assert!(
+            !intersect_ceiling_grant(&binding, &udp_deny_all)
+                .allows("10.0.0.1".parse().unwrap(), 53),
+            "a deny-all UDP ceiling must never be widened by a TCP-bound update"
+        );
+
+        // Port-scoped TCP grant: the same request must not widen ports either
+        // (the binding contributes nothing to that protocol).
+        let tcp_port_scoped = crate::seccomp::notif::NetworkPolicy::AllowList {
+            per_ip: HashMap::from([(
+                "10.0.0.1".parse().unwrap(),
+                crate::seccomp::notif::PortAllow::Specific(HashSet::from([443])),
+            )]),
+            cidrs: Vec::new(),
+            any_ip_ports: HashSet::new(),
+            wildcard_domains: Vec::new(),
+        };
+        let narrowed = intersect_ceiling_grant(&binding, &tcp_port_scoped);
+        assert!(
+            !narrowed.allows("10.0.0.1".parse().unwrap(), 444),
+            "port-scoped ceilings cannot be widened to any-port"
+        );
+
+        // Grant-based TCP ceiling: the binding applies for the granted IPs
+        // only (narrowing, never widening past the ceiling).
+        let tcp_ceiling = tcp_allow(&["10.0.0.1", "10.0.0.2"]);
+        let narrowed = intersect_ceiling_grant(
+            &tcp_allow(&["10.0.0.1", "10.0.0.2", "10.0.0.3"]),
+            &tcp_ceiling,
+        );
+        assert!(narrowed.allows("10.0.0.1".parse().unwrap(), 443));
+        assert!(narrowed.allows("10.0.0.2".parse().unwrap(), 443));
+        assert!(
+            !narrowed.allows("10.0.0.3".parse().unwrap(), 443),
+            "an IP outside the ceiling must stay denied for that protocol"
+        );
+    }
+
+    #[test]
+    fn attributed_default_child_prunes_on_exit() {
+        let mut ns = NetworkState::new();
+        assert!(!ns.has_exec_bindings());
+        ns.bind_exec_child(4242, None);
+        assert!(ns.has_exec_bindings(), "default-policy children are attributed");
+        assert!(
+            matches!(ns.pid_binding_for(4242), Some(None)),
+            "default-policy children are attributed with no bound policy"
+        );
+        ns.prune_pid(4242);
+        assert!(ns.pid_binding_for(4242).is_none());
+        assert!(
+            !ns.has_exec_bindings(),
+            "pruning the last attributed child ends fail-closed attribution"
+        );
     }
 }

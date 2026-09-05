@@ -11,7 +11,13 @@
 #   2. root-mode phases: oci (`--oci-root`) and the supervise foreign-uid
 #      acceptance (`--supervise-root`), both as root in the same privileged
 #      container.
-core_lib = 805 # F4.3/F4.4 (M2 update_network staleness + per-child network
+core_lib = 810 # F4 review follow-up (I1/I2 + minors): 805 -> 810, +1
+               # exec_params S9 unit test (fs_deny'd cwd refused) and +4
+               # seccomp/state.rs unit tests (DenyList-covered IP refused,
+               # deny-all refused, per-protocol composition never widens a
+               # deny-all/port-scoped ceiling, attributed-default child
+               # prunes on exit). F4.3/F4.4 (M2 update_network staleness +
+               # per-child network
                # binding): 803 -> 805, +2 unit tests in seccomp/state.rs
                # (bound_child_policy_wins_over_shared_static_policy,
                # sibling_group_never_shares_a_bound_policy).
@@ -32,7 +38,11 @@ core_lib = 805 # F4.3/F4.4 (M2 update_network staleness + per-child network
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 507 # F4.3/F4.4 (M2 update_network staleness + per-child
+core_integ = 509 # F4 review follow-up (I2/I4): 507 -> 509, +2 in
+                 # integration/test_instance_exec_params.rs
+                 # (test_bound_lineage_escapee_is_denied_sibling_wide_
+                 # destination, test_live_policy_tightening_denies_bound_
+                 # child). F4.3/F4.4 (M2 update_network staleness + per-child
                  # network binding): 506 -> 507, +1 in
                  # integration/test_instance_exec_params.rs
                  # (test_update_network_applies_to_new_exec_only_and_

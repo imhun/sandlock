@@ -330,6 +330,10 @@ pub(crate) struct ExecSession {
     /// Each exec child records the generation it was bound under; staleness
     /// compares it to the current generation.
     next_net_gen: u64,
+    /// Normalized (sorted, deduped) IP list of the last applied
+    /// `update_network`, so an identical no-op update does not bump the
+    /// generation or report running children stale.
+    next_net_ips: Option<Vec<IpAddr>>,
 }
 
 /// One registered child of an exec-capable session.
@@ -341,6 +345,13 @@ pub(crate) struct ExecChild {
     pidfd: Option<OwnedFd>,
     /// Host-side pty master for a pty exec (used by `resize_child`).
     pty: Option<OwnedFd>,
+    /// F4.1/I3: the per-exec parameters this child was launched with,
+    /// recorded host-side (cwd/env/clean_env applied by init, plus the
+    /// S9-validated extra_writable/bind_ports grants). Exposed through
+    /// [`SandboxInstance::child_params`] so the "recorded per child" claim is
+    /// observable and a future mediated per-child fs/bind layer can consume
+    /// the grants.
+    params: ExecParams,
     /// Reaped exit status, cached for idempotent `wait_child`.
     status: Option<ExitStatus>,
     /// F4.3: session network-policy generation this child was bound under
@@ -476,6 +487,7 @@ impl SandboxInstance {
             children: HashMap::new(),
             next_net_policy: None,
             next_net_gen: 0,
+            next_net_ips: None,
         }));
 
         // Register the main workload as child id 0 when the caller asked for
@@ -525,6 +537,7 @@ impl SandboxInstance {
                     pid,
                     pidfd: open_child_pidfd(pid),
                     pty: None,
+                    params: ExecParams::default(),
                     status: None,
                     net_gen: 0,
                 },
@@ -772,11 +785,14 @@ impl SandboxInstance {
                 .into());
             }
         };
-        // F4.3/F4.4: bind the announced child to the session network policy
-        // current at exec time (an `update_network` in flight between the
-        // request and the announcement applies to this exec — the request
-        // was sent under the policy generation we read here). Running
-        // children are never rebound by a later update.
+        // F4.3/F4.4: attribute the announced child to the session network
+        // policy current at exec time (an `update_network` in flight between
+        // the request and the announcement applies to this exec — the
+        // request was sent under the policy generation we read here).
+        // `Some(policy)` binds a post-update child; `None` still attributes
+        // a default-policy child so its lineage can never fall back wide
+        // through an unattributed lookup. Running children are never rebound
+        // by a later update.
         let (next_policy, net_gen) = {
             let session = self
                 .exec_session
@@ -784,10 +800,8 @@ impl SandboxInstance {
                 .expect("exec session presence checked by callers");
             (session.next_net_policy.clone(), session.next_net_gen)
         };
-        if let Some(policy) = next_policy {
-            if let Some(network) = self.supervisor_network.as_ref() {
-                network.lock().await.bind_child_policy(pid, policy);
-            }
+        if let Some(network) = self.supervisor_network.as_ref() {
+            network.lock().await.bind_exec_child(pid, next_policy);
         }
         let session = self
             .exec_session
@@ -807,6 +821,7 @@ impl SandboxInstance {
                 // caller's handle master was closed; the caller still owns
                 // the handle's master either way.
                 pty: registry_pty,
+                params: params.clone(),
                 status: None,
                 net_gen,
             },
@@ -828,9 +843,12 @@ impl SandboxInstance {
     /// only**: every child currently running keeps the policy it was created
     /// under, and the returned [`NetworkStaleness`] names those children.
     /// The request must be a subset of the instance-time destination ceiling
-    /// (S9): a requested IP not granted by the static TCP allowlist — or a
-    /// ceiling whose port-scoped rules cannot express an IP-any-port subset —
-    /// is refused with the named EPERM-class `PolicyTooWide` error.
+    /// (S9): a requested IP the static ceiling **explicitly denies** (any
+    /// protocol's DenyList rule, any-IP port deny, or deny-all) is refused
+    /// with the named EPERM-class `PolicyTooWide` error. Grant-based
+    /// AllowList ceilings are composed per protocol at verdict time
+    /// (reviewer I1), so a protocol that does not grant the IP keeps its
+    /// static policy — an update can never widen a protocol.
     ///
     /// Online tightening through `PolicyFnState.live_policy` (the policy-fn
     /// `restrict_network` path) is deliberately untouched: it is the
@@ -849,13 +867,29 @@ impl SandboxInstance {
         if self.exec_session.is_none() {
             return Err(Self::not_exec_capable());
         }
-        let binding = self.session_network_binding(allowed_ips).await?;
+        let normalized = normalized_ips(allowed_ips);
+        // No-op update: an identical payload must not bump the generation or
+        // report running children stale (reviewer minor).
+        let identical = self
+            .exec_session
+            .as_ref()
+            .expect("exec session presence checked above")
+            .next_net_ips
+            .as_ref()
+            == Some(&normalized);
+        if identical {
+            return Ok(NetworkStaleness {
+                stale_child_ids: Vec::new(),
+            });
+        }
+        let binding = self.session_network_binding(&normalized).await?;
         let gen = {
             let session = self
                 .exec_session
                 .as_mut()
                 .expect("exec session presence checked above");
             session.next_net_policy = Some(binding);
+            session.next_net_ips = Some(normalized);
             session.next_net_gen += 1;
             session.next_net_gen
         };
@@ -874,8 +908,17 @@ impl SandboxInstance {
         })
     }
 
-    /// Validate `allowed_ips` against the instance static TCP ceiling and
-    /// build the per-child allowlist policy new execs will be bound to.
+    /// Validate `allowed_ips` against the instance static ceilings and build
+    /// the per-child allowlist policy new execs will be bound to.
+    ///
+    /// Reviewer I1: an IP **explicitly denied** by any protocol's static
+    /// DenyList (a deny rule covering it, an any-IP port deny, or a deny-all
+    /// instance) is refused — the binding must never override an instance
+    /// deny. Grant-based AllowList ceilings are not refused here: the bound
+    /// policy is intersected with each protocol's ceiling at verdict time
+    /// ([`crate::seccomp::state::intersect_ceiling_grant`]), so a protocol
+    /// that does not grant the IP (e.g. a deny-all ICMP ceiling on a TCP
+    /// policy) simply keeps denying it instead of being widened.
     async fn session_network_binding(
         &self,
         allowed_ips: &[IpAddr],
@@ -891,15 +934,34 @@ impl SandboxInstance {
             .clone();
         let ns = network.lock().await;
         for ip in allowed_ips {
-            if !network_ceiling_allows(&ns.tcp_policy, *ip) {
-                return Err(SandboxRuntimeError::PolicyTooWide {
-                    field: "update_network",
-                    value: ip.to_string(),
+            for ceiling in [
+                &ns.tcp_policy,
+                &ns.udp_policy,
+                &ns.icmp_policy,
+            ] {
+                if crate::seccomp::state::update_network_denied_by_ceiling(ceiling, *ip) {
+                    return Err(SandboxRuntimeError::PolicyTooWide {
+                        field: "update_network",
+                        value: ip.to_string(),
+                    }
+                    .into());
                 }
-                .into());
             }
         }
         Ok(ip_only_allowlist(allowed_ips))
+    }
+
+    /// I3: read the per-exec parameters a registered child was launched with
+    /// (the audit surface that makes the host-side per-child record
+    /// observable). Unknown child ids are refused like every other per-child
+    /// verb.
+    pub fn child_params(&self, child_id: ChildId) -> Result<ExecParams, SandlockError> {
+        let session = self.exec_ref()?;
+        let child = session
+            .children
+            .get(&child_id)
+            .ok_or(SandboxRuntimeError::UnknownChild(child_id))?;
+        Ok(child.params.clone())
     }
 
     /// Wait for an exec child to exit (F3.2). Resolves on the child's
@@ -1925,38 +1987,13 @@ impl SandboxInstance {
     }
 }
 
-/// S9 ceiling check for an `update_network` request: is `ip` inside the
-/// instance's static TCP destination ceiling at any-port granularity?
-///
-/// * `Unrestricted`/`DenyList` ceilings are default-allow — any requested IP
-///   is a subset (the binding can only narrow them);
-/// * an `AllowList` grants `ip` only through an explicit
-///   `PortAllow::Any` entry (a port-scoped entry cannot express an
-///   IP-any-port subset, so the request would silently widen ports and is
-///   refused); any-IP-port rules have the same granularity problem and are
-///   refused for non-empty updates;
-/// * the empty update (deny all) is always a subset and is accepted by the
-///   caller without consulting this helper.
-fn network_ceiling_allows(tcp: &NetworkPolicy, ip: IpAddr) -> bool {
-    match tcp {
-        NetworkPolicy::Unrestricted | NetworkPolicy::DenyList { .. } => true,
-        NetworkPolicy::AllowList {
-            per_ip,
-            cidrs,
-            any_ip_ports,
-            ..
-        } => {
-            if !any_ip_ports.is_empty() {
-                return false;
-            }
-            if matches!(per_ip.get(&ip.to_canonical()), Some(PortAllow::Any)) {
-                return true;
-            }
-            cidrs.iter().any(|(net, allow)| {
-                net.contains(ip) && matches!(allow, PortAllow::Any)
-            })
-        }
-    }
+/// Normalized update payload: sorted, deduped IP list used both for the
+/// no-op comparison and the binding construction.
+fn normalized_ips(ips: &[IpAddr]) -> Vec<IpAddr> {
+    let mut out: Vec<IpAddr> = ips.to_vec();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// IP-only allowlist policy (any port to each listed IP) used to bind an

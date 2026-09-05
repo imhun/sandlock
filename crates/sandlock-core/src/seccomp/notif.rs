@@ -2732,6 +2732,13 @@ pub(crate) fn spawn_pid_watcher(
 /// a charge, so crediting whatever this entry holds is self-limiting.
 pub(crate) async fn cleanup_pid(ctx: &super::ctx::SupervisorCtx, key: super::state::PidKey) {
     cleanup_pid_with(&ctx.processes, &ctx.resource, key).await;
+    // F4.4 follow-up (reviewer minor): prune the per-pid network binding on
+    // exit, and the pgid entry once the child's group is empty, so the
+    // binding maps stay bounded by live processes / non-empty groups. The
+    // low-frequency GC backstop (`process_index_gc`) intentionally does not
+    // hold the network state; watcher-driven exits are the normal path and
+    // the GC is a defensive backstop for watcher loss.
+    ctx.network.lock().await.prune_pid(key.pid);
 }
 
 /// Body of `cleanup_pid`; takes the two pieces the cleanup actually touches so

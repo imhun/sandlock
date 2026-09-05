@@ -169,7 +169,9 @@ def test_update_network_applies_to_new_exec_only_and_reports_staleness():
         assert a.pid is not None
 
         stale = inst.update_network(["127.0.0.1"])
-        assert a.child_id in stale, f"running pre-update child A must be stale: {stale}"
+        assert stale == [a.child_id], f"pre-update child A must be the exact stale set: {stale}"
+        noop = inst.update_network(["127.0.0.1"])
+        assert noop == [], f"identical update must be a no-op: {noop}"
 
         b_script = probe("127.0.0.1", port_lo, os.path.join(b_out, "lo")) + probe(
             "127.0.0.2", port_hi, os.path.join(b_out, "hi")

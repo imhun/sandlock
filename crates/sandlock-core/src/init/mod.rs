@@ -176,11 +176,27 @@ fn spawn(
     // process-local mutations in the post-fork child, so one exec can never
     // leak its cwd/env into a sibling (they fork from init, which never
     // mutates its own cwd/env here).
+    // F4.1 follow-up (reviewer minor): a failed chdir must be loud, not
+    // silently ignored — running the workload in the wrong cwd is a real
+    // semantic error. The error is written to the child's stderr (the stdio
+    // fds were dup2'd above) and the child exits with a distinct setup-failure
+    // code (125; 126 is setpgid failure, 127 exec failure) so `wait_child`
+    // reports it instead of the workload silently running elsewhere.
     if let Some(c) = cwd {
-        if let Ok(cs) = CString::new(c.as_str()) {
-            unsafe {
-                libc::chdir(cs.as_ptr());
+        let chdir_errno = match CString::new(c.as_str()) {
+            Ok(cs) => {
+                if unsafe { libc::chdir(cs.as_ptr()) } == 0 {
+                    None
+                } else {
+                    std::io::Error::last_os_error().raw_os_error()
+                }
             }
+            Err(_) => Some(libc::EINVAL),
+        };
+        if let Some(errno) = chdir_errno {
+            child_fail(&format!(
+                "sandlock-init: chdir to {c:?} failed (errno {errno})\n"
+            ));
         }
     }
     if clean_env {
@@ -209,6 +225,15 @@ fn spawn(
         }
     }
     unsafe { libc::_exit(127) };
+}
+
+/// Write a child-side setup error to fd 2 and `_exit(125)`. Runs in the
+/// post-fork child; glibc's heap is fork-safe in this single-threaded loop.
+fn child_fail(msg: &str) -> ! {
+    unsafe {
+        libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+        libc::_exit(125);
+    }
 }
 
 /// Decode a `waitpid` status into `(code, signal)`.

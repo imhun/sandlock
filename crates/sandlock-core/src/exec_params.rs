@@ -125,6 +125,9 @@ impl ExecCeiling {
             if !cwd.is_absolute() {
                 return Err(Self::too_wide("cwd", value));
             }
+            if path_under_any(cwd, &self.fs_denied) {
+                return Err(Self::too_wide("cwd", value));
+            }
             let mut granted = self.fs_readable.clone();
             granted.extend(self.fs_writable.iter().cloned());
             granted.extend(self.writable_mounts.iter().cloned());
@@ -211,6 +214,23 @@ mod tests {
             ..Default::default()
         };
         assert!(c.validate(&p).is_err(), "fs_deny must never be overridable");
+    }
+
+    #[test]
+    fn fs_denied_cwd_is_refused() {
+        let c = ceiling();
+        let p = ExecParams {
+            cwd: Some(PathBuf::from("/tmp/denied")),
+            ..Default::default()
+        };
+        let err = c.validate(&p).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::SandlockError::Runtime(SandboxRuntimeError::PolicyTooWide {
+                field: "cwd",
+                value,
+            }) if value == "/tmp/denied"
+        ));
     }
 
     #[test]

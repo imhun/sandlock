@@ -17,7 +17,7 @@
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use sandlock_core::error::SandboxRuntimeError;
@@ -106,12 +106,24 @@ async fn test_per_exec_cwd_and_env_apply() {
         env: vec![("F4_MARKER".to_string(), "alpha".to_string())],
         ..Default::default()
     };
-    let (status, out) = exec_and_wait(
-        &mut inst,
-        &["sh", "-c", "/bin/pwd; printf '%s' \"$F4_MARKER\""],
-        &params,
-    )
-    .await;
+    // Run (a) manually so the host-side per-child record (I3) can be asserted
+    // against the exact request.
+    let h = inst
+        .exec_params(
+            &["sh", "-c", "/bin/pwd; printf '%s' \"$F4_MARKER\""],
+            &params,
+            ExecStdio::Piped,
+        )
+        .await
+        .expect("exec cwd/env child");
+    let recorded = inst.child_params(h.child_id).expect("child_params record");
+    assert_eq!(
+        recorded, params,
+        "the per-exec params must be recorded host-side per child"
+    );
+    drop(h.stdin);
+    let status = inst.wait_child(h.child_id).await.expect("wait cwd/env child");
+    let out = read_all_stdout(h.stdout.expect("piped stdout"));
     assert_eq!(status, ExitStatus::Code(0), "cwd/env exec must succeed");
     let text = String::from_utf8(out).expect("ascii child output");
     let mut lines = text.lines();
@@ -307,6 +319,13 @@ async fn test_per_exec_bind_port_reaches_listener() {
         .exec_params(&["/usr/bin/python3", "-c", &script], &params, ExecStdio::Null)
         .await
         .expect("exec bind-port child");
+    // I3: the S9-validated grants are recorded per child (the audit surface);
+    // the listener reachability below is what the current shared-Landlock
+    // domain can honestly assert (per-child *narrowing* is not yet
+    // kernel-enforced — see the report).
+    let recorded = inst.child_params(h.child_id).expect("child_params record");
+    assert_eq!(recorded.bind_ports, vec![port]);
+    assert!(recorded.extra_writable.is_empty());
 
     // Retry the host-side connect until the child's listener is up.
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -372,9 +391,12 @@ async fn test_update_network_applies_to_new_exec_only_and_reports_staleness() {
     let (port_lo, log_lo) = spawn_sink_listener("127.0.0.1".parse().unwrap());
     let (port_hi, log_hi) = spawn_sink_listener("127.0.0.2".parse().unwrap());
 
-    // Any-port destination ceiling over loopback: update_network may narrow
-    // it per child, and the pre-update child keeps the full ceiling.
-    let policy = base_policy().net_allow("*");
+    // Any-port destination ceiling over both loopback addresses:
+    // update_network may narrow it per child, and the pre-update child keeps
+    // the full ceiling.
+    let policy = base_policy()
+        .net_allow("127.0.0.1")
+        .net_allow("127.0.0.2");
     let mut inst = launch_exec_only_tmp(policy).await;
 
     let dir = scratch("net-update");
@@ -429,9 +451,20 @@ async fn test_update_network_applies_to_new_exec_only_and_reports_staleness() {
         .update_network(&["127.0.0.1".parse::<IpAddr>().unwrap()])
         .await
         .expect("update_network narrows the session to loopback-low");
+    assert_eq!(
+        stale.stale_child_ids,
+        vec![a.child_id],
+        "the only running pre-update child must be reported stale exactly"
+    );
+
+    // An identical update is a no-op: no generation bump, no stale report.
+    let noop = inst
+        .update_network(&["127.0.0.1".parse::<IpAddr>().unwrap()])
+        .await
+        .expect("identical update_network must be accepted");
     assert!(
-        stale.stale_child_ids.contains(&a.child_id),
-        "running pre-update child A must be reported stale, got {stale:?}"
+        noop.stale_child_ids.is_empty(),
+        "identical update must not report running children stale, got {noop:?}"
     );
 
     // Child B execs after the update: bound to the narrow policy — loopback
@@ -506,6 +539,211 @@ async fn test_update_network_applies_to_new_exec_only_and_reports_staleness() {
     }
     assert_eq!(log_lo.lock().unwrap().len(), 2, "low listener: A + B");
     assert_eq!(log_hi.lock().unwrap().len(), 1, "high listener: A only");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    inst.shutdown().await.expect("shutdown");
+}
+
+/// Reviewer I2: a descendant of a *bound* child that escapes its process
+/// group (`setsid`) must not fall back to the shared wide default. The
+/// per-pid lineage binding follows the ancestor chain, so the escapee stays
+/// under the bound child's narrow policy (denied the sibling-wide
+/// destination).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_bound_lineage_escapee_is_denied_sibling_wide_destination() {
+    let (port_hi, log_hi) = spawn_sink_listener("127.0.0.2".parse().unwrap());
+    let dir = scratch("escapee");
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).expect("create escapee out dir");
+    let go = dir.join("go");
+    let esc_out = out_dir.join("esc");
+
+    let policy = base_policy()
+        .net_allow("127.0.0.1")
+        .net_allow("127.0.0.2");
+    let mut inst = launch_exec_only_tmp(policy).await;
+    inst.update_network(&["127.0.0.1".parse::<IpAddr>().unwrap()])
+        .await
+        .expect("narrow the session to 127.0.0.1");
+
+    // The escapee's code is carried through an env var so it can run with
+    // `python3 -c` inside a `setsid`-prefixed Popen (no shell quoting).
+    let escapee_code = format!(
+        concat!(
+            "import os, socket, time\n",
+            "while not os.path.exists('{go}'):\n",
+            "    time.sleep(0.05)\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "s.settimeout(3)\n",
+            "try:\n",
+            "    s.connect(('127.0.0.2', {port}))\n",
+            "    open('{out}', 'w').write('OK')\n",
+            "except OSError as e:\n",
+            "    open('{out}', 'w').write('ERR%d' % e.errno)\n",
+            "finally:\n",
+            "    s.close()\n",
+        ),
+        go = go.display(),
+        port = port_hi,
+        out = esc_out.display(),
+    );
+    let root_code = concat!(
+        "import os, subprocess, sys\n",
+        "p = subprocess.Popen([sys.executable, '-c', os.environ['F4_ESCAPEE_CODE']],\n",
+        "                     preexec_fn=os.setsid)\n",
+        "sys.exit(p.wait())\n",
+    );
+    let params = ExecParams {
+        env: vec![("F4_ESCAPEE_CODE".to_string(), escapee_code)],
+        ..Default::default()
+    };
+    let h = inst
+        .exec_params(&["/usr/bin/python3", "-c", root_code], &params, ExecStdio::Null)
+        .await
+        .expect("exec bound root child");
+
+    std::fs::write(&go, b"go").expect("release escapee");
+    let status = inst.wait_child(h.child_id).await.expect("wait bound root");
+    assert_eq!(status, ExitStatus::Code(0));
+    assert_eq!(
+        std::fs::read_to_string(&esc_out).unwrap_or_default(),
+        "ERR111",
+        "a setsid escapee of a bound child must stay under the bound policy"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if log_hi.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        log_hi.lock().unwrap().is_empty(),
+        "the escapee must never reach the sibling-wide destination"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    inst.shutdown().await.expect("shutdown");
+}
+
+/// Reviewer I4: the policy-fn live-policy tightening channel still applies on
+/// top of an update-bound child (deny wins). A bound child whose exec-time
+/// policy allows an IP is denied it once a later event tightens `live_policy`
+/// — the incident-response deny path keeps working for bound children.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_live_policy_tightening_denies_bound_child() {
+    use sandlock_core::policy_fn::Verdict;
+
+    let (port_lo, _log_lo) = spawn_sink_listener("127.0.0.1".parse().unwrap());
+    let (port_hi, log_hi) = spawn_sink_listener("127.0.0.2".parse().unwrap());
+    let dir = scratch("live-tighten");
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).expect("create live-tighten out dir");
+    let go = dir.join("go");
+    let lo_out = out_dir.join("lo");
+    let hi_out = out_dir.join("hi");
+
+    let restricted = Arc::new(AtomicBool::new(false));
+    let restricted_flag = Arc::clone(&restricted);
+    let policy = base_policy()
+        .net_allow("127.0.0.1")
+        .net_allow("127.0.0.2")
+        .policy_fn(move |event, ctx| {
+        if event.syscall == "execve"
+            && event
+                .argv
+                .as_deref()
+                .map(|a| a.iter().any(|s| s == "F4RESTRICT"))
+                .unwrap_or(false)
+            && !restricted_flag.swap(true, Ordering::SeqCst)
+        {
+            // Incident-response tightening: after this event, the only live
+            // network grant is loopback-low.
+            ctx.restrict_network(&["127.0.0.1".parse().unwrap()]);
+        }
+        Verdict::Allow
+    });
+    let mut inst = launch_exec_only_tmp(policy).await;
+
+    inst.update_network(&[
+        "127.0.0.1".parse::<IpAddr>().unwrap(),
+        "127.0.0.2".parse::<IpAddr>().unwrap(),
+    ])
+    .await
+    .expect("bind new execs to loopback-low and loopback-high");
+
+    // A is bound (post-update) to both loopback destinations. It waits for a
+    // marker, then re-execs itself with an argv marker — the execve event
+    // triggers the policy-fn live restriction *while A is still running and
+    // bound* — and the inner process probes both destinations afterwards.
+    let inner = format!(
+        concat!(
+            "import socket\n",
+            "def probe(ip, port, out):\n",
+            "    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "    s.settimeout(3)\n",
+            "    try:\n",
+            "        s.connect((ip, port))\n",
+            "        open(out, 'w').write('OK')\n",
+            "    except OSError as e:\n",
+            "        open(out, 'w').write('ERR%d' % e.errno)\n",
+            "    finally:\n",
+            "        s.close()\n",
+            "probe('127.0.0.1', {p_lo}, '{o_lo}')\n",
+            "probe('127.0.0.2', {p_hi}, '{o_hi}')\n",
+        ),
+        p_lo = port_lo,
+        p_hi = port_hi,
+        o_lo = lo_out.display(),
+        o_hi = hi_out.display(),
+    );
+    let outer = format!(
+        concat!(
+            "import os, sys, time\n",
+            "while not os.path.exists('{go}'):\n",
+            "    time.sleep(0.05)\n",
+            "os.execv(sys.executable,\n",
+            "        [sys.executable, '-c', os.environ['F4_INNER'], 'F4RESTRICT'])\n",
+        ),
+        go = go.display(),
+    );
+    let params = ExecParams {
+        env: vec![("F4_INNER".to_string(), inner)],
+        ..Default::default()
+    };
+    let a = inst
+        .exec_params(
+            &["/usr/bin/python3", "-c", &outer],
+            &params,
+            ExecStdio::Null,
+        )
+        .await
+        .expect("exec bound child A");
+
+    std::fs::write(&go, b"go").expect("release bound child A");
+    let status_a = inst.wait_child(a.child_id).await.expect("wait bound child A");
+    assert_eq!(status_a, ExitStatus::Code(0));
+    assert_eq!(
+        std::fs::read_to_string(&lo_out).unwrap_or_default(),
+        "OK",
+        "the live grant (loopback-low) still applies to the bound child"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&hi_out).unwrap_or_default(),
+        "ERR111",
+        "live_policy tightening must deny a bound child its pre-tightening IP"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if log_hi.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        log_hi.lock().unwrap().is_empty(),
+        "the tightened bound child must never reach loopback-high"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
     inst.shutdown().await.expect("shutdown");
