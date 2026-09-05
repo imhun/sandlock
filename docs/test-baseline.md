@@ -8,7 +8,9 @@
 # Two-phase full gate (see scripts/test-all.sh header):
 #   1. non-root phase (entrypoint drops to uid 65534): core_lib, core_integ,
 #      ffi, cli, cli_build, python — `sh scripts/test-all.sh`
-#   2. root-mode phase: oci — `sh scripts/test-all.sh --oci-root` as root.
+#   2. root-mode phases: oci (`--oci-root`) and the supervise foreign-uid
+#      acceptance (`--supervise-root`), both as root in the same privileged
+#      container.
 core_lib = 791 # F1.4 (SL-8): +1 plan unit test pidfd_release_is_idempotent
                # in resource.rs
 core_integ = 494 # F2.1 (M0 lifecycle lift): 477 -> 481 (+4 lifecycle tests);
@@ -40,7 +42,9 @@ core_integ = 494 # F2.1 (M0 lifecycle lift): 477 -> 481 (+4 lifecycle tests);
                  # (test_list_prune_keeps_live_registered_channel).
 ffi = 89
 cli = 95      # after F0.4 wiring (cli suite includes net_bind_map tests)
-supervise = 26 # F2b.1: new crates/sandlock-supervise (full-field policy entry +
+supervise = 34 # Non-root targets only (--lib --test supervise): the
+               # root-mode foreign-uid target supervise_root is separate.
+               # F2b.1: new crates/sandlock-supervise (full-field policy entry +
                # uid self-check; 13 lib unit + 4 integration tests, including
                # test_supervise_refuses_wrong_uid and
                # test_policy_roundtrip_covers_every_field).
@@ -53,6 +57,25 @@ supervise = 26 # F2b.1: new crates/sandlock-supervise (full-field policy entry +
                # test_supervise_serve_wrong_token_exits_nonzero,
                # test_supervise_rejects_non_socket_control_fd,
                # test_supervise_policy_fd_partial_write_stall_times_out).
+               # F2b.3: 26 -> 34 (+4 lib units ProgramSpec parse/refuse
+               # cases; +4 integration: instance verbs over fd serve
+               # (test_supervise_fd_serve_launches_instance_and_serves_
+               # instance_verbs), instance verbs over the registered path
+               # (test_supervise_path_serve_launches_instance_and_serves_
+               # verbs_until_shutdown), AF_UNIX SO_DOMAIN refusal
+               # (test_supervise_rejects_non_unix_socket_control_fd), and
+               # the forbidden-remap pin
+               # (test_supervise_refuses_runtime_uid_map_verbs)).
+supervise_root = 2 # ROOT-MODE: run via scripts/test-all.sh
+                   # --supervise-root as root (same privileged container as
+                   # oci). F2b.3 foreign-uid acceptance in
+                   # tests/supervise_root.rs: supervise as uid 65533 via
+                   # setpriv, worker as uid 65534 —
+                   # test_supervisor_as_foreign_uid_is_fully_functional
+                   # (registered path; box/mediation/DNS/inbound/stats/
+                   # shutdown/no-residue) and
+                   # test_supervisor_as_foreign_uid_fd_handoff_serves_worker
+                   # (fd transport, same genuine identities).
 oci = 144     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e2e
               # supervises OCI-default root containers; S1.2 fail-closes
               # RunAs(0,0) for non-root supervisors (tested feature). 140 = 55+67+18

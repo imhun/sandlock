@@ -5,6 +5,8 @@
 # Usage: scripts/test-all.sh            (non-root suites; logs land in ./tmp/)
 #        scripts/test-all.sh --wheels   (also cross-build + verify wheel symbols)
 #        scripts/test-all.sh --oci-root (root-mode oci suite only; must run as root)
+#        scripts/test-all.sh --supervise-root (root-mode foreign-uid supervise
+#              suite only; must run as root)
 #
 # Canonical full-gate procedure (sandlock-dev:latest, repo mounted at /src):
 #   chmod -R a+rwX tmp
@@ -12,11 +14,16 @@
 #     sandlock-dev:latest sh scripts/test-all.sh
 #   docker run --privileged --rm -v "$PWD":/src -w /src --entrypoint bash \
 #     sandlock-dev:latest -c 'sh scripts/test-all.sh --oci-root'
+#   docker run --privileged --rm -v "$PWD":/src -w /src --entrypoint bash \
+#     sandlock-dev:latest -c 'sh scripts/test-all.sh --supervise-root'
 #
 # The oci suite is root-mode by design: sandlock-oci e2e supervises OCI-default
 # root containers, and S1.2 fail-closes RunAs(0,0) for non-root supervisors
-# (a tested feature, not a regression). The default (entrypoint drops to
-# uid 65534) run covers every other suite.
+# (a tested feature, not a regression). The supervise_root suite is
+# root-mode by design too: constructing a genuine foreign-uid peer pair
+# (supervise as uid X = 65533, worker as 65534) needs CAP_SETUID, which the
+# root container phase provides via setpriv. The default (entrypoint drops
+# to uid 65534) run covers every other suite.
 set -eu
 cd "$(dirname "$0")/.."
 mkdir -p tmp
@@ -92,8 +99,8 @@ run() {  # run <label> <command...>
 
 mode="${1:-}"
 case "$mode" in
-    ""|--wheels|--oci-root) ;;
-    *) printf 'usage: %s [--wheels|--oci-root]\n' "$0" >&2; exit 2 ;;
+    ""|--wheels|--oci-root|--supervise-root) ;;
+    *) printf 'usage: %s [--wheels|--oci-root|--supervise-root]\n' "$0" >&2; exit 2 ;;
 esac
 
 if [ "$mode" = "--oci-root" ]; then
@@ -107,11 +114,31 @@ if [ "$mode" = "--oci-root" ]; then
     exit 0
 fi
 
+if [ "$mode" = "--supervise-root" ]; then
+    if [ "$(id -u)" -ne 0 ]; then
+        printf '%s\n' \
+            'supervise_root is root-mode (the foreign-uid acceptance spawns' \
+            'supervise as uid 65533 and the worker as uid 65534 via setpriv):' \
+            'run scripts/test-all.sh --supervise-root as root in the same' \
+            'privileged container' >&2
+        exit 1
+    fi
+    # The test's workload (uid 65533) and worker (65534) write into the
+    # repo-mounted tmp; the non-root phase normally chmods it before entry.
+    chmod -R a+rwX tmp
+    run supervise_root cargo test -p sandlock-supervise --offline --test supervise_root -- --test-threads=1
+    exit 0
+fi
+
 run core_lib   cargo test -p sandlock-core --offline --lib
 run core_integ cargo test -p sandlock-core --offline --test integration -- --test-threads=1
 run ffi        cargo test -p sandlock-ffi --offline
 run cli        cargo test -p sandlock-cli --offline
-run supervise  cargo test -p sandlock-supervise --offline
+# The supervise crate's root-mode target (tests/supervise_root.rs) must NOT
+# run in the non-root phase: it constructs genuine cross-uid kernel peers via
+# setpriv and fails loudly without root.  Run the lib units + the non-root
+# integration target here; --supervise-root covers the rest.
+run supervise  cargo test -p sandlock-supervise --offline --lib --test supervise
 # Workspace release build gate (the F0.4 build-break class: a CLI face that
 # only `cargo test -p X` misses). No test binaries, so baseline count is 0.
 run cli_build  cargo build --release --workspace --locked
@@ -124,7 +151,9 @@ export LD_LIBRARY_PATH="$PWD/target-linux/debug${LD_LIBRARY_PATH:+:$LD_LIBRARY_P
 run python python3 -m pytest -p no:cacheprovider python/tests -q
 
 printf '%s\n' \
-    'oci is root-mode: run `sh scripts/test-all.sh --oci-root` as root to verify the oci baseline'
+    'oci is root-mode: run `sh scripts/test-all.sh --oci-root` as root to verify the oci baseline;' \
+    'supervise_root is root-mode: run `sh scripts/test-all.sh --supervise-root` as root to verify' \
+    'the foreign-uid acceptance'
 
 if [ "$mode" = "--wheels" ]; then
     ./python/build-wheels.sh && ./python/verify-wheel.sh
