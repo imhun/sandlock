@@ -45,7 +45,7 @@
 | **P2** | 提供 `mediation_run_as = caller \| supervisor` 开关，便于既有依赖 COW/chroot 语义的调用方渐进迁移 | 中 | **已落地（F6.1，commit `b62e201`/`dd5a7e8`）**：builder / Policy / profile / FFI+cbindgen / CLI `--mediation-run-as` / Python / supervise 全字段清单；显式 `supervisor` 档 WARN + `stats()` 计数。详见 §3.1 |
 | **P3** ✅（commit `17ee48d`） | `_HANDLED_FIELDS` 登记 `notify_rate_limit`（**一行**） | 低（但污染每条日志） | 字段其实**已生效**：`_sdk.py:1217` 调 `sandlock_sandbox_builder_notify_rate_limit`；集合 `_sdk.py:1138` 起漏了名字 ⇒ 每次建沙箱都打假告警。**已修**：名字已登记入 `_HANDLED_FIELDS`，假告警消除；python 全量 431 待 F0.1 基座落地后登记 |
 | **P4** | 修 T4：`net_isolation` + chroot（镜像 rootfs）下 MCP 入站端口映射起不来 | 中（该形态是 E2B 生产形态之一） | E2B 侧 `xfail(strict)` 跟踪，修好即 XPASS 报警 |
-| **P5** | `fs_mount` 目前只接受目录根（单文件/设备节点会以 `ENOTDIR` 失效）⇒ 调用方只能整树挂 `/dev`，进而**必须**下发 `fs_denied` 挡 `/dev/shm`，正好踩 SL-1。希望支持单节点挂载，或提供"最小可用 /dev（ptmx/pts/null/urandom）"构造 helper | 中（消除 SL-1 触发面） | 见 §3.1 影响面 |
+| **P5** ✅（F6.2） | `fs_mount` 目前只接受目录根（单文件/设备节点会以 `ENOTDIR` 失效）⇒ 调用方只能整树挂 `/dev`，进而**必须**下发 `fs_denied` 挡 `/dev/shm`，正好踩 SL-1。希望支持单节点挂载，或提供"最小可用 /dev（ptmx/pts/null/urandom）"构造 helper | 中（消除 SL-1 触发面） | **已落地**：单文件/chardev 单节点 bind-mount（`resolv.conf`、`/dev/null` 形态不再 ENOTDIR，ro 保持）+ `minimal_dev()` helper（`ptmx/pts/null/urandom/zero/tty`），调用方可省整树 `/dev` 挂载与 `/dev/shm` carve-out；F6.1 chroot A档用例已改经 helper 构造 `/dev`。详见 §3.1 |
 | **P6** | 无特权默认路径的细节补齐：`getsockname/getpeername` 反映合成视图、非阻塞 `connect` 的 `EINPROGRESS` 语义 | 低 | 已知限制条目化 |
 | **P7** | wheel 矩阵补 cp310 / cp312–313（沿用 zig 交叉编译流程） | 低 | E2B 运行时已统一 3.14 |
 | **P8** | 上游 PR 推送（需有写权限的 token）+ 合入后 E2B 回切官方 wheel | 中 | 阻塞在权限，不在技术 |
@@ -82,9 +82,11 @@ CLI `--mediation-run-as`（真接线）/ Python `Sandbox(mediation_run_as=...)` 
 supervise 全字段 policy 清单。历史复现与影响分析见 git 历史与
 `docs/sandbox-exec-security.md` §4.12（SL-1 叠加说明）。唯一遗留：C 档对照组依赖
 chroot 形态的中介代执行。F6.1 新增的 chroot/COW 断言本身**不下发** `fs_denied`
-（chroot/COW dispatch 本身就是 on-behalf 触发）；F6.2 的 minimal `/dev` helper
-落地后，按 plan F6.2 文字让 chroot 用例经 `fs_mount` 构造 `/dev` 并验证
-`fs_denied` 可省（依赖 seam，不在本任务范围）。
+（chroot/COW dispatch 本身就是 on-behalf 触发）；F6.2 已按 plan 文字把 chroot
+A档用例的 `/dev` 提供者换成 `minimal_dev()`（`fs_mount` 单节点集合，
+`ptmx/pts/null/urandom/zero/tty`），用例在沙箱内写 `/dev/null` 且**全程不下发
+`fs_denied` 也通过**——不再需要整树挂宿主 `/dev` 或为 `/dev/shm` 下发
+carve-out，SL-1 的最大触发面由构造消除。
 
 ### 3.2 `notify_rate_limit` 假告警（Low）
 
@@ -250,8 +252,9 @@ child 退出但其孙子持有 stdout 时，attached `exec` 被吊住约 30 s �
 - 纯 sandlock（无 chroot）形态**不再下发** `fs_denied`：这些路径本就不在 Landlock 可读白名单内，
   denial 冗余却要付 SL-1 的代价。改后实测：属主 = 沙箱 host uid、`chmod` 正常、
   跨 uid sticky 保护真的生效。落点 `envd_service/executors/sandlock.py`。
-- 镜像 rootfs 形态仍保留 denial（`/dev` 必须整树挂进 chroot 才有 ptmx/devpts，见 §2 P5），
-  该形态的属主问题由 `xfail(strict=True)` 跟踪，非 chroot 形态则**必须**通过。
+- 镜像 rootfs 形态仍保留 denial（`/dev` 必须整树挂进 chroot 才有 ptmx/devpts，见 §2 P5；
+  fork 侧已落地 `minimal_dev()` 单节点 `/dev` 集合，E2B 切过去后可撤整树挂载与该
+  denial），该形态的属主问题由 `xfail(strict=True)` 跟踪，非 chroot 形态则**必须**通过。
 - 测试环境补齐：容器 runner 自动 loop 挂载 XFS(`prjquota`) 并把沙箱工作目录放上去、
   `xfsprogs`/`e2fsprogs`/`nodejs`/`npm`、双形态默认同跑、`E2B_TEST_STRICT_SKIPS=1`
   把"能力型 skip"直接判失败。

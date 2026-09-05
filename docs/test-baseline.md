@@ -55,7 +55,11 @@ core_lib = 821 # F6.1 review I1: 820 -> 821, +1 unit test
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 526 # F6.1 (SL-1): 522 -> 526, +4 — 2 in the new
+core_integ = 526 # F6.2 (P5): count unchanged — the F6.1 chroot-form A档
+                 # test now constructs /dev via the minimal_dev single-node
+                 # helper (no whole-tree /dev mount, no fs_denied) and writes
+                 # to /dev/null through it.
+                 # F6.1 (SL-1): 522 -> 526, +4 — 2 in the new
                  # integration/test_mediation_identity.rs (A档:
                  # test_nonroot_created_file_owned_by_self,
                  # test_denied_path_still_denied), +1 chroot-form in
@@ -144,7 +148,10 @@ core_integ = 526 # F6.1 (SL-1): 522 -> 526, +4 — 2 in the new
                  # (test_exec_mode_main_exit_is_terminal_and_verbs_close);
                  # one-shot outlives regression stays green in
                  # test_instance_lifecycle.rs.
-ffi = 94 # F6.1 (SL-1): 92 -> 94, +2 in the new tests/mediation_run_as.rs
+ffi = 96 # F6.2 (P5): 94 -> 96, +2 in tests/fs_mount.rs
+         # (test_mount_single_file_node, test_mount_chardev_node) — single
+         # file/chardev bind-mount points open instead of failing ENOTDIR.
+         # F6.1 (SL-1): 92 -> 94, +2 in the new tests/mediation_run_as.rs
          # (builder_mediation_run_as_supervisor_lands_on_policy,
          # builder_mediation_run_as_defaults_to_caller_and_invalid_stays_
          # closed).
@@ -157,7 +164,11 @@ ffi = 94 # F6.1 (SL-1): 92 -> 94, +2 in the new tests/mediation_run_as.rs
          # compiles the regenerated sandlock.h against the cdylib (still 1);
          # header regeneration also picks up pre-existing drift at HEAD
          # (missing sandlock_sandbox_builder_notify_rate_limit declaration).
-cli = 97      # F6.1 (SL-1): 95 -> 97, +2 in tests/cli_test.rs
+cli = 98      # F6.2 (P5): 97 -> 98, +1 in tests/cli_test.rs
+              # (test_fs_mount_flag_wired_end_to_end_single_file) — the
+              # --fs-mount flag drives a chroot single-file mount through the
+              # real binary (the --pid-ns wiring-miss class is pinned).
+              # F6.1 (SL-1): 95 -> 97, +2 in tests/cli_test.rs
               # (test_mediation_run_as_flag_accepted_and_runs,
               # test_mediation_run_as_rejects_unknown_value_at_parse; the
               # root-tier wiring proof lives in the mediation_2uid suite).
@@ -265,7 +276,11 @@ oci = 144     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e
               # 56 lib + 68 bin + 15 integration.rs + 2 reaper + 3 process
               # groups = 144).
 cli_build = 0 # workspace release build gate (no test binaries; 0 = build passed)
-python = 453  # F6.1 (SL-1): 450 -> 453, +3 in tests/test_sandbox_config.py
+python = 454  # F6.2 (P5): 453 -> 454, +1 in tests/test_fs_mount.py
+              # (TestFsMount::test_minimal_dev_helper) — the minimal_dev()
+              # helper content is exact and its /dev/null mount serves the
+              # host chardev under chroot without fs_denied.
+              # F6.1 (SL-1): 450 -> 453, +3 in tests/test_sandbox_config.py
               # (TestMediationRunAs defaults / native round-trip / invalid
               # value rejection). F5.1 updates the Sandbox default + builder condition to 256;
               # count unchanged. F4 (M2 per-exec params + S9 + update_network):
