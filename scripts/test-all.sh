@@ -7,6 +7,8 @@
 #        scripts/test-all.sh --oci-root (root-mode oci suite only; must run as root)
 #        scripts/test-all.sh --supervise-root (root-mode foreign-uid supervise
 #              suite only; must run as root)
+#        scripts/test-all.sh --mediation-2uid (root-mode F6.1 B档 two-uid +
+#              C档 suite only; must run as root)
 #
 # Canonical full-gate procedure (sandlock-dev:latest, repo mounted at /src):
 #   chmod -R a+rwX tmp
@@ -16,6 +18,8 @@
 #     sandlock-dev:latest -c 'sh scripts/test-all.sh --oci-root'
 #   docker run --privileged --rm -v "$PWD":/src -w /src --entrypoint bash \
 #     sandlock-dev:latest -c 'sh scripts/test-all.sh --supervise-root'
+#   docker run --privileged --rm -v "$PWD":/src -w /src --entrypoint bash \
+#     sandlock-dev:latest -c 'sh scripts/test-all.sh --mediation-2uid'
 #
 # The oci suite is root-mode by design: sandlock-oci e2e supervises OCI-default
 # root containers, and S1.2 fail-closes RunAs(0,0) for non-root supervisors
@@ -23,7 +27,10 @@
 # root-mode by design too: constructing a genuine foreign-uid peer pair
 # (supervise as uid X = 65533, worker as 65534) needs CAP_SETUID, which the
 # root container phase provides via setpriv. The default (entrypoint drops
-# to uid 65534) run covers every other suite.
+# to uid 65534) run covers every other suite. The mediation_2uid suite is
+# root-mode the same way: two genuine distinct-uid supervise mediators (B档)
+# and the root in-process C档 refusal/leak controls need CAP_SETUID + the
+# privileged userns map, which the root container phase provides via setpriv.
 set -eu
 cd "$(dirname "$0")/.."
 mkdir -p tmp
@@ -99,8 +106,8 @@ run() {  # run <label> <command...>
 
 mode="${1:-}"
 case "$mode" in
-    ""|--wheels|--oci-root|--supervise-root) ;;
-    *) printf 'usage: %s [--wheels|--oci-root|--supervise-root]\n' "$0" >&2; exit 2 ;;
+    ""|--wheels|--oci-root|--supervise-root|--mediation-2uid) ;;
+    *) printf 'usage: %s [--wheels|--oci-root|--supervise-root|--mediation-2uid]\n' "$0" >&2; exit 2 ;;
 esac
 
 if [ "$mode" = "--oci-root" ]; then
@@ -127,6 +134,28 @@ if [ "$mode" = "--supervise-root" ]; then
     # repo-mounted tmp; the non-root phase normally chmods it before entry.
     chmod -R a+rwX tmp
     run supervise_root cargo test -p sandlock-supervise --offline --test supervise_root -- --test-threads=1
+    exit 0
+fi
+
+if [ "$mode" = "--mediation-2uid" ]; then
+    if [ "$(id -u)" -ne 0 ]; then
+        printf '%s\n' \
+            'mediation_2uid is root-mode (the F6.1 B档 two-supervisor pair' \
+            'spawns supervise as uid X/Y = 65531/65532 via setpriv, and the' \
+            'C档 root in-process refusal/leak controls need the privileged' \
+            'userns map): run scripts/test-all.sh --mediation-2uid as root in' \
+            'the same privileged container' >&2
+        exit 1
+    fi
+    # The non-root phase wrote test files; keep every uid able to use them.
+    chmod -R a+rwX tmp
+    # The CLI wiring test inside this suite drives the built sandlock binary.
+    if ! cargo build -p sandlock-cli --offline >tmp/test-all-mediation-build.log 2>&1; then
+        printf 'mediation_2uid: sandlock CLI build failed (see tmp/test-all-mediation-build.log)\n'
+        tail -40 tmp/test-all-mediation-build.log
+        exit 1
+    fi
+    run mediation_2uid cargo test -p sandlock-supervise --offline --test mediation_2uid -- --test-threads=1
     exit 0
 fi
 
@@ -158,7 +187,8 @@ run python python3 -m pytest -p no:cacheprovider python/tests -q
 printf '%s\n' \
     'oci is root-mode: run `sh scripts/test-all.sh --oci-root` as root to verify the oci baseline;' \
     'supervise_root is root-mode: run `sh scripts/test-all.sh --supervise-root` as root to verify' \
-    'the foreign-uid acceptance'
+    'the foreign-uid acceptance; mediation_2uid is root-mode: run `sh scripts/test-all.sh' \
+    '--mediation-2uid` as root to verify the F6.1 two-uid / C档 acceptance'
 
 if [ "$mode" = "--wheels" ]; then
     ./python/build-wheels.sh && ./python/verify-wheel.sh

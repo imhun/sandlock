@@ -161,6 +161,17 @@ the foreign-uid acceptance asserts the mediator's files/processes are
 actually owned by uid X (per-uid DAC holds by construction, not by
 simulation).
 
+F6.1 (SL-1) adds the core-side fail-closed twin of this invariant: the
+`mediation_run_as` tier (default `caller`) makes the mediator-identity
+contract explicit at the sandbox API level.  A *root in-process* mediator
+remapping a sandbox to a non-zero host uid with path mediation active is
+refused before fork — the exact route-B-C-grade revival this section forbids
+— and only the explicit `mediation_run_as=supervisor` tier can opt into it
+(warning + `stats().mediation_downgrades`, never silent; the root-mode
+`--mediation-2uid` acceptance proves that tier really runs as the root
+mediator).  Route B slots keep the single-entry self-map and never need the
+downgrade tier.
+
 ## 6. W1/W2 recycle semantics and hard invariants
 
 One uid = one supervise process = one sandbox generation; supervise is

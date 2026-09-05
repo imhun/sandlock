@@ -11,7 +11,10 @@
 #   2. root-mode phases: oci (`--oci-root`) and the supervise foreign-uid
 #      acceptance (`--supervise-root`), both as root in the same privileged
 #      container.
-core_lib = 816 # F5 review I1: 813 -> 816, +3 unit tests for the pid-ns
+core_lib = 820 # F6.1 (SL-1): 816 -> 820, +4 unit tests in
+               # sandbox/tests.rs (mediation_run_as parse/default/serde
+               # round-trip + the C档 refusal-decision truth table).
+               # F5 review I1: 813 -> 816, +3 unit tests for the pid-ns
                # stray-sweep translation guard (passthrough without pid_ns,
                # translation failure skips the raw ns pid, poisoned map
                # skips). F5 (M3 semantics): 812 -> 813, +1 unit test
@@ -49,7 +52,17 @@ core_lib = 816 # F5 review I1: 813 -> 816, +3 unit tests for the pid-ns
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 522 # F5 (M3 semantics): 514 -> 522, +8 tests —
+core_integ = 526 # F6.1 (SL-1): 522 -> 526, +4 — 2 in the new
+                 # integration/test_mediation_identity.rs (A档:
+                 # test_nonroot_created_file_owned_by_self,
+                 # test_denied_path_still_denied), +1 chroot-form in
+                 # integration/test_chroot.rs
+                 # (test_chroot_mediated_create_is_owned_by_caller_and_self_
+                 # chmod_works) and +1 COW-form in
+                 # integration/test_cow.rs
+                 # (test_cow_mediated_create_is_owned_by_caller_and_self_
+                 # chmod_works).
+                 # F5 (M3 semantics): 514 -> 522, +8 tests —
                  # 7 in integration/test_instance_semantics.rs
                  # (test_max_processes_default_bounds_whole_box,
                  # test_checkpoint_with_multiple_children_is_refused,
@@ -128,7 +141,11 @@ core_integ = 522 # F5 (M3 semantics): 514 -> 522, +8 tests —
                  # (test_exec_mode_main_exit_is_terminal_and_verbs_close);
                  # one-shot outlives regression stays green in
                  # test_instance_lifecycle.rs.
-ffi = 92 # F5.4 adds SANDLOCK_INSTANCE_ERR_DEAD (code 6) to the error-code
+ffi = 94 # F6.1 (SL-1): 92 -> 94, +2 in the new tests/mediation_run_as.rs
+         # (builder_mediation_run_as_supervisor_lands_on_policy,
+         # builder_mediation_run_as_defaults_to_caller_and_invalid_stays_
+         # closed).
+         # F5.4 adds SANDLOCK_INSTANCE_ERR_DEAD (code 6) to the error-code
          # mapping and header; no new FFI test target (mapping-only, covered
          # by the core Dead tests). F3.3 (instance exec FFI): 89 -> 92, +3 in the new
          # tests/instance_exec.rs (instance_exec_streams_stdio_and_waits_
@@ -137,10 +154,17 @@ ffi = 92 # F5.4 adds SANDLOCK_INSTANCE_ERR_DEAD (code 6) to the error-code
          # compiles the regenerated sandlock.h against the cdylib (still 1);
          # header regeneration also picks up pre-existing drift at HEAD
          # (missing sandlock_sandbox_builder_notify_rate_limit declaration).
-cli = 95      # after F0.4 wiring (cli suite includes net_bind_map tests);
+cli = 97      # F6.1 (SL-1): 95 -> 97, +2 in tests/cli_test.rs
+              # (test_mediation_run_as_flag_accepted_and_runs,
+              # test_mediation_run_as_rejects_unknown_value_at_parse; the
+              # root-tier wiring proof lives in the mediation_2uid suite).
+              # after F0.4 wiring (cli suite includes net_bind_map tests);
               # F5.1 updates the no-supervisor default validation to
               # DEFAULT_MAX_PROCESSES (256), no count change
-supervise = 35 # F5.4 adds the InstancePhase::Dead stats label; count
+supervise = 36 # F6.1 (SL-1): 35 -> 36, +1 unit test
+               # (policy::tests::mediation_run_as_rejects_unknown_wire_value)
+               # alongside the mediation_run_as manifest/apply/verify/readback
+               # extension. F5.4 adds the InstancePhase::Dead stats label; count
                # unchanged. Non-root targets only (--lib --test supervise): the
                # root-mode foreign-uid target supervise_root is separate.
                # F2b.1: new crates/sandlock-supervise (full-field policy entry +
@@ -193,6 +217,20 @@ supervise_root = 2 # ROOT-MODE: run via scripts/test-all.sh
                    # shutdown/no-residue) and
                    # test_supervisor_as_foreign_uid_fd_handoff_serves_worker
                    # (fd transport, same genuine identities).
+mediation_2uid = 4 # ROOT-MODE: run via scripts/test-all.sh
+                    # --mediation-2uid as root (same privileged container as
+                    # oci). F6.1 (SL-1) acceptance in
+                    # crates/sandlock-supervise/tests/mediation_2uid.rs:
+                    # test_two_supervisors_distinct_uids_isolate_files (B档
+                    # two supervise mediators at uid 65531/65532 via setpriv,
+                    # shared 1777+sticky dir, exact EPERM/ownership asserts),
+                    # test_root_inprocess_mediation_is_refused (C档 default
+                    # refusal + explicit supervisor tier with stats counter),
+                    # test_root_inprocess_mediation_with_caps_kept_would_leak
+                    # (C档 control: root-owned file + sticky-bypassing
+                    # unlink prove the downgrade is real), and
+                    # test_cli_mediation_run_as_is_wired (root-tier CLI
+                    # refusal vs --mediation-run-as supervisor warning).
 oci = 144     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e2e
               # supervises OCI-default root containers; S1.2 fail-closes
               # RunAs(0,0) for non-root supervisors (tested feature). 140 = 55+67+18
@@ -220,7 +258,9 @@ oci = 144     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e
               # 56 lib + 68 bin + 15 integration.rs + 2 reaper + 3 process
               # groups = 144).
 cli_build = 0 # workspace release build gate (no test binaries; 0 = build passed)
-python = 450  # F5.1 updates the Sandbox default + builder condition to 256;
+python = 453  # F6.1 (SL-1): 450 -> 453, +3 in tests/test_sandbox_config.py
+              # (TestMediationRunAs defaults / native round-trip / invalid
+              # value rejection). F5.1 updates the Sandbox default + builder condition to 256;
               # count unchanged. F4 (M2 per-exec params + S9 + update_network):
               # 446 -> 450, +4
               # in the new tests/test_instance_exec_params.py

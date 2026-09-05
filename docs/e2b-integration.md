@@ -41,8 +41,8 @@
 
 | 编号 | 方案 | 优先级 | 说明 |
 |---|---|---|---|
-| **P1** | **SL-1 修法**：路径中介必须以**调用方身份**执行（`setfsuid/setfsgid(caller)` 包住被中介的 syscall，或 `openat(O_CREAT)` 后 `fchown` 回调用 uid）；`unlinkat/renameat2/fchmodat/fchownat` 需按**调用方**复现内核 DAC 判定（owner / sticky / `CAP_FOWNER` 相对该 inode 所在 mount 的 userns），不成立返回 EPERM | 高（多租户隔离） | 详见 §3.1 |
-| **P2** | 提供 `mediation_run_as = caller \| supervisor` 开关，便于既有依赖 COW/chroot 语义的调用方渐进迁移 | 中 | 与 P1 同批实现成本最低 |
+| **P1** | **SL-1 修法**：路径中介必须以**调用方身份**执行（`setfsuid/setfsgid(caller)` 包住被中介的 syscall，或 `openat(O_CREAT)` 后 `fchown` 回调用 uid）；`unlinkat/renameat2/fchmodat/fchownat` 需按**调用方**复现内核 DAC 判定（owner / sticky / `CAP_FOWNER` 相对该 inode 所在 mount 的 userns），不成立返回 EPERM | 高（多租户隔离） | **由 F2b 取代，仅保留 fail-closed（F6.1，commit `b62e201`）**：route B 的 supervise 进程 euid == 沙箱 host uid ⇒ 无需 per-thread 身份技巧；`mediation_run_as=caller` 下 root 进程内 remap + 路径中介在 spawn 前被拒。详见 §3.1 |
+| **P2** | 提供 `mediation_run_as = caller \| supervisor` 开关，便于既有依赖 COW/chroot 语义的调用方渐进迁移 | 中 | **已落地（F6.1，commit `b62e201`/`dd5a7e8`）**：builder / Policy / profile / FFI+cbindgen / CLI `--mediation-run-as` / Python / supervise 全字段清单；显式 `supervisor` 档 WARN + `stats()` 计数。详见 §3.1 |
 | **P3** ✅（commit `17ee48d`） | `_HANDLED_FIELDS` 登记 `notify_rate_limit`（**一行**） | 低（但污染每条日志） | 字段其实**已生效**：`_sdk.py:1217` 调 `sandlock_sandbox_builder_notify_rate_limit`；集合 `_sdk.py:1138` 起漏了名字 ⇒ 每次建沙箱都打假告警。**已修**：名字已登记入 `_HANDLED_FIELDS`，假告警消除；python 全量 431 待 F0.1 基座落地后登记 |
 | **P4** | 修 T4：`net_isolation` + chroot（镜像 rootfs）下 MCP 入站端口映射起不来 | 中（该形态是 E2B 生产形态之一） | E2B 侧 `xfail(strict)` 跟踪，修好即 XPASS 报警 |
 | **P5** | `fs_mount` 目前只接受目录根（单文件/设备节点会以 `ENOTDIR` 失效）⇒ 调用方只能整树挂 `/dev`，进而**必须**下发 `fs_denied` 挡 `/dev/shm`，正好踩 SL-1。希望支持单节点挂载，或提供"最小可用 /dev（ptmx/pts/null/urandom）"构造 helper | 中（消除 SL-1 触发面） | 见 §3.1 影响面 |
@@ -56,63 +56,33 @@
 
 ### 3.1 SL-1 路径中介以 supervisor 身份执行系统调用（High，多租户 DAC 隔离）
 
-**现象**：启用**路径中介**后，沙箱自己创建的文件属主是 **uid 0**，且它请求的 mode 不生效
-（`chmod` → EPERM）；同时共享目录里"非 owner 不得删除他人文件"（1777 + sticky）的保护不再成立。
-中介的**实测触发条件**是 `fs_denied` 非空，或 chroot（镜像 rootfs）；源码里还有第三组
-`cow_path_syscalls()`（COW 分支），本文未单独验证其触发条件。
+**已修（构造消除，fork-plan F2b / F6.1，2026-09-05）**：中介没有独立特权进程，
+`notif::supervisor(...)` 跑在持有实例的那个进程里，所以**中介身份恒等于该进程的 euid**。
+route B 下每个沙箱由一个 `sandlock-supervise` 进程服务、且该进程 euid == 沙箱 host uid
+（见 `docs/supervise-identity-handoff.md`），DAC 判定由构造正确：属主落 root、
+`chmod` 失效、1777+sticky 跨 uid 保护不成立这三个症状在 A/B 档下不存在。
 
-**机制定位**
+fork 侧 F6.1 把这一点固化成「断言 + 拒绝」：
 
-```text
-crates/sandlock-core/src/seccomp_plan.rs
-  cow_path_syscalls():    openat openat2 execve unlinkat mkdirat mknodat renameat2
-                          symlinkat linkat fchmodat fchownat truncate utimensat
-                          newfstatat statx faccessat readlinkat getdents64 chdir getcwd (+ 旧式)
-  chroot_path_syscalls(): 同一组路径相关调用
-crates/sandlock-core/src/seccomp/notif.rs
-  这些调用由 supervisor 侧代发；全文没有 setfsuid / seteuid / geteuid ⇒ 身份 = supervisor(root)
-```
+- **A 档（同 uid 行为正确，默认 gate）**：`test_nonroot_created_file_owned_by_self`、
+  `test_denied_path_still_denied`，外加 chroot 与 COW 两形态的同一组断言
+  （文件属主 = 调用方 euid、自 chmod 生效、deny carve-out 仍 EACCES）。
+- **B 档（跨 uid 硬证据，root 容器阶段 `--mediation-2uid`）**：
+  `test_two_supervisors_distinct_uids_isolate_files` —— uid X/Y 各起一个
+  `sandlock-supervise`（setpriv，真实内核身份），双方都允许写同一 1777+sticky
+  共享目录：X 建的文件属主 X、X 自 chmod 生效，Y 可读但 `rm`/`chmod` 均 EPERM。
+- **C 档（fail-closed）**：`mediation_run_as`（默认 `caller`）下，root 进程内中介
+  + `RunAs(非 0 host uid)` + 路径中介 ⇒ **建箱前拒绝**并点名 route B 修法与显式
+  `supervisor` 档；显式档建箱成功但 WARN 且 `stats()` 计数，对照组
+  （root 保留 caps、chroot 中介）证明降级档真实降级（文件属主 root、同一条
+  `unlinkat` 成功绕过 sticky）——默认档拒绝不是装饰。
 
-即：Landlock 规则仍约束**子进程**（越出可写集合的写入照旧被拒，本文已验证），
-但凡经中介的操作，内核看到的操作者是 root —— 中介改变了"路径解析"却没有保留"操作者身份"。
-
-**证据（同一脚本，仅切换 `fs_denied`；两个沙箱 uid=4242 / 4343，共享目录 `0777`）**
-
-```text
-fs_denied=["/dev/shm"]      A: chmod=1 (Operation not permitted)   宿主: -rw-r--r-- 1 0 0 a.txt
-                            B: rm=0                                ← 删掉了 A 的文件
-fs_denied=[]（对照）        A: chmod=0                             宿主: -rw------- 1 4242 4242 a.txt
-                            B: rm=1 (Operation not permitted)      ← sticky 保护正常
-```
-
-**影响**
-
-1. 沙箱无法管理自己的产物：`pip`/`npm install` 之类需要 `chmod`/utime 的流程不可用；
-2. 沙箱之间在共享路径（卷、workspace 父级、临时目录）上失去内核 DAC 区分，可互相删除/改名；
-3. worker 上积累"不可信代码产生、属主却是 root"的文件：按 uid 审计、project-id 配额归属、
-   清理逻辑全部失真。
-**不是** Landlock 逃逸：`/var/lib`、`/etc` 等未授权写入仍被拒。
-
-**复现（不依赖 E2B 代码）**
-
-```python
-import os, subprocess, tempfile
-from pathlib import Path
-from sandlock import Sandbox
-
-shared = Path(tempfile.mkdtemp()); os.chmod(shared, 0o777)
-def sbx(uid, denied):
-    ws = Path(tempfile.mkdtemp()); os.chown(ws, uid, uid); os.chmod(ws, 0o700)
-    return Sandbox(fs_writable=[str(ws), str(shared)], fs_readable=["/usr","/lib","/bin"],
-                   fs_denied=denied, uid=uid, gid=uid, max_memory="256M",
-                   max_processes=32, max_open_files=512, max_cpu=100, clean_env=True, cwd=str(ws))
-a, b = sbx(4242, ["/dev/shm"]), sbx(4343, ["/dev/shm"])
-a.run(["/bin/sh","-c",f"printf x > {shared}/a.txt; chmod 600 {shared}/a.txt; echo chmod=$?"])
-b.run(["/bin/sh","-c",f"rm -f {shared}/a.txt; echo rm=$?"])
-print(subprocess.run(["ls","-n",str(shared)],capture_output=True,text=True).stdout)
-```
-
-（`fs_denied=[]` 的对照组请同时新建两个沙箱，勿复用同一 `shared`，因为 A 的文件已被删。）
+字段已贯通 builder / Policy / profile 序列化 / FFI setter + cbindgen 头 /
+CLI `--mediation-run-as`（真接线）/ Python `Sandbox(mediation_run_as=...)` /
+supervise 全字段 policy 清单。历史复现与影响分析见 git 历史与
+`docs/sandbox-exec-security.md` §4.12（SL-1 叠加说明）。唯一遗留：C 档对照组依赖
+chroot 形态的中介代执行，F6.2 的 minimal `/dev` helper 落地后 chroot 用例将改成
+不下发 `fs_denied` 也通过（见 fork-plan F6.1 Step 6 seam）。
 
 ### 3.2 `notify_rate_limit` 假告警（Low）
 
