@@ -5,7 +5,7 @@
 > `sandlock-e2b/docs/HANDOFF.md`, which now only points here.
 >
 > 维护方：E2B（`sandlock-e2b`）。本文是该 fork 的**已做改动 / 待做方案 / 未解决问题**的唯一事实源。
-> 最后更新：2026-09-03
+> 最后更新：2026-09-05（fork-plan F0–F9 全部收口，本文 §1/§2/§3.x/§5 已按真实 commit 终审）
 
 ## 0. 基线与硬约束
 
@@ -13,12 +13,16 @@
 |---|---|
 | 运行时基线分支 | `upstream-pr/netns-free-clean`（无 per-sandbox netns/veth，全程无 root 也能跑） |
 | 参考分支 | `feature/network-socks5`（含 netns 的旧主线，仅参考，不再出 wheel）、`feature/network-inject` |
-| wheel | `cp314` × `x86_64`/`aarch64`，`0.9.0b0 manylinux_2_34`，由 `build-sandlock-wheels.sh` 用 zig 交叉编译（glibc pin 2.34） |
+| wheel | `cp314` × `x86_64`/`aarch64`，`0.9.0b0 manylinux_2_34`；fork 自持 `python/build-wheels.sh`（zig + auditwheel 双架构单 builder，glibc pin 2.34）—— 产物与 tip 一致性由 fork 侧符号级自证 + supervise 指纹（§3.4，F9 已在最终 tip 重建） |
 | 上游 PR | 分支已整理好但**未推送**：`sandlock-e2b` 侧 `GITHUB_TOKEN` 只读（push/写 API 403），且该机无 `gh` CLI |
 | 原则 | 沙箱全程非 root（uid/gid 由 `RunAs` 决定）、无 root supervisor 也要可用；`E2B_ENABLE_NETNS` 仅作兼容保留 |
 | 发布前 | 重跑 wheel 构建 + 重建 worker/测试镜像（wheel 与 tip 的一致性只能靠重跑自证） |
 
-历史全绿基线（fork 自带三套，Linux 容器内非 root）：lib `788`、integration `465`、python `430`。
+历史全绿基线（fork 自带三套，Linux 容器内非 root）：lib `788`、integration `465`、python `430`
+（2026-09-03 计划期数字，**已被 F0.1 起的逐套实测替代**——当前全量数字按套件/档位登记在
+`docs/test-baseline.md`，F9 终局复验：core_lib 822 / core_integ 531 / ffi 98 / cli 98 /
+supervise 36 / supervise_cost 3 / cli_build 0 / python 454，root 档 oci 144 /
+supervise_root 2 / mediation_2uid 5，见 §5）。
 
 ## 1. 已落地的修改方案（fork 侧）
 
@@ -36,17 +40,23 @@
 | E7 前置 | 运行时基线移除 per-sandbox netns/veth（`network/netns.rs`、test_netns、`netns` flag/FFI/Python 全删），通配走无特权共享路径 | — | ✅ | netns 集成测试仅存于 `feature/network-socks5` |
 | M6 | cp314 双架构 wheel + 私有 index 安装；fork build.rs 加 `-mcmodel=large`（manylinux gcc-toolset-14 下 restore-stub 32 位绝对重定位溢出） | 构建 | ✅ | cp310 / 3.12–3.13 未做 |
 | 测试 | 非 root 测试入口 `b6ef050`（`Dockerfile.test-runner` 里 `/usr/bin/python3 → /usr/local/bin/python3` 之类由 E2B 侧镜像负责） | python 测试 | ✅ 430 passed | — |
+| M0 每沙箱一实例（fork-plan F2） | `SandboxInstance` 持 ResourceState / notif / 控制目录+token / DNS 网关；`Sandbox::run/popen/spawn` 走一次性实例（外部语义与 ABI 不变）；`shutdown()` 七步固定顺序且幂等；stats 露出 `proc_count_vs_live`/`children_live`/`instance_state` | `instance.rs`（F2.1–F2.3） | ✅ commit `57f543c`..`2cb1d99`（core_integ 477→488；全门绿） | §8 M4（E2B 接线）未动，属 E2B 侧 |
+| M1 `exec` 下沉 + child 句柄（fork-plan F3） | init/proto/fdpass 从 `sandlock-oci` 原样搬入 `core::init`（oci 走 re-export seam，oci-root 144 精确不变）；per-child `exec/wait_child/kill_child/resize_child` + SCM_RIGHTS stdio；FFI `sandlock_instance_*`（launch/exec/wait/kill/resize/free，F4 再加 exec_params/update_network，cbindgen 同步）；Python `SandboxInstance.exec() -> ExecProcess` | core::init + supervise 双传输 + FFI/Python | ✅ commit `d063437`、`4411c7b`、`3d42bc7` + fix `3fa0b95` | supervise 主退出顺序竞态等见 `docs/fork-plan-followups.md` |
+| M2 per-exec 参数 + 子集校验（fork-plan F4） | per-exec `cwd/env/extra_writable/bind_ports`（execve 前 chdir/envp）；S9 单 choke point（越出实例上限 ⇒ EPERM/`PolicyTooWide`）；`update_network` 只绑新 exec + staleness 回报；per-child 网络按 pid 血缘、未归因 fail-closed | `exec_params.rs` + network 按 pgid 绑定 | ✅ commit `b58b634`、`9f959f1`、`c5d1108` + fixes `902e522`/`e5c7214` | per-child 正向收窄非内核可强制等 seam 见 follow-ups |
+| M3 语义/默认/兜底（fork-plan F5） | 整箱 `max_processes` 默认 **256**（Q10）；多 child `checkpoint()` 显式拒绝；`pid_ns`+实例并存（PidKey 收窄 on-behalf /proc、init reaper）；统一 `InstanceDead`（FFI code 6 / python 消息）；idle `T_idle`/`T_max` | core + FFI/Python 错误面 | ✅ commit `b56fcbe`..`1321ba0`（F5.1–F5.5 + review fix） | **用户可见行为变化**已入 CHANGELOG（默认值/拒绝/Dead/寿命） |
+| SL-1/P1/P2 路径中介身份（fork-plan F6.1） | A 档（同 uid 属主正确）+ B 档（两 supervise 不同 uid 真内核隔离硬证据）+ C 档 fail-closed（root 进程内 remap + 路径中介 ⇒ 建箱前拒绝）；`mediation_run_as=caller|supervisor` 贯穿 builder/Policy/FFI+cbindgen/CLI/Python/supervise 全字段 | notif/builder + 全栈 | ✅ commit `b62e201`、`dd5a7e8`、`7f81314` + fix `75bbe0b` | `--pid-ns` CLI 旧漏线等见 follow-ups |
+| P5 `fs_mount` 单节点 + `minimal_dev`（fork-plan F6.2） | 单文件/chardev bind-mount（不再 ENOTDIR、ro 保持、写家族 EBUSY 防宿主源被删/移）；`minimal_dev()`（`ptmx/pts/null/urandom/zero/tty`）免整树挂 /dev 与 `/dev/shm` carve-out | core + FFI + CLI `--fs-mount` + Python | ✅ commit `de2f749`、`dc0edf3` + fix `6fcb8e2`（ffi 98、python 454） | link-at-mount-point 直击测试、目录挂载点 rmdir 等见 follow-ups |
 
 ## 2. 待实施的修改方案（E2B 提出，需要改 fork）
 
 | 编号 | 方案 | 优先级 | 说明 |
 |---|---|---|---|
-| **P1** | **SL-1 修法**：路径中介必须以**调用方身份**执行（`setfsuid/setfsgid(caller)` 包住被中介的 syscall，或 `openat(O_CREAT)` 后 `fchown` 回调用 uid）；`unlinkat/renameat2/fchmodat/fchownat` 需按**调用方**复现内核 DAC 判定（owner / sticky / `CAP_FOWNER` 相对该 inode 所在 mount 的 userns），不成立返回 EPERM | 高（多租户隔离） | **由 F2b 取代，仅保留 fail-closed（F6.1，commit `b62e201`）**：route B 的 supervise 进程 euid == 沙箱 host uid ⇒ 无需 per-thread 身份技巧；`mediation_run_as=caller` 下 root 进程内 remap + 路径中介在 spawn 前被拒。详见 §3.1 |
-| **P2** | 提供 `mediation_run_as = caller \| supervisor` 开关，便于既有依赖 COW/chroot 语义的调用方渐进迁移 | 中 | **已落地（F6.1，commit `b62e201`/`dd5a7e8`）**：builder / Policy / profile / FFI+cbindgen / CLI `--mediation-run-as` / Python / supervise 全字段清单；显式 `supervisor` 档 WARN + `stats()` 计数。详见 §3.1 |
-| **P3** ✅（commit `17ee48d`） | `_HANDLED_FIELDS` 登记 `notify_rate_limit`（**一行**） | 低（但污染每条日志） | 字段其实**已生效**：`_sdk.py:1217` 调 `sandlock_sandbox_builder_notify_rate_limit`；集合 `_sdk.py:1138` 起漏了名字 ⇒ 每次建沙箱都打假告警。**已修**：名字已登记入 `_HANDLED_FIELDS`，假告警消除；python 全量 431 待 F0.1 基座落地后登记 |
-| **P4** ✅（F7 regression pins，commit `4e78c98`） | 修 T4：`net_isolation` + chroot（镜像 rootfs）下 MCP 入站端口映射起不来 | 中（该形态是 E2B 生产形态之一） | **fork 侧前提证伪 + 回归 pin（非代码修复）**：chroot + `net_isolation` + `net_bind_map` 三合一形态经 9 种忠实构造（HEAD 与 T4 观测时代 `be387c7`）验证可用；新增 3 条镜像测试（mcp/epoll/poll under chroot，core_integ 529）。e2b 侧 T4 有真实 image-rootfs + netns 失败记录（strict-1 实跑，2026-09-03，与 §3.3 一致）；残差可能在 envd gateway 接线层，需 e2b 侧以 `E2B_BASE_IMAGE` + `xfail(run=True)` 复测，登记为 E2B follow-up，见 §3.3 |
-| **P5** ✅（F6.2） | `fs_mount` 目前只接受目录根（单文件/设备节点会以 `ENOTDIR` 失效）⇒ 调用方只能整树挂 `/dev`，进而**必须**下发 `fs_denied` 挡 `/dev/shm`，正好踩 SL-1。希望支持单节点挂载，或提供"最小可用 /dev（ptmx/pts/null/urandom）"构造 helper | 中（消除 SL-1 触发面） | **已落地**：单文件/chardev 单节点 bind-mount（`resolv.conf`、`/dev/null` 形态不再 ENOTDIR，ro 保持）+ `minimal_dev()` helper（`ptmx/pts/null/urandom/zero/tty`），调用方可省整树 `/dev` 挂载与 `/dev/shm` carve-out；F6.1 chroot A档用例已改经 helper 构造 `/dev`。详见 §3.1 |
-| **P6** ✅（F8 设计取舍） | 无特权默认路径的细节补齐：`getsockname/getpeername` 反映合成视图、非阻塞 `connect` 的 `EINPROGRESS` 语义 | 低 | **设计取舍 + 文档条目**（非代码修复）：注入连接按宿主侧视图执行（peer/local 为真实宿主端点）；fd-inject 形态的 connect 由宿主侧阻塞完成、子进程 `SO_SNDTIMEO` 为上界、不向客户端报 `EINPROGRESS`。矩阵两条用例 pin 当前文档化行为（core_integ 529→531）。详见 §3.10 |
+| **P1** | **SL-1 修法**：路径中介必须以**调用方身份**执行（`setfsuid/setfsgid(caller)` 包住被中介的 syscall，或 `openat(O_CREAT)` 后 `fchown` 回调用 uid）；`unlinkat/renameat2/fchmodat/fchownat` 需按**调用方**复现内核 DAC 判定（owner / sticky / `CAP_FOWNER` 相对该 inode 所在 mount 的 userns），不成立返回 EPERM | 高（多租户隔离） | **F9 终态：由 F2b 取代，仅保留 fail-closed**（route B 的 supervise 进程 euid == 沙箱 host uid ⇒ 原修法不再需要；`mediation_run_as=caller` 下 root 进程内 remap + 路径中介在 spawn 前被拒）。F6.1 commit `b62e201` + B/C 档验收 `7f81314` + fix `75bbe0b`。详见 §3.1 |
+| **P2** | 提供 `mediation_run_as = caller \| supervisor` 开关，便于既有依赖 COW/chroot 语义的调用方渐进迁移 | 中 | **F9 终态：已落地**（F6.1，commit `b62e201`/`dd5a7e8`）：builder / Policy / profile / FFI+cbindgen / CLI `--mediation-run-as` / Python / supervise 全字段清单；显式 `supervisor` 档 WARN + `stats()` 计数。详见 §3.1 |
+| **P3** ✅（commit `17ee48d`） | `_HANDLED_FIELDS` 登记 `notify_rate_limit`（**一行**） | 低（但污染每条日志） | **F9 终态：已修**：名字已登记入 `_HANDLED_FIELDS`，假告警消除；python 全量 454 已在 F0.1 基座 + F9 终局实测登记（`docs/test-baseline.md`） |
+| **P4** ✅（F7 前提证伪 + 回归 pin，commit `4e78c98`；文档 `da9c3a7`/`7183884`） | 修 T4：`net_isolation` + chroot（镜像 rootfs）下 MCP 入站端口映射起不来 | 中（该形态是 E2B 生产形态之一） | **F9 终态：fork 侧已闭环（非代码修复）**：chroot + `net_isolation` + `net_bind_map` 三合一形态经 9 种忠实构造（HEAD 与 T4 观测时代 `be387c7`）验证可用；新增 3 条镜像测试（mcp/epoll/poll under chroot，core_integ 529）。e2b 侧 T4 有真实 image-rootfs + netns 失败记录（strict-1 实跑，2026-09-03，与 §3.3 一致）；残差可能在 envd gateway 接线层，需 e2b 侧以 `E2B_BASE_IMAGE` + `xfail(run=True)` 复测 —— **显式 out-of-fork follow-up**（见 §3.3 / `docs/fork-plan-followups.md` FUP-E1） |
+| **P5** ✅（F6.2，commit `de2f749` + fix `6fcb8e2`） | `fs_mount` 目前只接受目录根（单文件/设备节点会以 `ENOTDIR` 失效）⇒ 调用方只能整树挂 `/dev`，进而**必须**下发 `fs_denied` 挡 `/dev/shm`，正好踩 SL-1。希望支持单节点挂载，或提供"最小可用 /dev（ptmx/pts/null/urandom）"构造 helper | 中（消除 SL-1 触发面） | **F9 终态：已修**：单文件/chardev 单节点 bind-mount（`resolv.conf`、`/dev/null` 形态不再 ENOTDIR，ro 保持、挂载点写家族 EBUSY）+ `minimal_dev()` helper（`ptmx/pts/null/urandom/zero/tty`），调用方可省整树 `/dev` 挂载与 `/dev/shm` carve-out；F6.1 chroot A档用例已改经 helper 构造 `/dev`（全程不下发 `fs_denied`）。详见 §3.1 |
+| **P6** ✅（F8 设计取舍，commit `c8f76d4`） | 无特权默认路径的细节补齐：`getsockname/getpeername` 反映合成视图、非阻塞 `connect` 的 `EINPROGRESS` 语义 | 低 | **F9 终态：设计取舍 + 文档条目**（非代码修复）：注入连接按宿主侧视图执行（peer/local 为真实宿主端点）；fd-inject 形态的 connect 由宿主侧阻塞完成、子进程 `SO_SNDTIMEO` 为上界、不向客户端报 `EINPROGRESS`（legacy dup 路径原生 EINPROGRESS 成立，取舍仅限 fd-inject 形态）。矩阵两条用例 pin 当前文档化行为（core_integ 529→531）。详见 §3.10 |
 | **P7** | wheel 矩阵补 cp310 / cp312–313（沿用 zig 交叉编译流程） | 低 | E2B 运行时已统一 3.14 |
 | **P8** | 上游 PR 推送（需有写权限的 token）+ 合入后 E2B 回切官方 wheel | 中 | 阻塞在权限，不在技术 |
 | **P9** ✅**已采纳，见 §8** | 支持**一沙箱一实例**：`Sandbox.spawn(cmd, cwd=None, env=None) -> Process`（不占用"单活进程"busy 标记、每个 Process 自持 handle、并发上限由 `max_processes` 内核核算）+ per-exec `cwd`/`env` 覆盖（见 §3.7 评估） | 中（做进程级 checkpoint / 开 `pid_ns` 的前置） | E2B 当前不需要，故未催 |
@@ -56,7 +66,9 @@
 
 ### 3.1 SL-1 路径中介以 supervisor 身份执行系统调用（High，多租户 DAC 隔离）
 
-**已修（构造消除，fork-plan F2b / F6.1，2026-09-05）**：中介没有独立特权进程，
+**已修（构造消除 + fail-closed，fork-plan F2b / F6.1；commit `b62e201`（core 拒绝+断言）、
+`dd5a7e8`（全栈 `mediation_run_as`）、`7f81314`（B/C 档验收 + runner 分层）、`75bbe0b`
+（review I1 policy_fn 谓词），2026-09-05）**：中介没有独立特权进程，
 `notif::supervisor(...)` 跑在持有实例的那个进程里，所以**中介身份恒等于该进程的 euid**。
 route B 下每个沙箱由一个 `sandlock-supervise` 进程服务、且该进程 euid == 沙箱 host uid
 （见 `docs/supervise-identity-handoff.md`），DAC 判定由构造正确：属主落 root、
@@ -99,7 +111,8 @@ unlink/rename/link 按真实 bind-mount 语义返回 `EBUSY`（防 nofollow 写�
 
 ### 3.3 T4：`net_isolation` + chroot 下 MCP 入站映射不通（Medium）
 
-**fork 侧已闭环（前提证伪，非代码修复；F7，commit `4e78c98`）**：
+**已修口径 = fork 侧前提证伪 + 回归 pin（非代码修复；F7，commit `4e78c98` + 文档
+`da9c3a7`/`7183884`，2026-09-05）**：
 `net_isolation` + 镜像 rootfs 组合下 MCP 入站映射"起不来"的形态在 fork 内 9 种忠实构造下全部验证可用——
 in-process mcp/epoll/poll、python3 exec（mount 宿主目录）、asyncio/uvicorn 型 0.0.0.0、
 instance-exec（S12）、root supervisor + `RunAs(1000)`、以及真实 python3.14 镜像 rootfs + 真
@@ -151,6 +164,11 @@ wheel 内 supervise 必须存在、ELF 机器与 wheel 架构一致、sha256 与
 notify_rate_limit,pid_ns,net_isolation,fd_inject_connect}`，`port_mappings` 走 `net_bind_map`，本就不是
 独立符号）仍成立。发布前重跑 `python/build-wheels.sh && python/verify-wheel.sh`（
 `scripts/test-all.sh --wheels` 已把两者串起来）并重建 worker/测试镜像。
+**发布纪律（F9 复核补记）**：rebuild 前工作树应为 clean（`git status` 除 git-ignored
+产物外无改动）；wheel/standalone/清单必须同批取用；supervise 指纹是**构建时锚定**
+（构建容器与 dev 容器工具链不同，无法在容器内逐字节再推导），verify 以清单 HEAD 钉住
+tip —— 源码变更后必须先 rebuild 再 verify，stale 清单即红。F9 已在 fork 最终 tip
+重建并 verify（§5）。
 
 ### 3.5 非 root supervisor 无法映射任意 host uid（S1.2 约束，结构性）
 
@@ -199,6 +217,13 @@ root 属主，实例复用只会把这个错位从"每条命令"变成"整个沙
 
 ### 3.8 内存/CPU/进程配额是按**实例**而非按沙箱（实测会超卖）
 
+**已修（fork 侧 M0–M3 落地，2026-09-05；commit `57f543c`（M0 SandboxInstance）..
+`1321ba0`（M3 语义 review fix），E2B §8 采纳的"一沙箱一实例 + exec"由 fork 交付，
+执行边界 = 产品边界 ⇒ 超卖由构造消除）**：下面保留的是 2026-09-03 的实测证据（历史
+形态：E2B 每条命令一个实例）。E2B 侧接上 §8 M4（gateway + 命令都走同一实例的 exec）
+后，内存/CPU/进程数按**实例**记账即按**沙箱**记账；fork 侧配套默认/语义见 §2 P9 采纳、
+`docs/fork-plan-2026-09.md` 阶段 F2–F5 与 CHANGELOG。
+
 `max_memory` 由 `crates/sandlock-core/src/resource.rs` 在 `brk`/`mmap` 的 USER_NOTIF 里记账，
 账本挂在**该 Sandbox 实例**的运行时状态上（同实例内父+子会一起算，所以限额本身是有效的）。
 但 E2B 是"每条命令一个实例"（§3.7），于是同一沙箱的 K 个并发命令各拿一份配额。
@@ -231,6 +256,13 @@ project，限额是真加总的（这也是为什么只有内存/CPU/进程数�
 
 
 ### 3.9 一沙箱一实例的安全前置：exec 复用新开的攻击面（2026-09-04）
+
+**已清零（M0′：fork-plan F1.1–F1.8 全部落地，2026-09-05；commit `3d804b1`（SL-4）/
+`c5a0fe7`（H1/H2）`95608be`+`ceaa069`（SL-7）/`f0b3d78`（SL-8）/`793aaf3`+`e85d031`
+（SL-6）/`4b7f7d0`+`d2bd459`（SECE-6）/`df5d77a`（deadline）/`0f51fce`（SL-5）；
+相关计数逐 commit 登记在 `docs/test-baseline.md`，oci-root 144 与全门在 F9 终局复验）**：
+下方表格即 M0′ 各放行门槛的原始记录 —— 每行的缺陷现在都有对应修复 + 红→绿用例，
+不再构成 exec 放行门槛。
 
 §8 的改造在**沙箱内部**新开一类回退（今天互不可见的兄弟命令，合并后同 uid、同 pid 空间、同一条
 宿主控制 socket），并把 `sandlock-oci` 现状实现与本文件既有的记账/鉴权问题合计**五条**变成放行门槛：
@@ -303,7 +335,9 @@ core_integ 529→531。
   内核默认 TCP 超时。
 - 真实 EINPROGRESS 转发需要「先回 EINPROGRESS → 后台宿主 connect → 稍后注入 fd 并合成
   可写事件」，并覆盖 poll/select/send 全生命周期，属特性级重构，超出低优先补齐范围；
-  还会破坏「注入 connect 必须返回 0」（CPython `socket.connect()` 兼容，既有回归 pin）。
+  还会破坏 fd-inject 形态的既有契约：注入 connect 的 syscall 结果必须返回 0
+  （该约束在**非阻塞可观察面**严格成立——阻塞形态宿主侧完成后同样返回 0；
+  CPython `socket.connect()` 兼容，既有回归 pin）。
 - 默认共享 netns 的 legacy dup 路径不受此限：connect 在子进程自己的 socket 对象上执行，
   内核继续异步握手，`EINPROGRESS` 原生透传（`test_net_isolate.rs` 的 `connect_script`
   注释已记录）。取舍范围仅限 fd-inject 形态。
@@ -322,13 +356,19 @@ core_integ 529→531。
   `xfsprogs`/`e2fsprogs`/`nodejs`/`npm`、双形态默认同跑、`E2B_TEST_STRICT_SKIPS=1`
   把"能力型 skip"直接判失败。
 
-## 5. 验证矩阵（最近一次，2026-09-03）
+## 5. 验证矩阵（最近一次，2026-09-05）
 
 | 套件 | 结果 |
 |---|---|
-| E2B 全量（Linux 容器，镜像 rootfs + netns + XFS + npm + strict） | `867 passed / 1 skipped / 2 xfailed / 0 failed / 0 error` |
-| E2B 全量（macOS 宿主，unit+contract+sdk python/js+security） | `813 passed / 53 skipped / 0 failed` |
-| fork lib / integration / python | 历史基线 `788 / 465 / 430`（本轮未重跑） |
+| E2B 全量（Linux 容器，镜像 rootfs + netns + XFS + npm + strict；2026-09-03 实测，E2B 侧） | `867 passed / 1 skipped / 2 xfailed / 0 failed / 0 error` |
+| E2B 全量（macOS 宿主，unit+contract+sdk python/js+security；2026-09-03 实测，E2B 侧） | `813 passed / 53 skipped / 0 failed` |
+| fork 全量门禁非 root 档（F9 终局，2026-09-05，sandlock-dev:latest 特权容器） | core_lib `822` / core_integ `531` / ffi `98` / cli `98` / supervise `36` / supervise_cost `3` / cli_build `0` / python `454`（log `tmp/sdd/f9-gate-nonroot.log`） |
+| fork 全量门禁 root 档（F9 终局，2026-09-05，同容器 root 阶段） | oci-root `144` / supervise_root `2` / mediation_2uid `5`（log `tmp/sdd/f9-oci-root.log`、`f9-supervise-root.log`、`f9-mediation-2uid.log`） |
+| fork wheel 自证（F9 终局重建，2026-09-05） | `python/build-wheels.sh` 双架构 + `python/verify-wheel.sh` 全绿（FFI 符号双向相等 + supervise 指纹三方一致 + `--uid` 拒绝冒烟；清单 HEAD = F9 tip）（log `tmp/sdd/f9-wheel-build.log`、`f9-wheel-verify.log`） |
+
+逐套件权威数字与历史注释见 `docs/test-baseline.md`（F9 终局已复核；本计划新增用例数
+已随各 commit 登记）。E2B 侧两行是 E2B 仓库 2026-09-03 的实测，fork F0–F9 期间未复跑
+（fork 侧只负责本仓库自证）。
 
 fork 侧复跑命令（非 root 全程，入口脚本做一次性 root 准备）见
 `sandlock-e2b/docs/HANDOFF.md`「sandlock fork 验证」。
@@ -356,6 +396,12 @@ fork 侧复跑命令（非 root 全程，入口脚本做一次性 root 准备）
 3. 编号沿用：`SL-*` = fork 缺陷，`T*` = E2B 待办，`R*/S*/E*/M*` = 已落地方案编号。
 
 ## 8. 采纳方案：每沙箱一个实例（2026-09-03 复核后按最小改动界定）
+
+> **F9 收口（2026-09-05）**：本方案的 fork 侧实现（M0–M3 + F2b route-B supervise +
+> F3–F5 exec/per-exec/语义/兜底）已全部落地并全门复验 —— 对应 §1 M0–M3 行与
+> §2 P9 采纳。余下的 **M4（E2B 接线：SandlockExecutor 持实例、`_CommandGate` 保留、
+> 控制目录名 sandbox_id + token、超卖探针改断言）在 E2B 仓库执行**，不在 fork 范围；
+> fork 侧文档与 follow-up 见 `docs/fork-plan-followups.md`。
 
 > 决策：一个 E2B 沙箱 = 一个长命 sandlock 实例，命令是"往这个实例里 exec 一个进程"。
 > 目的：让**执行边界 = 产品边界**，§3.8 的内存/CPU/进程数超卖从根上消失。
