@@ -11,7 +11,7 @@
 #   2. root-mode phase: oci — `sh scripts/test-all.sh --oci-root` as root.
 core_lib = 791 # F1.4 (SL-8): +1 plan unit test pidfd_release_is_idempotent
                # in resource.rs
-core_integ = 493 # F2.1 (M0 lifecycle lift): 477 -> 481 (+4 lifecycle tests);
+core_integ = 494 # F2.1 (M0 lifecycle lift): 477 -> 481 (+4 lifecycle tests);
                  # F2.2 (shutdown seven-step order + idempotency): 481 -> 484,
                  # +3 in integration/test_instance_lifecycle.rs
                  # (test_shutdown_escalates_after_grace_for_term_ignoring_child,
@@ -36,9 +36,11 @@ core_integ = 493 # F2.1 (M0 lifecycle lift): 477 -> 481 (+4 lifecycle tests);
                  # test_path_mode_peer_uid_mismatch_closes,
                  # test_registered_path_channel_accepts_allowlisted_peer_with_token,
                  # test_sandbox_cannot_reach_sibling_channel).
+                 # F2b.2 review fix (I1): 493 -> 494, +1
+                 # (test_list_prune_keeps_live_registered_channel).
 ffi = 89
 cli = 95      # after F0.4 wiring (cli suite includes net_bind_map tests)
-supervise = 22 # F2b.1: new crates/sandlock-supervise (full-field policy entry +
+supervise = 26 # F2b.1: new crates/sandlock-supervise (full-field policy entry +
                # uid self-check; 13 lib unit + 4 integration tests, including
                # test_supervise_refuses_wrong_uid and
                # test_policy_roundtrip_covers_every_field).
@@ -46,6 +48,11 @@ supervise = 22 # F2b.1: new crates/sandlock-supervise (full-field policy entry +
                # +4 integration: real --policy <fd> happy path + timeout +
                # oversize-limit semantics, and single-generation fd-serve
                # lifecycle test_supervise_serves_control_fd_until_shutdown).
+               # F2b.2 review fix (I2/I4): 22 -> 26, +4 integration
+               # (test_supervise_serve_eof_without_shutdown_exits_nonzero,
+               # test_supervise_serve_wrong_token_exits_nonzero,
+               # test_supervise_rejects_non_socket_control_fd,
+               # test_supervise_policy_fd_partial_write_stall_times_out).
 oci = 144     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e2e
               # supervises OCI-default root containers; S1.2 fail-closes
               # RunAs(0,0) for non-root supervisors (tested feature). 140 = 55+67+18

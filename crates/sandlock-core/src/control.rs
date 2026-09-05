@@ -838,6 +838,15 @@ pub fn list_live_sandboxes() -> Result<Vec<(String, i32)>, std::io::Error> {
         if !dir.is_dir() {
             continue;
         }
+        // Only per-sandbox runtime dirs (`<16-hex>.d`) are candidates for
+        // liveness/pruning.  Anything else under the root — including the
+        // registered-channel registry if it ever lives here — is not a
+        // sandbox state dir and must never be `remove_dir_all`'d as "stale
+        // debris" (F2b.2 review I1: a live registry carries no pid file and
+        // would otherwise be pruned after the 2 s recency window).
+        if !is_sandbox_state_dir(&dir) {
+            continue;
+        }
 
         // Parse the pid file.  Format: child_pid\nsupervisor_pid\nstarttime\n
         let (child_pid, supervisor_pid, recorded_starttime) = match read_pid_file(&dir) {
@@ -893,6 +902,22 @@ pub fn list_live_sandboxes() -> Result<Vec<(String, i32)>, std::io::Error> {
     // Sort by name for deterministic output.
     live.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(live)
+}
+
+/// True when `dir`'s file name is the per-sandbox `<fnv1a16(name)>.d` shape
+/// (16 lowercase hex digits plus `.d`).  `list_live_sandboxes` uses this to
+/// distinguish sandbox state dirs from any other directory that may share
+/// the control root.
+fn is_sandbox_state_dir(dir: &Path) -> bool {
+    let name = match dir.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n,
+        None => return false,
+    };
+    let stem = match name.strip_suffix(".d") {
+        Some(s) => s,
+        None => return false,
+    };
+    stem.len() == 16 && stem.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Return true if `dir` was modified less than 2 seconds ago.
@@ -1025,10 +1050,12 @@ pub const MAX_FRAME_BYTES: usize = 65536;
 /// The shared registry root for registered-path control channels.
 ///
 /// Route B slots run as uid X while the worker connects as a different uid
-/// (default 65534), so this root cannot be the historical owner-only
-/// per-user root: it must be traversable by the worker.  It is created
-/// 1777+sticky when the process can (the canonical privileged launcher /
-/// deployment layer), letting every uid publish its own hashed slot dir
+/// (default 65534), so this root must NOT be a child of the historical
+/// owner-only per-user root: the worker would be EACCES-blocked at the 0700
+/// parent before ever reaching the registry.  It is therefore a *sibling* of
+/// the per-user root under a traversable parent (default `/tmp`; the
+/// `SANDBOX_CTL_ROOT` test override maps to a sibling `<root>-registry`), and
+/// is created 1777+sticky so every uid can publish its own hashed slot dir
 /// while nobody can delete another uid's dir.  Per-sandbox runtime dirs stay
 /// owner-only (0700/0600); only the socket a slot explicitly publishes is
 /// world-connectable, and it is additionally protected by the `SO_PEERCRED`
@@ -1036,13 +1063,15 @@ pub const MAX_FRAME_BYTES: usize = 65536;
 pub fn channel_registry_root() -> PathBuf {
     if let Ok(root) = std::env::var(CTL_ROOT_ENV) {
         if !root.is_empty() {
-            return PathBuf::from(root).join("registry");
+            // Sibling of the per-process per-uid root so the two live under
+            // the same isolated parent for tests, but the registry chain is
+            // traversable by the worker uid.
+            return PathBuf::from(format!("{}-registry", root.trim_end_matches('/')));
         }
     }
-    PathBuf::from(format!(
-        "/tmp/sandlock-ctl-{}/registry",
-        unsafe { libc::getuid() }
-    ))
+    PathBuf::from(format!("/tmp/sandlock-ctl-{}-registry", unsafe {
+        libc::getuid()
+    }))
 }
 
 /// Ensure the shared registry root exists with 1777+sticky permissions and
@@ -1146,16 +1175,20 @@ pub fn write_response_frame(
     Ok(())
 }
 
-/// Outcome of a served request: the session may keep the transport open for
-/// the next request, or the transport (and the process serving it — the
-/// supervise single-generation case) should now shut down.
+/// Outcome of a served request / serve loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServeOutcome {
     /// Keep serving on this transport.
     Continue,
-    /// Shut the transport (and, for a supervise generation, the process)
-    /// down after responding.
+    /// A `shutdown` verb completed the generation: shut the transport down
+    /// cleanly (exit 0 for a supervise generation).
     Shutdown,
+    /// The transport ended without a clean shutdown: the peer closed /
+    /// disappeared mid-generation, or a request was refused (parse error,
+    /// bad protocol version, missing/mismatched token).  A supervise
+    /// generation must exit non-zero so a crashed or attacking peer cannot
+    /// masquerade as a clean generation end.
+    PeerGone,
 }
 
 /// Handles one authenticated control verb and writes its response.
@@ -1165,7 +1198,7 @@ pub enum ServeOutcome {
 /// are served by the async in-process loop; the dual-transport serve path
 /// serves the verbs the caller registered (probe `ping` in tests, supervise
 /// `config`/`shutdown` in the binary).
-pub trait ControlHandler: Send + 'static {
+pub trait ControlHandler {
     fn handle(
         &mut self,
         stream: &mut std::os::unix::net::UnixStream,
@@ -1199,15 +1232,20 @@ pub fn serve_registered_once(
 /// `SO_PEERCRED` check: the descriptor proves the peer is the launcher's
 /// supervise child), so the only gate is the per-channel token — the belt
 /// against a third party that somehow obtained the descriptor.
+///
+/// Outcomes are split so the caller can distinguish a clean generation end
+/// ([`ServeOutcome::Shutdown`], from a `shutdown` verb) from an abnormal end
+/// ([`ServeOutcome::PeerGone`]: EOF, parse/version refusal, or token
+/// refusal) — supervise exits 0 only on Shutdown.
 pub fn serve_fd_connection(
     stream: std::os::unix::net::UnixStream,
-    expected_token: &str,
+    expected_token: Option<&str>,
     handler: &mut dyn ControlHandler,
 ) -> ServeOutcome {
     let mut stream = stream;
     loop {
         let Some(body) = read_request_body(&mut stream) else {
-            return ServeOutcome::Shutdown;
+            return ServeOutcome::PeerGone;
         };
         let req: ControlRequest = match serde_json::from_slice(&body) {
             Ok(r) => r,
@@ -1219,7 +1257,7 @@ pub fn serve_fd_connection(
                     err: Some(format!("parse error: {}", e)),
                 };
                 let _ = write_response_frame(&mut stream, &resp);
-                return ServeOutcome::Shutdown;
+                return ServeOutcome::PeerGone;
             }
         };
         if req.v != 1 {
@@ -1230,29 +1268,35 @@ pub fn serve_fd_connection(
                 err: Some(format!("unsupported protocol version: {}", req.v)),
             };
             let _ = write_response_frame(&mut stream, &resp);
-            return ServeOutcome::Shutdown;
+            return ServeOutcome::PeerGone;
         }
-        let authorized = match req.token.as_deref() {
-            Some(given) => token_eq(given, expected_token),
-            None => false,
-        };
-        if !authorized {
-            let resp = ControlResponse {
-                v: 1,
-                ok: false,
-                data: None,
-                err: Some(format!(
-                    "permission denied: verb '{}' requires a valid channel token \
-                     (missing or mismatched)",
-                    req.verb
-                )),
+        if let Some(expected) = expected_token {
+            let authorized = match req.token.as_deref() {
+                Some(given) => token_eq(given, expected),
+                None => false,
             };
-            let _ = write_response_frame(&mut stream, &resp);
-            return ServeOutcome::Shutdown;
+            if !authorized {
+                let resp = ControlResponse {
+                    v: 1,
+                    ok: false,
+                    data: None,
+                    err: Some(format!(
+                        "permission denied: verb '{}' requires a valid channel token \
+                         (missing or mismatched)",
+                        req.verb
+                    )),
+                };
+                let _ = write_response_frame(&mut stream, &resp);
+                return ServeOutcome::PeerGone;
+            }
         }
         match handler.handle(&mut stream, &req) {
             ServeOutcome::Continue => {}
             ServeOutcome::Shutdown => return ServeOutcome::Shutdown,
+            // Handlers describe verbs (Continue/Shutdown); PeerGone is
+            // transport-level and only returned by the frame/auth paths
+            // above — defensively propagate it if a handler ever returns it.
+            ServeOutcome::PeerGone => return ServeOutcome::PeerGone,
         }
     }
 }

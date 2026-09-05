@@ -113,7 +113,10 @@ fn run(cli: Cli) -> Result<()> {
     let sandbox = sandlock_supervise::policy::validate(&bytes)
         .map_err(|e| anyhow::anyhow!("policy rejected: {e}"))?;
 
-    // 3. Control descriptor must be open.
+    // 3. Control descriptor must be an open SOCK_STREAM unix socket — the
+    //    supervise fd transport serves a socketpair end; a regular file
+    //    passed by a misconfigured launcher must fail by name instead of
+    //    silently exiting 0.
     let flags = unsafe { libc::fcntl(cli.control_fd, libc::F_GETFD) };
     if flags == -1 {
         bail!(
@@ -122,19 +125,59 @@ fn run(cli: Cli) -> Result<()> {
             std::io::Error::last_os_error()
         );
     }
+    {
+        let mut sock_type: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                cli.control_fd,
+                libc::SOL_SOCKET,
+                libc::SO_TYPE,
+                &mut sock_type as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            bail!(
+                "control fd {} is not a socket: {}",
+                cli.control_fd,
+                std::io::Error::last_os_error()
+            );
+        }
+        if sock_type != libc::SOCK_STREAM {
+            bail!(
+                "control fd {} is a {} socket, not SOCK_STREAM: \
+                 the fd transport serves a connected stream socketpair end",
+                cli.control_fd,
+                sock_type
+            );
+        }
+    }
 
     // F2b.2: single generation.  Serve the control channel (fd handoff
-    // transport) until shutdown; then the process exits 0.
+    // transport); exit semantics split clean/abnormal ends so a crashed or
+    // attacking peer (or a misconfigured non-socket fd) cannot look like a
+    // clean generation end.
     if cli.serve {
         let outcome = sandlock_supervise::serve::serve_control_fd(
             cli.control_fd,
-            &sandbox,
+            std::sync::Arc::new(sandbox),
             cli.token.as_deref(),
         );
-        if outcome == sandlock_core::control::ServeOutcome::Shutdown {
-            return Ok(());
+        match outcome {
+            sandlock_core::control::ServeOutcome::Shutdown => return Ok(()),
+            other => {
+                // PeerGone (EOF without shutdown, parse/version/token
+                // refusal) or any other abnormal end: non-zero so the
+                // deployment can tell a completed generation from a broken
+                // one.
+                bail!(
+                    "control channel ended abnormally (outcome {:?}); \
+                     only a shutdown verb completes a generation",
+                    other
+                );
+            }
         }
-        bail!("control channel ended without a shutdown verb");
     }
 
     // F2b.1 validate-and-exit behaviour (kept for callers that only want the

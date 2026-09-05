@@ -23,7 +23,8 @@ use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 
 use sandlock_core::control::{
-    read_request_body, write_response_frame, ControlRequest, ControlResponse, ServeOutcome,
+    serve_fd_connection, write_response_frame, ControlHandler, ControlRequest, ControlResponse,
+    ServeOutcome,
 };
 use sandlock_core::profile::sandbox_to_profile;
 use sandlock_core::Sandbox;
@@ -42,87 +43,39 @@ pub const MAX_POLICY_BYTES: usize = 16 * 1024 * 1024;
 /// sandbox policy of this generation — the `config` verb serves its
 /// snapshot.  No workload has been launched yet (the exec/launch verb lands
 /// with F2b.3/F3), so the single generation is the control-channel
-/// generation; `shutdown` completes it and the binary exits 0.
+/// generation.
+///
+/// The frame loop itself is core's [`serve_fd_connection`] (transport 1's
+/// shared session): parse/version/token refusals and EOF are classified
+/// there.  This function only supplies the generation's verb handler and
+/// the fd, so supervise and the core fd transport can never drift apart in
+/// framing or auth.
 pub fn serve_control_fd(
     control_fd: RawFd,
-    policy: &Sandbox,
+    policy: std::sync::Arc<Sandbox>,
     expected_token: Option<&str>,
 ) -> ServeOutcome {
     // The handed-off fd is the connected worker end of the launcher's
     // socketpair.  Taking ownership is correct for the serve duration: this
     // process exits right after serving.
-    let mut stream = unsafe { UnixStream::from_raw_fd(control_fd) };
+    let stream = unsafe { UnixStream::from_raw_fd(control_fd) };
     let mut handler = GenerationHandler { policy };
-    loop {
-        let Some(body) = read_request_body(&mut stream) else {
-            return ServeOutcome::Shutdown;
-        };
-        let req: ControlRequest = match serde_json::from_slice(&body) {
-            Ok(r) => r,
-            Err(e) => {
-                let resp = ControlResponse {
-                    v: 1,
-                    ok: false,
-                    data: None,
-                    err: Some(format!("parse error: {}", e)),
-                };
-                let _ = write_response_frame(&mut stream, &resp);
-                return ServeOutcome::Shutdown;
-            }
-        };
-        if req.v != 1 {
-            let resp = ControlResponse {
-                v: 1,
-                ok: false,
-                data: None,
-                err: Some(format!("unsupported protocol version: {}", req.v)),
-            };
-            let _ = write_response_frame(&mut stream, &resp);
-            return ServeOutcome::Shutdown;
-        }
-        // fd transport auth: the fd itself is the credential (a path never
-        // participates).  When a channel token was agreed at handoff, every
-        // verb must carry it — the belt over the fd.
-        if let Some(expected) = expected_token {
-            let authorized = match req.token.as_deref() {
-                Some(given) => sandlock_core::control::token_eq(given, expected),
-                None => false,
-            };
-            if !authorized {
-                let resp = ControlResponse {
-                    v: 1,
-                    ok: false,
-                    data: None,
-                    err: Some(format!(
-                        "permission denied: verb '{}' requires a valid channel token \
-                         (missing or mismatched)",
-                        req.verb
-                    )),
-                };
-                let _ = write_response_frame(&mut stream, &resp);
-                return ServeOutcome::Shutdown;
-            }
-        }
-        match handler.handle(&mut stream, &req) {
-            ServeOutcome::Continue => {}
-            ServeOutcome::Shutdown => return ServeOutcome::Shutdown,
-        }
-    }
+    serve_fd_connection(stream, expected_token, &mut handler)
 }
 
 /// Verb handler for one generation: `config` returns the policy snapshot;
 /// `shutdown` completes the generation.  The snapshot has no dynamic
 /// policy_fn denies (supervise validates a static policy; the dynamic
 /// callback machinery is launcher/Python-side and not part of this entry).
-struct GenerationHandler<'a> {
-    policy: &'a Sandbox,
+struct GenerationHandler {
+    policy: std::sync::Arc<Sandbox>,
 }
 
-impl GenerationHandler<'_> {
+impl ControlHandler for GenerationHandler {
     fn handle(&mut self, stream: &mut UnixStream, req: &ControlRequest) -> ServeOutcome {
         match req.verb.as_str() {
             "config" => {
-                let profile = sandbox_to_profile(self.policy, &[]);
+                let profile = sandbox_to_profile(&self.policy, &[]);
                 let data = serde_json::to_value(&profile).unwrap_or_else(
                     |e| serde_json::json!({"error": format!("serialize config: {e}")}),
                 );
@@ -167,34 +120,38 @@ impl GenerationHandler<'_> {
 pub fn read_policy_fd(fd: RawFd, timeout: std::time::Duration) -> Result<Vec<u8>, String> {
     use std::io::Read;
 
-    // Poll first: a pipe whose writer never wrote would otherwise block the
-    // read indefinitely.  POLLIN|POLLHUP means data (or EOF) is available.
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN | libc::POLLHUP,
-        revents: 0,
-    };
-    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-    let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-    if rc < 0 {
-        return Err(format!(
-            "policy fd {fd}: poll failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    if rc == 0 {
-        return Err(format!(
-            "policy fd {fd}: timed out after {} ms waiting for policy bytes",
-            timeout_ms
-        ));
-    }
-
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
     let mut bytes = Vec::new();
-    // Bounded read: fail once the document exceeds the cap instead of
-    // silently truncating at MAX_POLICY_BYTES.
+    let started = std::time::Instant::now();
     let mut buf = [0u8; 8192];
     loop {
+        // Poll with the REMAINING deadline before every read: a writer that
+        // stalls mid-stream (after delivering the first bytes) must still
+        // fail within the deadline instead of hanging the slot forever.
+        let elapsed = started.elapsed();
+        let remaining = timeout.saturating_sub(elapsed);
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, remaining.as_millis().min(i32::MAX as u128) as i32) };
+        if rc < 0 {
+            return Err(format!(
+                "policy fd {fd}: poll failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if rc == 0 {
+            return Err(format!(
+                "policy fd {fd}: timed out after {} ms waiting for policy bytes",
+                timeout.as_millis()
+            ));
+        }
+        // POLLHUP with no POLLIN means the writer closed: EOF.
+        if pfd.revents & libc::POLLIN == 0 && pfd.revents & libc::POLLHUP != 0 {
+            break;
+        }
         let n = file
             .read(&mut buf)
             .map_err(|e| format!("policy fd {fd}: read failed: {e}"))?;

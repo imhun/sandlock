@@ -1482,7 +1482,7 @@ fn test_socketpair_channel_rejects_third_party() {
     // Serve the handed-off end through the real fd serve implementation.
     let serve = std::thread::spawn(move || {
         let mut handler = ProbeHandler;
-        serve_fd_connection(server_end, &token, &mut handler)
+        serve_fd_connection(server_end, Some(&token), &mut handler)
     });
 
     // Worker (launcher-held end): served with the token.
@@ -1530,7 +1530,7 @@ fn test_fd_handoff_channel_rejects_third_party() {
     let a_token = a.token.clone();
     let a_serve = std::thread::spawn(move || {
         let mut handler = ProbeHandler;
-        serve_fd_connection(a_server, &a_token, &mut handler)
+        serve_fd_connection(a_server, Some(&a_token), &mut handler)
     });
 
     // Channel B: third party with the fd but not the token.
@@ -1539,7 +1539,7 @@ fn test_fd_handoff_channel_rejects_third_party() {
     let b_token = b.token.clone();
     let b_serve = std::thread::spawn(move || {
         let mut handler = ProbeHandler;
-        serve_fd_connection(b_server, &b_token, &mut handler)
+        serve_fd_connection(b_server, Some(&b_token), &mut handler)
     });
 
     // Positive control: A's worker is served.
@@ -1575,7 +1575,81 @@ fn test_fd_handoff_channel_rejects_third_party() {
     assert!(resp.ok, "A shutdown: {:?}", resp.err);
     assert_eq!(a_serve.join().expect("A serve"), ServeOutcome::Shutdown);
     drop(b.worker);
-    let _ = b_serve.join();
+    assert_eq!(
+        b_serve.join().expect("B serve"),
+        ServeOutcome::PeerGone,
+        "B's serve must end abnormally: the third party was refused, not shut down"
+    );
+}
+
+/// I1 regression: `list_live_sandboxes` (the `sandlock ps` prune path) must
+/// never treat a live registered channel as stale debris.  The registry is a
+/// sibling of the per-uid control root (so the worker uid's parent chain is
+/// traversable) and carries no pid file — before the fix a registry left in
+/// place past the 2 s recency window was `remove_dir_all`'d by the pruner.
+/// Backdate the registry so it is provably past the recency window, run the
+/// prune path, and assert the registry root and the live socket survive.
+#[test]
+fn test_list_prune_keeps_live_registered_channel() {
+    isolate_ctl_root();
+    let name = format!("test-ctrl-registry-prune-{}", std::process::id());
+    let channel = RegisteredPathChannel::bind(&name, Vec::new()).expect("bind registered channel");
+    let sock = channel.socket_path().to_path_buf();
+    let registry = sandlock_core::control::channel_registry_root();
+    assert!(
+        registry.exists(),
+        "registry root must exist after a channel is bound: {:?}",
+        registry
+    );
+
+    // Backdate every directory on the registry chain past the 2 s recency
+    // window so the pruner's recency guard cannot be what saves it.
+    let old_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs() as libc::time_t
+        - 10;
+    for dir in [registry.as_path(), sock.parent().expect("sock parent")] {
+        let old = libc::timespec {
+            tv_sec: old_secs,
+            tv_nsec: 0,
+        };
+        let times = [old, old];
+        let c = CString::new(dir.to_str().expect("utf8 dir")).expect("cstring");
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(rc, 0, "backdate {:?} failed", dir);
+    }
+
+    // The prune/list path must leave the live registry and its socket alone.
+    let live = sandlock_core::control::list_live_sandboxes().expect("list/prune");
+    assert!(
+        !live.iter().any(|(n, _)| n == &name),
+        "a registered channel is not a sandbox and must not appear in the live list"
+    );
+    assert!(
+        registry.exists(),
+        "prune must not delete the live registry: {:?}",
+        registry
+    );
+    assert!(
+        sock.exists(),
+        "prune must not delete a live registered socket: {:?}",
+        sock
+    );
+
+    // Positive control: the channel still serves its same-uid owner after
+    // the prune path ran.
+    let listener = channel.listener();
+    let token = channel.token().to_string();
+    let serve = std::thread::spawn(move || {
+        let mut handler = ProbeHandler;
+        serve_registered_once(&listener, &token, &[], &mut handler).expect("accept once")
+    });
+    let resp = channel
+        .connect_and_request("ping", serde_json::json!({}))
+        .expect("owner ping after prune");
+    assert!(resp.ok, "owner ping: {:?}", resp.err);
+    assert_eq!(serve.join().expect("serve thread"), ServeOutcome::Continue);
 }
 
 /// Path mode: the same-uid special case is the allowlist containing only the
@@ -1756,8 +1830,10 @@ fn test_registered_path_channel_accepts_allowlisted_peer_with_token() {
 }
 
 /// A sibling sandbox cannot reach a registered control channel: the hashed
-/// registry lives under the same control root the F1.3 sibling probe already
-/// proved unreachable from inside a sandbox, so enumeration and connect are
+/// registry lives under a sibling root whose parent chain the F1.3 sibling
+/// probe already proved unreachable from inside a sandbox (the control-root
+/// parent is owner-only in the test override, and /tmp is outside the
+/// sandbox Landlock view), so enumeration and connect are
 /// EACCES/ENOENT/ECONNREFUSED — never a served response.
 #[test]
 fn test_sandbox_cannot_reach_sibling_channel() {
@@ -1765,7 +1841,9 @@ fn test_sandbox_cannot_reach_sibling_channel() {
     let name_b = format!("test-ctrl-sibchan-b-{}", std::process::id());
     let channel = RegisteredPathChannel::bind(&name_b, Vec::new()).expect("bind registered channel");
 
-    let root = isolate_ctl_root();
+    // Ensure the per-process control root override is installed (the
+    // registry path derives from it).
+    let _root = isolate_ctl_root();
     let name_a = format!("test-ctrl-sibchan-a-{}", std::process::id());
     let script = r#"import os, socket, sys
 root = sys.argv[1]
@@ -1825,7 +1903,9 @@ print("PROBE PASS")
         "-B".into(),
         "-c".into(),
         script,
-        root.join("registry").display().to_string(),
+        sandlock_core::control::channel_registry_root()
+            .display()
+            .to_string(),
         channel.socket_path().display().to_string(),
     ]);
 
