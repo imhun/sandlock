@@ -1375,3 +1375,66 @@ async fn test_seccomp_cow_hardlink_cannot_cross_the_workdir_boundary() {
     let _ = fs::remove_dir_all(&workdir);
     let _ = fs::remove_dir_all(&outside);
 }
+
+/// F6.1 (SL-1) COW-form A档 assertion: the seccomp-COW branch stages the
+/// workload's writes supervisor-side, so a file created through the COW
+/// dispatch is owned by the owning process's uid and the workload's own
+/// `chmod` takes effect — the exact pair SL-1's C档 shape gets wrong.
+#[tokio::test]
+async fn test_cow_mediated_create_is_owned_by_caller_and_self_chmod_works() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let workdir = temp_dir("mediation-owner");
+    fs::create_dir_all(&workdir).unwrap();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_write(&workdir)
+        .workdir(&workdir) // workdir set -> seccomp COW branch
+        .on_exit(BranchAction::Commit)
+        .build()
+        .unwrap();
+
+    let file = workdir.join("cow-mediated.txt");
+    let cmd = format!(
+        "echo cow-mediated > {}; chmod 0600 {}",
+        file.display(),
+        file.display()
+    );
+    let result = policy
+        .clone()
+        .run(&["sh", "-c", &cmd])
+        .await
+        .expect("cow-mediated run must succeed");
+    assert!(
+        result.success(),
+        "COW create + self-chmod must succeed, stderr: {:?}",
+        result.stderr_str()
+    );
+
+    let meta = fs::metadata(&file).expect("host-side stat of COW-mediated file");
+    let euid = unsafe { libc::geteuid() };
+    assert_eq!(
+        meta.uid(),
+        euid,
+        "COW-mediated create must run as the owning process's uid (mediator == \
+         sandbox host uid in A/B档); got uid {}",
+        meta.uid()
+    );
+    assert_eq!(
+        meta.mode() & 0o7777,
+        0o600,
+        "the workload's own chmod must take effect on its COW-mediated file"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).expect("read COW-mediated file"),
+        "cow-mediated\n"
+    );
+
+    let _ = fs::remove_dir_all(&workdir);
+}

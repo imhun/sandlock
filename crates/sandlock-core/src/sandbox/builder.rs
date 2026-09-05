@@ -279,6 +279,22 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "user", value_name = "UID:GID"))]
     pub user: Option<RunAs>,
 
+    /// Identity tier for supervisor-side ("on-behalf") path mediation.
+    /// `caller` (default) refuses a root in-process mediator remapping the
+    /// sandbox to a different host uid; `supervisor` explicitly accepts the
+    /// downgrade (with a warning and a `stats()` counter).  See
+    /// [`super::MediationRunAs`] for the full contract.
+    #[cfg_attr(
+        feature = "cli",
+        arg(
+            long = "mediation-run-as",
+            value_name = "caller|supervisor",
+            default_value = "caller",
+            value_parser = parse_mediation_run_as,
+        )
+    )]
+    pub mediation_run_as: super::MediationRunAs,
+
     /// Per-protection state overrides. Defaults to `strict_all`: every
     /// protection enforced, matching the historical `MIN_ABI = 6` floor.
     /// Use the `allow_degraded` / `disable` builder methods to deviate.
@@ -379,6 +395,7 @@ impl Default for SandboxBuilder {
             pid_ns: false,
             control_socket: true,
             user: None,
+            mediation_run_as: super::MediationRunAs::Caller,
             protection_policy: ProtectionPolicy::default(),
             policy_fn: None,
             name: None,
@@ -452,6 +469,7 @@ impl Clone for SandboxBuilder {
             pid_ns: self.pid_ns,
             control_socket: self.control_socket,
             user: self.user,
+            mediation_run_as: self.mediation_run_as,
             protection_policy: self.protection_policy.clone(),
             policy_fn: self.policy_fn.clone(),
             name: self.name.clone(),
@@ -939,6 +957,15 @@ impl SandboxBuilder {
         self
     }
 
+    /// Declare the mediation identity tier for on-behalf path operations
+    /// (see [`super::MediationRunAs`]).  Defaults to `caller`; pass
+    /// `supervisor` only to explicitly accept the root in-process
+    /// downgrade tier (warning + `stats()` counter).
+    pub fn mediation_run_as(mut self, tier: super::MediationRunAs) -> Self {
+        self.mediation_run_as = tier;
+        self
+    }
+
     /// Set the sandbox instance name (exposed as the virtual hostname).
     /// Auto-generated if not set.
     pub fn name(mut self, name: impl Into<String>) -> Self {
@@ -1270,6 +1297,7 @@ impl SandboxBuilder {
             pid_ns: self.pid_ns,
             control_socket: self.control_socket,
             user: self.user,
+            mediation_run_as: self.mediation_run_as,
             policy_fn: self.policy_fn,
             name: self.name,
             mode: self.mode,
@@ -1315,6 +1343,12 @@ fn parse_port_pair(s: &str) -> Result<(u16, u16), String> {
         format!("invalid --net-bind-map '{s}': sandbox port '{sandbox}' is not a port (0-65535)")
     })?;
     Ok((host_port, sandbox_port))
+}
+
+/// Parse `--mediation-run-as` (`caller` | `supervisor`).
+#[cfg(feature = "cli")]
+fn parse_mediation_run_as(s: &str) -> Result<super::MediationRunAs, String> {
+    s.parse()
 }
 
 /// An fs grant that exposes a credential file to the sandboxed child, with the

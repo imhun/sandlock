@@ -672,6 +672,7 @@ async fn test_instance_stats_live_reconciled() {
 
     let want = InstanceStats {
         proc_count_vs_live: 0,
+        mediation_downgrades: 0,
         children_live: 1,
         instance_state: InstancePhase::Live,
     };
@@ -818,6 +819,7 @@ async fn test_shutdown_draining_observable_on_cancelled_shutdown() {
         draining,
         InstanceStats {
             proc_count_vs_live: 0,
+            mediation_downgrades: 0,
             children_live: 1,
             instance_state: InstancePhase::Draining,
         },

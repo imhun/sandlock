@@ -111,3 +111,6 @@ mod test_fd_inherit;
 
 #[path = "integration/test_instance_semantics.rs"]
 mod test_instance_semantics;
+
+#[path = "integration/test_mediation_identity.rs"]
+mod test_mediation_identity;

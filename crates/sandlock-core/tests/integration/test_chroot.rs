@@ -130,6 +130,68 @@ async fn test_chroot_ls_root() {
     cleanup_rootfs(&rootfs);
 }
 
+/// F6.1 (SL-1) chroot-form A档 assertion: chroot mediation performs the
+/// workload's path operations supervisor-side (chroot dispatch), so the
+/// mediator identity must be the owning process's own uid for the sandbox's
+/// files to behave.  When the supervisor is the sandbox's host uid (route A
+/// on the non-root gate), a file created through the mediated open is owned
+/// by that uid and the workload's own `chmod` takes effect — the exact pair
+/// SL-1's C档 shape (root supervisor + remap) gets wrong.
+#[tokio::test]
+async fn test_chroot_mediated_create_is_owned_by_caller_and_self_chmod_works() {
+    use std::os::unix::fs::MetadataExt;
+
+    let rootfs = build_test_rootfs("mediation-owner");
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "echo chroot-mediated > /tmp/mediated.txt; chmod 0600 /tmp/mediated.txt",
+        ])
+        .await
+        .expect("chroot-mediated run must succeed");
+    assert!(
+        result.success(),
+        "chroot create + self-chmod must succeed, stderr: {:?}",
+        result.stderr_str()
+    );
+
+    let real_path = rootfs.join("tmp/mediated.txt");
+    let meta = fs::metadata(&real_path).expect("host-side stat of chroot-mediated file");
+    let euid = unsafe { libc::geteuid() };
+    assert_eq!(
+        meta.uid(),
+        euid,
+        "chroot-mediated create must run as the owning process's uid (mediator == \
+         sandbox host uid in A/B档); got uid {}",
+        meta.uid()
+    );
+    assert_eq!(
+        meta.mode() & 0o7777,
+        0o600,
+        "the workload's own chmod must take effect on its chroot-mediated file"
+    );
+    assert_eq!(
+        fs::read_to_string(&real_path).expect("read chroot-mediated file"),
+        "chroot-mediated\n"
+    );
+
+    cleanup_rootfs(&rootfs);
+}
+
 /// Path traversal via /../../ stays confined — reads a file unique to the chroot.
 #[tokio::test]
 async fn test_chroot_no_escape() {
