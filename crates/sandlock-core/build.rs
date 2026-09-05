@@ -120,12 +120,20 @@ fn main() {
 /// present, newer than `bin`, and no compiler in `ccs` succeeded; a missing
 /// source (a packaged crate) or an up-to-date `bin` reports success. The caller
 /// decides whether that failure is a hard error or a warning.
+///
+/// A 0-byte `bin` never counts as up-to-date (I1/P5 review): a stale empty
+/// artifact (e.g. an interrupted cross-filesystem copy) would otherwise skip
+/// the rebuild and hand every chroot/ffi/python test an "Exec format error".
 fn build_static(src: &Path, bin: &Path, ccs: &[&str], args: &[&str]) -> bool {
     println!("cargo:rerun-if-changed={}", src.display());
     if !src.exists() {
         return true;
     }
-    if bin.exists() {
+    let bin_nonempty = bin
+        .metadata()
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
+    if bin.exists() && bin_nonempty {
         if let (Ok(s), Ok(b)) = (src.metadata(), bin.metadata()) {
             if let (Ok(st), Ok(bt)) = (s.modified(), b.modified()) {
                 if bt >= st {

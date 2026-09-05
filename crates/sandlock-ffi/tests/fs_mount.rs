@@ -386,6 +386,7 @@ fn build_single_node_policy(
     virtual_path: &str,
     host_path: &Path,
     read_only: bool,
+    writable_prefixes: &[&str],
 ) -> *mut sandlock_sandbox_t {
     let mut b = sandlock_sandbox_builder_new();
     assert!(!b.is_null(), "builder_new returned null");
@@ -397,6 +398,13 @@ fn build_single_node_policy(
     for p in ["/usr", "/bin"] {
         let c = cstr(p);
         b = unsafe { sandlock_sandbox_builder_fs_read(b, c.as_ptr()) };
+    }
+    // Optional write grants above the mount point (e.g. "/etc"): the
+    // read-only marking must beat the writable prefix, and the EBUSY guard
+    // must fire even when the prefix would otherwise allow the write family.
+    for p in writable_prefixes {
+        let c = cstr(p);
+        b = unsafe { sandlock_sandbox_builder_fs_write(b, c.as_ptr()) };
     }
 
     let (vp, hp) = (cstr(virtual_path), cstr(host_path.to_str().unwrap()));
@@ -451,7 +459,7 @@ fn test_mount_single_file_node() {
         "test rootfs must not shadow the mounted file"
     );
 
-    let policy = build_single_node_policy(&rootfs, "/etc/resolv.conf", &host_file, false);
+    let policy = build_single_node_policy(&rootfs, "/etc/resolv.conf", &host_file, false, &[]);
 
     let r = run_in_sandbox(policy, &["rootfs-helper", "cat", "/etc/resolv.conf"]);
     assert!(
@@ -469,17 +477,21 @@ fn test_mount_single_file_node() {
 
     // Read-only variant (ro kept): writes through the single-file mount are
     // refused and the host file stays byte-identical.
-    let ro_policy = build_single_node_policy(&rootfs, "/etc/resolv.conf", &host_file, true);
+    // The /etc write prefix is granted so the refusal pins the read-only
+    // mount winning over a writable prefix (mount_ro is checked before the
+    // is_mounted allow), not merely the absence of a write grant.
+    let ro_policy =
+        build_single_node_policy(&rootfs, "/etc/resolv.conf", &host_file, true, &["/etc"]);
     let w = run_in_sandbox(ro_policy, &["rootfs-helper", "write", "/etc/resolv.conf", "clobber"]);
     assert!(
         !w.success,
         "writing through a read-only single-file mount must fail: stdout={} stderr={}",
         w.stdout, w.stderr,
     );
-    assert!(
-        w.stderr.contains("Permission denied"),
-        "the denied write must surface EACCES, got stderr={:?}",
+    assert_eq!(
         w.stderr,
+        "write: /etc/resolv.conf: Permission denied\n",
+        "the denied write must surface EACCES with the exact helper error",
     );
     assert_eq!(
         fs::read_to_string(&host_file).unwrap(),
@@ -511,7 +523,7 @@ fn test_mount_chardev_node() {
         "test requires a real character device at /dev/null"
     );
 
-    let policy = build_single_node_policy(&rootfs, "/dev/null", Path::new("/dev/null"), false);
+    let policy = build_single_node_policy(&rootfs, "/dev/null", Path::new("/dev/null"), false, &[]);
 
     // open() + fstat on the injected fd: the inode must be the host chardev's
     // (a synthesized regular file would have a different inode).
@@ -547,6 +559,136 @@ fn test_mount_chardev_node() {
 
     unsafe { sandlock_sandbox_free(policy) };
     let _ = fs::remove_dir_all(&rootfs);
+}
+
+/// A single-node bind-mount point is a policy object, not a name the guest
+/// owns: rm/mv of an rw single-file mount must fail with EBUSY and leave the
+/// HOST file untouched (I1/P5 review). A read-only mount refuses the same
+/// operations with EACCES first, even when a writable prefix above the mount
+/// point (here `/etc`) would otherwise allow them.
+#[test]
+fn test_rw_mount_point_resists_unlink_and_rename() {
+    let rootfs = build_test_rootfs("mount-point-mutation");
+    let host_dir = temp_dir("mount-point-mutation-host");
+    let host_file = host_dir.join("resolv.conf");
+    let content = "nameserver 127.0.0.11\n";
+    fs::write(&host_file, content).unwrap();
+
+    // rw mount + writable /etc prefix: can_write passes, so EBUSY is the
+    // guard that stops the guest from reaching the host source.
+    let policy =
+        build_single_node_policy(&rootfs, "/etc/resolv.conf", &host_file, false, &["/etc"]);
+
+    let rm = run_in_sandbox(policy, &["rootfs-helper", "rm", "/etc/resolv.conf"]);
+    assert!(
+        !rm.success,
+        "rm of an rw single-file mount point must fail: stdout={} stderr={}",
+        rm.stdout, rm.stderr,
+    );
+    assert_eq!(
+        rm.stderr,
+        "rm: /etc/resolv.conf: Device or resource busy\n",
+        "unlink at a mount point must surface EBUSY with the exact helper error",
+    );
+    assert_eq!(
+        fs::read_to_string(&host_file).unwrap(),
+        content,
+        "rm must not delete the host file behind the mount",
+    );
+
+    let mv = run_in_sandbox(
+        policy,
+        &["rootfs-helper", "mv", "/etc/resolv.conf", "/etc/renamed.conf"],
+    );
+    assert!(
+        !mv.success,
+        "mv of an rw single-file mount point must fail: stdout={} stderr={}",
+        mv.stdout, mv.stderr,
+    );
+    assert_eq!(
+        mv.stderr,
+        "mv: /etc/resolv.conf: Device or resource busy\n",
+        "rename of a mount point must surface EBUSY with the exact helper error",
+    );
+    assert_eq!(
+        fs::read_to_string(&host_file).unwrap(),
+        content,
+        "rename must not move the host file behind the mount",
+    );
+    assert!(
+        !host_dir.join("renamed.conf").exists(),
+        "rename must not create a host file under the moved name",
+    );
+
+    unsafe { sandlock_sandbox_free(policy) };
+
+    // ro mount over the same writable prefix: EACCES wins (ro checked before
+    // is_mounted), and the host file stays intact.
+    let ro_policy =
+        build_single_node_policy(&rootfs, "/etc/resolv.conf", &host_file, true, &["/etc"]);
+    let ro_rm = run_in_sandbox(ro_policy, &["rootfs-helper", "rm", "/etc/resolv.conf"]);
+    assert!(
+        !ro_rm.success,
+        "rm of a read-only single-file mount point must fail: stdout={} stderr={}",
+        ro_rm.stdout, ro_rm.stderr,
+    );
+    assert_eq!(
+        ro_rm.stderr,
+        "rm: /etc/resolv.conf: Permission denied\n",
+        "the read-only mount must beat the writable /etc prefix with EACCES",
+    );
+    assert_eq!(
+        fs::read_to_string(&host_file).unwrap(),
+        content,
+        "the denied rm must not touch the host file",
+    );
+
+    unsafe { sandlock_sandbox_free(ro_policy) };
+    let _ = fs::remove_dir_all(&rootfs);
+    let _ = fs::remove_dir_all(&host_dir);
+}
+
+/// A single-file mount leaf resolves through the mount before the rootfs, so
+/// a virtual parent chain missing from the rootfs does not block a direct
+/// open of the mounted node (I2/P5 review pin: no parent precreate mechanism
+/// exists or is needed for direct leaf opens).
+#[test]
+fn test_single_file_leaf_opens_without_rootfs_parents() {
+    let rootfs = build_test_rootfs("absent-parent-leaf");
+    // The rootfs has neither /opt nor /opt/app; only the mount provides the
+    // name /opt/app/config.yaml.
+    assert!(
+        !rootfs.join("opt").exists(),
+        "test rootfs must not pre-create the virtual parents"
+    );
+
+    let host_dir = temp_dir("absent-parent-leaf-host");
+    let host_file = host_dir.join("config.yaml");
+    let content = "leaf-without-parents: true\n";
+    fs::write(&host_file, content).unwrap();
+
+    let policy = build_single_node_policy(
+        &rootfs,
+        "/opt/app/config.yaml",
+        &host_file,
+        false,
+        &[],
+    );
+    let r = run_in_sandbox(policy, &["rootfs-helper", "cat", "/opt/app/config.yaml"]);
+    assert!(
+        r.success,
+        "direct open of a leaf mount without rootfs parents must succeed: exit={} stderr={}",
+        r.code, r.stderr,
+    );
+    assert_eq!(
+        r.stdout,
+        content,
+        "the sandbox must read the bound host file's exact content",
+    );
+
+    unsafe { sandlock_sandbox_free(policy) };
+    let _ = fs::remove_dir_all(&rootfs);
+    let _ = fs::remove_dir_all(&host_dir);
 }
 
 #[test]

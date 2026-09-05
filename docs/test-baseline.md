@@ -11,7 +11,10 @@
 #   2. root-mode phases: oci (`--oci-root`) and the supervise foreign-uid
 #      acceptance (`--supervise-root`), both as root in the same privileged
 #      container.
-core_lib = 821 # F6.1 review I1: 820 -> 821, +1 unit test
+core_lib = 822 # F6.2 review I1/I2: 821 -> 822, +1 unit test
+               # (sandbox::tests::minimal_dev_registers_exactly_the_six_dev_
+               # nodes) pinning the minimal_dev() six-node rw set.
+               # F6.1 review I1: 820 -> 821, +1 unit test
                # (mediation_active_covers_policy_fn_deny_capability) pinning
                # the policy_fn-mediated on-behalf trigger in the C档
                # predicate. F6.1 (SL-1): 816 -> 820, +4 unit tests in
@@ -148,7 +151,13 @@ core_integ = 526 # F6.2 (P5): count unchanged — the F6.1 chroot-form A档
                  # (test_exec_mode_main_exit_is_terminal_and_verbs_close);
                  # one-shot outlives regression stays green in
                  # test_instance_lifecycle.rs.
-ffi = 96 # F6.2 (P5): 94 -> 96, +2 in tests/fs_mount.rs
+ffi = 98 # F6.2 review I1/I2: 96 -> 98, +2 in tests/fs_mount.rs
+         # (test_rw_mount_point_resists_unlink_and_rename — EBUSY guard on
+         # unlink/rename/link at mount points plus ro-over-writable-prefix
+         # EACCES; test_single_file_leaf_opens_without_rootfs_parents — the
+         # missing-parent direct-open pin). The I1 RED (rm of an rw mount
+         # point deleted the host file) is in tmp/sdd/f6.2-fix-red-i1.log.
+         # F6.2 (P5): 94 -> 96, +2 in tests/fs_mount.rs
          # (test_mount_single_file_node, test_mount_chardev_node) — single
          # file/chardev bind-mount points open instead of failing ENOTDIR.
          # F6.1 (SL-1): 92 -> 94, +2 in the new tests/mediation_run_as.rs

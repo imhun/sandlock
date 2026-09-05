@@ -871,6 +871,14 @@ impl SandboxBuilder {
     /// where `/dev/ptmx` is a symlink to `/dev/pts/ptmx` the mount source is
     /// canonicalized to that node, which is the same object a whole-tree
     /// `/dev` mount would reach.
+    ///
+    /// Further semantic boundaries of the canonicalized single-node bind:
+    /// `/dev/tty` opens the mediator process's controlling terminal (the
+    /// same object a whole-tree `/dev` mount would hand over), so a mediator
+    /// without a controlling terminal yields `ENXIO`; and `readlink("/dev/
+    /// ptmx")` returns `EINVAL` against the canonical character node rather
+    /// than the host symlink's text — guests that parse that text should
+    /// bind `/dev/pts/ptmx` or the `/dev/pts` directory instead.
     pub fn minimal_dev(self) -> Self {
         const MINIMAL_DEV_NODES: [&str; 6] = [
             "/dev/ptmx",

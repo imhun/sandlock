@@ -86,7 +86,10 @@ chroot 形态的中介代执行。F6.1 新增的 chroot/COW 断言本身**不下
 A档用例的 `/dev` 提供者换成 `minimal_dev()`（`fs_mount` 单节点集合，
 `ptmx/pts/null/urandom/zero/tty`），用例在沙箱内写 `/dev/null` 且**全程不下发
 `fs_denied` 也通过**——不再需要整树挂宿主 `/dev` 或为 `/dev/shm` 下发
-carve-out，SL-1 的最大触发面由构造消除。
+carve-out，SL-1 的最大触发面由构造消除。另注：对挂载点本身的
+unlink/rename/link 按真实 bind-mount 语义返回 `EBUSY`（防 nofollow 写家族
+直取宿主源删/移宿主文件）；目录挂载点的 `rmdir` 暴露为既有问题，不在 F6.2
+范围内。
 
 ### 3.2 `notify_rate_limit` 假告警（Low）
 

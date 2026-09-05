@@ -1169,6 +1169,16 @@ pub(crate) async fn handle_chroot_write(
         };
         if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
         let is_dir = (notif.data.args[2] & libc::AT_REMOVEDIR as u64) != 0;
+        // A mount point is a policy object, not a name the guest owns. Real
+        // bind mounts refuse unlink(2) at the mount point with EBUSY; here,
+        // resolving the leaf to its host source and unlinking it would delete
+        // the HOST object behind the mount (I1/P5 review). rmdir is excluded:
+        // a directory mount point's rmdir exposure is pre-existing and out of
+        // this task's scope, and a file/chardev leaf already fails rmdir
+        // natively (ENOTDIR on the host source).
+        if !is_dir && ctx.mount_leaf_host(&vp).is_some() {
+            return NotifAction::Errno(libc::EBUSY);
+        }
 
         {
             let mut cs = cow_state.lock().await;
@@ -1237,6 +1247,12 @@ pub(crate) async fn handle_chroot_write(
         };
         if !ctx.can_write(&old_vp) || !ctx.can_write(&new_vp) {
             return NotifAction::Errno(libc::EACCES);
+        }
+        // Real bind mounts refuse rename(2) of (or onto) a mount point with
+        // EBUSY. Resolving either leaf to the host source and renaming there
+        // would move the HOST object behind the mount (I1/P5 review).
+        if ctx.mount_leaf_host(&old_vp).is_some() || ctx.mount_leaf_host(&new_vp).is_some() {
+            return NotifAction::Errno(libc::EBUSY);
         }
 
         {
@@ -1359,6 +1375,12 @@ pub(crate) async fn handle_chroot_write(
         // Landlock enforces this already: linking needs REFER on both sides.
         if !ctx.can_write(&old_vp) || !ctx.can_write(&new_vp) {
             return NotifAction::Errno(libc::EACCES);
+        }
+        // link(2) to a mount point source is refused by real bind mounts
+        // (EBUSY); letting the leaf resolve to the host source would create a
+        // hard link to the HOST object behind the mount (I1/P5 review).
+        if ctx.mount_leaf_host(&old_vp).is_some() {
+            return NotifAction::Errno(libc::EBUSY);
         }
 
         {

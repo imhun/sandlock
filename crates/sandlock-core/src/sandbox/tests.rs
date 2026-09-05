@@ -645,3 +645,29 @@ fn mediation_active_covers_policy_fn_deny_capability() {
         mediation_active_for(false, false, false, false, false)
     ));
 }
+
+#[test]
+fn minimal_dev_registers_exactly_the_six_dev_nodes() {
+    // The helper's six-node set is a semantic contract (F6.2/P5): drift here
+    // would silently change which /dev nodes a caller exposes and whether a
+    // whole-tree host /dev mount is still needed.
+    let policy = Sandbox::builder().minimal_dev().build().unwrap();
+    let expected: Vec<(PathBuf, PathBuf)> = [
+        "/dev/ptmx",
+        "/dev/pts",
+        "/dev/null",
+        "/dev/urandom",
+        "/dev/zero",
+        "/dev/tty",
+    ]
+    .iter()
+    .map(|p| (PathBuf::from(p), PathBuf::from(p)))
+    .collect();
+    assert_eq!(policy.fs_mount, expected);
+    assert!(
+        policy.fs_mount_ro.is_empty(),
+        "minimal_dev nodes are rw (guests write to null/zero/ptmx); ro must be \
+         opted into per node, got: {:?}",
+        policy.fs_mount_ro,
+    );
+}
