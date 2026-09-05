@@ -44,8 +44,8 @@
 //! host uid.  Multi-entry uid maps, `setuid` helpers, and CAP_SETUID live
 //! strictly outside this crate (the deployer's launcher), never inside it.
 
-use std::os::fd::FromRawFd;
-use std::os::unix::io::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::io::{OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 
@@ -55,6 +55,7 @@ use sandlock_core::control::{
 };
 use sandlock_core::instance::{InstancePhase, SandboxInstance};
 use sandlock_core::profile::sandbox_to_profile;
+use sandlock_core::result::ExitStatus;
 use sandlock_core::Sandbox;
 
 /// Default deadline for the `--policy <fd>` / `--program <fd>` startup read:
@@ -175,15 +176,14 @@ impl Generation {
             return Ok(());
         }
         let program = self.program.clone().ok_or_else(|| {
-            "generation has no program spec: run/launch needs --program at slot start; \
-                 multi-process exec arrives with F3"
+            "generation has no program spec: run/launch needs --program at slot start"
                 .to_string()
         })?;
         let policy = (*self.policy).clone();
         let cmd: Vec<&str> = program.argv.iter().map(|arg| arg.as_str()).collect();
         let instance = self
             .rt
-            .block_on(SandboxInstance::launch(policy, &cmd))
+            .block_on(SandboxInstance::launch_exec(policy, &cmd))
             .map_err(|e| format!("instance launch failed: {e}"))?;
         self.instance = Some(instance);
         Ok(())
@@ -272,6 +272,112 @@ impl Generation {
             }),
         }
     }
+
+    /// Serve an `exec` verb: install the worker's three stdio fds into a new
+    /// registered child of the generation's instance and report its child id.
+    /// `fds` arrive attached to the exec frame over SCM_RIGHTS (one protocol
+    /// for both holders — the same `RunExec` frame the in-process executor
+    /// sends to `sandlock-init`).
+    fn handle_exec(
+        &mut self,
+        args: &serde_json::Value,
+        fds: &[OwnedFd],
+    ) -> Result<serde_json::Value, String> {
+        if fds.len() < 3 {
+            return Err("exec requires 3 stdio fds attached via SCM_RIGHTS".to_string());
+        }
+        let argv: Vec<String> = args
+            .get("argv")
+            .and_then(|a| serde_json::from_value(a.clone()).ok())
+            .ok_or_else(|| "exec requires an `argv` string array".to_string())?;
+        if argv.is_empty() {
+            return Err("exec: empty argv (argv[0] is the executable)".to_string());
+        }
+        let instance = self.instance.as_mut().ok_or_else(|| {
+            "generation has no instance: exec requires a launched session \
+             (provision --program at slot start)"
+                .to_string()
+        })?;
+        let mut raw_fds = [0i32; 3];
+        for (i, dst) in raw_fds.iter_mut().enumerate() {
+            let dup = unsafe { libc::fcntl(fds[i].as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            if dup < 0 {
+                return Err(format!(
+                    "dup stdio fd {} for exec: {}",
+                    i,
+                    std::io::Error::last_os_error()
+                ));
+            }
+            *dst = dup;
+        }
+        let child_fds = raw_fds.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+        let arg_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+        let handle = self
+            .rt
+            .block_on(instance.exec_with_fds(&arg_refs, child_fds))
+            .map_err(|e| format!("instance exec failed: {e}"))?;
+        Ok(serde_json::json!({
+            "child_id": handle.child_id,
+            "pid": handle.pid,
+        }))
+    }
+
+    /// Serve a `wait_child` verb: block until the named child exits and
+    /// report its status (exit routing runs through the core executor's F1.2
+    /// announced registry).
+    fn handle_wait_child(&mut self, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let child_id: u64 = args
+            .get("child_id")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| "wait_child requires a numeric `child_id`".to_string())?;
+        let instance = self.instance.as_mut().ok_or_else(|| {
+            "generation has no instance: wait_child requires a launched session".to_string()
+        })?;
+        let status = self
+            .rt
+            .block_on(instance.wait_child(child_id))
+            .map_err(|e| format!("instance wait_child failed: {e}"))?;
+        Ok(exit_status_json(&status))
+    }
+
+    /// Serve a `kill_child` verb: deliver `signum` to the named child through
+    /// its registered pid/pidfd (never an arbitrary-pid verb).
+    fn handle_kill_child(&mut self, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let child_id: u64 = args
+            .get("child_id")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| "kill_child requires a numeric `child_id`".to_string())?;
+        let signum: i32 = args
+            .get("signum")
+            .and_then(|v| v.as_i64())
+            .and_then(|v| i32::try_from(v).ok())
+            .ok_or_else(|| "kill_child requires a numeric `signum`".to_string())?;
+        let instance = self.instance.as_mut().ok_or_else(|| {
+            "generation has no instance: kill_child requires a launched session".to_string()
+        })?;
+        instance
+            .kill_child(child_id, signum)
+            .map_err(|e| format!("instance kill_child failed: {e}"))?;
+        Ok(serde_json::json!({}))
+    }
+}
+
+/// JSON form of an exec child's exit status for the `wait_child` verb.
+fn exit_status_json(status: &ExitStatus) -> serde_json::Value {
+    match status {
+        ExitStatus::Code(c) => {
+            serde_json::json!({ "code": c, "signal": null, "killed": false, "timed_out": false })
+        }
+        ExitStatus::Signal(s) => {
+            serde_json::json!({ "code": null, "signal": s, "killed": false, "timed_out": false })
+        }
+        ExitStatus::Killed => {
+            serde_json::json!({ "code": null, "signal": null, "killed": true, "timed_out": false })
+        }
+        ExitStatus::Timeout => {
+            serde_json::json!({ "code": null, "signal": null, "killed": false, "timed_out": true })
+        }
+    }
 }
 
 fn ok_response(data: serde_json::Value) -> ControlResponse {
@@ -302,11 +408,18 @@ fn err_response(err: &str) -> ControlResponse {
 /// * `ports` — live inbound (S2.5) mappings + the live `port_remap` table;
 /// * `run` — launch-first trigger/state query: ok with the pid once the M0
 ///   process is running, explicit error when no program was provisioned;
-/// * `exec` — explicit F3 skeleton error (multi-process exec arrives later);
+/// * `exec` — register a new child with the worker's three stdio fds
+///   (SCM_RIGHTS) and reply with its child id;
+/// * `wait_child` / `kill_child` — per-child exit/status verbs by child id;
 /// * `shutdown` — ends the generation (instance teardown runs after the
 ///   response is written, in [`Generation::finish`]).
 impl ControlHandler for Generation {
-    fn handle(&mut self, stream: &mut UnixStream, req: &ControlRequest) -> ServeOutcome {
+    fn handle(
+        &mut self,
+        stream: &mut UnixStream,
+        req: &ControlRequest,
+        fds: &[OwnedFd],
+    ) -> ServeOutcome {
         match req.verb.as_str() {
             "config" => {
                 let profile = sandbox_to_profile(&self.policy, &[]);
@@ -328,7 +441,7 @@ impl ControlHandler for Generation {
                 let resp = if !req.args.as_object().map(|o| o.is_empty()).unwrap_or(true) {
                     err_response(
                         "run takes no arguments in this fork stage: the generation's program \
-                         is provisioned at slot start (--program); the exec verb arrives with F3",
+                         is provisioned at slot start (--program)",
                     )
                 } else {
                     match self.launch_first() {
@@ -343,10 +456,26 @@ impl ControlHandler for Generation {
                 ServeOutcome::Continue
             }
             "exec" => {
-                let resp = err_response(
-                    "exec verb arrives with F3 (multi-process exec); this generation serves \
-                     one M0 process launched at serve start (launch-first)",
-                );
+                let resp = match self.handle_exec(&req.args, fds) {
+                    Ok(data) => ok_response(data),
+                    Err(e) => err_response(&e),
+                };
+                let _ = write_response_frame(stream, &resp);
+                ServeOutcome::Continue
+            }
+            "wait_child" => {
+                let resp = match self.handle_wait_child(&req.args) {
+                    Ok(data) => ok_response(data),
+                    Err(e) => err_response(&e),
+                };
+                let _ = write_response_frame(stream, &resp);
+                ServeOutcome::Continue
+            }
+            "kill_child" => {
+                let resp = match self.handle_kill_child(&req.args) {
+                    Ok(data) => ok_response(data),
+                    Err(e) => err_response(&e),
+                };
                 let _ = write_response_frame(stream, &resp);
                 ServeOutcome::Continue
             }

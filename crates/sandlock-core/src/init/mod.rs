@@ -73,6 +73,7 @@
 pub mod proto;
 pub mod fdpass;
 mod fdrecv;
+pub(crate) mod executor;
 
 pub use proto::{Req, Resp, CONTROL_FD};
 use proto::FrameKind;

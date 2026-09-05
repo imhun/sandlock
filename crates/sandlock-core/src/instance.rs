@@ -32,7 +32,8 @@
 //! a configurable grace window.
 
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +41,8 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 
 use crate::error::{SandboxRuntimeError, SandlockError};
+use crate::init::executor::{open_child_pidfd, ExecLink};
+use crate::init::{Req, Resp, CONTROL_FD};
 use crate::result::{ExitStatus, RunResult};
 use crate::sandbox::{BranchAction, SharedCow};
 
@@ -105,6 +108,48 @@ pub struct InstanceStats {
     /// form of `Live` / `Draining` / `ShutDown`. M1 adds the exec-side states
     /// and the `Dead` error state with reason counters (§5.6).
     pub instance_state: InstancePhase,
+}
+
+/// A per-child token assigned by an exec-capable session's executor. Child
+/// ids are never pids: they name a registered child (F1.2 announced
+/// registry), and per-child signals resolve the token to the child's pidfd
+/// host-side (F1.7: no pid-addressed signal verb exists anywhere on the
+/// init channel).
+pub type ChildId = u64;
+
+/// Stdio wiring for one `exec` child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecStdio {
+    /// Create three cloexec pipes; the child-side ends are delivered to init
+    /// over SCM_RIGHTS and the caller keeps the host ends in the returned
+    /// [`ExecHandle`] (stdin write end, stdout/stderr read ends).
+    Piped,
+    /// The child inherits the session process's stdio (0/1/2).
+    Inherit,
+    /// The child's stdio is wired to `/dev/null`.
+    Null,
+    /// Create a pty; the slave becomes the child's stdin/stdout/stderr and
+    /// the caller keeps the master in [`ExecHandle::pty`] (usable with
+    /// [`SandboxInstance::resize_child`]).
+    Pty,
+}
+
+/// Result of [`SandboxInstance::exec`]: the registered child id plus the
+/// caller-owned host ends of each requested stream.
+#[derive(Debug)]
+pub struct ExecHandle {
+    /// Registered child id for `wait_child`/`kill_child`/`resize_child`.
+    pub child_id: ChildId,
+    /// Host pid of the registered child (init-reported, announced registry).
+    pub pid: i32,
+    /// Host write end of the piped stdin (Piped only).
+    pub stdin: Option<OwnedFd>,
+    /// Host read end of the piped stdout (Piped only).
+    pub stdout: Option<OwnedFd>,
+    /// Host read end of the piped stderr (Piped only).
+    pub stderr: Option<OwnedFd>,
+    /// Host-side pty master (Pty only), used by `resize_child`.
+    pub pty: Option<OwnedFd>,
 }
 
 /// One configured inbound (S2.5 `net_bind_map`) mapping with its live
@@ -214,6 +259,11 @@ pub struct SandboxInstance {
     /// fields before spawn, which is exactly when the snapshot is taken.
     pub(crate) on_exit: BranchAction,
     pub(crate) on_error: BranchAction,
+    /// F3.2 exec-capable session state. `Some` only for sessions launched
+    /// with [`SandboxInstance::launch_exec`]; the M0 single-child fields
+    /// above then describe the confined `sandlock-init` direct child and the
+    /// per-child table lives here.
+    pub(crate) exec_session: Option<Box<ExecSession>>,
 }
 
 /// Lifecycle state of the session's single (M0) child.
@@ -223,6 +273,30 @@ pub(crate) enum RuntimeState {
     Running,
     Paused,
     Stopped(ExitStatus),
+}
+
+/// Per-child bookkeeping for an exec-capable session (F3.2).
+pub(crate) struct ExecSession {
+    /// The daemon end of the control channel to the confined `sandlock-init`.
+    link: Arc<ExecLink>,
+    /// Next host-assigned child id. The main child (launch_exec argv) is
+    /// registered as child id 0 at launch; `exec` children get 1, 2, ...
+    next_child_id: u64,
+    /// Per-child registry: id -> pid/pidfd/exit cache.
+    children: HashMap<u64, ExecChild>,
+}
+
+/// One registered child of an exec-capable session.
+pub(crate) struct ExecChild {
+    /// Host pid of the child (init-reported, announced registry).
+    pid: i32,
+    /// Host-side pidfd opened when the child was announced; the per-child
+    /// signal handle for `kill_child` (never a pid-addressed wire verb).
+    pidfd: Option<OwnedFd>,
+    /// Host-side pty master for a pty exec (used by `resize_child`).
+    pty: Option<OwnedFd>,
+    /// Reaped exit status, cached for idempotent `wait_child`.
+    status: Option<ExitStatus>,
 }
 
 impl SandboxInstance {
@@ -271,16 +345,382 @@ impl SandboxInstance {
         Ok(*rt)
     }
 
+    /// Launch an **exec-capable** session (F3.2): the confined direct child
+    /// is `sandlock-init` (core::init::run_init) running over a CONTROL_FD
+    /// socketpair, and `cmd` is registered as the session's main child
+    /// (child id 0) via a `RunMain` request. Additional commands are added
+    /// with [`SandboxInstance::exec`], each getting its own child id and
+    /// stdio delivered to init over SCM_RIGHTS.
+    ///
+    /// This is the additive M1 sibling of [`SandboxInstance::launch`]: the
+    /// M0 single-child fields of the returned instance describe the direct
+    /// confined child (init), while the per-child table lives in the
+    /// `exec_session` and `pid()` reports the main workload (child 0), not
+    /// init. Legacy sessions created with `launch` (and every
+    /// `Sandbox::run`/`popen`/`spawn` one-shot) keep their exact M0
+    /// semantics; they are not exec-capable.
+    ///
+    /// `cmd` must be non-empty (argv[0] is the executable). On failure the
+    /// session is cleaned up exactly as an abandoned `Sandbox` would be.
+    pub async fn launch_exec(
+        mut policy: crate::sandbox::Sandbox,
+        cmd: &[&str],
+    ) -> Result<SandboxInstance, SandlockError> {
+        if cmd.is_empty() {
+            return Err(SandboxRuntimeError::Child(
+                "empty command for exec session".into(),
+            )
+            .into());
+        }
+        let (daemon_ctl, child_ctl) = UnixStream::pair().map_err(SandboxRuntimeError::Io)?;
+        // The confined init (and with it the RunMain workload, which inherits
+        // init's stdio) is wired to /dev/null: an exec-capable session's
+        // output is delivered per-child through `exec` stdio, and the
+        // supervisor's own stdio must never fill up with workload output
+        // (the legacy launch path discarded captures the same way).
+        policy.ensure_runtime()?;
+        let null = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .map_err(SandboxRuntimeError::Io)?;
+        let null_raw = null.as_raw_fd();
+        policy.set_child_stdio_override(Some(null_raw), Some(null_raw), Some(null_raw));
+        policy
+            .create_with_in_child_main(
+                "sandlock-init",
+                vec![(CONTROL_FD, child_ctl.as_raw_fd())],
+                crate::init::run_init,
+            )
+            .await?;
+        drop(child_ctl);
+        policy.do_start()?;
+        let mut rt = *policy
+            .runtime
+            .take()
+            .expect("create_with_in_child_main installed the session runtime");
+
+        // Daemon end of the control channel: a blocking dup for the writer
+        // and a tokio stream for the background reader (same split the OCI
+        // supervisor uses). The reader task is spawned on the current
+        // runtime, which also drives the instance's supervisor tasks.
+        let writer = daemon_ctl
+            .try_clone()
+            .map_err(SandboxRuntimeError::Io)?;
+        daemon_ctl
+            .set_nonblocking(true)
+            .map_err(SandboxRuntimeError::Io)?;
+        let reader = tokio::net::UnixStream::from_std(daemon_ctl)
+            .map_err(SandboxRuntimeError::Io)?;
+        let link = ExecLink::new(writer, reader);
+        rt.exec_session = Some(Box::new(ExecSession {
+            link: link.clone(),
+            next_child_id: 1,
+            children: HashMap::new(),
+        }));
+
+        // Register the main workload as child id 0. If this fails the
+        // half-built session is dropped here; the exec-aware Drop backstop
+        // kills init and collapses whatever exists.
+        let argv: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
+        let reply = match link
+            .request(
+                0,
+                &Req::RunMain {
+                    argv,
+                    env: vec![],
+                    cwd: None,
+                },
+                &[],
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                drop(rt);
+                return Err(e);
+            }
+        };
+        let pid = match reply {
+            Resp::Started { pid } => pid,
+            Resp::Err { msg } => {
+                drop(rt);
+                return Err(SandboxRuntimeError::Child(msg).into());
+            }
+            other => {
+                drop(rt);
+                return Err(SandboxRuntimeError::Child(format!(
+                    "unexpected init reply to RunMain: {other:?}"
+                ))
+                .into());
+            }
+        };
+        let session = rt
+            .exec_session
+            .as_mut()
+            .expect("exec session installed before RunMain");
+        session.children.insert(
+            0,
+            ExecChild {
+                pid,
+                pidfd: open_child_pidfd(pid),
+                pty: None,
+                status: None,
+            },
+        );
+        Ok(rt)
+    }
+
+    /// Refuse a per-child verb when the session is not exec-capable.
+    fn not_exec_capable() -> SandlockError {
+        SandboxRuntimeError::Child(
+            "instance is not exec-capable: launch with `SandboxInstance::launch_exec` \
+             before calling exec/wait_child/kill_child"
+                .into(),
+        )
+        .into()
+    }
+
+    /// Borrow the exec session, mapping a missing session to the unified
+    /// closed-instance error once the instance left `Live` (a legacy session
+    /// is only "not exec-capable" while it is live).
+    fn exec_ref(&self) -> Result<&ExecSession, SandlockError> {
+        match self.exec_session.as_ref() {
+            Some(session) => Ok(session),
+            None if matches!(self.phase, InstancePhase::Live) => Err(Self::not_exec_capable()),
+            None => Err(SandboxRuntimeError::InstanceClosed.into()),
+        }
+    }
+
+    /// Run an additional command inside an exec-capable session (F3.2).
+    ///
+    /// The child is forked by the confined `sandlock-init` (so it shares the
+    /// session's seccomp filter, Landlock ruleset, resource budget and
+    /// network state) and registered under a fresh child id. Stdio child ends
+    /// are delivered to init over SCM_RIGHTS; the caller keeps the host ends
+    /// described by [`ExecStdio`] in the returned [`ExecHandle`].
+    ///
+    /// Only a `Live` session accepts `exec`; after `shutdown` (or when the
+    /// exec link died / the channel closed) every call fails with the same
+    /// unified [`SandboxRuntimeError::InstanceClosed`] error.
+    pub async fn exec(
+        &mut self,
+        argv: &[&str],
+        stdio: ExecStdio,
+    ) -> Result<ExecHandle, SandlockError> {
+        if self.phase != InstancePhase::Live {
+            return Err(SandboxRuntimeError::InstanceClosed.into());
+        }
+        if self.exec_session.is_none() {
+            return Err(Self::not_exec_capable());
+        }
+        if argv.is_empty() {
+            return Err(SandboxRuntimeError::Child(
+                "exec: empty command (argv[0] is the executable)".into(),
+            )
+            .into());
+        }
+        let (host, child_ends) = build_exec_stdio(stdio)?;
+        self.exec_with_fds_inner(argv, child_ends, host)
+            .await
+    }
+
+    /// Exec with caller-supplied child-side stdio ends (the cross-process
+    /// holder shape: a worker's fds arrive over the control channel and
+    /// supervise hands them straight to init). The returned handle carries
+    /// no host ends — the caller owns them.
+    pub async fn exec_with_fds(
+        &mut self,
+        argv: &[&str],
+        fds: [OwnedFd; 3],
+    ) -> Result<ExecHandle, SandlockError> {
+        if self.phase != InstancePhase::Live {
+            return Err(SandboxRuntimeError::InstanceClosed.into());
+        }
+        if self.exec_session.is_none() {
+            return Err(Self::not_exec_capable());
+        }
+        if argv.is_empty() {
+            return Err(SandboxRuntimeError::Child(
+                "exec: empty command (argv[0] is the executable)".into(),
+            )
+            .into());
+        }
+        self.exec_with_fds_inner(argv, fds.into(), ExecHostStdio::default())
+            .await
+    }
+
+    /// Shared exec body: send `RunExec` + the three child ends over the
+    /// link, register the announced child, and return the handle.
+    async fn exec_with_fds_inner(
+        &mut self,
+        argv: &[&str],
+        child_ends: Vec<OwnedFd>,
+        host: ExecHostStdio,
+    ) -> Result<ExecHandle, SandlockError> {
+        let session = self
+            .exec_session
+            .as_ref()
+            .expect("exec session presence checked by callers");
+        let child_id = session.next_child_id;
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        let raw: Vec<RawFd> = child_ends.iter().map(|f| f.as_raw_fd()).collect();
+        let req = Req::RunExec {
+            argv,
+            env: vec![],
+            cwd: None,
+            detach: false,
+        };
+        let reply = session.link.request(child_id, &req, &raw).await?;
+        drop(child_ends);
+        let pid = match reply {
+            Resp::Started { pid } => pid,
+            Resp::Err { msg } => {
+                return Err(SandboxRuntimeError::Child(msg).into());
+            }
+            other => {
+                return Err(SandboxRuntimeError::Child(format!(
+                    "unexpected init reply to RunExec: {other:?}"
+                ))
+                .into());
+            }
+        };
+        let session = self
+            .exec_session
+            .as_mut()
+            .expect("exec session presence checked by callers");
+        session.next_child_id = child_id + 1;
+        let registry_pty = host
+            .pty
+            .as_ref()
+            .and_then(|master| dup_fd_cloexec(master.as_raw_fd()));
+        session.children.insert(
+            child_id,
+            ExecChild {
+                pid,
+                pidfd: open_child_pidfd(pid),
+                // Best-effort registry copy: resize_child works even after the
+                // caller's handle master was closed; the caller still owns
+                // the handle's master either way.
+                pty: registry_pty,
+                status: None,
+            },
+        );
+        Ok(ExecHandle {
+            child_id,
+            pid,
+            stdin: host.stdin,
+            stdout: host.stdout,
+            stderr: host.stderr,
+            pty: host.pty,
+        })
+    }
+
+    /// Wait for an exec child to exit (F3.2). Resolves on the child's
+    /// `Exited` frame routed through the F1.2 announced registry; a repeated
+    /// wait returns the cached status (idempotent). If the session closes
+    /// while a wait is pending, the child is reported `Killed` rather than
+    /// the waiter hanging.
+    pub async fn wait_child(&mut self, child_id: ChildId) -> Result<ExitStatus, SandlockError> {
+        let session = self.exec_ref()?;
+        let child = session
+            .children
+            .get(&child_id)
+            .ok_or(SandboxRuntimeError::UnknownChild(child_id))?;
+        if let Some(status) = child.status.as_ref() {
+            return Ok(status.clone());
+        }
+        let rx = session.link.register_exit(child_id);
+        let status = match rx.await {
+            Ok(s) => s,
+            // The waiter's sender was dropped without a synthetic Killed
+            // (defensive); never leave the caller hanging.
+            Err(_) => ExitStatus::Killed,
+        };
+        if let Some(session) = self.exec_session.as_mut() {
+            if let Some(child) = session.children.get_mut(&child_id) {
+                child.status = Some(status.clone());
+            }
+        }
+        Ok(status)
+    }
+
+    /// Deliver `signum` to one registered exec child (F3.2/F1.7).
+    ///
+    /// The child token is resolved through the session registry to the
+    /// child's pid (its own process group, per F1.7's per-child-group
+    /// layout) and its host-side pidfd. Delivery is group-first (the child's
+    /// whole command subtree) with a pidfd direct complement only when the
+    /// child escaped its own group — the same shape `sandlock-init` uses
+    /// internally, performed host-side against a registry the guest can
+    /// never name through a frame. A child whose exit was already reported
+    /// makes this an idempotent no-op.
+    pub fn kill_child(
+        &self,
+        child_id: ChildId,
+        signum: i32,
+    ) -> Result<(), SandlockError> {
+        let session = self.exec_ref()?;
+        let child = session
+            .children
+            .get(&child_id)
+            .ok_or(SandboxRuntimeError::UnknownChild(child_id))?;
+        if child.status.is_some() {
+            return Ok(());
+        }
+        signal_registered_child(child, signum);
+        Ok(())
+    }
+
+    /// Resize the pty of an exec child (F3.2): `TIOCSWINSZ` on the host-side
+    /// master fd retained in the child registry. Fails when the child has no
+    /// pty (it was not exec'd with [`ExecStdio::Pty`]).
+    pub fn resize_child(
+        &self,
+        child_id: ChildId,
+        rows: u16,
+        cols: u16,
+    ) -> Result<(), SandlockError> {
+        let session = self.exec_ref()?;
+        let child = session
+            .children
+            .get(&child_id)
+            .ok_or(SandboxRuntimeError::UnknownChild(child_id))?;
+        let master = child
+            .pty
+            .as_ref()
+            .ok_or_else(|| SandboxRuntimeError::Child(format!(
+                "child {child_id} has no pty master (exec without ExecStdio::Pty)"
+            )))?;
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let rc = unsafe {
+            libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws)
+        };
+        if rc != 0 {
+            return Err(SandboxRuntimeError::Io(std::io::Error::last_os_error()).into());
+        }
+        Ok(())
+    }
+
     // ================================================================
     // Session lifecycle verbs
     // ================================================================
 
-    /// Wait for the session's process to exit and return its captured result.
+    /// Wait for the session's M0 process to exit and return its captured
+    /// result. This is the *main* wait: on a legacy (non-exec) session the
+    /// direct child is the session's process; on an exec-capable session the
+    /// caller uses the per-child [`SandboxInstance::wait_child`] with the
+    /// child id (the main child is id 0).
     ///
     /// The session itself stays alive: the control directory, DNS gateway and
     /// supervisor-side state are *not* released here — that is
     /// [`SandboxInstance::shutdown`]'s job. Like the historical `Sandbox::wait`,
-    /// this is cancellation-safe: a cancelled `wait_child` parks any output it
+    /// this is cancellation-safe: a cancelled `wait_main` parks any output it
     /// had already drained and a later call (or `shutdown`) picks it up.
     ///
     /// Once the child has been reaped, a completed `wait_child` also hands the
@@ -293,7 +733,18 @@ impl SandboxInstance {
     /// using the reaped exit status exactly once — dropping right after
     /// `wait_child` commits/aborts/keeps exactly like the historical
     /// `Sandbox::wait`-then-drop path.
-    pub async fn wait_child(&mut self) -> Result<RunResult, SandlockError> {
+    pub async fn wait_main(&mut self) -> Result<RunResult, SandlockError> {
+        // Exec-capable session: the main workload is child id 0 and its exit
+        // is routed through the executor (its stdio is never captured — the
+        // session was launched with inherited stdio).
+        if self.exec_session.is_some() {
+            let exit_status = self.wait_child(0).await?;
+            return Ok(RunResult {
+                exit_status,
+                stdout: None,
+                stderr: None,
+            });
+        }
         let pid = self.child_pid.ok_or(SandboxRuntimeError::NotRunning)?;
 
         // Already reaped: hand back the same status again, plus whatever the
@@ -419,12 +870,28 @@ impl SandboxInstance {
 
         // §5.3 steps 2–3 — graceful shutdown request + grace, then escalation.
         // Only a child this session has not yet reaped is drained; a child
-        // `wait_child` already reaped (state `Stopped`) is left alone, so
+        // already reaped (state `Stopped`) is left alone, so
         // repeated shutdowns never re-kill.
-        if self.child_pid.is_some() && !matches!(self.state, RuntimeState::Stopped(_)) {
+        if self.exec_session.is_some() {
+            // Exec-capable session: step 2 is the init `Shutdown` frame
+            // (init collapses every registered child group — §5.3 "init
+            // Shutdown frame + grace" applies directly here), with the same
+            // escalation ladder on grace expiry.
+            if self.child_pid.is_some() && !matches!(self.state, RuntimeState::Stopped(_)) {
+                let exit = self.shutdown_exec_child_after_grace(grace).await;
+                self.state = RuntimeState::Stopped(exit);
+            }
+        } else if self.child_pid.is_some() && !matches!(self.state, RuntimeState::Stopped(_)) {
             let exit = self.shutdown_child_after_grace(grace).await;
             self.state = RuntimeState::Stopped(exit);
         }
+
+        // Close the exec control channel now that init is gone: the writer
+        // end drops here (the reader task observes the peer's EOF once init
+        // closed its end) and the per-child registry fds (pidfds, pty
+        // masters) are released with it. Post-shutdown per-child verbs
+        // report the unified closed-instance error.
+        drop(self.exec_session.take());
 
         // §5.3 step 4 — close the host side of the stdio pipes: capture read
         // ends that were never handed to a drain, an untaken piped stdin, and
@@ -541,6 +1008,106 @@ impl SandboxInstance {
             self.tty_foreground_taken = false;
         }
         reaped
+    }
+
+    /// §5.3 steps 2–3 for an exec-capable session: the confined direct child
+    /// is `sandlock-init`, so step 2 is the actual `Shutdown` frame (init
+    /// delivers SIGKILL over its registered child-group set — live plus
+    /// retained dead groups — and exits), not an M0 SIGTERM-to-the-workload.
+    ///
+    /// Real exit statuses already reported by init are drained into the
+    /// per-child caches *before* the teardown frame, so a later idempotent
+    /// wait still sees a genuinely-exited child's true status; children
+    /// killed by the teardown without a reported frame are cached as
+    /// `Killed`. If the grace window expires with init alive, the escalation
+    /// ladder mirrors M0: per-child pidfd SIGKILL on init, then a killpg
+    /// sweep over every registered child group, then reap init.
+    async fn shutdown_exec_child_after_grace(&mut self, grace: Duration) -> ExitStatus {
+        let pid = self.child_pid.expect("guarded by the shutdown caller");
+
+        // Preserve every exit init already reported (buffered early exits).
+        let mut early: HashMap<u64, ExitStatus> = HashMap::new();
+        if let Some(session) = self.exec_session.as_ref() {
+            session.link.drain_early_exits(&mut early);
+        }
+        if let Some(session) = self.exec_session.as_mut() {
+            for (child_id, status) in early {
+                if let Some(child) = session.children.get_mut(&child_id) {
+                    if child.status.is_none() {
+                        child.status = Some(status);
+                    }
+                }
+            }
+        }
+
+        // §5.3 step 2 — init `Shutdown` frame (fire-and-forget; init acts on
+        // it, collapses the child groups, and exits).
+        if let Some(session) = self.exec_session.as_ref() {
+            session.link.send_shutdown().await;
+        }
+
+        if let Some(reaped) = self.wait_direct_child_exit(pid, grace).await {
+            // Init exited within the grace window after collapsing every
+            // registered group (including retained dead groups, so a
+            // grandchild holding stdout dies with its group — §4.14). Belt:
+            // sweep the registered child groups anyway (ESRCH is expected),
+            // then cache Killed for anything init had not yet reported.
+            self.sweep_exec_child_groups();
+            self.mark_unreported_exec_children_killed();
+            return reaped;
+        }
+
+        // §5.3 step 3 — escalation: init ignored/was stuck. Per-child pidfd
+        // SIGKILL on init, group sweep over the registered children, reap.
+        match self.pidfd.as_ref() {
+            Some(pidfd) => {
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal as libc::c_long,
+                        pidfd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::c_void>(),
+                        0u32,
+                    );
+                }
+            }
+            None => {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+        self.sweep_exec_child_groups();
+        let reaped = reap_direct_child(pid).unwrap_or(ExitStatus::Killed);
+        self.mark_unreported_exec_children_killed();
+        reaped
+    }
+
+    /// Best-effort SIGKILL sweep over every registered exec child group
+    /// (escalation and belt paths; ESRCH after init already collapsed the
+    /// groups is expected and harmless).
+    fn sweep_exec_child_groups(&self) {
+        let Some(session) = self.exec_session.as_ref() else {
+            return;
+        };
+        for child in session.children.values() {
+            unsafe {
+                libc::killpg(child.pid, libc::SIGKILL);
+            }
+        }
+    }
+
+    /// Cache `Killed` for every registered child whose real exit was never
+    /// reported (init died before reaping them), so post-shutdown idempotent
+    /// waits stay well-defined. Genuine statuses drained earlier are left
+    /// untouched.
+    fn mark_unreported_exec_children_killed(&mut self) {
+        let Some(session) = self.exec_session.as_mut() else {
+            return;
+        };
+        for child in session.children.values_mut() {
+            if child.status.is_none() {
+                child.status = Some(ExitStatus::Killed);
+            }
+        }
     }
 
     /// §5.3 step 3 — the SIGKILL escalation ladder, reached when the grace
@@ -704,7 +1271,7 @@ impl SandboxInstance {
     /// `Sandbox::run`/`popen`/`spawn` one-shot: their caller never sees a
     /// live session after the process exits.
     pub(crate) async fn wait_one_shot(&mut self) -> Result<RunResult, SandlockError> {
-        let result = self.wait_child().await?;
+        let result = self.wait_main().await?;
         self.shutdown().await?;
         Ok(result)
     }
@@ -719,6 +1286,9 @@ impl SandboxInstance {
     /// callers decide whether to record the status (`Drop` deliberately does
     /// not, preserving the old drop-time disposition).
     fn kill_and_reap(&mut self) -> Option<ExitStatus> {
+        if self.exec_session.is_some() {
+            return self.kill_and_reap_exec();
+        }
         if let Some(pid) = self.child_pid {
             let mut reaped: Option<ExitStatus> = None;
             if matches!(
@@ -740,6 +1310,54 @@ impl SandboxInstance {
             return reaped;
         }
         None
+    }
+
+    /// Drop-backstop variant for exec-capable sessions. No frame dance and no
+    /// grace: SIGKILL every registered child group (pidfd direct complement
+    /// covers an escaped child), SIGKILL init's own group, reap init, and
+    /// mark the link terminated so pending waiters resolve instead of
+    /// hanging. Best-effort like the M0 backstop — dropping must never hang.
+    fn kill_and_reap_exec(&mut self) -> Option<ExitStatus> {
+        // First resolve every pending waiter (nothing may hang on a dropped
+        // session) and fail fast any later request.
+        if let Some(session) = self.exec_session.as_ref() {
+            session.link.mark_terminated();
+        }
+        // Per-child SIGKILL: pidfd direct (escapee-proof) plus group killpg
+        // (in-group descendants).
+        if let Some(session) = self.exec_session.as_mut() {
+            for child in session.children.values_mut() {
+                if child.status.is_some() {
+                    continue;
+                }
+                if let Some(pidfd) = child.pidfd.take() {
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_pidfd_send_signal as libc::c_long,
+                            pidfd.as_raw_fd(),
+                            libc::SIGKILL,
+                            std::ptr::null::<libc::c_void>(),
+                            0u32,
+                        );
+                    }
+                }
+                unsafe {
+                    libc::killpg(child.pid, libc::SIGKILL);
+                }
+            }
+        }
+        let mut reaped: Option<ExitStatus> = None;
+        if let Some(pid) = self.child_pid {
+            if matches!(
+                self.state,
+                RuntimeState::Created | RuntimeState::Running | RuntimeState::Paused
+            ) {
+                let group = self.leader_pid.unwrap_or(pid);
+                unsafe { libc::killpg(group, libc::SIGKILL) };
+                reaped = reap_direct_child(pid);
+            }
+        }
+        reaped
     }
 
     /// Abort every supervisor-side session task (best-effort; each handle is
@@ -891,9 +1509,19 @@ impl SandboxInstance {
             }
             _ => 0,
         };
-        let children_live = u32::from(
-            self.child_pid.is_some() && !matches!(self.state, RuntimeState::Stopped(_)),
-        );
+        let children_live = match self.exec_session.as_ref() {
+            // Exec-capable session: announced children whose exit has not
+            // been consumed by a wait (the F3.1 report's announced-minus-
+            // reaped generalization of the M0 record).
+            Some(session) => session
+                .children
+                .values()
+                .filter(|c| c.status.is_none())
+                .count() as u32,
+            None => u32::from(
+                self.child_pid.is_some() && !matches!(self.state, RuntimeState::Stopped(_)),
+            ),
+        };
         InstanceStats {
             proc_count_vs_live,
             children_live,
@@ -939,6 +1567,16 @@ impl SandboxInstance {
     /// The session's (single, M0) process PID, or `None` before launch. Remains
     /// `Some` after the process exits, until the instance is dropped.
     pub fn pid(&self) -> Option<i32> {
+        if let Some(session) = self.exec_session.as_ref() {
+            // Exec-capable session: report the main workload (child id 0),
+            // not the confined `sandlock-init` direct child.
+            return session
+                .children
+                .get(&0)
+                .map(|child| child.pid)
+                .or(self.leader_pid)
+                .or(self.child_pid);
+        }
         self.leader_pid.or(self.child_pid)
     }
 
@@ -964,6 +1602,188 @@ impl Drop for SandboxInstance {
         // synchronous backstop: a dropped session never leaves a live
         // process, task, control dir or un-disposed branch behind.
         self.drop_teardown();
+    }
+}
+
+// ================================================================
+// F3.2 exec stdio helpers
+// ================================================================
+
+/// Host ends of one `exec` stdio setup (see [`build_exec_stdio`]).
+struct ExecHostStdio {
+    stdin: Option<OwnedFd>,
+    stdout: Option<OwnedFd>,
+    stderr: Option<OwnedFd>,
+    pty: Option<OwnedFd>,
+}
+
+impl Default for ExecHostStdio {
+    fn default() -> Self {
+        ExecHostStdio {
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            pty: None,
+        }
+    }
+}
+
+/// Duplicate `fd` with FD_CLOEXEC (best-effort helper for registry-owned
+/// pty masters).
+fn dup_fd_cloexec(fd: RawFd) -> Option<OwnedFd> {
+    let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if dup < 0 {
+        None
+    } else {
+        Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) })
+    }
+}
+
+/// Build the stdio set for one exec child: host ends (kept by the caller)
+/// and the three child-side ends that will be sent to `sandlock-init` via
+/// SCM_RIGHTS.
+fn build_exec_stdio(
+    stdio: ExecStdio,
+) -> Result<(ExecHostStdio, Vec<OwnedFd>), SandlockError> {
+    use crate::sandbox::make_cloexec_pipe;
+
+    match stdio {
+        ExecStdio::Piped => {
+            // stdin: the child reads, so the parent keeps the write end;
+            // stdout/stderr: the child writes, so the parent keeps the read
+            // ends. `make_cloexec_pipe` returns (read, write).
+            let (stdin_r, stdin_w) = make_cloexec_pipe().map_err(SandboxRuntimeError::Io)?;
+            let (stdout_r, stdout_w) = make_cloexec_pipe().map_err(SandboxRuntimeError::Io)?;
+            let (stderr_r, stderr_w) = make_cloexec_pipe().map_err(SandboxRuntimeError::Io)?;
+            Ok((
+                ExecHostStdio {
+                    stdin: Some(stdin_w),
+                    stdout: Some(stdout_r),
+                    stderr: Some(stderr_r),
+                    pty: None,
+                },
+                vec![stdin_r, stdout_w, stderr_w],
+            ))
+        }
+        ExecStdio::Inherit => {
+            // The child inherits the session process's stdio. Passing the raw
+            // 0/1/2 through SCM_RIGHTS gives init duplicates of the same open
+            // file descriptions; init's copies close after the dup2 and the
+            // caller's originals are untouched.
+            let mut child = Vec::with_capacity(3);
+            for i in 0..3 {
+                child.push(dup_fd_cloexec(i).ok_or_else(|| {
+                    SandboxRuntimeError::Io(std::io::Error::last_os_error())
+                })?);
+            }
+            Ok((ExecHostStdio::default(), child))
+        }
+        ExecStdio::Null => {
+            let null = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/null")
+                .map_err(SandboxRuntimeError::Io)?;
+            let raw = null.as_raw_fd();
+            let mut child = Vec::with_capacity(3);
+            for _ in 0..3 {
+                child.push(
+                    dup_fd_cloexec(raw)
+                        .ok_or_else(|| SandboxRuntimeError::Io(std::io::Error::last_os_error()))?,
+                );
+            }
+            Ok((ExecHostStdio::default(), child))
+        }
+        ExecStdio::Pty => {
+            let (master, slave) = open_pty_pair().map_err(SandboxRuntimeError::Io)?;
+            let raw = slave.as_raw_fd();
+            let mut child = Vec::with_capacity(3);
+            for _ in 0..3 {
+                child.push(
+                    dup_fd_cloexec(raw)
+                        .ok_or_else(|| SandboxRuntimeError::Io(std::io::Error::last_os_error()))?,
+                );
+            }
+            drop(slave);
+            Ok((
+                ExecHostStdio {
+                    stdin: None,
+                    stdout: None,
+                    stderr: None,
+                    pty: Some(master),
+                },
+                child,
+            ))
+        }
+    }
+}
+
+/// Open a pty pair: `(master, slave)` with the slave opened `O_RDWR` and
+/// `O_NOCTTY`. The master stays host-side (resize/EOF source); the slave is
+/// dup'd three times into the child's stdio.
+fn open_pty_pair() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    use std::os::fd::FromRawFd;
+
+    let master_raw = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+    if master_raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let master = unsafe { OwnedFd::from_raw_fd(master_raw) };
+    if unsafe { libc::grantpt(master.as_raw_fd()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::unlockpt(master.as_raw_fd()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut name = [0u8; 128];
+    let rc = unsafe {
+        libc::ptsname_r(
+            master.as_raw_fd(),
+            name.as_mut_ptr() as *mut libc::c_char,
+            name.len(),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let nul = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    let slave_raw = unsafe {
+        libc::open(
+            name[..nul].as_ptr() as *const libc::c_char,
+            libc::O_RDWR | libc::O_NOCTTY,
+        )
+    };
+    if slave_raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((master, unsafe { OwnedFd::from_raw_fd(slave_raw) }))
+}
+
+/// Deliver `signum` to one registered child the way `sandlock-init` does
+/// internally: group-first `killpg` over the child's own process group
+/// (pid == pgid under F1.7's per-child-group layout), with a pidfd direct
+/// complement only when the child escaped its own group. All best-effort:
+/// ESRCH after the child exited is expected and harmless. This runs
+/// host-side against the instance's own registry — there is no pid-addressed
+/// signal verb on any wire (F1.7).
+fn signal_registered_child(child: &ExecChild, signum: i32) {
+    if let Some(pidfd) = child.pidfd.as_ref() {
+        let group = unsafe { libc::getpgid(child.pid) };
+        let escaped = group != child.pid;
+        if escaped {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal as libc::c_long,
+                    pidfd.as_raw_fd(),
+                    signum,
+                    std::ptr::null::<libc::c_void>(),
+                    0u32,
+                );
+            }
+        }
+    }
+    unsafe {
+        libc::killpg(child.pid, signum);
     }
 }
 

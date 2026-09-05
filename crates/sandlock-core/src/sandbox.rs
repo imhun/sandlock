@@ -1567,6 +1567,7 @@ impl Sandbox {
                 phase: crate::instance::InstancePhase::Live,
                 on_exit: sandbox_cfg.on_exit.clone(),
                 on_error: sandbox_cfg.on_error.clone(),
+                exec_session: None,
             }));
             clones.push(clone_sb);
         }
@@ -1675,8 +1676,23 @@ impl Sandbox {
             phase: crate::instance::InstancePhase::Live,
             on_exit: self.on_exit.clone(),
             on_error: self.on_error.clone(),
+            exec_session: None,
         }));
         Ok(())
+    }
+
+    /// Override the confined child's stdio with caller-supplied fds (used by
+    /// [`SandboxInstance::launch_exec`](crate::instance::SandboxInstance::launch_exec)
+    /// to wire `sandlock-init` — and with it the RunMain workload — to
+    /// /dev/null). Crate-internal setter: `io_overrides` is a private runtime
+    /// field.
+    pub(crate) fn set_child_stdio_override(
+        &mut self,
+        stdin: Option<i32>,
+        stdout: Option<i32>,
+        stderr: Option<i32>,
+    ) {
+        self.rt_mut().io_overrides = Some((stdin, stdout, stderr));
     }
 
     /// Attach a transaction's shared COW branch to this sandbox before `create`.

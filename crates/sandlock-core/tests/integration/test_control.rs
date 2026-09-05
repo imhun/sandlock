@@ -1432,6 +1432,7 @@ impl ControlHandler for ProbeHandler {
         &mut self,
         stream: &mut std::os::unix::net::UnixStream,
         req: &ControlRequest,
+        _fds: &[std::os::fd::OwnedFd],
     ) -> ServeOutcome {
         match req.verb.as_str() {
             "ping" => {

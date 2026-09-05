@@ -152,6 +152,29 @@ fn registered_verb(sock_path: &std::path::Path, token: &str, verb: &str) -> serd
     )
 }
 
+/// One `exec` verb over the registered path: a fresh connection carries the
+/// verb plus the three child-side stdio fds (SCM_RIGHTS), and the response
+/// is read on the same connection.
+fn registered_exec(
+    sock_path: &std::path::Path,
+    token: &str,
+    argv: &[&str],
+    child_ends: &[i32; 3],
+) -> serde_json::Value {
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(sock_path).expect("connect registered socket");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .expect("read timeout");
+    let body = serde_json::json!({
+        "v": 1,
+        "verb": "exec",
+        "token": token,
+        "args": { "argv": argv },
+    });
+    roundtrip_frame_with_fds(&mut stream, &body, child_ends)
+}
+
 /// Spawn `sandlock-supervise --serve` (fd handoff) with an instance-launching
 /// program and return the child plus the worker end the test drives.
 fn spawn_serve_supervisor_with_program(
@@ -432,12 +455,28 @@ fn spawn_serve_supervisor(policy: &PathBuf, extra_args: &[&str]) -> (std::proces
 
 /// Send one control frame over the worker end and read the response.
 fn roundtrip_frame(worker: &mut std::os::unix::net::UnixStream, body: &serde_json::Value) -> serde_json::Value {
-    use std::io::{Read, Write};
+    roundtrip_frame_with_fds(worker, body, &[])
+}
+
+/// Send one control frame (with optional SCM_RIGHTS fds — the F3.2 exec
+/// verb's stdio delivery) in a single `sendmsg` and read the response.
+fn roundtrip_frame_with_fds(
+    worker: &mut std::os::unix::net::UnixStream,
+    body: &serde_json::Value,
+    fds: &[i32],
+) -> serde_json::Value {
     let bytes = serde_json::to_vec(body).expect("serialize frame");
-    worker
-        .write_all(&(bytes.len() as u32).to_be_bytes())
-        .and_then(|_| worker.write_all(&bytes))
-        .expect("write control frame");
+    let mut frame = Vec::with_capacity(4 + bytes.len());
+    frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&bytes);
+    sandlock_core::init::fdpass::send_with_fds(worker, &frame, fds)
+        .expect("write control frame with fds");
+    read_control_response(worker)
+}
+
+/// Read one length-prefixed control response.
+fn read_control_response(worker: &mut std::os::unix::net::UnixStream) -> serde_json::Value {
+    use std::io::Read;
     let mut len_buf = [0u8; 4];
     worker
         .read_exact(&mut len_buf)
@@ -447,6 +486,38 @@ fn roundtrip_frame(worker: &mut std::os::unix::net::UnixStream, body: &serde_jso
     let mut resp = vec![0u8; resp_len];
     worker.read_exact(&mut resp).expect("read response");
     serde_json::from_slice(&resp).expect("response is JSON")
+}
+
+/// Create the three pipes an exec worker owns: returns
+/// `(host_stdin_write, host_stdout_read, host_stderr_read)` and the three
+/// child-side ends to send over SCM_RIGHTS.
+fn make_exec_stdio() -> (
+    std::os::unix::io::OwnedFd,
+    std::os::unix::io::OwnedFd,
+    std::os::unix::io::OwnedFd,
+    [i32; 3],
+) {
+    use std::os::fd::FromRawFd;
+    let mut pipes = [[0i32; 2]; 3];
+    for p in pipes.iter_mut() {
+        assert_eq!(
+            unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) },
+            0,
+            "pipe2: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    // pipes[i] = (read, write). stdin: child reads (0), host writes (1);
+    // stdout: child writes (2), host reads (3); stderr likewise (4, 5).
+    let host_stdin = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(pipes[0][1]) };
+    let host_stdout = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(pipes[1][0]) };
+    let host_stderr = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(pipes[2][0]) };
+    (
+        host_stdin,
+        host_stdout,
+        host_stderr,
+        [pipes[0][0], pipes[1][1], pipes[2][1]],
+    )
 }
 
 /// A real `--policy <fd>` happy path: the launcher writes the JSON document
@@ -779,16 +850,54 @@ fn test_supervise_fd_serve_launches_instance_and_serves_instance_verbs() {
     assert_eq!(resp["data"]["launched"], serde_json::Value::Bool(true));
     assert_eq!(resp["data"]["inbound"], serde_json::json!([]));
 
-    // exec: explicit F3 skeleton error — never a silent no-op.
+    // exec (F3.2): the worker's stdio fds arrive over SCM_RIGHTS; supervise
+    // registers a second child and reports its child id.
+    let (host_stdin, host_stdout, host_stderr, child_ends) = make_exec_stdio();
+    let resp = roundtrip_frame_with_fds(
+        &mut worker,
+        &serde_json::json!({
+            "v": 1,
+            "verb": "exec",
+            "args": { "argv": ["/bin/sh", "-c", "printf hello-from-exec"] },
+        }),
+        &child_ends,
+    );
+    for fd in child_ends {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "exec: {resp:?}");
+    let exec_pid = resp["data"]["pid"].as_i64().expect("exec reports a pid");
+    let child_id = resp["data"]["child_id"].as_u64().expect("exec child id");
+    assert!(
+        process_alive(exec_pid as i32),
+        "the exec'd child must be running right after exec"
+    );
+
+    // wait_child: exit routing through the generation's instance registry.
     let resp = roundtrip_frame(
         &mut worker,
-        &serde_json::json!({ "v": 1, "verb": "exec", "args": {} }),
+        &serde_json::json!({
+            "v": 1,
+            "verb": "wait_child",
+            "args": { "child_id": child_id },
+        }),
     );
-    assert_eq!(resp["ok"], serde_json::Value::Bool(false), "exec: {resp:?}");
-    assert!(
-        resp["err"].as_str().unwrap_or_default().contains("F3"),
-        "exec skeleton must name the F3 boundary: {resp:?}"
-    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "wait_child: {resp:?}");
+    assert_eq!(resp["data"]["code"], 0, "exec child must exit 0: {resp:?}");
+    assert_eq!(resp["data"]["killed"], serde_json::Value::Bool(false));
+
+    // The worker's stdout pipe carries exactly the child's payload.
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::fs::File::from(host_stdout),
+        &mut out,
+    )
+    .expect("read exec stdout");
+    assert_eq!(out, b"hello-from-exec");
+    drop(host_stdin);
+    drop(host_stderr);
 
     // The workload really ran and wrote its evidence.
     wait_until(
@@ -941,6 +1050,70 @@ fn test_supervise_path_serve_launches_instance_and_serves_verbs_until_shutdown()
                 .map(|s| s == "hello-from-path-workload\n")
                 .unwrap_or(false)
         },
+    );
+
+    // exec over the registered path (F3.2): the child-side stdio ends arrive
+    // on a dedicated connection; kill_child and wait_child use their own
+    // connections afterwards (one request per connection).
+    let (_host_stdin, _host_stdout, _host_stderr, child_ends) = make_exec_stdio();
+    let resp = registered_exec(
+        &sock_path,
+        token,
+        &["/bin/sh", "-c", "exec sleep 30"],
+        &child_ends,
+    );
+    for fd in child_ends {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "path exec: {resp:?}");
+    let exec_pid = resp["data"]["pid"].as_i64().expect("path exec pid");
+    let child_id = resp["data"]["child_id"].as_u64().expect("path exec child id");
+    assert!(
+        process_alive(exec_pid as i32),
+        "the path exec'd child must be running"
+    );
+
+    // kill_child: per-child signal by registered child id (never a pid
+    // verb), then wait_child reports the Killed exit on its own connection.
+    let resp = registered_verb(
+        &sock_path,
+        token,
+        "kill_child",
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(false), "kill without args: {resp:?}");
+    let resp = roundtrip_frame_with_fds(
+        &mut std::os::unix::net::UnixStream::connect(&sock_path).expect("connect kill socket"),
+        &serde_json::json!({
+            "v": 1,
+            "verb": "kill_child",
+            "token": token,
+            "args": { "child_id": child_id, "signum": 9 },
+        }),
+        &[],
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "path kill_child: {resp:?}");
+    let resp = roundtrip_frame_with_fds(
+        &mut std::os::unix::net::UnixStream::connect(&sock_path).expect("connect wait socket"),
+        &serde_json::json!({
+            "v": 1,
+            "verb": "wait_child",
+            "token": token,
+            "args": { "child_id": child_id },
+        }),
+        &[],
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "path wait_child: {resp:?}");
+    assert_eq!(
+        resp["data"]["killed"],
+        serde_json::Value::Bool(true),
+        "kill_child must make wait_child report Killed: {resp:?}"
+    );
+    wait_until(
+        Instant::now() + Duration::from_secs(10),
+        "path exec'd child reap",
+        || !process_alive(exec_pid as i32),
     );
 
     // shutdown ends the generation; the slot exits 0.

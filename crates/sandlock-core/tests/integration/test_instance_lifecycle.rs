@@ -145,7 +145,7 @@ async fn test_instance_outlives_first_process() {
     let child_pid = inst.pid().expect("launched process pid");
     assert_eq!(inst.phase(), InstancePhase::Live);
 
-    let result = inst.wait_child().await.expect("wait for first process");
+    let result = inst.wait_main().await.expect("wait for first process");
     assert!(result.success(), "first process must exit 0");
     assert_eq!(
         result.stdout.as_deref(),
@@ -192,7 +192,7 @@ async fn test_shutdown_is_idempotent() {
         .expect("session control dir")
         .clone();
     assert!(dir.exists(), "control dir must exist while the session is live");
-    inst.wait_child().await.expect("wait for first process");
+    inst.wait_main().await.expect("wait for first process");
 
     inst.shutdown().await.expect("first shutdown");
     assert_eq!(inst.phase(), InstancePhase::ShutDown);
@@ -338,7 +338,7 @@ async fn test_drop_after_wait_child_disposes_cow_branch() {
     )
     .await
     .expect("launch");
-    let result = inst.wait_child().await.expect("wait for first process");
+    let result = inst.wait_main().await.expect("wait for first process");
     assert!(result.success(), "touch must succeed");
     assert_eq!(
         inst.phase(),
@@ -480,7 +480,7 @@ async fn test_shutdown_group_sweep_after_compliant_grace_exit() {
 
     // The direct child exited compliantly (exit 0) inside the grace window:
     // shutdown recorded that status, which later wait_child hands back.
-    let result = inst.wait_child().await.expect("wait_child after shutdown");
+    let result = inst.wait_main().await.expect("wait_main after shutdown");
     assert!(
         result.success(),
         "the compliant direct child's exit status must be recorded (stderr: {:?})",
@@ -518,7 +518,7 @@ async fn test_shutdown_releases_control_dir_and_dns_gateway() {
 
     assert_eq!(dir, control::sandbox_dir(name));
     assert!(dir.exists(), "control dir must exist while the session is live");
-    inst.wait_child().await.expect("wait for first process");
+    inst.wait_main().await.expect("wait for first process");
     assert_session_resources_live(&inst);
 
     inst.shutdown().await.expect("shutdown");

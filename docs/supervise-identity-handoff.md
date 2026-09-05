@@ -122,7 +122,8 @@ Instance-level verb surface (all served against the live `SandboxInstance`):
 | `run` | Launch-first trigger/state query: ok with the instance pid once the M0 process is running; explicit error when no `--program` was provisioned |
 | `stats` | `instance_state` / `children_live` / `proc_count_vs_live` (+ pid) |
 | `ports` | Live S2.5 inbound mappings (`sandbox_port`/`host_port`/`live`) + live `port_remap` table |
-| `exec` | **Explicit F3 skeleton**: returns a clear “exec arrives with F3” error — never a silent no-op |
+| `exec` | F3.2: registers a new child; the worker's three stdio fds arrive attached to the frame (SCM_RIGHTS) and the reply carries `child_id` + pid |
+| `wait_child` / `kill_child` | F3.2 per-child verbs by `child_id`: exit status round-trip / registered signal delivery |
 | `shutdown` | Ends the generation: response, then full §5.3 teardown, exit 0 |
 
 `--program <fd|PATH.json>` carries the generation's first-process argv

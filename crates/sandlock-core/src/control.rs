@@ -74,6 +74,7 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::init::fdpass;
 use crate::sandbox::Sandbox;
 use crate::seccomp::ctx::SupervisorCtx;
 
@@ -1140,6 +1141,51 @@ pub fn read_request_body(stream: &mut std::os::unix::net::UnixStream) -> Option<
     Some(body)
 }
 
+/// Read one length-prefixed request frame (blocking), returning its JSON
+/// body plus any SCM_RIGHTS fds that arrived attached to the request (the
+/// F3.2 `exec` verb carries its three stdio fds this way).
+///
+/// The sender must write the 4-byte length + JSON body in **one** `sendmsg`
+/// when fds are attached (fdpass semantics: ancillary data binds to the
+/// bytes of that one sendmsg). The first read of a frame therefore captures
+/// any fds; the body is completed with further reads (plain frames may still
+/// be split arbitrarily by the stream). Returns `None` on EOF/error or when
+/// the declared body exceeds [`MAX_FRAME_BYTES`].
+pub fn read_request_frame(
+    stream: &mut std::os::unix::net::UnixStream,
+) -> Option<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
+    use std::os::unix::io::AsRawFd;
+
+    let mut data: Vec<u8> = Vec::new();
+    let mut fds: Vec<std::os::fd::OwnedFd> = Vec::new();
+    loop {
+        let (chunk, chunk_fds) = fdpass::recv_with_fds(stream.as_raw_fd(), 3).ok()?;
+        if chunk.is_empty() {
+            // EOF: at a clean boundary the caller distinguishes a requestless
+            // close; mid-frame this is a truncated request.
+            return None;
+        }
+        fds.extend(chunk_fds);
+        data.extend_from_slice(&chunk);
+        if data.len() < 4 {
+            continue;
+        }
+        let body_len = u32::from_be_bytes(data[..4].try_into().expect("4-byte length")) as usize;
+        if body_len > MAX_FRAME_BYTES {
+            return None;
+        }
+        let total = 4 + body_len;
+        if data.len() >= total {
+            if data.len() > total {
+                // More bytes than one request: frame misalignment (a
+                // pipelined request) is not a supported wire shape.
+                return None;
+            }
+            return Some((data[4..].to_vec(), fds));
+        }
+    }
+}
+
 /// Write one length-prefixed JSON response body (blocking), capping
 /// oversized bodies the same way the async server does.
 pub fn write_response_frame(
@@ -1205,6 +1251,7 @@ pub trait ControlHandler {
         &mut self,
         stream: &mut std::os::unix::net::UnixStream,
         req: &ControlRequest,
+        fds: &[std::os::fd::OwnedFd],
     ) -> ServeOutcome;
 }
 
@@ -1253,7 +1300,7 @@ pub fn serve_fd_connection(
 ) -> ServeOutcome {
     let mut stream = stream;
     loop {
-        let Some(body) = read_request_body(&mut stream) else {
+        let Some((body, fds)) = read_request_frame(&mut stream) else {
             return ServeOutcome::PeerGone;
         };
         let req: ControlRequest = match serde_json::from_slice(&body) {
@@ -1299,7 +1346,7 @@ pub fn serve_fd_connection(
                 return ServeOutcome::PeerGone;
             }
         }
-        match handler.handle(&mut stream, &req) {
+        match handler.handle(&mut stream, &req, &fds) {
             ServeOutcome::Continue => {}
             ServeOutcome::Shutdown => return ServeOutcome::Shutdown,
             // Handlers describe verbs (Continue/Shutdown); PeerGone is
@@ -1340,7 +1387,7 @@ pub fn serve_connection(
         return ServeOutcome::PeerGone;
     }
 
-    let Some(body) = read_request_body(&mut stream) else {
+    let Some((body, fds)) = read_request_frame(&mut stream) else {
         return ServeOutcome::PeerGone;
     };
 
@@ -1393,7 +1440,7 @@ pub fn serve_connection(
         }
     }
 
-    handler.handle(&mut stream, &req)
+    handler.handle(&mut stream, &req, &fds)
 }
 
 /// Worker/client side of a control channel: send one verb with the channel
@@ -1405,7 +1452,23 @@ pub fn channel_request(
     verb: &str,
     args: serde_json::Value,
 ) -> Result<ControlResponse, String> {
-    use std::io::Write;
+    channel_request_with_fds(stream, token, verb, args, &[])
+}
+
+/// Worker/client side of a control channel with SCM_RIGHTS fd delivery (the
+/// F3.2 `exec` verb): send one verb with the channel token attached and up to
+/// three stdio fds, and return the parsed response. Header + body + fds are
+/// written in **one** `sendmsg` so the fds bind to the request frame
+/// (fdpass semantics); plain verbs call this with an empty fd slice.
+/// Sets 2-second read/write timeouts so a wedged server cannot hang the
+/// caller.
+pub fn channel_request_with_fds(
+    stream: &mut std::os::unix::net::UnixStream,
+    token: &str,
+    verb: &str,
+    args: serde_json::Value,
+    fds: &[std::os::fd::RawFd],
+) -> Result<ControlResponse, String> {
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(2)))
         .map_err(|e| format!("set_read_timeout: {}", e))?;
@@ -1421,9 +1484,10 @@ pub fn channel_request(
     };
     let body = serde_json::to_vec(&req).map_err(|e| format!("serialize request: {}", e))?;
     let len = (body.len() as u32).to_be_bytes();
-    stream
-        .write_all(&len)
-        .and_then(|_| stream.write_all(&body))
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&len);
+    frame.extend_from_slice(&body);
+    fdpass::send_with_fds(stream, &frame, fds)
         .map_err(|e| format!("write request: {}", e))?;
 
     let Some(resp_body) = read_request_body(stream) else {

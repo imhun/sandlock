@@ -54,6 +54,23 @@ pub enum SandboxRuntimeError {
     #[error("sandbox not running")]
     NotRunning,
 
+    /// The session is closed and cannot take new work: `shutdown` completed,
+    /// the exec control link died (a request deadline exceeded and the link
+    /// was marked Dead, or the init channel closed), or the session was never
+    /// exec-capable. Every later `exec`/`wait_child`/`kill_child` on this
+    /// instance fails with this same variant — the F5.4 S5 unified
+    /// closed-instance code, reserved here on F3.2's terms. The instance is
+    /// never silently re-launched.
+    #[error("instance is closed (shut down or its exec link is dead); no new work is accepted")]
+    InstanceClosed,
+
+    /// A per-child verb named a child id that was never registered by this
+    /// session's executor (F1.2 announced-registry checking). The id is
+    /// reported exactly so callers can distinguish a stale handle from a
+    /// wrong id.
+    #[error("instance has no child with id {0}")]
+    UnknownChild(u64),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

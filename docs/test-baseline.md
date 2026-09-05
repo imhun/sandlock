@@ -46,6 +46,19 @@ core_integ = 494 # F2.1 (M0 lifecycle lift): 477 -> 481 (+4 lifecycle tests);
                  # test_sandbox_cannot_reach_sibling_channel).
                  # F2b.2 review fix (I1): 493 -> 494, +1
                  # (test_list_prune_keeps_live_registered_channel).
+                 # F3.2 (per-child exec API): 494 -> 502, +8 in the new
+                 # integration/test_instance_exec.rs
+                 # (test_two_concurrent_exec_keep_independent_stdio,
+                 # test_double_wait_child_is_idempotent,
+                 # test_close_stdin_does_not_deadlock,
+                 # test_exec_after_shutdown_returns_same_error,
+                 # test_grandchild_holding_stdout_does_not_hang_wait_or_shutdown,
+                 # test_child_registry_rejects_unknown_child_id,
+                 # test_kill_child_after_reap_is_idempotent,
+                 # test_exec_pty_returns_master_and_resize_works).
+                 # The M0 no-arg wait_child became wait_main (per-child
+                 # wait_child(child_id) is the F3.2 surface); no M0 test was
+                 # removed or weakened.
 ffi = 89
 cli = 95      # after F0.4 wiring (cli suite includes net_bind_map tests)
 supervise = 34 # Non-root targets only (--lib --test supervise): the
@@ -72,6 +85,12 @@ supervise = 34 # Non-root targets only (--lib --test supervise): the
                # (test_supervise_rejects_non_unix_socket_control_fd), and
                # the forbidden-remap pin
                # (test_supervise_refuses_runtime_uid_map_verbs)).
+               # F3.2 (exec verb + per-child verbs over both transports):
+               # count unchanged (18 lib + 16 integration). The two instance
+               # verb tests now drive a REAL exec (stdio fds over SCM_RIGHTS
+               # on the F2b.2 control channel) with wait_child/kill_child
+               # round-trips instead of the F3 skeleton error; supervise
+               # generations now launch exec-capable sessions (launch_exec).
 supervise_root = 2 # ROOT-MODE: run via scripts/test-all.sh
                    # --supervise-root as root (same privileged container as
                    # oci). F2b.3 foreign-uid acceptance in
