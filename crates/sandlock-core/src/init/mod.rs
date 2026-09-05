@@ -119,6 +119,7 @@ fn spawn(
     argv: &[String],
     env: &[(String, String)],
     cwd: &Option<String>,
+    clean_env: bool,
     stdio: Option<[RawFd; 3]>,
 ) -> i32 {
     // SL-4 belt: the control socket must never survive the workload's execvp.
@@ -168,11 +169,24 @@ fn spawn(
             }
         }
     }
+    // Per-exec parameter application (F4.1): chdir first, then build the
+    // environment. `clean_env` starts from an empty environ and applies
+    // `env` as the child's complete environment; otherwise `env` entries are
+    // additive overrides of init's inherited session environment. Both are
+    // process-local mutations in the post-fork child, so one exec can never
+    // leak its cwd/env into a sibling (they fork from init, which never
+    // mutates its own cwd/env here).
     if let Some(c) = cwd {
         if let Ok(cs) = CString::new(c.as_str()) {
             unsafe {
                 libc::chdir(cs.as_ptr());
             }
+        }
+    }
+    if clean_env {
+        let keys: Vec<_> = std::env::vars_os().map(|(k, _)| k).collect();
+        for key in keys {
+            std::env::remove_var(&key);
         }
     }
     for (k, v) in env {
@@ -547,7 +561,7 @@ pub fn run_init() {
                                 replies.push(Resp::Err { msg: "main already running".into() });
                                 continue;
                             }
-                            let pid = spawn(&argv, &env, &cwd, None);
+                            let pid = spawn(&argv, &env, &cwd, false, None);
                             if pid < 0 {
                                 replies.push(Resp::Err { msg: "fork failed".into() });
                                 continue;
@@ -565,7 +579,15 @@ pub fn run_init() {
                             );
                             replies.push(Resp::Started { pid });
                         }
-                        Req::RunExec { argv, env, cwd, detach } => {
+                        Req::RunExec {
+                            argv,
+                            env,
+                            cwd,
+                            detach,
+                            clean_env,
+                            extra_writable: _,
+                            bind_ports: _,
+                        } => {
                             if received.fds.len() < 3 {
                                 replies.push(Resp::Err { msg: "exec needs 3 fds".into() });
                                 continue;
@@ -575,7 +597,7 @@ pub fn run_init() {
                                 received.fds[1].as_raw_fd(),
                                 received.fds[2].as_raw_fd(),
                             ];
-                            let pid = spawn(&argv, &env, &cwd, Some(stdio));
+                            let pid = spawn(&argv, &env, &cwd, clean_env, Some(stdio));
                             if pid < 0 {
                                 replies.push(Resp::Err { msg: "fork failed".into() });
                                 continue;

@@ -91,7 +91,15 @@ mod tests {
 
     #[test]
     fn req_roundtrip() {
-        let r = Req::RunExec { argv: vec!["sh".into()], env: vec![("A".into(),"1".into())], cwd: Some("/".into()), detach: false };
+        let r = Req::RunExec {
+            argv: vec!["sh".into()],
+            env: vec![("A".into(), "1".into())],
+            cwd: Some("/".into()),
+            detach: false,
+            clean_env: false,
+            extra_writable: vec![],
+            bind_ports: vec![],
+        };
         let j = serde_json::to_string(&r).unwrap();
         assert!(j.contains("runexec"));
         assert!(matches!(serde_json::from_str::<Req>(&j).unwrap(), Req::RunExec { .. }));

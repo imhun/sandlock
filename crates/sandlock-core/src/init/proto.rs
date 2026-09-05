@@ -176,7 +176,30 @@ pub fn decode_frame(bytes: &[u8]) -> Result<Frame<'_>, FrameError> {
 #[serde(tag = "req", rename_all = "lowercase")]
 pub enum Req {
     RunMain { argv: Vec<String>, env: Vec<(String, String)>, cwd: Option<String> },
-    RunExec { argv: Vec<String>, env: Vec<(String, String)>, cwd: Option<String>, detach: bool },
+    RunExec {
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+        cwd: Option<String>,
+        detach: bool,
+        /// F4.1: per-exec `clean_env` — start the child from an empty
+        /// environment, then apply `env` (as opposed to additive overrides
+        /// over the inherited init environment). `#[serde(default)]` keeps
+        /// pre-F4 frames (which never carried the field) parseable.
+        #[serde(default)]
+        clean_env: bool,
+        /// F4.1/F4.2: per-exec extra writable paths (absolute). Carried for
+        /// the host-side audit/registry and the subset validation; init's
+        /// `spawn` needs only cwd/env/clean_env. Host-side validation
+        /// already refused anything wider than the instance ceiling, so a
+        /// well-formed supervisor never sends an out-of-ceiling grant.
+        #[serde(default)]
+        extra_writable: Vec<String>,
+        /// F4.1/F4.2: per-exec TCP bind ports (absolute grants inside the
+        /// instance `net_allow_bind` ceiling). Same carrying semantics as
+        /// `extra_writable`: init does not consume them.
+        #[serde(default)]
+        bind_ports: Vec<u16>,
+    },
     /// Instance-level signal: `sandlock-init` delivers `signum` to every
     /// registered child's process group (group-first killpg + pidfd
     /// complement). No pid payload — see the module docs.
@@ -257,10 +280,29 @@ mod tests {
 
     #[test]
     fn req_roundtrip() {
-        let r = Req::RunExec { argv: vec!["sh".into()], env: vec![("A".into(),"1".into())], cwd: Some("/".into()), detach: false };
+        let r = Req::RunExec {
+            argv: vec!["sh".into()],
+            env: vec![("A".into(), "1".into())],
+            cwd: Some("/".into()),
+            detach: false,
+            clean_env: false,
+            extra_writable: vec![],
+            bind_ports: vec![],
+        };
         let j = serde_json::to_string(&r).unwrap();
         assert!(j.contains("runexec"));
         assert!(matches!(serde_json::from_str::<Req>(&j).unwrap(), Req::RunExec { .. }));
+        // F4 wire evolution: a pre-F4 RunExec frame (no per-exec fields) is
+        // still parseable — the new fields default to "no per-exec change".
+        let old = r#"{"req":"runexec","argv":["sh"],"env":[],"cwd":null,"detach":false}"#;
+        match serde_json::from_str::<Req>(old).unwrap() {
+            Req::RunExec { clean_env, extra_writable, bind_ports, .. } => {
+                assert!(!clean_env);
+                assert!(extra_writable.is_empty());
+                assert!(bind_ports.is_empty());
+            }
+            other => panic!("expected RunExec, got {other:?}"),
+        }
     }
     #[test]
     fn resp_roundtrip() {

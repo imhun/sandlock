@@ -1012,7 +1012,15 @@ async fn handle_exec(
     }
 
     let raw: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
-    let req = Req::RunExec { argv: args, env, cwd, detach };
+    let req = Req::RunExec {
+        argv: args,
+        env,
+        cwd,
+        detach,
+        clean_env: false,
+        extra_writable: vec![],
+        bind_ports: vec![],
+    };
     let started = link.request(&req, &raw).await;
     // init has now dup'd the fds (SCM_RIGHTS); drop the daemon's copies.
     drop(fds);
@@ -1589,6 +1597,9 @@ mod tests {
             env: vec![],
             cwd: None,
             detach: false,
+            clean_env: false,
+            extra_writable: vec![],
+            bind_ports: vec![],
         };
 
         // Announce CAP + 2 children through the real request/Started path
@@ -1659,6 +1670,9 @@ mod tests {
             env: vec![],
             cwd: None,
             detach: true,
+            clean_env: false,
+            extra_writable: vec![],
+            bind_ports: vec![],
         };
         let announcer = spawn_init_announcer(child, vec![DETACHED]);
         match link.request(&detach_req, &[]).await.expect("request must be answered") {
@@ -1695,6 +1709,9 @@ mod tests {
             env: vec![],
             cwd: None,
             detach: false,
+            clean_env: false,
+            extra_writable: vec![],
+            bind_ports: vec![],
         };
 
         // (a) A forged Exited whose pid matches a FUTURE exec (announced only
@@ -1808,6 +1825,9 @@ mod tests {
             env: vec![],
             cwd: None,
             detach: false,
+            clean_env: false,
+            extra_writable: vec![],
+            bind_ports: vec![],
         };
 
         // (a) One healthy request/Started round-trip announces pid 111, then

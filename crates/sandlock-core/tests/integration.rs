@@ -91,6 +91,9 @@ mod test_instance_lifecycle;
 #[path = "integration/test_instance_exec.rs"]
 mod test_instance_exec;
 
+#[path = "integration/test_instance_exec_params.rs"]
+mod test_instance_exec_params;
+
 #[path = "integration/test_restore.rs"]
 mod test_restore;
 

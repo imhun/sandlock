@@ -46,6 +46,9 @@ use crate::init::{Req, Resp, CONTROL_FD};
 use crate::result::{ExitStatus, RunResult};
 use crate::sandbox::{BranchAction, SharedCow};
 
+pub use crate::exec_params::ExecParams;
+use crate::exec_params::ExecCeiling;
+
 /// Lifecycle phase of a sandbox session (M0 shutdown skeleton + M1 exec-mode
 /// terminal semantics).
 ///
@@ -281,6 +284,10 @@ pub struct SandboxInstance {
     /// / `Sandbox`-embedded sessions), whose outlives-first-process
     /// semantics are unchanged.
     pub(crate) exec_session: Option<Box<ExecSession>>,
+    /// F4.2 (S9): the immutable per-exec ceiling captured from the policy at
+    /// session creation. `Some` for exec-capable sessions only; the M0
+    /// single-process sessions have no exec surface to validate.
+    pub(crate) exec_ceiling: Option<ExecCeiling>,
 }
 
 /// Lifecycle state of the session's single (M0) child.
@@ -383,6 +390,10 @@ impl SandboxInstance {
         mut policy: crate::sandbox::Sandbox,
         cmd: Option<&[&str]>,
     ) -> Result<SandboxInstance, SandlockError> {
+        // F4.2 (S9): the ceiling is fixed from the policy *before* anything
+        // mutates it — every later exec request is validated against this
+        // snapshot and can never widen it.
+        let ceiling = ExecCeiling::from_policy(&policy);
         if let Some(cmd) = cmd {
             if cmd.is_empty() {
                 return Err(SandboxRuntimeError::Child(
@@ -432,6 +443,7 @@ impl SandboxInstance {
         let reader = tokio::net::UnixStream::from_std(daemon_ctl)
             .map_err(SandboxRuntimeError::Io)?;
         let link = ExecLink::new(writer, reader);
+        rt.exec_ceiling = Some(ceiling);
         rt.exec_session = Some(Box::new(ExecSession {
             link: link.clone(),
             next_child_id: 1,
@@ -595,9 +607,27 @@ impl SandboxInstance {
     /// Only a `Live` session accepts `exec`; after `shutdown` (or when the
     /// exec link died / the channel closed) every call fails with the same
     /// unified [`SandboxRuntimeError::InstanceClosed`] error.
+    /// Run an additional command inside an exec-capable session (F3.2)
+    /// without per-exec parameters (equivalent to
+    /// [`SandboxInstance::exec_params`] with `ExecParams::default()`).
     pub async fn exec(
         &mut self,
         argv: &[&str],
+        stdio: ExecStdio,
+    ) -> Result<ExecHandle, SandlockError> {
+        self.exec_params(argv, &ExecParams::default(), stdio).await
+    }
+
+    /// Run an additional command inside an exec-capable session with per-exec
+    /// parameters (F4.1): `cwd`/`env`/`clean_env` are applied by
+    /// `sandlock-init` before execve, and `extra_writable`/`bind_ports` are
+    /// validated against the instance-time policy ceiling (S9) and recorded
+    /// for this child only. An out-of-ceiling request is refused with
+    /// [`SandboxRuntimeError::PolicyTooWide`] before any child is spawned.
+    pub async fn exec_params(
+        &mut self,
+        argv: &[&str],
+        params: &ExecParams,
         stdio: ExecStdio,
     ) -> Result<ExecHandle, SandlockError> {
         self.enter_exec_terminal_if_needed();
@@ -614,17 +644,35 @@ impl SandboxInstance {
             .into());
         }
         let (host, child_ends) = build_exec_stdio(stdio)?;
-        self.exec_with_fds_inner(argv, child_ends, host)
+        self.exec_with_fds_inner(argv, params, child_ends, host)
             .await
     }
 
     /// Exec with caller-supplied child-side stdio ends (the cross-process
     /// holder shape: a worker's fds arrive over the control channel and
     /// supervise hands them straight to init). The returned handle carries
-    /// no host ends — the caller owns them.
+    /// no host ends — the caller owns them. No per-exec parameters
+    /// (equivalent to [`SandboxInstance::exec_with_fds_params`] with
+    /// `ExecParams::default()`).
     pub async fn exec_with_fds(
         &mut self,
         argv: &[&str],
+        fds: [OwnedFd; 3],
+    ) -> Result<ExecHandle, SandlockError> {
+        self.exec_with_fds_params(argv, &ExecParams::default(), fds)
+            .await
+    }
+
+    /// Exec with caller-supplied child-side stdio ends and per-exec
+    /// parameters (F4.1). This is the on-behalf fd-injection route: the
+    /// worker-held fds bypass no checks — the same S9 subset validation the
+    /// in-process `exec_params` path runs applies here (F4.2), so a wider
+    /// per-exec grant is refused identically no matter which holder the
+    /// request arrived through.
+    pub async fn exec_with_fds_params(
+        &mut self,
+        argv: &[&str],
+        params: &ExecParams,
         fds: [OwnedFd; 3],
     ) -> Result<ExecHandle, SandlockError> {
         self.enter_exec_terminal_if_needed();
@@ -640,7 +688,7 @@ impl SandboxInstance {
             )
             .into());
         }
-        self.exec_with_fds_inner(argv, fds.into(), ExecHostStdio::default())
+        self.exec_with_fds_inner(argv, params, fds.into(), ExecHostStdio::default())
             .await
     }
 
@@ -649,9 +697,18 @@ impl SandboxInstance {
     async fn exec_with_fds_inner(
         &mut self,
         argv: &[&str],
+        params: &ExecParams,
         child_ends: Vec<OwnedFd>,
         host: ExecHostStdio,
     ) -> Result<ExecHandle, SandlockError> {
+        // F4.2 (S9): single validation choke point for both holder routes.
+        // The ceiling was fixed at session creation; an out-of-ceiling
+        // request fails here — before any fd is consumed or frame sent.
+        let ceiling = self
+            .exec_ceiling
+            .as_ref()
+            .expect("exec-capable sessions always capture a policy ceiling");
+        ceiling.validate(params)?;
         let session = self
             .exec_session
             .as_ref()
@@ -661,9 +718,16 @@ impl SandboxInstance {
         let raw: Vec<RawFd> = child_ends.iter().map(|f| f.as_raw_fd()).collect();
         let req = Req::RunExec {
             argv,
-            env: vec![],
-            cwd: None,
+            env: params.env.clone(),
+            cwd: params.cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
             detach: false,
+            clean_env: params.clean_env,
+            extra_writable: params
+                .extra_writable
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect(),
+            bind_ports: params.bind_ports.clone(),
         };
         let reply = session.link.request(child_id, &req, &raw).await?;
         drop(child_ends);

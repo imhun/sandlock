@@ -1567,6 +1567,7 @@ impl Sandbox {
                 phase: crate::instance::InstancePhase::Live,
                 on_exit: sandbox_cfg.on_exit.clone(),
                 on_error: sandbox_cfg.on_error.clone(),
+                exec_ceiling: None,
                 exec_session: None,
             }));
             clones.push(clone_sb);
@@ -1676,6 +1677,7 @@ impl Sandbox {
             phase: crate::instance::InstancePhase::Live,
             on_exit: self.on_exit.clone(),
             on_error: self.on_error.clone(),
+            exec_ceiling: None,
             exec_session: None,
         }));
         Ok(())

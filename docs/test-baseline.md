@@ -11,7 +11,11 @@
 #   2. root-mode phases: oci (`--oci-root`) and the supervise foreign-uid
 #      acceptance (`--supervise-root`), both as root in the same privileged
 #      container.
-core_lib = 799 # F1.4 (SL-8): +1 plan unit test pidfd_release_is_idempotent
+core_lib = 803 # F4.1/F4.2 (M2 per-exec params + S9): 799 -> 803, +4 unit
+               # tests in the new core/src/exec_params.rs (S9 ceiling
+               # validation: in-ceiling accepts, wider extra_writable refuses,
+               # fs_deny never overridable, out-of-ceiling cwd/bind_ports
+               # refuse). F1.4 (SL-8): +1 plan unit test pidfd_release_is_idempotent
                # in resource.rs.
                # F3.1 (exec machinery lift): 791 -> 797, +6 unit tests moved
                # verbatim with their code from sandlock-oci into
@@ -24,7 +28,12 @@ core_lib = 799 # F1.4 (SL-8): +1 plan unit test pidfd_release_is_idempotent
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 503 # F2.1 (M0 lifecycle lift): 477 -> 481 (+4 lifecycle tests);
+core_integ = 506 # F4.1/F4.2 (M2 per-exec params + S9): 503 -> 506, +3 in the
+                 # new integration/test_instance_exec_params.rs
+                 # (test_per_exec_cwd_and_env_apply,
+                 # test_wider_policy_is_rejected,
+                 # test_per_exec_bind_port_reaches_listener). F2.1 (M0
+                 # lifecycle lift): 477 -> 481 (+4 lifecycle tests);
                  # F2.2 (shutdown seven-step order + idempotency): 481 -> 484,
                  # +3 in integration/test_instance_lifecycle.rs
                  # (test_shutdown_escalates_after_grace_for_term_ignoring_child,

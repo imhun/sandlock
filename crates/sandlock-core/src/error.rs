@@ -76,6 +76,23 @@ pub enum SandboxRuntimeError {
     #[error("child {0} has no pty master (exec without ExecStdio::Pty)")]
     NoPtyMaster(u64),
 
+    /// F4.2 (S9): an exec request carried a per-exec parameter wider than the
+    /// instance-time policy ceiling (an `extra_writable` path outside the
+    /// writable grants, a `cwd` outside every fs grant, a `bind_ports` port
+    /// outside `net_allow_bind`, or a path the instance `fs_deny`'d). The
+    /// ceiling is fixed at instance creation; a wider request is refused with
+    /// this EPERM-class error naming the field and the offending value, never
+    /// silently granted (the on-behalf fd-injection entry point enforces the
+    /// same check).
+    #[error("exec params exceed the instance policy ceiling: {field} {value} is outside the allowed set (EPERM)")]
+    PolicyTooWide {
+        /// Which per-exec parameter dimension went out of bounds.
+        field: &'static str,
+        /// The offending value (path string or port number), so the error is
+        /// log-visible and machine-comparable.
+        value: String,
+    },
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
