@@ -848,6 +848,45 @@ impl SandboxBuilder {
         self
     }
 
+    /// Convenience bind-mount set exposing the canonical minimal `/dev` a
+    /// guest needs: `ptmx`, `pts`, `null`, `urandom`, `zero` and `tty`,
+    /// each single-node mounted from the host's `/dev` (F6.2 / P5).
+    ///
+    /// Single-node mounts make this safe where a whole-tree host `/dev`
+    /// mount is not: only the listed nodes are reachable, so `/dev/shm` and
+    /// friends are simply absent from the sandbox view and the caller needs
+    /// no `fs_deny` carve-out for them (removing the SL-1 trigger surface
+    /// whole-tree `/dev` mounts created).
+    ///
+    /// The rootfs should still carry the standard parent directory (`/dev`)
+    /// for traversal and directory listings, as with every mount; the
+    /// single-node mounts provide the node names themselves, and a direct
+    /// open of a mounted node resolves through the mount before the rootfs,
+    /// so a missing parent chain never blocks it.
+    ///
+    /// `pts` semantics: `/dev/pts` is bound as a directory so a devpts
+    /// mounted on the host exposes its slave nodes, exactly as a whole-tree
+    /// `/dev` mount would; each slave still obeys the host DAC of the
+    /// mediator process. `ptmx` is bound as a single node — on devpts hosts
+    /// where `/dev/ptmx` is a symlink to `/dev/pts/ptmx` the mount source is
+    /// canonicalized to that node, which is the same object a whole-tree
+    /// `/dev` mount would reach.
+    pub fn minimal_dev(self) -> Self {
+        const MINIMAL_DEV_NODES: [&str; 6] = [
+            "/dev/ptmx",
+            "/dev/pts",
+            "/dev/null",
+            "/dev/urandom",
+            "/dev/zero",
+            "/dev/tty",
+        ];
+        let mut b = self;
+        for node in MINIMAL_DEV_NODES {
+            b = b.fs_mount(node, node);
+        }
+        b
+    }
+
     pub fn clean_env(mut self, v: bool) -> Self {
         self.clean_env = v;
         self

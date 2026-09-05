@@ -787,3 +787,101 @@ fn test_help_shows_ps_and_inspect() {
         "--help should NOT show 'list' command (renamed to 'ps')"
     );
 }
+
+/// Path to the static rootfs-helper binary (compiled by sandlock-core's
+/// build.rs, which has already run because this crate depends on it).
+fn rootfs_helper_binary() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/rootfs-helper")
+        .canonicalize()
+        .expect("rootfs-helper not found; sandlock-core's build.rs should have compiled it")
+}
+
+fn cli_temp_dir(name: &str) -> std::path::PathBuf {
+    // Same-filesystem temp dir (under cargo's per-test-binary tmp) so the
+    // rootfs can hard-link the helper instead of copying.
+    let base = option_env!("CARGO_TARGET_TMPDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join(format!(
+        "sandlock-cli-fsmount-{}-{}",
+        name,
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("create cli test temp dir");
+    dir
+}
+
+/// Minimal self-contained rootfs with the busybox-style rootfs-helper.
+fn build_cli_rootfs(name: &str) -> std::path::PathBuf {
+    let rootfs = cli_temp_dir(name);
+    let helper = rootfs_helper_binary();
+
+    for dir in &["usr/bin", "usr/sbin", "etc", "proc", "dev", "tmp"] {
+        std::fs::create_dir_all(rootfs.join(dir)).expect("create rootfs dir");
+    }
+    let dest = rootfs.join("usr/bin/rootfs-helper");
+    std::fs::hard_link(&helper, &dest)
+        .or_else(|_| std::fs::copy(&helper, &dest).map(|_| ()))
+        .expect("install rootfs-helper into rootfs");
+    for cmd in &["cat", "write", "ls", "true"] {
+        let link = rootfs.join(format!("usr/bin/{}", cmd));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink("rootfs-helper", &link).expect("create busybox symlink");
+    }
+    let _ = std::os::unix::fs::symlink("usr/bin", rootfs.join("bin"));
+    let _ = std::os::unix::fs::symlink("usr/sbin", rootfs.join("sbin"));
+    rootfs
+}
+
+/// F6.2 (P5): `--fs-mount` must be really wired to the runtime builder —
+/// the `--pid-ns` class of miss is not acceptable. This drives the real CLI
+/// binary through chroot + a *single-file* mount and reads the bound host
+/// file from inside the sandbox; before the F6.2 single-node mount support
+/// the same run failed with ENOTDIR, so the test also pins the P5 behavior.
+#[test]
+fn test_fs_mount_flag_wired_end_to_end_single_file() {
+    let rootfs = build_cli_rootfs("single-file");
+    let host_dir = cli_temp_dir("single-file-host");
+    let host_file = host_dir.join("resolv.conf");
+    let content = "nameserver 127.0.0.11\n";
+    std::fs::write(&host_file, content).expect("write host file");
+    assert!(
+        !rootfs.join("etc/resolv.conf").exists(),
+        "test rootfs must not shadow the mounted file"
+    );
+
+    let mount_spec = format!("/etc/resolv.conf:{}", host_file.display());
+    let output = sandlock_bin()
+        .args([
+            "run",
+            "--chroot",
+            rootfs.to_str().unwrap(),
+            "-r",
+            "/usr",
+            "-r",
+            "/bin",
+            "--fs-mount",
+            &mount_spec,
+            "--",
+            "rootfs-helper",
+            "cat",
+            "/etc/resolv.conf",
+        ])
+        .output()
+        .expect("failed to run sandlock");
+    assert!(
+        output.status.success(),
+        "sandlock run with --fs-mount single file must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout,
+        content,
+        "the sandbox must read the bound host file's exact content"
+    );
+
+    let _ = std::fs::remove_dir_all(&rootfs);
+    let _ = std::fs::remove_dir_all(&host_dir);
+}

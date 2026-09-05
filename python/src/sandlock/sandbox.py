@@ -138,6 +138,42 @@ class ExecStdio(IntEnum):
     ``ExecProcess.resize`` drives TIOCSWINSZ through it."""
 
 
+def minimal_dev() -> dict[str, str]:
+    """Bind-mount set exposing the canonical minimal ``/dev`` a guest needs.
+
+    Returns the six single-node mounts ``ptmx``, ``pts``, ``null``,
+    ``urandom``, ``zero`` and ``tty``, each mapping the virtual path to the
+    same-named host node (use as ``Sandbox(..., fs_mount=minimal_dev())``
+    under a chroot).
+
+    Single-node mounts make this safe where a whole-tree host ``/dev`` mount
+    is not: only the listed nodes are reachable, so ``/dev/shm`` and friends
+    are absent from the sandbox view and no ``fs_deny`` carve-out is needed
+    for them (fork-plan F6.2 / P5 — removing the SL-1 trigger surface).
+
+    The rootfs should still carry the standard parent directory (``/dev``)
+    for traversal and directory listings, as with every mount; the
+    single-node mounts provide the node names themselves, and a direct open
+    of a mounted node resolves through the mount before the rootfs, so a
+    missing parent chain never blocks it.
+
+    ``pts`` is bound as a directory so a host devpts exposes its slave nodes,
+    exactly as a whole-tree ``/dev`` mount would; each slave still obeys the
+    host DAC of the mediator process. ``ptmx`` is bound as a single node — on
+    devpts hosts where ``/dev/ptmx`` is a symlink to ``/dev/pts/ptmx`` the
+    mount source resolves to that node, the same object a whole-tree ``/dev``
+    mount would reach.
+    """
+    return {
+        "/dev/ptmx": "/dev/ptmx",
+        "/dev/pts": "/dev/pts",
+        "/dev/null": "/dev/null",
+        "/dev/urandom": "/dev/urandom",
+        "/dev/zero": "/dev/zero",
+        "/dev/tty": "/dev/tty",
+    }
+
+
 @dataclass(frozen=True)
 class Change:
     """A single filesystem change detected by dry-run."""

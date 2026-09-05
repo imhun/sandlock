@@ -148,6 +148,26 @@ impl ChrootCtx<'_> {
         self.mounts.iter().any(|(vp, _)| virtual_path.starts_with(vp))
     }
 
+    /// The host source when `virtual_path` names a mount point exactly (the
+    /// leaf itself), rather than something below it.
+    ///
+    /// Single-node bind mounts (a regular file such as `/etc/resolv.conf`, a
+    /// character device such as `/dev/null`) have no interior to resolve:
+    /// the object the child asked for *is* the configured host source.
+    /// Treating a non-directory source as an openat2 resolution root fails
+    /// with `ENOTDIR` (the root fd is opened with `O_DIRECTORY`), which is
+    /// the F6.2/P5 failure this leaf case fixes. Directory mount points
+    /// match here too — for them the direct source is the same object an
+    /// `openat2(..., ".")` under the source would yield.
+    ///
+    /// `virtual_path` must already be in confined (canonical) form.
+    fn mount_leaf_host(&self, virtual_path: &Path) -> Option<&Path> {
+        self.mounts
+            .iter()
+            .find(|(vp, _)| vp == virtual_path)
+            .map(|(_, hp)| hp.as_path())
+    }
+
     /// Return (mount_target_dir, sub_path_string) for a virtual path under a mount.
     /// Uses longest-prefix matching when multiple mounts could match.
     fn mount_target(&self, virtual_path: &Path) -> Option<(&Path, String)> {
@@ -180,6 +200,13 @@ impl ChrootCtx<'_> {
     ) -> Option<(PathBuf, PathBuf)> {
         let confined = confine(virtual_path);
         let (mount_target, sub_path) = self.mount_target(&confined)?;
+        if sub_path == "/" {
+            // The child asked for the mount point itself. Resolving inside
+            // the source would open the source as a directory root, which
+            // fails with ENOTDIR for file/chardev single-node mounts; the
+            // bound object is the leaf, so return it directly.
+            return Some((mount_target.to_path_buf(), confined));
+        }
         resolver(mount_target, &sub_path).map(|(host, _)| (host, confined))
     }
 
@@ -725,8 +752,29 @@ fn open_in_namespace(
     match openat2_in_root_with_resolve(&root, &sub, flags, mode, resolve) {
         // Category 1.
         Ok(fd) => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
-        // Category 2, reached through symlinks.
+        // Category 2 (magic links) plus the F6.2 single-node leaf.
         Err(errno) if matches!(errno, libc::EXDEV | libc::ENOENT | libc::ENOTDIR) => {
+            // F6.2 single-node mounts: the child opened the mount point
+            // itself and the configured source is a regular file or device
+            // node, which cannot be an openat2 root (ENOTDIR at the root
+            // open). The leaf is the requested object, so open the trusted
+            // host source directly. Anything *below* a file/chardev mount is
+            // not a leaf and keeps the kernel's ENOTDIR below.
+            if errno == libc::ENOTDIR {
+                if let Some(host) = ctx.mount_leaf_host(virtual_path) {
+                    let c_host = match path_cstr(host, libc::EINVAL) {
+                        Ok(c) => c,
+                        Err(NotifAction::Errno(e)) => return Err(e),
+                        Err(_) => return Err(libc::EINVAL),
+                    };
+                    let fd = unsafe { libc::open(c_host.as_ptr(), flags as i32, mode) };
+                    return if fd < 0 {
+                        Err(last_errno(libc::EIO))
+                    } else {
+                        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+                    };
+                }
+            }
             match resolve_self_fd_magic(ctx, child_pid, &vp_str) {
                 Some(child_fd) => crate::seccomp::notif::dup_fd_from_pid(child_pid, child_fd)
                     .map_err(|_| errno),

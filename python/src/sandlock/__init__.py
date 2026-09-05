@@ -15,7 +15,7 @@ from ._sdk import (
 from .inputs import inputs
 from .handler import Handler, NotifAction, HandlerCtx, ExceptionPolicy
 from .sandbox import (
-    Sandbox, BranchAction, parse_ports, Change, DryRunResult, StdioMode, Process,
+    Sandbox, BranchAction, minimal_dev, parse_ports, Change, DryRunResult, StdioMode, Process,
     SandboxInstance, ExecProcess, ExecStdio,
 )
 from ._profile import load_profile, list_profiles
@@ -51,6 +51,7 @@ __all__ = [
     "GatherPipeline",
     "inputs",
     "BranchAction",
+    "minimal_dev",
     "parse_ports",
     "Change",
     "DryRunResult",

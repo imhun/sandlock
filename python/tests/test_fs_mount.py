@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from sandlock import Sandbox
+from sandlock import Sandbox, minimal_dev
 
 
 _HELPER_BIN = Path(__file__).resolve().parent.parent.parent / "tests" / "rootfs-helper"
@@ -119,6 +119,47 @@ class TestFsMount:
         result = policy.run(["getxattr", "/work/f.txt", "user.greeting"])
         assert result.success, f"failed: {result.stderr.decode(errors='replace')}"
         assert b"OK hello" in result.stdout
+
+    def test_minimal_dev_helper(self, rootfs):
+        """minimal_dev() yields exactly the six-node /dev set and, mounted
+        into a chroot, serves the real host character devices without a
+        whole-tree /dev mount or any fs_denied carve-out (fork-plan F6.2 /
+        P5, SL-1 trigger surface)."""
+        dev = minimal_dev()
+        assert dev == {
+            "/dev/ptmx": "/dev/ptmx",
+            "/dev/pts": "/dev/pts",
+            "/dev/null": "/dev/null",
+            "/dev/urandom": "/dev/urandom",
+            "/dev/zero": "/dev/zero",
+            "/dev/tty": "/dev/tty",
+        }, dev
+
+        policy = Sandbox(
+            chroot=str(rootfs),
+            fs_mount=dev,
+            fs_readable=["/usr", "/bin", "/etc", "/proc"],
+            clean_env=True,
+            env={"PATH": "/bin:/usr/bin"},
+        )
+
+        # open + fstat of the mounted node must reach the host chardev's
+        # inode (not a synthesized empty file).
+        host_ino = os.stat("/dev/null").st_ino
+        result = policy.run(["rootfs-helper", "fstat-fd", "/dev/null"])
+        assert result.success, (
+            "open of minimal_dev /dev/null must succeed: "
+            f"{result.stderr.decode(errors='replace')}"
+        )
+        assert result.stdout == f"OK size=0 ino={host_ino}\n".encode()
+
+        # Writes to the chardev sink succeed through the rw single-node mount.
+        result = policy.run(["write", "/dev/null", "discard"])
+        assert result.success, (
+            "write to minimal_dev /dev/null must succeed: "
+            f"{result.stderr.decode(errors='replace')}"
+        )
+        assert result.stdout == b""
 
     def test_fs_mount_listxattr(self, rootfs, tmp_path):
         """listxattr on a mounted file must resolve to the mount source (issue #84)."""

@@ -137,6 +137,13 @@ async fn test_chroot_ls_root() {
 /// on the non-root gate), a file created through the mediated open is owned
 /// by that uid and the workload's own `chmod` takes effect — the exact pair
 /// SL-1's C档 shape (root supervisor + remap) gets wrong.
+///
+/// F6.2 (P5) coupling: `/dev` is provided by the `minimal_dev` single-node
+/// bind-mount helper instead of an empty rootfs `/dev` dir or a whole-tree
+/// host `/dev` mount, and the guest writes to `/dev/null` through it. No
+/// `fs_denied` is dispatched anywhere in this policy — the minimal set has no
+/// `/dev/shm` node to carve out, which is exactly the SL-1 trigger surface
+/// single-node mounts eliminate.
 #[tokio::test]
 async fn test_chroot_mediated_create_is_owned_by_caller_and_self_chmod_works() {
     use std::os::unix::fs::MetadataExt;
@@ -148,7 +155,7 @@ async fn test_chroot_mediated_create_is_owned_by_caller_and_self_chmod_works() {
         .fs_read("/bin")
         .fs_read("/etc")
         .fs_read("/proc")
-        .fs_read("/dev")
+        .minimal_dev()
         .fs_write("/tmp")
         .build()
         .unwrap();
@@ -159,13 +166,14 @@ async fn test_chroot_mediated_create_is_owned_by_caller_and_self_chmod_works() {
             "rootfs-helper",
             "sh",
             "-c",
-            "echo chroot-mediated > /tmp/mediated.txt; chmod 0600 /tmp/mediated.txt",
+            "echo chroot-mediated > /tmp/mediated.txt; chmod 0600 /tmp/mediated.txt; \
+             echo discard > /dev/null",
         ])
         .await
         .expect("chroot-mediated run must succeed");
     assert!(
         result.success(),
-        "chroot create + self-chmod must succeed, stderr: {:?}",
+        "chroot create + self-chmod + /dev/null write must succeed, stderr: {:?}",
         result.stderr_str()
     );
 

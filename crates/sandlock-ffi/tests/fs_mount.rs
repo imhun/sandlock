@@ -379,6 +379,176 @@ fn build_mount_policy(rootfs: &Path, ro_host: &Path, rw_host: &Path) -> *mut san
     policy
 }
 
+/// Build a chroot policy through the C ABI with a single node mounted at
+/// `virtual_path` (a regular file or a character device node).
+fn build_single_node_policy(
+    rootfs: &Path,
+    virtual_path: &str,
+    host_path: &Path,
+    read_only: bool,
+) -> *mut sandlock_sandbox_t {
+    let mut b = sandlock_sandbox_builder_new();
+    assert!(!b.is_null(), "builder_new returned null");
+
+    let root = cstr(rootfs.to_str().unwrap());
+    b = unsafe { sandlock_sandbox_builder_chroot(b, root.as_ptr()) };
+    // Execution grants for the static rootfs-helper; the mounted node needs
+    // no fs_read grant of its own (mounts are readable by definition).
+    for p in ["/usr", "/bin"] {
+        let c = cstr(p);
+        b = unsafe { sandlock_sandbox_builder_fs_read(b, c.as_ptr()) };
+    }
+
+    let (vp, hp) = (cstr(virtual_path), cstr(host_path.to_str().unwrap()));
+    b = unsafe {
+        if read_only {
+            sandlock_sandbox_builder_fs_mount_ro(b, vp.as_ptr(), hp.as_ptr())
+        } else {
+            sandlock_sandbox_builder_fs_mount(b, vp.as_ptr(), hp.as_ptr())
+        }
+    };
+
+    let mut err: c_int = 0;
+    let mut err_msg: *mut c_char = ptr::null_mut();
+    let policy = unsafe { sandlock_sandbox_build(b, &mut err, &mut err_msg) };
+    if err != 0 {
+        let msg = if err_msg.is_null() {
+            String::new()
+        } else {
+            let m = unsafe { CStr::from_ptr(err_msg) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { sandlock_string_free(err_msg) };
+            m
+        };
+        panic!("sandbox_build failed: {}", msg);
+    }
+    assert!(!policy.is_null(), "sandbox_build returned null policy");
+    policy
+}
+
+/// Bind-mounting a single regular file (the `/etc/resolv.conf` shape) must
+/// expose the host file's content inside the chroot.
+///
+/// Regression (fork-plan F6.2 / P5): single-file mount points were treated
+/// as resolution *roots*, so the mediator tried to `open(O_DIRECTORY)` the
+/// host file and every access failed with `ENOTDIR`. A single-node bind
+/// mount is a leaf: the object the child asked for *is* the configured host
+/// source, so no interior resolution applies.
+#[test]
+fn test_mount_single_file_node() {
+    let rootfs = build_test_rootfs("single-file-node");
+    let host_dir = temp_dir("single-file-host");
+    let host_file = host_dir.join("resolv.conf");
+    let content = "nameserver 127.0.0.11\n";
+    fs::write(&host_file, content).unwrap();
+
+    // The rootfs deliberately has no resolv.conf of its own: the mount is
+    // the only way the sandbox can see the name. Keep /etc clean so the
+    // assertion cannot pass by falling through to a rootfs copy.
+    assert!(
+        !rootfs.join("etc/resolv.conf").exists(),
+        "test rootfs must not shadow the mounted file"
+    );
+
+    let policy = build_single_node_policy(&rootfs, "/etc/resolv.conf", &host_file, false);
+
+    let r = run_in_sandbox(policy, &["rootfs-helper", "cat", "/etc/resolv.conf"]);
+    assert!(
+        r.success,
+        "cat of a single-file bind mount must succeed: exit={} stderr={}",
+        r.code, r.stderr,
+    );
+    assert_eq!(
+        r.stdout,
+        content,
+        "the sandbox must read the bound host file's exact content",
+    );
+
+    unsafe { sandlock_sandbox_free(policy) };
+
+    // Read-only variant (ro kept): writes through the single-file mount are
+    // refused and the host file stays byte-identical.
+    let ro_policy = build_single_node_policy(&rootfs, "/etc/resolv.conf", &host_file, true);
+    let w = run_in_sandbox(ro_policy, &["rootfs-helper", "write", "/etc/resolv.conf", "clobber"]);
+    assert!(
+        !w.success,
+        "writing through a read-only single-file mount must fail: stdout={} stderr={}",
+        w.stdout, w.stderr,
+    );
+    assert!(
+        w.stderr.contains("Permission denied"),
+        "the denied write must surface EACCES, got stderr={:?}",
+        w.stderr,
+    );
+    assert_eq!(
+        fs::read_to_string(&host_file).unwrap(),
+        content,
+        "the denied write must not reach the host file",
+    );
+
+    unsafe { sandlock_sandbox_free(ro_policy) };
+    let _ = fs::remove_dir_all(&rootfs);
+    let _ = fs::remove_dir_all(&host_dir);
+}
+
+/// Bind-mounting a character device node (`/dev/null`) must hand the guest a
+/// real fd to the host chardev — the same inode — rather than failing with
+/// `ENOTDIR` (fork-plan F6.2 / P5).
+#[test]
+fn test_mount_chardev_node() {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::FileTypeExt;
+
+    let rootfs = build_test_rootfs("chardev-node");
+    // The rootfs has an empty /dev dir; /dev/null only exists through the
+    // single-node mount.
+    let host_meta = fs::metadata("/dev/null").expect("host /dev/null must exist");
+    let host_ino = host_meta.ino();
+    assert_eq!(
+        host_meta.file_type().is_char_device(),
+        true,
+        "test requires a real character device at /dev/null"
+    );
+
+    let policy = build_single_node_policy(&rootfs, "/dev/null", Path::new("/dev/null"), false);
+
+    // open() + fstat on the injected fd: the inode must be the host chardev's
+    // (a synthesized regular file would have a different inode).
+    let r = run_in_sandbox(policy, &["rootfs-helper", "fstat-fd", "/dev/null"]);
+    assert!(
+        r.success,
+        "open+fstat of a mounted chardev must succeed: exit={} stderr={}",
+        r.code, r.stderr,
+    );
+    assert_eq!(
+        r.stdout,
+        format!("OK size=0 ino={}\n", host_ino),
+        "the sandbox fd must be the real host /dev/null chardev",
+    );
+
+    // Raw openat2 spelling reaches the same node (the newest open ABI).
+    let o = run_in_sandbox(policy, &["rootfs-helper", "openat2", "/dev/null"]);
+    assert!(
+        o.success,
+        "openat2 on a mounted chardev must succeed: exit={} stderr={}",
+        o.code, o.stderr,
+    );
+    assert_eq!(o.stdout, "", "reading /dev/null yields no bytes");
+
+    // Writes to the chardev sink succeed (rw mount), proving the node is not
+    // merely readable.
+    let w = run_in_sandbox(policy, &["rootfs-helper", "write", "/dev/null", "discard"]);
+    assert!(
+        w.success,
+        "writing to /dev/null through the mount must succeed: exit={} stderr={}",
+        w.code, w.stderr,
+    );
+
+    unsafe { sandlock_sandbox_free(policy) };
+    let _ = fs::remove_dir_all(&rootfs);
+}
+
 #[test]
 fn read_only_mount_allows_reads_and_denies_writes() {
     let rootfs = build_test_rootfs("ro-enforced");
