@@ -677,6 +677,16 @@ sandlock_builder_t *sandlock_sandbox_builder_user(sandlock_builder_t *b,
                                                   uint32_t gid);
 
 /**
+ * Set the mediation identity tier for on-behalf path operations:
+ * `0` = `caller` (default; root in-process remaps are refused), `1` =
+ * `supervisor` (explicit downgrade tier; warning + `stats()` counter).
+ *
+ * # Safety
+ * `b` must be a valid builder pointer.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_mediation_run_as(sandlock_builder_t *b, uint8_t tier);
+
+/**
  * # Safety
  * `b` and `rule` must be valid pointers.
  */
@@ -1620,10 +1630,11 @@ char *sandlock_handle_restore_skipped_path(const sandlock_handle_t *h, uintptr_t
  *
  * The session inherits the core instance lifetime defaults (F5.5): an idle
  * reclaim of 15 minutes (child table empty and no wait_child subscriber)
- * and a forced 24-hour maximum lifetime measured from launch. This C
- * surface has no lifetime override; hosts that need different values must
- * keep their own reclamation loop, and must keep outer timeouts because an
- * in-flight `sandlock_instance_wait_child` is not preempted at expiry.
+ * and a forced 24-hour maximum lifetime measured from launch. Lifetime
+ * knobs are core-constructor-only; this C surface has no override — hosts
+ * that need different values must call the Rust API or keep their own
+ * reclamation loop, and must keep outer timeouts because an in-flight
+ * `sandlock_instance_wait_child` is not preempted at expiry.
  *
  * Returns an opaque instance handle, or NULL on any failure (the caller
  * frees it with `sandlock_instance_free`).

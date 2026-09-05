@@ -111,6 +111,60 @@ fn test_cpu_cores_flag_accepted() {
     assert!(stdout.contains("--cpu-cores"), "help should mention --cpu-cores");
 }
 
+/// F6.1 (SL-1): `--mediation-run-as` must be a real CLI flag (parse
+/// surface; the runtime wiring is pinned end-to-end by the root-mode
+/// `mediation_2uid` suite, where the two tiers behave differently).
+#[test]
+fn test_mediation_run_as_flag_accepted_and_runs() {
+    // Path mediation is active (deny carve-out under the /etc grant) and
+    // the explicit supervisor tier is accepted; on the non-root gate the
+    // supervisor euid equals the sandbox host uid, so no downgrade warning
+    // fires and the run must succeed.
+    let output = sandlock_bin()
+        .args(args_for_host(&[
+            "run",
+            "-r", "/usr",
+            "-r", "/lib",
+            "-r", "/lib64",
+            "-r", "/bin",
+            "-r", "/etc",
+            "--fs-deny", "/etc/shadow",
+            "--mediation-run-as", "supervisor",
+            "--", "echo", "mediation-ok",
+        ]))
+        .output()
+        .expect("failed to run sandlock");
+    assert!(
+        output.status.success(),
+        "sandlock run with --mediation-run-as must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "mediation-ok");
+}
+
+#[test]
+fn test_mediation_run_as_rejects_unknown_value_at_parse() {
+    let output = sandlock_bin()
+        .args(args_for_host(&[
+            "run",
+            "-r", "/bin",
+            "--mediation-run-as", "root",
+            "--", "true",
+        ]))
+        .output()
+        .expect("failed to run sandlock");
+    assert!(
+        !output.status.success(),
+        "an unknown --mediation-run-as value must be rejected by clap"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid mediation_run_as") && stderr.contains("root"),
+        "clap must name the invalid value, got: {stderr}"
+    );
+}
+
 #[test]
 fn test_status_fd_flag_accepted() {
     // Just verify the flag is accepted without error

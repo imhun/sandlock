@@ -628,6 +628,32 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_user(
     Box::into_raw(Box::new(builder.user(uid, gid)))
 }
 
+/// Set the mediation identity tier for on-behalf path operations:
+/// `0` = `caller` (default; root in-process remaps are refused), `1` =
+/// `supervisor` (explicit downgrade tier; warning + `stats()` counter).
+///
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_mediation_run_as(
+    b: *mut SandboxBuilder,
+    tier: u8,
+) -> *mut SandboxBuilder {
+    if b.is_null() {
+        return b;
+    }
+    let builder = *Box::from_raw(b);
+    let tier = match tier {
+        0 => sandlock_core::sandbox::MediationRunAs::Caller,
+        1 => sandlock_core::sandbox::MediationRunAs::Supervisor,
+        _other => {
+            // Unknown discriminants keep the fail-closed default (caller).
+            return Box::into_raw(Box::new(builder));
+        }
+    };
+    Box::into_raw(Box::new(builder.mediation_run_as(tier)))
+}
+
 // ----------------------------------------------------------------
 // Sandbox Builder — HTTP ACL
 // ----------------------------------------------------------------

@@ -36,6 +36,7 @@
 //! | `chroot`/`fs_mount` (spec list `VIRTUAL:HOST[:ro]`) | `[filesystem].chroot/mount` | `chroot`/`fs_mount`+`fs_mount_ro` | `chroot`/`fs_mount` (rw dict only) |
 //! | `clean_env`/`env` | `[program].clean_env/env` | same | same |
 //! | `uid`/`gid` | `[program].uid/gid` | `user` (`RunAs`) | same |
+//! | `mediation_run_as` | not in profile (profile default = `caller`) | `mediation_run_as` (`MediationRunAs`) | same |
 //! | `workdir`/`cwd`/`fs_storage` | `[config].workdir/fs_storage`; `[program].cwd` | same | same |
 //! | `on_exit`/`on_error` | `[filesystem].on_exit/on_error` | `on_exit`/`on_error` | same |
 //! | `allow_degraded`/`disable` | not in profile | `protection_policy` | same |
@@ -74,7 +75,7 @@ use std::time::SystemTime;
 use sandlock_core::http::HttpRule;
 use sandlock_core::profile::parse_mount_spec;
 use sandlock_core::sandbox::{
-    BindPorts, BranchAction, ByteSize, NetRule, RunAs, Sandbox, SandboxBuilder,
+    BindPorts, BranchAction, ByteSize, MediationRunAs, NetRule, RunAs, Sandbox, SandboxBuilder,
 };
 use sandlock_core::{Protection, ProtectionPolicy, ProtectionState};
 use serde::Deserialize;
@@ -119,6 +120,7 @@ pub const POLICY_FIELDS: &[&str] = &[
     "max_memory",
     "max_open_files",
     "max_processes",
+    "mediation_run_as",
     "net_allow",
     "net_allow_bind",
     "net_deny",
@@ -177,6 +179,7 @@ pub struct SupervisePolicy {
     pub max_cpu: Option<u8>,
     pub max_disk: Option<ByteSpec>,
     pub notify_rate_limit: Option<u32>,
+    pub mediation_run_as: Option<MediationRunAs>,
     pub cpu_cores: Option<Vec<u32>>,
     pub num_cpus: Option<u32>,
     pub gpu_devices: Option<Vec<u32>>,
@@ -518,6 +521,11 @@ fn apply(parsed: &ParsedPolicy) -> Result<SandboxBuilder, String> {
     if prov.contains("notify_rate_limit") {
         if let Some(n) = p.notify_rate_limit {
             b = b.notify_rate_limit(n);
+        }
+    }
+    if prov.contains("mediation_run_as") {
+        if let Some(tier) = p.mediation_run_as {
+            b = b.mediation_run_as(tier);
         }
     }
     if prov.contains("cpu_cores") {
@@ -1152,6 +1160,13 @@ fn verify(sandbox: &Sandbox, parsed: &ParsedPolicy) -> Result<(), String> {
             &sandbox.notify_rate_limit
         );
     }
+    if prov.contains("mediation_run_as") {
+        check!(
+            "mediation_run_as",
+            &p.mediation_run_as,
+            &Some(sandbox.mediation_run_as)
+        );
+    }
     if prov.contains("cpu_cores") {
         check!("cpu_cores", &p.cpu_cores, &sandbox.cpu_cores);
     }
@@ -1355,6 +1370,7 @@ pub fn example_policy_json(secret_path: &Path) -> String {
         "max_cpu": 42,
         "max_disk": "64M",
         "notify_rate_limit": 1000,
+        "mediation_run_as": "supervisor",
         "cpu_cores": [0, 2],
         "num_cpus": 4,
         "gpu_devices": [0],
@@ -1462,6 +1478,11 @@ mod tests {
         assert_eq!(sandbox.on_error, BranchAction::Keep);
         assert_eq!(sandbox.max_processes, 7);
         assert_eq!(
+            sandbox.mediation_run_as,
+            MediationRunAs::Supervisor,
+            "mediation_run_as read-back"
+        );
+        assert_eq!(
             sandbox.protection_policy.state(Protection::FsRefer),
             ProtectionState::Degradable
         );
@@ -1499,6 +1520,17 @@ mod tests {
         assert!(
             err.contains("`bogus`"),
             "unknown field must be named, got: {err}"
+        );
+    }
+
+    #[test]
+    fn mediation_run_as_rejects_unknown_wire_value() {
+        let err =
+            validate(br#"{"mediation_run_as": "root"}"#).expect_err("unknown tier must fail");
+        assert!(
+            err.contains("unknown variant `root`")
+                && err.contains("expected `caller` or `supervisor`"),
+            "the wire schema must reject an unknown tier naming the accepted values, got: {err}"
         );
     }
 

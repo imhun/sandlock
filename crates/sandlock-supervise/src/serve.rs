@@ -277,6 +277,7 @@ impl Generation {
                     "instance_state": state,
                     "children_live": stats.children_live,
                     "proc_count_vs_live": stats.proc_count_vs_live,
+                    "mediation_downgrades": stats.mediation_downgrades,
                     "pid": instance.pid(),
                 })
             }

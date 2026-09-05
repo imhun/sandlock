@@ -585,6 +585,8 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         b = b.port_remap(base.port_remap);
         // Process identity
         if let Some(user) = base.user { b = b.user(user.uid, user.gid); }
+        // Mediation identity tier (F6.1/SL-1)
+        b = b.mediation_run_as(base.mediation_run_as);
         // Hardware constraints
         if let Some(ref devs) = base.gpu_devices { b = b.gpu_devices(devs.clone()); }
         if let Some(ref cores) = base.cpu_cores { b = b.cpu_cores(cores.clone()); }
@@ -609,6 +611,9 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     for p in &pb.fs_denied { builder = builder.fs_deny(p); }
     if let Some(ref path) = pb.chroot { builder = builder.chroot(path); }
     if let Some(user) = pb.user { builder = builder.user(user.uid, user.gid); }
+    // F6.1 (SL-1): --mediation-run-as must reach the runtime builder (this
+    // was the --pid-ns wiring class of miss — the flag is real, not dead).
+    builder = builder.mediation_run_as(pb.mediation_run_as);
     if let Some(ref path) = pb.workdir { builder = builder.workdir(path); }
     if let Some(ref path) = pb.cwd { builder = builder.cwd(path); }
     if let Some(ref path) = pb.fs_storage { builder = builder.fs_storage(path); }
