@@ -44,7 +44,7 @@
 | **P1** | **SL-1 修法**：路径中介必须以**调用方身份**执行（`setfsuid/setfsgid(caller)` 包住被中介的 syscall，或 `openat(O_CREAT)` 后 `fchown` 回调用 uid）；`unlinkat/renameat2/fchmodat/fchownat` 需按**调用方**复现内核 DAC 判定（owner / sticky / `CAP_FOWNER` 相对该 inode 所在 mount 的 userns），不成立返回 EPERM | 高（多租户隔离） | **由 F2b 取代，仅保留 fail-closed（F6.1，commit `b62e201`）**：route B 的 supervise 进程 euid == 沙箱 host uid ⇒ 无需 per-thread 身份技巧；`mediation_run_as=caller` 下 root 进程内 remap + 路径中介在 spawn 前被拒。详见 §3.1 |
 | **P2** | 提供 `mediation_run_as = caller \| supervisor` 开关，便于既有依赖 COW/chroot 语义的调用方渐进迁移 | 中 | **已落地（F6.1，commit `b62e201`/`dd5a7e8`）**：builder / Policy / profile / FFI+cbindgen / CLI `--mediation-run-as` / Python / supervise 全字段清单；显式 `supervisor` 档 WARN + `stats()` 计数。详见 §3.1 |
 | **P3** ✅（commit `17ee48d`） | `_HANDLED_FIELDS` 登记 `notify_rate_limit`（**一行**） | 低（但污染每条日志） | 字段其实**已生效**：`_sdk.py:1217` 调 `sandlock_sandbox_builder_notify_rate_limit`；集合 `_sdk.py:1138` 起漏了名字 ⇒ 每次建沙箱都打假告警。**已修**：名字已登记入 `_HANDLED_FIELDS`，假告警消除；python 全量 431 待 F0.1 基座落地后登记 |
-| **P4** ✅（F7 regression pins，commit `4e78c98`） | 修 T4：`net_isolation` + chroot（镜像 rootfs）下 MCP 入站端口映射起不来 | 中（该形态是 E2B 生产形态之一） | **fork 侧前提证伪 + 回归 pin（非代码修复）**：chroot + `net_isolation` + `net_bind_map` 三合一形态经 9 种忠实构造（HEAD 与 T4 观测时代 `be387c7`）验证可用；新增 3 条镜像测试（mcp/epoll/poll under chroot，core_integ 529）。原 T4 观测归因 e2b 侧 strict 契约测量（`E2B_BASE_IMAGE` 未设置时即失败；此后 `xfail(run=False)` 未再真跑）——需 e2b 侧以 `E2B_BASE_IMAGE` + `xfail(run=True)` 复测，登记为 E2B follow-up，见 §3.3 |
+| **P4** ✅（F7 regression pins，commit `4e78c98`） | 修 T4：`net_isolation` + chroot（镜像 rootfs）下 MCP 入站端口映射起不来 | 中（该形态是 E2B 生产形态之一） | **fork 侧前提证伪 + 回归 pin（非代码修复）**：chroot + `net_isolation` + `net_bind_map` 三合一形态经 9 种忠实构造（HEAD 与 T4 观测时代 `be387c7`）验证可用；新增 3 条镜像测试（mcp/epoll/poll under chroot，core_integ 529）。e2b 侧 T4 有真实 image-rootfs + netns 失败记录（strict-1 实跑，2026-09-03，与 §3.3 一致）；残差可能在 envd gateway 接线层，需 e2b 侧以 `E2B_BASE_IMAGE` + `xfail(run=True)` 复测，登记为 E2B follow-up，见 §3.3 |
 | **P5** ✅（F6.2） | `fs_mount` 目前只接受目录根（单文件/设备节点会以 `ENOTDIR` 失效）⇒ 调用方只能整树挂 `/dev`，进而**必须**下发 `fs_denied` 挡 `/dev/shm`，正好踩 SL-1。希望支持单节点挂载，或提供"最小可用 /dev（ptmx/pts/null/urandom）"构造 helper | 中（消除 SL-1 触发面） | **已落地**：单文件/chardev 单节点 bind-mount（`resolv.conf`、`/dev/null` 形态不再 ENOTDIR，ro 保持）+ `minimal_dev()` helper（`ptmx/pts/null/urandom/zero/tty`），调用方可省整树 `/dev` 挂载与 `/dev/shm` carve-out；F6.1 chroot A档用例已改经 helper 构造 `/dev`。详见 §3.1 |
 | **P6** | 无特权默认路径的细节补齐：`getsockname/getpeername` 反映合成视图、非阻塞 `connect` 的 `EINPROGRESS` 语义 | 低 | 已知限制条目化 |
 | **P7** | wheel 矩阵补 cp310 / cp312–313（沿用 zig 交叉编译流程） | 低 | E2B 运行时已统一 3.14 |
@@ -106,11 +106,18 @@ instance-exec（S12）、root supervisor + `RunAs(1000)`、以及真实 python3.
 `mcp-gateway.py` 栈；HEAD 与 T4 观测时代 commit（`be387c7`）均绿，无可修根因（证据与日志见
 `tmp/sdd/f7-report.md` 与 `tmp/sdd/f7-red-*.log` / `f7-red-old*.log`）。
 
-原 T4 观测的实跑证据（`full-strict-1.log`，2026-09-03）是在 `E2B_BASE_IMAGE` 未设置的状态下失败的，
-与"纯 sandlock 3/3 通过、仅 image-rootfs 失败"的归因不符；此后该用例 `xfail(strict=True, run=False)`，
-未被真实执行。**E2B 侧 follow-up（超出 fork 范围）**：以 `E2B_BASE_IMAGE` + `xfail(run=True)`
-复测 `tests/contract/test_mcp_netns.py::test_mcp_full_path_under_net_isolation`；若仍失败，
-在 worker 栈定位（gateway stderr / 宿主映射端口快照），修好前 §2 P4 的 E2B 侧 xfail 保持不动。
+**T4 观测证据的准确归因（本段为 brief §2 之外的显式 scope 扩展）**：
+`full-strict-1.log`（2026-09-03 11:30，407a59c 之前的同款新 runner 环境：XFS 已挂载、
+`E2B_BASE_IMAGE` 与 `E2B_TEST_NET_ISOLATION` 均已设置）是一次**真实的 image-rootfs + netns 实跑**，
+其中 `test_mcp_full_path_under_net_isolation` **FAILED**（`mcp-gateway did not start listening`），
+与 e2b T4 记录一致（同场另有三个无关 failures/errors 与 volume_quota 1 skip）。
+该 run **没有同场 pure-shape 对照**（"纯 sandlock 3/3 通过"来自其他 run），因此它不能证明
+pure 形态失败，也不与 fork-core 9 种直构 GREEN 矛盾——两者独立成立。407a59c 之后才加上
+keyed on `E2B_BASE_IMAGE` 的 `xfail(strict=True, run=False)`，故该用例此后未再被真实执行。
+残余缺陷可能位于 envd gateway 接线层。**E2B 侧 follow-up（超出 fork 范围）**：以
+`E2B_BASE_IMAGE` + `xfail(run=True)` 复测
+`tests/contract/test_mcp_netns.py::test_mcp_full_path_under_net_isolation`；若仍失败，
+在 worker 栈定位（gateway stderr / 宿主映射端口快照）；修好前 §2 P4 的 E2B 侧 xfail 保持不动。
 
 ### 3.4 wheel 与 tip 的一致性：fork 侧符号级自证 + supervise 指纹（已落地，F0.2 / F2b.5）
 
