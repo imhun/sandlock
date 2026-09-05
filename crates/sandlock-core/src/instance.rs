@@ -814,6 +814,31 @@ impl SandboxInstance {
             .unwrap_or(true)
     }
 
+    /// Fold init-reported exits that no waiter consumed yet into the child
+    /// registry, so liveness counts (idle eligibility, checkpoint) reflect
+    /// reality instead of a routed-but-unconsumed `Exited` frame.
+    fn reconcile_early_exits(&mut self) {
+        if !self.is_exec_mode() {
+            return;
+        }
+        let mut early: HashMap<u64, ExitStatus> = HashMap::new();
+        if let Some(session) = self.exec_session.as_ref() {
+            session.link.drain_early_exits(&mut early);
+        }
+        if early.is_empty() {
+            return;
+        }
+        if let Some(session) = self.exec_session.as_mut() {
+            for (child_id, status) in early {
+                if let Some(child) = session.children.get_mut(&child_id) {
+                    if child.status.is_none() {
+                        child.status = Some(status);
+                    }
+                }
+            }
+        }
+    }
+
     /// F5.5: recompute the idle clock after any mutation of the child table
     /// or the waiter set. A live child or a pending waiter clears the clock;
     /// the clock starts when the table becomes empty and stays empty.
@@ -824,6 +849,7 @@ impl SandboxInstance {
         {
             return;
         }
+        self.reconcile_early_exits();
         if self.idle_eligible() {
             if self.idle_since.is_none() {
                 self.idle_since = Some(std::time::Instant::now());
@@ -860,6 +886,12 @@ impl SandboxInstance {
     /// `T_max`: live children are collapsed by the drain), and return the
     /// refusal error the verb must surface. `None` = no expiry, proceed.
     async fn drain_if_lifetime_expired(&mut self) -> Option<SandlockError> {
+        // Lifetime knobs only govern exec sessions; an exec-flavored verb
+        // misused against a long-lived one-shot (M0) instance must fail with
+        // "not exec-capable", never force-drain the M0 session.
+        if !self.is_exec_mode() {
+            return None;
+        }
         self.refresh_idle_state();
         let expiry = self.lifetime_expiry()?;
         self.expired = Some(expiry);
@@ -1367,6 +1399,12 @@ impl SandboxInstance {
                 .into())
             }
         };
+        // Fold routed-but-unconsumed exits first: a child whose Exited frame
+        // already arrived is not "live", so the live count (and the refusal
+        // error's `live` number) reflects reality — a single dead child
+        // reports CheckpointNoLiveChild instead of over-refusing with
+        // misleading live:1.
+        self.reconcile_early_exits();
         let live: Vec<(ChildId, i32)> = self
             .exec_session
             .as_ref()
@@ -1801,19 +1839,20 @@ impl SandboxInstance {
             }
         }
         for stray_pid in session.link.stray_pids() {
-            // F5.3: stray pids are init-announced namespace pids in a pid-ns
-            // session; translate before the host-side group sweep.
-            let stray_pid = match self.pid_ns_map.as_ref() {
-                Some(map) => map
-                    .write()
-                    .ok()
-                    .and_then(|mut m| m.host_pid(stray_pid as u32))
-                    .map(|h| h as i32)
-                    .unwrap_or(stray_pid),
-                None => stray_pid,
-            };
-            unsafe {
-                libc::killpg(stray_pid, libc::SIGKILL);
+            // I1: never signal a stray by its raw announced pid. Strays are
+            // init-announced namespace pids in pid-ns sessions — small
+            // integers that `killpg` would interpret as HOST pgids, with
+            // possible collateral SIGKILL of an unrelated host group. When
+            // the ns→host translation is unavailable the stray is skipped
+            // (it cannot be addressed safely); the instance's own group
+            // sweeps above plus init's Shutdown collapse remain the
+            // authoritative teardown.
+            if let Some(host_pid) =
+                stray_sweep_target(self.pid_ns_map.as_ref(), stray_pid)
+            {
+                unsafe {
+                    libc::killpg(host_pid, libc::SIGKILL);
+                }
             }
         }
     }
@@ -2402,6 +2441,30 @@ fn ip_only_allowlist(ips: &[IpAddr]) -> NetworkPolicy {
     }
 }
 
+/// Resolve one init-announced stray pid to the host pid a teardown sweep may
+/// signal (I1).
+///
+/// With a pid namespace, strays are **namespace** pids — small integers that
+/// `killpg` would interpret as host pgids. `None` means "do not signal this
+/// stray": either the session has no pid namespace (never happens — strays
+/// are host pids then and this returns `Some`) or the ns→host translation
+/// failed (unknown/exited pid or a poisoned map) and the raw value must
+/// never reach a host `killpg`. Skipping is safe because teardown remains
+/// covered by the registered-child group sweeps and init's own Shutdown
+/// collapse.
+fn stray_sweep_target(
+    pid_ns_map: Option<&Arc<RwLock<crate::procfs::PidNsMap>>>,
+    stray_pid: i32,
+) -> Option<i32> {
+    match pid_ns_map {
+        None => Some(stray_pid),
+        Some(map) => map
+            .write()
+            .ok()
+            .and_then(|mut m| m.host_pid(stray_pid as u32).map(|h| h as i32)),
+    }
+}
+
 impl Drop for SandboxInstance {
     fn drop(&mut self) {
         // Standalone instances and `Sandbox`-embedded sessions share one
@@ -2787,5 +2850,51 @@ fn restore_tty_foreground(child_pid: i32) {
         libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
         libc::tcsetpgrp(0, libc::getpgrp());
         libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stray_sweep_target_passthrough_without_pid_ns() {
+        // Non-pid-ns sessions announce host pids: the stray is signalled
+        // as-is (translation is a no-op).
+        assert_eq!(stray_sweep_target(None, 4242), Some(4242));
+    }
+
+    #[test]
+    fn stray_sweep_translation_failure_skips_raw_ns_pid() {
+        // Deterministic translation failure: PidNsMap::new for a leader that
+        // does not exist has no namespace inode, so refresh never resolves
+        // any ns pid. The raw (small, namespace) stray must never come back
+        // as a host killpg target — I1: killpg would read it as a HOST pgid.
+        let map = Arc::new(RwLock::new(crate::procfs::PidNsMap::new(
+            999_999_999,
+        )));
+        assert_eq!(
+            stray_sweep_target(Some(&map), 5),
+            None,
+            "an untranslatable stray must be skipped, never signalled by its \
+             raw namespace pid"
+        );
+    }
+
+    #[test]
+    fn stray_sweep_target_skips_on_poisoned_map() {
+        let map = Arc::new(RwLock::new(crate::procfs::PidNsMap::new(
+            999_999_999,
+        )));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = map.write().expect("fresh lock");
+            panic!("poison the pid-ns map on purpose");
+        }));
+        assert!(poisoned.is_err(), "test precondition: map must be poisoned");
+        assert_eq!(
+            stray_sweep_target(Some(&map), 5),
+            None,
+            "a poisoned map must not fall back to the raw ns pid"
+        );
     }
 }

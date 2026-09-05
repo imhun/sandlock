@@ -54,7 +54,9 @@ use sandlock_core::control::{
     serve_fd_connection, serve_registered_once, write_response_frame, ControlHandler,
     ControlRequest, ControlResponse, ServeOutcome,
 };
-use sandlock_core::instance::{ExecParams, InstancePhase, SandboxInstance};
+use sandlock_core::instance::{
+    ExecParams, InstanceLifetime, InstancePhase, SandboxInstance,
+};
 use sandlock_core::profile::sandbox_to_profile;
 use sandlock_core::result::ExitStatus;
 use sandlock_core::Sandbox;
@@ -182,9 +184,24 @@ impl Generation {
         })?;
         let policy = (*self.policy).clone();
         let cmd: Vec<&str> = program.argv.iter().map(|arg| arg.as_str()).collect();
+        // I2: generation lifetime is deployment-owned. The core `T_max`
+        // default (24 h) would force-drain a long-lived generation even
+        // while its workload is alive — the deployment (slot pool / W1-W2
+        // recycle, docs/supervise-identity-handoff.md §6) owns when a
+        // generation ends, so supervise disables the core max-lifetime cap.
+        // Idle reclaim keeps the core default (15 min) and only fires when
+        // the child table is empty with no wait subscriber, which a running
+        // workload prevents. Callers that want a cap must keep their own
+        // outer timeout / reclamation loop.
+        let lifetime = InstanceLifetime {
+            max_lifetime: None,
+            ..InstanceLifetime::default()
+        };
         let instance = self
             .rt
-            .block_on(SandboxInstance::launch_exec(policy, &cmd))
+            .block_on(SandboxInstance::launch_exec_with_lifetime(
+                policy, &cmd, lifetime,
+            ))
             .map_err(|e| format!("instance launch failed: {e}"))?;
         self.instance = Some(instance);
         Ok(())

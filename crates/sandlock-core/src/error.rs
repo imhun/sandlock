@@ -55,13 +55,17 @@ pub enum SandboxRuntimeError {
     NotRunning,
 
     /// The session is closed and cannot take new work: `shutdown` completed,
-    /// the exec control link died (a request deadline exceeded and the link
-    /// was marked Dead, or the init channel closed), or the session was never
-    /// exec-capable. Every later `exec`/`wait_child`/`kill_child` on this
-    /// instance fails with this same variant — the F5.4 S5 unified
-    /// closed-instance code, reserved here on F3.2's terms. The instance is
-    /// never silently re-launched.
-    #[error("instance is closed (shut down or its exec link is dead); no new work is accepted")]
+    /// the init channel closed after the main-exit container collapse, or the
+    /// session was never exec-capable. Every later
+    /// `exec`/`wait_child`/`kill_child` on this instance fails with this same
+    /// variant — the F5.4 S5 unified closed-instance code. A machinery
+    /// failure (request deadline, unexpected init termination) is the
+    /// distinct [`SandboxRuntimeError::InstanceDead`] code instead. The
+    /// instance is never silently re-launched.
+    #[error(
+        "instance is closed (shut down, or the init channel closed after the \
+         main-exit container end); no new work is accepted"
+    )]
     InstanceClosed,
 
     /// F5.4 (M3 S5): the session's machinery died — the exec control link

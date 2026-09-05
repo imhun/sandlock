@@ -538,3 +538,30 @@ parse_ports([80, "443", "8000-8005"])
    `fs_denied`) or in `ctx.deny_path()` for runtime additions.
    `event.argv` is exposed and TOCTOU-safe; the supervisor freezes
    peer tasks before exposing it.
+5. **Instance lifetime (`T_idle` / `T_max`, fork-plan F5.5/M3 S7).**
+   Every exec-capable session carries a lifetime policy: an **idle
+   timeout** (default 15 min) that drains the session once the exec child
+   table is empty **and** no `wait_child` subscriber is pending, and a
+   **forced maximum lifetime** (default 24 h measured from launch) that
+   drains the session even with a live child. A drained session reads
+   `Draining`, the next verb (or `shutdown`) completes the teardown to
+   `ShutDown`, and later verbs report the closed-instance error. A live
+   child is never "idle": running workloads keep the session ineligible.
+   The knobs are **core-constructor-only** today
+   (`SandboxInstance::launch_exec_with_lifetime` /
+   `launch_exec_only_with_lifetime`; no env-var or FFI/Python override —
+   chosen over the `E2B_INSTANCE_IDLE_TIMEOUT_S` precedent to keep the
+   ABI surface additive-free in F5; revisit if E2B needs per-sandbox
+   tuning). Instances created through FFI/Python (`sandlock_instance_launch`
+   / `SandboxInstance(policy)`) therefore run with the 15 min / 24 h
+   defaults.
+6. **Hosts keep outer timeouts.** Lifetime expiry is enforced at verb
+   entry and observed via `phase()`/`stats()`; a blocking `wait_child`
+   that is already parked when `T_max` elapses is **not preempted
+   mid-await**. E2B/supervise hosts must keep their own outer timeouts /
+   reclamation loops for in-flight operations.
+7. **supervise generations.** `sandlock-supervise` launches generations
+   with `max_lifetime: None` — a generation's lifetime is
+   deployment-owned (slot pool / W1-W2 recycle), so the core 24 h cap
+   never force-drains a long-lived generation. Idle reclaim (15 min)
+   still applies only when the generation's child table is empty.

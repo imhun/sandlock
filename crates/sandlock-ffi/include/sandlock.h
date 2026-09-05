@@ -1618,6 +1618,13 @@ char *sandlock_handle_restore_skipped_path(const sandlock_handle_t *h, uintptr_t
  * arrives through `sandlock_instance_exec` (the S12 shape: no main process
  * whose exit ends the container; the session ends on shutdown/free).
  *
+ * The session inherits the core instance lifetime defaults (F5.5): an idle
+ * reclaim of 15 minutes (child table empty and no wait_child subscriber)
+ * and a forced 24-hour maximum lifetime measured from launch. This C
+ * surface has no lifetime override; hosts that need different values must
+ * keep their own reclamation loop, and must keep outer timeouts because an
+ * in-flight `sandlock_instance_wait_child` is not preempted at expiry.
+ *
  * Returns an opaque instance handle, or NULL on any failure (the caller
  * frees it with `sandlock_instance_free`).
  *

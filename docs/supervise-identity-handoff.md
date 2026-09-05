@@ -197,6 +197,17 @@ a different-uid slot; teardown is allowed only as (a) the slot's own protocol
 shutdown, (b) PDEATHSIG arranged by the starter, or (c) the starter
 (deployment/launcher) reclaiming it.
 
+Generation lifetime is deployment-owned in the same sense. `sandlock-supervise`
+launches its instance with the core **maximum-lifetime cap disabled**
+(`max_lifetime: None`): a slot's TTL is decided by the W1/W2 recycle policy
+above (pool size / allocation cursor / starter reclamation), never by a
+24-hour core default that could force-drain a long-lived workload. The core
+idle reclaim default (15 min, only when the child table is empty with no
+`wait_child` subscriber) still applies. Deployments must keep their own outer
+timeouts for in-flight operations — core expiry is enforced at verb entry and
+does not preempt an already-parked `wait_child` (see
+`docs/sandbox-reference.md` "Instance lifetime").
+
 ## 7. How the fork proves the claim (test harness and uid choice)
 
 The non-root gate cannot construct a second host uid (no CAP_SETUID), so the

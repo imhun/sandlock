@@ -11,7 +11,10 @@
 #   2. root-mode phases: oci (`--oci-root`) and the supervise foreign-uid
 #      acceptance (`--supervise-root`), both as root in the same privileged
 #      container.
-core_lib = 813 # F5 (M3 semantics): 812 -> 813, +1 unit test
+core_lib = 816 # F5 review I1: 813 -> 816, +3 unit tests for the pid-ns
+               # stray-sweep translation guard (passthrough without pid_ns,
+               # translation failure skips the raw ns pid, poisoned map
+               # skips). F5 (M3 semantics): 812 -> 813, +1 unit test
                # (sandbox::tests::default_max_processes_is_whole_box_256)
                # pinning the whole-box max_processes default of 256 (F5.1).
                # F4 re-review (C1): 810 -> 812, +2 fork-based seccomp/state.rs

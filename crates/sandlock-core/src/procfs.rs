@@ -666,13 +666,17 @@ pub(crate) async fn handle_proc_open(
                 return NotifAction::Errno(EACCES);
             };
             // F5.3 (M3 S4): the on-behalf whitelist is narrowed to the
-            // caller's own subtree. Every confined process is its own
+            // caller's own process group. Every confined process is its own
             // process-group leader or stays in its command's group (F1.7
             // per-child groups; the one-shot leader's descendants share its
-            // group), so "own subtree" is exactly "own process group": the
-            // caller may read metadata of itself and its descendants, never
-            // of a sibling command or of `sandlock-init`. Without this a
-            // sibling's `cmdline`/`status` would leak through the
+            // group), so same-group == same command subtree in the fork's
+            // per-child topology: the caller (identified by its PidKey /
+            // notif pid) may read metadata of itself and in-group
+            // descendants, never of a sibling command or of
+            // `sandlock-init`. Group scope is the subtree approximation —
+            // a descendant that `setsid()`s into its own group is denied
+            // too (fail closed; documented PidKey limitation). Without the
+            // check a sibling's `cmdline`/`status` would leak through the
             // supervisor's on-behalf open.
             let caller_pgid = unsafe { libc::getpgid(notif.pid as i32) };
             let target_pgid = unsafe { libc::getpgid(host_pid) };

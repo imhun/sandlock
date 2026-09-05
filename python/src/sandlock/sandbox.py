@@ -1851,6 +1851,14 @@ class SandboxInstance:
     registration — closing the instance kills and reaps them all.
 
     ``name`` is optional (a unique name is generated when omitted).
+
+    Lifetime (fork-plan F5.5): the native session carries core defaults —
+    a 15-minute idle reclaim (child table empty and no ``wait_child``
+    subscriber) and a forced 24-hour maximum lifetime. The knobs are not
+    exposed on the Python/FFI surface (core-constructor-only); a reclaimed
+    instance reports the closed error on later calls. Hosts must keep their
+    own outer timeouts for in-flight operations: expiry is enforced at verb
+    entry and does not preempt an already-parked ``wait``.
     """
 
     # Stable FFI error codes (crates/sandlock-ffi/src/lib.rs).
