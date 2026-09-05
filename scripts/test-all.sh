@@ -139,6 +139,11 @@ run cli        cargo test -p sandlock-cli --offline
 # setpriv and fails loudly without root.  Run the lib units + the non-root
 # integration target here; --supervise-root covers the rest.
 run supervise  cargo test -p sandlock-supervise --offline --lib --test supervise
+# F2b.4 cost target: the three supervise cost tests must run against the
+# RELEASE binary (CARGO_BIN_EXE_sandlock-supervise is the release build under
+# --release) and measure PSS/latency with no parallel-test noise, hence the
+# separate label and --test-threads=1.
+run supervise_cost cargo test -p sandlock-supervise --offline --release --test supervise_cost -- --test-threads=1
 # Workspace release build gate (the F0.4 build-break class: a CLI face that
 # only `cargo test -p X` misses). No test binaries, so baseline count is 0.
 run cli_build  cargo build --release --workspace --locked

@@ -174,6 +174,15 @@ supervise = 35 # F5.4 adds the InstancePhase::Dead stats label; count
                # F3.2/3.3 review follow-up (main-exit generation end): 34 ->
                # 35, +1 integration
                # (test_supervise_main_exit_ends_generation_cleanly).
+supervise_cost = 3 # F2b.4 cost target (release-only): new
+                   # tests/supervise_cost.rs — the three plan-named cost
+                   # tests (per-sandbox supervisor PSS within budget at the
+                   # four protocol points, exec round-trip latency within
+                   # budget with tmp/perf/ profile, exit frames never lost
+                   # over 1000 rounds). Run by scripts/test-all.sh as its own
+                   # release label (CARGO_BIN_EXE_sandlock-supervise = the
+                   # release binary) with --test-threads=1. Counts/budgets
+                   # documented in docs/supervise-capacity.md.
 supervise_root = 2 # ROOT-MODE: run via scripts/test-all.sh
                    # --supervise-root as root (same privileged container as
                    # oci). F2b.3 foreign-uid acceptance in

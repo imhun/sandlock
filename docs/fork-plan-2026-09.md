@@ -393,6 +393,18 @@ python = 430
 4. **这个数是下界，不是最终预算**：探针只含"1 命令 + notif + 控制面 + 捕获管道"。`net_isolation`（DNS 网关任务）、`chroot` 镜像 rootfs、MCP 入站端口监听、PTY、COW 都要另测一档。F2b.4 的协议保留，正式 supervise 出来后按同样方法重采，并把结果写进 `docs/test-baseline.md` 旁边的一份容量表。
 5. `/proc/meminfo` 的 `MemAvailable` 增减在本轮不可信（有正有负，页缓存回收主导）⇒ 容量口径一律用 PSS，别用 MemAvailable 差分。
 
+**正式复采（2026-09-05，release sandlock-supervise 真实二进制，Task F2b.4）→ 容量表 `docs/supervise-capacity.md`**
+
+上面的探针表是 2026-09-04 的 core 探针下界；F2b.4 已按同协议对正式
+`sandlock-supervise`（带 instance + exec 面、fd/path 双传输）复采并写进
+容量表。要点：单 supervisor 空载 PSS ≈ **4.2–4.5 MB**；N=32/64 并发时
+每 slot 边际 PSS ≈ **486/418 kB**（idle 无实例 ≈ 500/442 kB）⇒ 容量建议
+**0.5 MB/slot**；四配置 × 四点表、预算推导（RSS 6–6.5 MB 单进程上界；
+exec 往返 p50 ≈ 102 ms、预算 200 ms，`REAP_POLL_MS=100` 是地板）与
+§11.1 对照、账本项（先扣 N × PSS）全部在容量表。三例 cost 测试
+（`crates/sandlock-supervise/tests/supervise_cost.rs`，runner label
+`supervise_cost`，release）已绿。
+
 **本轮顺带产出的两个真实缺陷**（已进计划）：
 
 - **F0.4：`cargo build --release -p sandlock-cli` 在 fork tip 上编译不过** —— `sandbox/builder.rs:66` 的 `net_bind_map: Vec<(u16,u16)>`（S2.5，commit `3a07995` 引入）缺 `#[cfg_attr(feature = "cli", arg(...))]`，而 `sandlock-cli` 依赖 `sandlock-core` 的 `cli` feature ⇒ clap 找不到 `(u16,u16)` 的 value parser。本地验证命令只跑 `-p sandlock-core --lib/--test integration`（default features，不含 cli）与 python 套，所以一直没暴露；CI（`cargo test --release --workspace`）本来会抓到，但推送被 token 权限挡住 ⇒ 从未跑过。**这正是 F0.1 全量 runner 要抓的那类问题**，第一次跑就抓到两个：cli 构建坏了 + 下面这条。
