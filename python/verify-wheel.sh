@@ -6,6 +6,17 @@
 # export with an un-rebuilt wheel goes red immediately); extras are also
 # named and fail, so the equality check runs in both directions.
 #
+# F2b.5 supervise self-proof, same spirit: every wheel must carry
+# sandlock/bin/sandlock-supervise whose sha256 equals the fingerprint
+# python/build-wheels.sh recorded in SHA256SUMS.supervise (the same bytes as
+# the standalone supervise/<arch>/sandlock-supervise copies). The manifest is
+# HEAD-pinned: verifying a stale manifest (wheels built at an older commit)
+# is red and names both commits. The extracted binary is then exercised with
+# a --uid self-check smoke: starting it with a --uid that does not match the
+# process euid must refuse with exit != 0 and stderr naming both uids. The
+# smoke needs an executable of the verify host's arch, so a foreign-arch
+# wheel is verified structurally (presence, ELF machine, fingerprint) instead.
+#
 # Runs inside the Linux dev container — nm -D reads ELF and the release lib is
 # built in-container. When the repo is a submodule mounted at /src, its .git
 # pointer is relative to the OUTER repo and git cannot resolve HEAD inside the
@@ -48,6 +59,38 @@ if [ "$#" -eq 0 ] || [ ! -f "$1" ]; then
     exit 1
 fi
 
+# F2b.5: the fingerprint manifest and the standalone supervise copies live
+# next to the wheels (python/build-wheels.sh emits SHA256SUMS.supervise into
+# the same directory as the wheels it verifies against).
+wheel_dir="$(dirname "$1")"
+manifest="$wheel_dir/SHA256SUMS.supervise"
+if [ ! -f "$manifest" ]; then
+    echo "verify-wheel: $manifest not found -- supervise fingerprint manifest missing;" >&2
+    echo "  rerun python/build-wheels.sh at the tip (it writes the manifest next to the wheels)" >&2
+    exit 1
+fi
+manifest_head="$(sed -n 's/^# HEAD=//p' "$manifest" | head -1)"
+if [ -z "$manifest_head" ]; then
+    echo "verify-wheel: $manifest has no '# HEAD=<sha>' record" >&2
+    exit 1
+fi
+if [ "$manifest_head" != "$HEAD" ]; then
+    echo "FAIL -- supervise fingerprint manifest is for commit $manifest_head" >&2
+    echo "  but current tip is $HEAD; rebuild the wheels from the tip before verifying" >&2
+    exit 1
+fi
+echo "==> supervise fingerprint manifest: $manifest (HEAD $manifest_head matches current tip)"
+
+case "$(uname -m)" in
+    x86_64) host_arch=x86_64 ;;
+    aarch64 | arm64) host_arch=aarch64 ;;
+    *) host_arch=unknown ;;
+esac
+if ! command -v readelf >/dev/null 2>&1; then
+    echo "verify-wheel: readelf required for the supervise ELF-arch check" >&2
+    exit 1
+fi
+
 work="tmp/wheel-verify"
 rm -rf "$work"
 mkdir -p "$work"
@@ -58,6 +101,60 @@ if command -v unzip >/dev/null 2>&1; then
 else
     unpack() { python3 -m zipfile -e "$1" "$2"; }
 fi
+
+hash_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        echo "verify-wheel: no sha256sum/shasum available" >&2
+        exit 1
+    fi
+}
+
+manifest_hash_for() {  # manifest_hash_for <arch>
+    awk -v a="$1" '$2 == "supervise/" a "/sandlock-supervise" { print $1 }' \
+        "$manifest" | head -1
+}
+
+wheel_arch() {  # wheel_arch <wheel-filename>
+    case "$1" in
+        *x86_64*) echo x86_64 ;;
+        *aarch64*) echo aarch64 ;;
+        *) echo unknown ;;
+    esac
+}
+
+elf_arch() {  # elf_arch <file> — readelf machine line of the ELF header
+    case "$(readelf -h "$1" 2>/dev/null)" in
+        *X86-64*) echo x86_64 ;;
+        *AArch64*) echo aarch64 ;;
+        *) echo unknown ;;
+    esac
+}
+
+# F2b.5 --uid self-check smoke: refuse to start when euid != --uid. The
+# startup check runs before the policy transport is touched, so only the
+# required --policy/--uid args are needed.
+uid_smoke() {
+    bin="$1"
+    euid="$(id -u)"
+    if [ "$euid" -eq 0 ]; then wrong=65534; else wrong=0; fi
+    smoke_rc=0
+    "$bin" --policy 3 --uid "$wrong" >"$work/uid-smoke.out" 2>"$work/uid-smoke.err" \
+        || smoke_rc=$?
+    if [ "$smoke_rc" -eq 0 ]; then
+        echo "  FAIL -- supervise --uid refusal smoke: exited 0 with --uid $wrong (euid $euid)" >&2
+        return 1
+    fi
+    if ! grep -q "does not match --uid $wrong" "$work/uid-smoke.err"; then
+        echo "  FAIL -- supervise --uid refusal smoke: exit $smoke_rc but stderr does not name the mismatch:" >&2
+        sed 's/^/    /' "$work/uid-smoke.err" >&2
+        return 1
+    fi
+    echo "  --uid refusal smoke: euid $euid with --uid $wrong refused (exit $smoke_rc), stderr names both uids"
+}
 
 # Release symbol set (same for every wheel under test).
 nm -D --defined-only "$RELEASE_SO" | awk '{print $NF}' | sort -u > "$work/release.syms"
@@ -115,6 +212,62 @@ for wheel in "$@"; do
     else
         echo "  symbol sets equal (both directions): no"
         rc=1
+    fi
+
+    # F2b.5 supervise: presence, ELF arch, sha256 vs manifest, standalone
+    # twin, then the --uid refusal smoke on the host-arch binary.
+    sup="$dir/sandlock/bin/sandlock-supervise"
+    want_arch="$(wheel_arch "$(basename "$wheel")")"
+    if [ ! -f "$sup" ]; then
+        echo "  FAIL -- supervise binary MISSING from wheel: sandlock/bin/sandlock-supervise" >&2
+        rc=1
+    else
+        chmod +x "$sup"
+        got_arch="$(elf_arch "$sup")"
+        echo "  supervise: sandlock/bin/sandlock-supervise (present, ELF $got_arch)"
+        if [ "$got_arch" != "$want_arch" ]; then
+            echo "  FAIL -- supervise ELF machine is $got_arch but wheel is $want_arch" >&2
+            rc=1
+        fi
+        wheel_hash="$(hash_file "$sup")"
+        man_hash="$(manifest_hash_for "$want_arch")"
+        if [ -z "$man_hash" ]; then
+            echo "  FAIL -- no supervise fingerprint entry for $want_arch in $manifest" >&2
+            rc=1
+        else
+            echo "  supervise sha256 (wheel):     $wheel_hash"
+            echo "  supervise sha256 (manifest):  $man_hash"
+            if [ "$wheel_hash" != "$man_hash" ]; then
+                echo "  FAIL -- supervise fingerprint MISMATCH in $(basename "$wheel"):" >&2
+                echo "    wheel sandlock/bin/sandlock-supervise sha256 $wheel_hash" >&2
+                echo "    manifest ($manifest) expects              $man_hash" >&2
+                rc=1
+            else
+                echo "  supervise fingerprint matches manifest: yes"
+            fi
+        fi
+        companion="$wheel_dir/supervise/$want_arch/sandlock-supervise"
+        if [ ! -f "$companion" ]; then
+            echo "  FAIL -- standalone supervise MISSING: $companion" >&2
+            rc=1
+        elif [ -n "$man_hash" ]; then
+            comp_hash="$(hash_file "$companion")"
+            if [ "$comp_hash" != "$man_hash" ]; then
+                echo "  FAIL -- standalone supervise fingerprint MISMATCH:" >&2
+                echo "    $companion sha256 $comp_hash" >&2
+                echo "    manifest expects   $man_hash" >&2
+                rc=1
+            else
+                echo "  standalone supervise ($want_arch) matches manifest: yes"
+            fi
+        fi
+        if [ "$want_arch" = "$host_arch" ]; then
+            if ! uid_smoke "$sup"; then
+                rc=1
+            fi
+        else
+            echo "  --uid refusal smoke: not run for $want_arch ELF on $host_arch verify host (exec format)"
+        fi
     fi
 
     echo "  git HEAD: $HEAD"

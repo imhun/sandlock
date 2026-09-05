@@ -125,7 +125,7 @@ print(subprocess.run(["ls","-n",str(shared)],capture_output=True,text=True).stdo
 `net_isolation` + 镜像 rootfs 组合下，MCP 网关监听起不来（宿主侧映射端口整段连不上）；
 纯 sandlock 形态同一套件 3/3 通过。E2B 侧 `net_isolation` + chroot 用例标 `xfail(strict=True)`。
 
-### 3.4 wheel 与 tip 的一致性：fork 侧符号级自证（已落地，F0.2）
+### 3.4 wheel 与 tip 的一致性：fork 侧符号级自证 + supervise 指纹（已落地，F0.2 / F2b.5）
 
 wheel 产物时间戳早于 tip 提交，无法从文件本身判定；F0.2 起 fork 自己拥有 wheel 构建，产物与 tip 的
 一致性由 fork 侧脚本**符号级自证**，不再依赖外部仓库重跑：
@@ -138,6 +138,20 @@ wheel 产物时间戳早于 tip 提交，无法从文件本身判定；F0.2 起 
   与当前 tip 的 `target/release/libsandlock_ffi.so`（容器内构建）双向对比。规则是**符号集必须等于当前
   tip 的符号集**：tip 有而 wheel 缺的符号逐个点名并以非零退出（新增 FFI 符号后 wheel 未重建 ⇒ 立刻红），
   wheel 多出的符号同样点名失败；同时打印 `git rev-parse HEAD` 与 wheel 内 `sandlock/_version.py`。
+
+F2b.5 起 `sandlock-supervise` 随 wheel 发布（今天发布只打 `libsandlock_ffi.so` + Python 绑定的事实改变），
+同一 buildx 运行按架构用同一 zig 交叉配方（wheel-builder 同款 glibc 2.34 pin）构建 supervise release 二进制，
+一份字节三种形态：
+
+- 每个 wheel 内 `sandlock/bin/sandlock-supervise`（auditwheel repair 之后由 `python/build-wheels.sh` 注入并
+  更新 RECORD ⇒ `pip install` 落 0755，E2B 可直接 exec）；
+- 独立 artifact `wheels/supervise/{x86_64,aarch64}/sandlock-supervise`（镜像构建 COPY 用，不经 pip）；
+- `wheels/SHA256SUMS.supervise` 指纹清单：sha256 + 构建时 `HEAD`（wheel/独立副本/清单同批同源）。
+
+`python/verify-wheel.sh` 的 F2b.5 自证：清单 `HEAD` 必须等于当前 tip（stale 清单即红并点名两个 commit）；
+wheel 内 supervise 必须存在、ELF 机器与 wheel 架构一致、sha256 与清单及独立副本三方相等（篡改/删除即红并点名）；
+再对宿主架构的 supervise 做 `--uid` 自检冒烟：以与 euid 不符的 `--uid` 启动必须拒绝（exit ≠ 0，stderr 点名
+两个 uid）。自证命令与 F0.2 相同（见上）：`docker buildx build` 后容器内 `HEAD=<sha> python/verify-wheel.sh`。
 
 符号核对佐证 fork 侧能力（`sandlock_sandbox_builder_{egress_proxy,http_auth,credential,host_mask,
 notify_rate_limit,pid_ns,net_isolation,fd_inject_connect}`，`port_mappings` 走 `net_bind_map`，本就不是

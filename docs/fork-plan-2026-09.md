@@ -415,6 +415,14 @@ exec 往返 p50 ≈ 102 ms、预算 200 ms，`REAP_POLL_MS=100` 是地板）与
 - `sandlock-supervise` 要进 wheel/镜像（今天发布只打 `libsandlock_ffi.so` + Python 绑定，§0）：`python/build-wheels.sh` 增加二进制随包（或独立 artifact + `--verify` 校验其二进制存在与 `--uid` 自检行为）。
 - F0.2 的 wheel/tip 自证扩到"符号集 + supervise 二进制指纹"。
 
+**正式落地（2026-09-05，Task F2b.5）**：选型 = wheel 内 `sandlock/bin/sandlock-supervise`
+（auditwheel repair 后注入 + RECORD 更新，pip 落 0755）+ 同字节独立副本
+`wheels/supervise/{x86_64,aarch64}/` + HEAD 钉住的 `wheels/SHA256SUMS.supervise` 指纹清单
+（wheel/独立副本/清单同批同源）；`python/verify-wheel.sh` 扩为：FFI 符号双向相等 +
+supervise 存在/ELF 架构/sha256 三方一致（缺失/篡改即红点名）+ 宿主架构二进制的
+`--uid` 错 uid 拒绝冒烟。发布物形态与自证命令见 `docs/e2b-integration.md` §3.4 与
+`docs/supervise-identity-handoff.md` §9；任务报告 `tmp/sdd/f2b.5-report.md`。
+
 ## 阶段 F3（M1）：`exec` 下沉复用 + child 句柄
 
 > B 档下 `exec` 的调用方是宿主 worker、被调用方是 `sandlock-supervise` 进程 ⇒ F3 的 child 句柄与 stdio 交付必须**同时**支持同进程（旧 API、单测）与跨进程（经 F2b.2 交接的 fd）两种持有者；帧协议只写一套。

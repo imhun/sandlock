@@ -253,3 +253,42 @@ transports' instance verbs in the same-uid special case.
   (per-uid DAC assertions do not hold there) — that fallback is a deployment
   decision, documented in the plan, not something supervise silently
   downgrades into.
+
+## 9. Release deliverable: where the binary and fingerprint ship (F2b.5)
+
+`sandlock-supervise` now ships with the wheel release, built per-arch in the
+same buildx run as the wheels (`python/build-wheels.sh`, zig cross-linker,
+glibc 2.34 pin identical to the FFI `.so`). One build produces three forms of
+the same bytes:
+
+- **In-wheel**: each `sandlock-*manylinux_2_34_{x86_64,aarch64}.whl` carries
+  `sandlock/bin/sandlock-supervise`. `python/build-wheels.sh` injects it after
+  auditwheel repair and updates RECORD, so `pip install` lands it executable
+  (0755) at `site-packages/sandlock/bin/sandlock-supervise`. E2B image builds
+  that already `pip install` the per-`TARGETARCH` wheel can exec it directly,
+  e.g. `python -c 'import sandlock, pathlib; print(pathlib.Path(sandlock.__file__).parent / "bin" / "sandlock-supervise")'`.
+- **Standalone**: `supervise/{x86_64,aarch64}/sandlock-supervise` next to the
+  wheels for image builds that COPY the binary without pip (`COPY --from` /
+  `docker cp` from the release directory, picking the dir that matches
+  `TARGETARCH`; `chmod +x` is not needed, the file is 0755).
+- **Fingerprint**: `SHA256SUMS.supervise` next to the wheels records the sha256
+  of each arch's binary plus the `HEAD` commit the run built from. Take wheel,
+  standalone binary, and manifest from the **same** release directory — they
+  are the same bytes; a mixed-commit pair fails the release self-proof below.
+
+Release self-proof (extended F0.2 verifier): build the tip release lib
+in-container, then run
+
+```sh
+HEAD=<sha> python/verify-wheel.sh   # default: wheels/*.whl
+```
+
+The verifier unpacks each wheel and asserts (in addition to the F0.2 FFI
+symbol-set equality) that `sandlock/bin/sandlock-supervise` is present, is the
+wheel's own architecture, and its sha256 equals both the manifest entry and the
+standalone copy; the manifest `HEAD` must equal the current tip. It then
+executes the extracted host-arch binary with a mismatched `--uid` and requires
+a refusal (exit ≠ 0, stderr naming both uids) — the same startup contract as
+§1, proven against the shipped artifact rather than only the source tree.
+Deleting or tampering with the supervise binary, the standalone copy, or the
+manifest goes red with the offending path/hash named.

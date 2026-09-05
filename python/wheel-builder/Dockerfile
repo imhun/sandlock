@@ -56,12 +56,28 @@ WORKDIR /src/sandlock-src/python
 # glibc 2.34 so the binaries run on the manylinux_2_34 image itself (glibc
 # 2.34) and pass the policy check. The x86_64 wheel is auditwheel-repaired
 # here; auditwheel refuses to repair a foreign-arch wheel, so the aarch64
-# repack happens in the arm64 stage below.
+# repack happens in the arm64 stage below. F2b.5: each arch's
+# sandlock-supervise release binary is cross-built the same way (same zig
+# target/linker config) and staged under /tmp/supervise/<arch>/ — the export
+# stage lands it next to the wheels and python/build-wheels.sh injects the
+# same bytes into the matching wheel (sandlock/bin/sandlock-supervise).
 RUN set -eu; \
-    for spec in "x86_64-unknown-linux-gnu x86_64-linux-gnu.2.34 linux_x86_64" \
-                "aarch64-unknown-linux-gnu aarch64-linux-gnu.2.34 linux_aarch64"; do \
+    for spec in "x86_64-unknown-linux-gnu x86_64-linux-gnu.2.34 linux_x86_64 x86_64" \
+                "aarch64-unknown-linux-gnu aarch64-linux-gnu.2.34 linux_aarch64 aarch64"; do \
         set -- $spec; \
-        triple=$1; plat=$2; whlplat=$3; \
+        triple=$1; plat=$2; whlplat=$3; archdir=$4; \
+        echo "==> cross-building sandlock-supervise ($triple)"; \
+        mkdir -p src/sandlock/bin /tmp/supervise/$archdir; \
+        CARGO_BUILD_TARGET="$triple" ZIG_TARGET="$plat" \
+            CC_x86_64_unknown_linux_gnu="zigcc" \
+            CC_aarch64_unknown_linux_gnu="zigcc" \
+            cargo build --release --target "$triple" -p sandlock-supervise; \
+        # cargo puts the artifact in the workspace root's target/ (this WORKDIR
+        # is python/, one level below Cargo.toml).
+        install -m755 "../target/$triple/release/sandlock-supervise" \
+            src/sandlock/bin/sandlock-supervise; \
+        cp -p src/sandlock/bin/sandlock-supervise \
+            "/tmp/supervise/$archdir/sandlock-supervise"; \
         rm -rf build src/sandlock.egg-info; \
         echo "==> cross-building $triple"; \
         CARGO_BUILD_TARGET="$triple" ZIG_TARGET="$plat" \
@@ -91,3 +107,5 @@ RUN auditwheel repair --plat manylinux_2_34_aarch64 -w /out /in/*.whl
 FROM scratch AS export
 COPY --from=build /out/x86_64/*.whl /
 COPY --from=repair-arm /out/*.whl /
+COPY --from=build /tmp/supervise/x86_64/ /supervise/x86_64/
+COPY --from=build /tmp/supervise/aarch64/ /supervise/aarch64/
