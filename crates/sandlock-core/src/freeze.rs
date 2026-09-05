@@ -61,6 +61,10 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io;
+use std::sync::Arc;
+use std::sync::mpsc::SyncSender;
+
+use tokio::task::JoinHandle;
 
 /// Read the `State:` field from `/proc/<tid>/status`. Returns the
 /// single-character state code (`R`, `S`, `D`, `T`, `t`, `Z`, `X`)
@@ -396,6 +400,120 @@ pub(crate) fn detach_all(freeze: &SandboxFreeze) {
 /// requires freezing siblings.
 pub(crate) fn requires_freeze_on_continue(syscall_nr: i64) -> bool {
     syscall_nr == libc::SYS_execve || syscall_nr == libc::SYS_execveat
+}
+
+/// What the freeze-owner worker should do once the execve response is out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FreezeCmd {
+    /// Execve was allowed: sibling TIDs die in `de_thread`; detach the
+    /// peer TIDs and reap queued interrupts.
+    Allow,
+    /// Execve was denied (or the response failed / the handler vanished):
+    /// detach siblings and peers, then reap queued interrupts.
+    Deny,
+}
+
+/// Handle to the dedicated blocking thread that owns an execve argv-safety
+/// freeze (F5 regression fix).
+///
+/// ptrace commands are per-tracer-*thread*. The notif supervisor is an async
+/// task that can migrate between tokio workers at every `.await`, so a
+/// `PTRACE_DETACH` issued by the handler after its awaits could land on a
+/// different thread than the one that seized the peers — silently failing
+/// and leaving a sandbox peer frozen forever (observed: `sandlock-init`
+/// parked in a ptrace stop while the session hung). The whole
+/// freeze→(park)→detach lifecycle therefore runs on one `spawn_blocking`
+/// thread, exactly like the process-creation fork tracker.
+pub(crate) struct ExecveFreezeOwner {
+    cmd_tx: SyncSender<FreezeCmd>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl ExecveFreezeOwner {
+    /// Tell the owner worker whether execve was allowed and wait for it to
+    /// finish detaching/reaping. The worker's detach runs on the same thread
+    /// that seized the peers, so the ptrace commands are always legal.
+    pub(crate) async fn finish(mut self, allow: bool) {
+        let cmd = if allow { FreezeCmd::Allow } else { FreezeCmd::Deny };
+        let _ = self.cmd_tx.send(cmd);
+        if let Some(join) = self.join.take() {
+            let _ = join.await;
+        }
+    }
+}
+
+impl Drop for ExecveFreezeOwner {
+    fn drop(&mut self) {
+        // Handler vanished before sending a command (task aborted / panic):
+        // the worker treats a closed channel as Deny and releases everything
+        // it still holds. The join handle is detached — the worker finishes
+        // on its own thread.
+        let _ = self.cmd_tx.send(FreezeCmd::Deny);
+    }
+}
+
+/// Start the freeze-owner worker: it seizes every sandbox peer of the
+/// execve caller on its own thread and reports the outcome (or the rollback
+/// error with any queued-interrupt TIDs). The caller awaits `attached_rx`,
+/// runs the argv inspection / policy callback, sends the execve response,
+/// and then calls [`ExecveFreezeOwner::finish`] with the verdict so the same
+/// thread can detach.
+pub(crate) fn spawn_execve_freeze_owner(
+    processes: Arc<crate::seccomp::state::ProcessIndex>,
+    caller_tid: i32,
+) -> (
+    ExecveFreezeOwner,
+    tokio::sync::oneshot::Receiver<Result<(), String>>,
+) {
+    let (attached_tx, attached_rx) = tokio::sync::oneshot::channel();
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<FreezeCmd>(1);
+    let join = tokio::task::spawn_blocking(move || {
+        execve_freeze_worker(processes, caller_tid, attached_tx, cmd_rx);
+    });
+    (
+        ExecveFreezeOwner {
+            cmd_tx,
+            join: Some(join),
+        },
+        attached_rx,
+    )
+}
+
+fn execve_freeze_worker(
+    processes: Arc<crate::seccomp::state::ProcessIndex>,
+    caller_tid: i32,
+    attached_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
+    cmd_rx: std::sync::mpsc::Receiver<FreezeCmd>,
+) {
+    let outcome = freeze_sandbox_for_execve(&processes, caller_tid);
+    let _ = attached_tx.send(
+        outcome
+            .as_ref()
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+    );
+    let allow = match cmd_rx.recv() {
+        Ok(FreezeCmd::Allow) => true,
+        Ok(FreezeCmd::Deny) | Err(_) => false,
+    };
+    match outcome {
+        Ok(freeze) => {
+            if allow {
+                // Sibling TIDs die in de_thread during the allowed execve.
+                detach_peers(&freeze.peer_tids);
+            } else {
+                detach_all(&freeze);
+            }
+            reap_pending(&freeze.pending_tids);
+        }
+        Err(e) => {
+            // `freeze_sandbox_for_execve` already detached every task it had
+            // frozen during rollback; only queued-interrupt TIDs (which could
+            // not be released before the deny response) remain, and the deny
+            // response is what clears the kernel wait that holds them.
+            reap_pending(&e.pending_tids);
+        }
+    }
 }
 
 #[cfg(test)]

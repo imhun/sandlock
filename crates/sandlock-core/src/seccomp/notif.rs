@@ -2357,39 +2357,44 @@ async fn handle_notification(
     //
     // Strict on failure: if we cannot establish the freeze, we cannot
     // safely expose argv or allow execve, so we deny with EPERM.
-    let mut exec_freeze = None;
+    let mut freeze_owner: Option<crate::freeze::ExecveFreezeOwner> = None;
     if matches!(action, NotifAction::Continue)
         && policy.argv_safety_required
         && crate::freeze::requires_freeze_on_continue(nr)
     {
-        match crate::freeze::freeze_sandbox_for_execve(
-            &ctx.processes,
+        // The freeze and its release run on ONE dedicated blocking thread
+        // (see ExecveFreezeOwner): ptrace commands are per-tracer-thread, and
+        // this async handler can migrate between tokio workers across the
+        // awaits below — a detach from the wrong thread would silently fail
+        // and leave a sandbox peer frozen forever.
+        let (owner, attached_rx) = crate::freeze::spawn_execve_freeze_owner(
+            Arc::clone(&ctx.processes),
             notif.pid as i32,
-        ) {
-            Ok(outcome) => {
-                exec_freeze = Some(outcome);
-            }
-            Err(e) => {
+        );
+        freeze_owner = Some(owner);
+        match attached_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(msg)) => {
                 eprintln!(
                     "sandlock: argv-safety freeze failed for pid {}: {} \
                      — denying execve to preserve TOCTOU invariant",
-                    notif.pid, e
+                    notif.pid, msg
                 );
                 action = NotifAction::Errno(libc::EPERM);
-                // Rollback could not release tasks that had not entered
-                // ptrace-stop yet; carry them to the post-send reap.
-                if !e.pending_tids.is_empty() {
-                    exec_freeze = Some(crate::freeze::SandboxFreeze {
-                        pending_tids: e.pending_tids,
-                        ..Default::default()
-                    });
-                }
+            }
+            Err(_) => {
+                eprintln!(
+                    "sandlock: argv-safety freeze worker vanished for pid {} \
+                     — denying execve to preserve TOCTOU invariant",
+                    notif.pid
+                );
+                action = NotifAction::Errno(libc::EPERM);
             }
         }
     }
 
     // Emit event to policy_fn callback if active. For execve, argv is
-    // only populated after `exec_freeze` has stopped every possible
+    // only populated after the freeze owner has stopped every possible
     // writer, and those tasks stay stopped until after NOTIF_SEND.
     if let Some(verdict) = emit_policy_event(&notif, &action, &ctx.policy_fn, fd).await {
         use crate::policy_fn::Verdict;
@@ -2446,6 +2451,9 @@ async fn handle_notification(
             || crate::resource::requires_process_creation_tracking(&notif, fd, policy)
         {
             let _ = send_response(fd, notif.id, NotifAction::Errno(libc::EPERM));
+            if let Some(owner) = freeze_owner.take() {
+                owner.finish(false).await;
+            }
             return;
         }
         // The S2.5 inbound accept and the E7.1 poll/epoll readiness waits
@@ -2476,7 +2484,7 @@ async fn handle_notification(
     }
 
     // Ignore error — child may have exited between recv and response.
-    let exec_continued = exec_freeze.is_some() && matches!(action, NotifAction::Continue);
+    let exec_continued = freeze_owner.is_some() && matches!(action, NotifAction::Continue);
     let send_result = send_response(fd, notif.id, action);
 
     if let Some(trace) = creation_trace {
@@ -2500,16 +2508,11 @@ async fn handle_notification(
         }
     }
 
-    if let Some(freeze) = exec_freeze {
-        if exec_continued && send_result.is_ok() {
-            crate::freeze::detach_peers(&freeze.peer_tids);
-        } else {
-            crate::freeze::detach_all(&freeze);
-        }
-        // Now that the response is out, the kernel wait holding any pending
-        // task (the vfork parent waiting on this very execve) can clear;
-        // reap the queued interrupts and detach.
-        crate::freeze::reap_pending(&freeze.pending_tids);
+    if let Some(owner) = freeze_owner.take() {
+        // The owner worker detaches on its own thread now that the response
+        // is out; for pending tasks the response is what clears the kernel
+        // wait holding their queued interrupts.
+        owner.finish(exec_continued && send_result.is_ok()).await;
     }
 }
 

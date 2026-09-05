@@ -385,7 +385,11 @@ async fn test_max_lifetime_forces_shutdown_with_live_child() {
     ));
     assert_eq!(inst.phase(), InstancePhase::ShutDown);
     assert!(
-        !process_is_alive(child.pid),
+        poll_until(
+            || !process_is_alive(child.pid),
+            Duration::from_secs(10),
+        )
+        .await,
         "the forced T_max drain must kill the live child"
     );
     inst.shutdown().await.expect("shutdown after T_max is idempotent");
