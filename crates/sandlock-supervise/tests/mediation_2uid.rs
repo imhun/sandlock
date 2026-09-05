@@ -38,6 +38,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use sandlock_core::sandbox::MediationRunAs;
+use sandlock_core::policy_fn::Verdict;
 use sandlock_core::{Sandbox, SandlockError};
 
 /// Route-B slot uids for the B档 pair: distinct non-root, non-reserved ids
@@ -520,6 +521,60 @@ async fn test_root_inprocess_mediation_is_refused() {
         before + 1,
         "the supervisor-tier launch must be counted in stats() exactly once"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// I1 review fix (live shape): the on-behalf open gate is
+/// `has_denied_paths()` on the shared DeniedSet, which also receives live
+/// `policy_fn`-issued `deny_path()` calls.  A root in-process mediator with
+/// `RunAs(non-zero)` and a path-denying policy_fn (no static
+/// fs_denied/chroot/COW) must therefore be refused under the default
+/// `caller` tier too — and the explicit `supervisor` tier remains the
+/// escape hatch.
+#[tokio::test]
+async fn test_root_inprocess_mediation_refused_with_policy_fn_deny_shape() {
+    root_phase_env_check();
+    let dir = dac_tmp_dir("c-policy-fn");
+    let deny_target = dir.join("secret.txt").to_string_lossy().into_owned();
+
+    let build = |tier: Option<MediationRunAs>| {
+        let target = deny_target.clone();
+        let mut b = Sandbox::builder()
+            .fs_read("/usr")
+            .fs_read("/lib")
+            .fs_read_if_exists("/lib64")
+            .fs_read("/bin")
+            .fs_read("/etc")
+            .fs_read("/proc")
+            .fs_read("/dev")
+            .fs_write(&dir)
+            .user(HOST_UID_A, HOST_UID_A)
+            .policy_fn(move |_ev, ctx| {
+                // A live path-denying policy_fn: subsequent opens of the
+                // target are mediated on-behalf by the supervisor.
+                ctx.deny_path(&target);
+                Verdict::Allow
+            });
+        if let Some(tier) = tier {
+            b = b.mediation_run_as(tier);
+        }
+        b.build().expect("policy_fn policy builds")
+    };
+
+    // Default caller tier: refused even with no static fs_denied/chroot/COW
+    // — the deny_path capability is a mediation trigger.
+    let mut sb = build(None);
+    let err = sb
+        .run(&["true"])
+        .await
+        .expect_err("the policy_fn deny shape must refuse under caller");
+    assert_run_refused(err, &refusal_msg(HOST_UID_A));
+
+    // Explicit supervisor tier: builds and runs (the escape hatch).
+    let mut sup = build(Some(MediationRunAs::Supervisor));
+    let r = sup.run(&["true"]).await.expect("supervisor tier runs");
+    assert!(r.success(), "the explicit supervisor tier must run with policy_fn");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

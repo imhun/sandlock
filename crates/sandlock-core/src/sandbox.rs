@@ -197,6 +197,26 @@ pub(crate) fn mediation_remap_is_refused(euid: u32, host_uid: u32, mediation_act
     mediation_active && euid == 0 && host_uid != 0
 }
 
+/// Whether this sandbox can exercise supervisor-side path mediation at
+/// spawn time (I1 review fix): static `fs_denied` carve-outs, chroot and
+/// COW dispatch all perform on-behalf opens, and — because the on-behalf
+/// gate is `PolicyFnState::has_denied_paths()`, whose `DeniedSet` also
+/// receives live `policy_fn`-issued `deny_path()` calls — a present
+/// `policy_fn` is treated as mediation-capable too.  Conservative by
+/// design: the refusal is about *capability*, not whether a deny has fired
+/// yet; the explicit `mediation_run_as=supervisor` tier is the escape
+/// hatch.  `no_supervisor` disables the notif supervisor entirely, so no
+/// on-behalf path exists.
+pub(crate) fn mediation_active_for(
+    no_supervisor: bool,
+    fs_denies: bool,
+    chroot: bool,
+    cow: bool,
+    policy_fn: bool,
+) -> bool {
+    !no_supervisor && (fs_denies || chroot || cow || policy_fn)
+}
+
 /// Process-wide count of sandboxes launched in the explicit
 /// `mediation_run_as=supervisor` downgrade tier (root in-process remap).
 /// Exposed through [`InstanceStats::mediation_downgrades`] so a downgrade
@@ -2181,10 +2201,13 @@ impl Sandbox {
         // in the error.  The explicit tier is allowed but loud: a warning
         // plus a `stats()` counter, so the downgrade is never silent.
         let mediator_euid = unsafe { libc::geteuid() };
-        let mediation_active = !self.no_supervisor
-            && (resolved.features.fs_denies
-                || resolved.features.chroot
-                || resolved.features.cow);
+        let mediation_active = mediation_active_for(
+            self.no_supervisor,
+            resolved.features.fs_denies,
+            resolved.features.chroot,
+            resolved.features.cow,
+            resolved.features.policy_fn,
+        );
         if mediation_remap_is_refused(mediator_euid, host_uid, mediation_active) {
             match self.mediation_run_as {
                 MediationRunAs::Caller => {

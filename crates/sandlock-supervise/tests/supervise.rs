@@ -828,6 +828,7 @@ fn test_supervise_fd_serve_launches_instance_and_serves_instance_verbs() {
         if resp["data"]["instance_state"] == "Live"
             && resp["data"]["children_live"] == 1
             && resp["data"]["proc_count_vs_live"] == 0
+            && resp["data"]["mediation_downgrades"] == 0
             && resp["data"]["pid"].as_i64() == Some(pid)
         {
             settled = true;
@@ -838,7 +839,7 @@ fn test_supervise_fd_serve_launches_instance_and_serves_instance_verbs() {
     assert!(
         settled,
         "stats must settle to the live reconciled snapshot (Live, one live \
-         child, drift 0, pid {pid})"
+         child, drift 0, mediation_downgrades 0, pid {pid})"
     );
 
     // ports: no inbound mapping configured; empty but live-shaped response.

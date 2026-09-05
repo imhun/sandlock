@@ -17,7 +17,6 @@
 //! refused / explicitly downgraded elsewhere (see the root-mode
 //! `mediation_2uid` target and `mediation_run_as`).
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use sandlock_core::Sandbox;

@@ -613,7 +613,11 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     if let Some(user) = pb.user { builder = builder.user(user.uid, user.gid); }
     // F6.1 (SL-1): --mediation-run-as must reach the runtime builder (this
     // was the --pid-ns wiring class of miss — the flag is real, not dead).
-    builder = builder.mediation_run_as(pb.mediation_run_as);
+    // Presence-aware: the flattened field is Option, so an omitted flag can
+    // never clobber a value the profile base carried (review M1).
+    if let Some(tier) = pb.mediation_run_as {
+        builder = builder.mediation_run_as(tier);
+    }
     if let Some(ref path) = pb.workdir { builder = builder.workdir(path); }
     if let Some(ref path) = pb.cwd { builder = builder.cwd(path); }
     if let Some(ref path) = pb.fs_storage { builder = builder.fs_storage(path); }

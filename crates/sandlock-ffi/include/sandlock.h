@@ -678,8 +678,11 @@ sandlock_builder_t *sandlock_sandbox_builder_user(sandlock_builder_t *b,
 
 /**
  * Set the mediation identity tier for on-behalf path operations:
- * `0` = `caller` (default; root in-process remaps are refused), `1` =
+ * `0` = `caller` (root in-process remaps are refused), `1` =
  * `supervisor` (explicit downgrade tier; warning + `stats()` counter).
+ * Unknown discriminants are ignored and **preserve the builder's current
+ * state** (on a fresh builder that current state is the fail-closed
+ * `caller` default).
  *
  * # Safety
  * `b` must be a valid builder pointer.

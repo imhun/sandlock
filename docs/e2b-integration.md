@@ -81,8 +81,10 @@ fork 侧 F6.1 把这一点固化成「断言 + 拒绝」：
 CLI `--mediation-run-as`（真接线）/ Python `Sandbox(mediation_run_as=...)` /
 supervise 全字段 policy 清单。历史复现与影响分析见 git 历史与
 `docs/sandbox-exec-security.md` §4.12（SL-1 叠加说明）。唯一遗留：C 档对照组依赖
-chroot 形态的中介代执行，F6.2 的 minimal `/dev` helper 落地后 chroot 用例将改成
-不下发 `fs_denied` 也通过（见 fork-plan F6.1 Step 6 seam）。
+chroot 形态的中介代执行。F6.1 新增的 chroot/COW 断言本身**不下发** `fs_denied`
+（chroot/COW dispatch 本身就是 on-behalf 触发）；F6.2 的 minimal `/dev` helper
+落地后，按 plan F6.2 文字让 chroot 用例经 `fs_mount` 构造 `/dev` 并验证
+`fs_denied` 可省（依赖 seam，不在本任务范围）。
 
 ### 3.2 `notify_rate_limit` 假告警（Low）
 

@@ -11,7 +11,10 @@
 #   2. root-mode phases: oci (`--oci-root`) and the supervise foreign-uid
 #      acceptance (`--supervise-root`), both as root in the same privileged
 #      container.
-core_lib = 820 # F6.1 (SL-1): 816 -> 820, +4 unit tests in
+core_lib = 821 # F6.1 review I1: 820 -> 821, +1 unit test
+               # (mediation_active_covers_policy_fn_deny_capability) pinning
+               # the policy_fn-mediated on-behalf trigger in the C档
+               # predicate. F6.1 (SL-1): 816 -> 820, +4 unit tests in
                # sandbox/tests.rs (mediation_run_as parse/default/serde
                # round-trip + the C档 refusal-decision truth table).
                # F5 review I1: 813 -> 816, +3 unit tests for the pid-ns
@@ -217,20 +220,24 @@ supervise_root = 2 # ROOT-MODE: run via scripts/test-all.sh
                    # shutdown/no-residue) and
                    # test_supervisor_as_foreign_uid_fd_handoff_serves_worker
                    # (fd transport, same genuine identities).
-mediation_2uid = 4 # ROOT-MODE: run via scripts/test-all.sh
-                    # --mediation-2uid as root (same privileged container as
-                    # oci). F6.1 (SL-1) acceptance in
-                    # crates/sandlock-supervise/tests/mediation_2uid.rs:
-                    # test_two_supervisors_distinct_uids_isolate_files (B档
-                    # two supervise mediators at uid 65531/65532 via setpriv,
-                    # shared 1777+sticky dir, exact EPERM/ownership asserts),
-                    # test_root_inprocess_mediation_is_refused (C档 default
-                    # refusal + explicit supervisor tier with stats counter),
-                    # test_root_inprocess_mediation_with_caps_kept_would_leak
-                    # (C档 control: root-owned file + sticky-bypassing
-                    # unlink prove the downgrade is real), and
-                    # test_cli_mediation_run_as_is_wired (root-tier CLI
-                    # refusal vs --mediation-run-as supervisor warning).
+mediation_2uid = 5 # ROOT-MODE: run via scripts/test-all.sh
+                   # --mediation-2uid as root (same privileged container as
+                   # oci). F6.1 (SL-1) acceptance in
+                   # crates/sandlock-supervise/tests/mediation_2uid.rs:
+                   # test_two_supervisors_distinct_uids_isolate_files (B档
+                   # two supervise mediators at uid 65531/65532 via setpriv,
+                   # shared 1777+sticky dir, exact EPERM/ownership asserts),
+                   # test_root_inprocess_mediation_is_refused (C档 default
+                   # refusal + explicit supervisor tier with stats counter),
+                   # test_root_inprocess_mediation_refused_with_policy_fn_
+                   # deny_shape (review I1: live policy_fn deny_path()
+                   # capability is a mediation trigger and is refused under
+                   # caller; explicit supervisor tier runs),
+                   # test_root_inprocess_mediation_with_caps_kept_would_leak
+                   # (C档 control: root-owned file + sticky-bypassing
+                   # unlink prove the downgrade is real), and
+                   # test_cli_mediation_run_as_is_wired (root-tier CLI
+                   # refusal vs --mediation-run-as supervisor warning).
 oci = 144     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e2e
               # supervises OCI-default root containers; S1.2 fail-closes
               # RunAs(0,0) for non-root supervisors (tested feature). 140 = 55+67+18

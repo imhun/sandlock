@@ -629,8 +629,11 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_user(
 }
 
 /// Set the mediation identity tier for on-behalf path operations:
-/// `0` = `caller` (default; root in-process remaps are refused), `1` =
+/// `0` = `caller` (root in-process remaps are refused), `1` =
 /// `supervisor` (explicit downgrade tier; warning + `stats()` counter).
+/// Unknown discriminants are ignored and **preserve the builder's current
+/// state** (on a fresh builder that current state is the fail-closed
+/// `caller` default).
 ///
 /// # Safety
 /// `b` must be a valid builder pointer.
@@ -647,7 +650,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_mediation_run_as(
         0 => sandlock_core::sandbox::MediationRunAs::Caller,
         1 => sandlock_core::sandbox::MediationRunAs::Supervisor,
         _other => {
-            // Unknown discriminants keep the fail-closed default (caller).
+            // Unknown discriminants preserve the builder's current state
+            // (fail-closed only when the builder is still at its fresh
+            // default).
             return Box::into_raw(Box::new(builder));
         }
     };

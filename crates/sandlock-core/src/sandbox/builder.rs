@@ -283,17 +283,20 @@ pub struct SandboxBuilder {
     /// `caller` (default) refuses a root in-process mediator remapping the
     /// sandbox to a different host uid; `supervisor` explicitly accepts the
     /// downgrade (with a warning and a `stats()` counter).  See
-    /// [`super::MediationRunAs`] for the full contract.
+    /// [`super::MediationRunAs`] for the full contract.  `None` = not
+    /// declared by this builder layer, which resolves to `caller` at build
+    /// time — kept as an `Option` so a CLI flatten that omits the flag can
+    /// never clobber a value carried by a base profile (presence-aware
+    /// forwarding, review M1).
     #[cfg_attr(
         feature = "cli",
         arg(
             long = "mediation-run-as",
             value_name = "caller|supervisor",
-            default_value = "caller",
             value_parser = parse_mediation_run_as,
         )
     )]
-    pub mediation_run_as: super::MediationRunAs,
+    pub mediation_run_as: Option<super::MediationRunAs>,
 
     /// Per-protection state overrides. Defaults to `strict_all`: every
     /// protection enforced, matching the historical `MIN_ABI = 6` floor.
@@ -395,7 +398,7 @@ impl Default for SandboxBuilder {
             pid_ns: false,
             control_socket: true,
             user: None,
-            mediation_run_as: super::MediationRunAs::Caller,
+            mediation_run_as: None,
             protection_policy: ProtectionPolicy::default(),
             policy_fn: None,
             name: None,
@@ -962,7 +965,7 @@ impl SandboxBuilder {
     /// `supervisor` only to explicitly accept the root in-process
     /// downgrade tier (warning + `stats()` counter).
     pub fn mediation_run_as(mut self, tier: super::MediationRunAs) -> Self {
-        self.mediation_run_as = tier;
+        self.mediation_run_as = Some(tier);
         self
     }
 
@@ -1297,7 +1300,7 @@ impl SandboxBuilder {
             pid_ns: self.pid_ns,
             control_socket: self.control_socket,
             user: self.user,
-            mediation_run_as: self.mediation_run_as,
+            mediation_run_as: self.mediation_run_as.unwrap_or_default(),
             policy_fn: self.policy_fn,
             name: self.name,
             mode: self.mode,

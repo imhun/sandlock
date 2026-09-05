@@ -1382,7 +1382,7 @@ async fn test_seccomp_cow_hardlink_cannot_cross_the_workdir_boundary() {
 /// `chmod` takes effect — the exact pair SL-1's C档 shape gets wrong.
 #[tokio::test]
 async fn test_cow_mediated_create_is_owned_by_caller_and_self_chmod_works() {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::MetadataExt;
 
     let workdir = temp_dir("mediation-owner");
     fs::create_dir_all(&workdir).unwrap();

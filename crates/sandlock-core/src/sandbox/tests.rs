@@ -536,11 +536,17 @@ fn mediation_run_as_parses_both_tiers_and_rejects_unknown() {
 
 #[test]
 fn mediation_run_as_defaults_to_caller_everywhere() {
-    // Builder default, built-Sandbox default, and serde-default (old
-    // profiles / configs that predate the field keep the fail-closed
-    // caller tier rather than silently downgrading to supervisor).
+    // Builder default (undecided layer), built-Sandbox default, and
+    // serde-default (old profiles / configs that predate the field keep
+    // the fail-closed caller tier rather than silently downgrading to
+    // supervisor).
     let b = SandboxBuilder::default();
-    assert_eq!(b.mediation_run_as, MediationRunAs::Caller);
+    assert_eq!(
+        b.mediation_run_as,
+        None,
+        "the builder layer must stay undecided (None) so a base layer's \
+         explicit value can never be clobbered by a default"
+    );
     let sb = Sandbox::builder().build().unwrap();
     assert_eq!(sb.mediation_run_as, MediationRunAs::Caller);
 
@@ -597,4 +603,45 @@ fn mediation_identity_gate_refuses_only_root_remap_with_mediation() {
     // separately), nor root without mediation (nothing runs on-behalf).
     assert!(!refused(65534, 10000, true));
     assert!(!refused(0, 10000, false));
+}
+
+/// I1 review fix: the on-behalf open gate is `has_denied_paths()` on the
+/// shared `DeniedSet`, which receives both static `fs_denied` paths and
+/// live `policy_fn`-issued `deny_path()` calls — so spawn-time mediation
+/// capability must include a present `policy_fn`, not just the static
+/// triggers.  The refusal is capability-based (conservative): the explicit
+/// `supervisor` tier is the escape hatch.
+#[test]
+fn mediation_active_covers_policy_fn_deny_capability() {
+    let active = |fs: bool, chroot: bool, cow: bool, pfn: bool| {
+        mediation_active_for(false, fs, chroot, cow, pfn)
+    };
+    // Each static trigger alone activates mediation...
+    assert!(active(true, false, false, false));
+    assert!(active(false, true, false, false));
+    assert!(active(false, false, true, false));
+    // ...and so does a live path-denying policy_fn (the I1 shape).
+    assert!(active(false, false, false, true));
+    assert!(!active(false, false, false, false));
+    // no_supervisor disables the notif supervisor, so nothing is mediated.
+    assert!(!mediation_active_for(true, true, true, true, true));
+
+    // Composite: root in-process + RunAs(nonzero) + policy_fn-only
+    // mediation is refused under the default caller tier.
+    assert!(mediation_remap_is_refused(
+        0,
+        10000,
+        mediation_active_for(false, false, false, false, true)
+    ));
+    // Non-root and no-mediation composites stay untouched.
+    assert!(!mediation_remap_is_refused(
+        65534,
+        65534,
+        mediation_active_for(false, false, false, false, true)
+    ));
+    assert!(!mediation_remap_is_refused(
+        0,
+        10000,
+        mediation_active_for(false, false, false, false, false)
+    ));
 }
