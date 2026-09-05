@@ -253,6 +253,7 @@ impl Generation {
                     InstancePhase::Draining => "Draining",
                     InstancePhase::ShutDown => "ShutDown",
                     InstancePhase::Exited => "Exited",
+                    InstancePhase::Dead => "Dead",
                 };
                 serde_json::json!({
                     "launched": true,

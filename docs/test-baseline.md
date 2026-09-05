@@ -11,7 +11,10 @@
 #   2. root-mode phases: oci (`--oci-root`) and the supervise foreign-uid
 #      acceptance (`--supervise-root`), both as root in the same privileged
 #      container.
-core_lib = 812 # F4 re-review (C1): 810 -> 812, +2 fork-based seccomp/state.rs
+core_lib = 813 # F5 (M3 semantics): 812 -> 813, +1 unit test
+               # (sandbox::tests::default_max_processes_is_whole_box_256)
+               # pinning the whole-box max_processes default of 256 (F5.1).
+               # F4 re-review (C1): 810 -> 812, +2 fork-based seccomp/state.rs
                # unit tests (pgid_entry_pruned_once_group_is_empty,
                # pgid_entry_survives_leader_exit_with_live_member) pinning
                # group-emptiness probing with kill(-pgid, 0) instead of
@@ -43,7 +46,18 @@ core_lib = 812 # F4 re-review (C1): 810 -> 812, +2 fork-based seccomp/state.rs
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 514 # F4 re-review (C1/R2 + minors): 509 -> 514, +5 in
+core_integ = 522 # F5 (M3 semantics): 514 -> 522, +8 tests —
+                 # 7 in integration/test_instance_semantics.rs
+                 # (test_max_processes_default_bounds_whole_box,
+                 # test_checkpoint_with_multiple_children_is_refused,
+                 # test_checkpoint_single_live_child_captures_that_child,
+                 # test_dead_state_surfaces_single_error_code,
+                 # test_idle_timeout_drains_and_shuts_down,
+                 # test_max_lifetime_forces_shutdown_with_live_child,
+                 # test_pid_ns_procfs_scope_narrows_to_child) and 1 in
+                 # integration/test_pid_ns.rs
+                 # (test_init_reaps_ns_pid_1_exit). F4 re-review (C1/R2 +
+                 # minors): 509 -> 514, +5 in
                  # integration/test_instance_exec_params.rs
                  # (test_bound_child_pgid_entry_survives_leader_exit,
                  # test_main_workload_egress_survives_exec_child_announcement,
@@ -111,15 +125,20 @@ core_integ = 514 # F4 re-review (C1/R2 + minors): 509 -> 514, +5 in
                  # (test_exec_mode_main_exit_is_terminal_and_verbs_close);
                  # one-shot outlives regression stays green in
                  # test_instance_lifecycle.rs.
-ffi = 92 # F3.3 (instance exec FFI): 89 -> 92, +3 in the new
+ffi = 92 # F5.4 adds SANDLOCK_INSTANCE_ERR_DEAD (code 6) to the error-code
+         # mapping and header; no new FFI test target (mapping-only, covered
+         # by the core Dead tests). F3.3 (instance exec FFI): 89 -> 92, +3 in the new
          # tests/instance_exec.rs (instance_exec_streams_stdio_and_waits_
          # by_child_id, instance_exec_rejects_unknown_stdio_mode,
          # instance_kill_after_reap_is_idempotent). The C smoke target
          # compiles the regenerated sandlock.h against the cdylib (still 1);
          # header regeneration also picks up pre-existing drift at HEAD
          # (missing sandlock_sandbox_builder_notify_rate_limit declaration).
-cli = 95      # after F0.4 wiring (cli suite includes net_bind_map tests)
-supervise = 35 # Non-root targets only (--lib --test supervise): the
+cli = 95      # after F0.4 wiring (cli suite includes net_bind_map tests);
+              # F5.1 updates the no-supervisor default validation to
+              # DEFAULT_MAX_PROCESSES (256), no count change
+supervise = 35 # F5.4 adds the InstancePhase::Dead stats label; count
+               # unchanged. Non-root targets only (--lib --test supervise): the
                # root-mode foreign-uid target supervise_root is separate.
                # F2b.1: new crates/sandlock-supervise (full-field policy entry +
                # uid self-check; 13 lib unit + 4 integration tests, including
@@ -189,7 +208,9 @@ oci = 144     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e
               # 56 lib + 68 bin + 15 integration.rs + 2 reaper + 3 process
               # groups = 144).
 cli_build = 0 # workspace release build gate (no test binaries; 0 = build passed)
-python = 450  # F4 (M2 per-exec params + S9 + update_network): 446 -> 450, +4
+python = 450  # F5.1 updates the Sandbox default + builder condition to 256;
+              # count unchanged. F4 (M2 per-exec params + S9 + update_network):
+              # 446 -> 450, +4
               # in the new tests/test_instance_exec_params.py
               # (test_per_exec_cwd_and_env_apply,
               # test_wider_policy_is_rejected,
