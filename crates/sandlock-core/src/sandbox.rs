@@ -1582,6 +1582,7 @@ impl Sandbox {
                 on_error: sandbox_cfg.on_error.clone(),
                 exec_ceiling: None,
                 exec_session: None,
+                policy_image: None,
             }));
             clones.push(clone_sb);
         }
@@ -1692,6 +1693,7 @@ impl Sandbox {
             on_error: self.on_error.clone(),
             exec_ceiling: None,
             exec_session: None,
+            policy_image: None,
         }));
         Ok(())
     }

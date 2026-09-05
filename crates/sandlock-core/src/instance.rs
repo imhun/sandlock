@@ -302,6 +302,16 @@ pub struct SandboxInstance {
     /// session creation. `Some` for exec-capable sessions only; the M0
     /// single-process sessions have no exec surface to validate.
     pub(crate) exec_ceiling: Option<ExecCeiling>,
+    /// F5.2: bincode snapshot of the runtime-less policy the session was
+    /// launched from, retained so `checkpoint()` can refuse
+    /// credential-injection sessions and embed the same policy clone the
+    /// legacy `Sandbox::checkpoint` path stores in the image. Stored
+    /// serialized (not as a live `Sandbox`) because a full `Sandbox` is not
+    /// `Sync` — its `init_fn` is an `FnOnce` — while the instance futures
+    /// must stay `Send`. `None` for one-shot sessions (whose checkpoint
+    /// surface stays on the live `Sandbox`, unchanged) or if the snapshot
+    /// failed to encode.
+    pub(crate) policy_image: Option<Vec<u8>>,
 }
 
 /// Lifecycle state of the session's single (M0) child.
@@ -481,6 +491,10 @@ impl SandboxInstance {
             .map_err(SandboxRuntimeError::Io)?;
         let link = ExecLink::new(writer, reader);
         rt.exec_ceiling = Some(ceiling);
+        // Runtime-less policy snapshot (Sandbox::clone drops the runtime
+        // block) encoded with bincode — see `policy_image` for why the
+        // snapshot is serialized rather than held live.
+        rt.policy_image = bincode::serialize(&policy).ok();
         rt.exec_session = Some(Box::new(ExecSession {
             link: link.clone(),
             next_child_id: 1,
@@ -1062,6 +1076,87 @@ impl SandboxInstance {
             return Err(SandboxRuntimeError::Io(std::io::Error::last_os_error()).into());
         }
         Ok(())
+    }
+
+    /// F5.2 (M3 S3): capture a checkpoint of the exec session's **single**
+    /// live child.
+    ///
+    /// A checkpoint image freezes one address space (`registers` + memory +
+    /// fd table of that process). A session with more than one live child is
+    /// refused with [`SandboxRuntimeError::CheckpointMultipleChildren`] —
+    /// silently storing one command's address space while siblings keep
+    /// running would misrepresent what was snapshotted. With exactly one live
+    /// child the legacy single-command semantics apply unchanged: the box's
+    /// forks are held, that child's process group is stopped, the child is
+    /// captured by its host pid, and everything is resumed.
+    ///
+    /// Only exec-capable sessions expose this verb (one-shot `Sandbox`
+    /// sessions keep their historical `Sandbox::checkpoint` surface).
+    pub async fn checkpoint(
+        &mut self,
+    ) -> Result<crate::checkpoint::Checkpoint, SandlockError> {
+        self.enter_exec_terminal_if_needed();
+        if self.phase != InstancePhase::Live {
+            return Err(SandboxRuntimeError::InstanceClosed.into());
+        }
+        if self.exec_session.is_none() {
+            return Err(Self::not_exec_capable());
+        }
+        let policy: crate::sandbox::Sandbox = match self.policy_image.as_deref() {
+            Some(bytes) => bincode::deserialize(bytes).map_err(|e| {
+                SandboxRuntimeError::Child(format!(
+                    "checkpoint: retained policy snapshot failed to decode: {e}"
+                ))
+            })?,
+            None => {
+                return Err(SandboxRuntimeError::Child(
+                    "checkpoint: the session has no retained policy snapshot".into(),
+                )
+                .into())
+            }
+        };
+        let live: Vec<(ChildId, i32)> = self
+            .exec_session
+            .as_ref()
+            .expect("exec session presence checked above")
+            .children
+            .iter()
+            .filter(|(_, child)| child.status.is_none())
+            .map(|(id, child)| (*id, child.pid))
+            .collect();
+        let pid = match live.len() {
+            0 => return Err(SandboxRuntimeError::CheckpointNoLiveChild.into()),
+            1 => live[0].1,
+            n => {
+                return Err(SandboxRuntimeError::CheckpointMultipleChildren {
+                    live: n as u32,
+                }
+                .into())
+            }
+        };
+
+        // Freeze: hold fork notifications box-wide and stop the target
+        // child's process group (its command subtree — F1.7 per-child
+        // groups), so no sibling can spawn or mutate state mid-capture.
+        // The capture itself is synchronous; the holds are cleared in the
+        // matching thaw.
+        if let Some(ref resource) = self.supervisor_resource {
+            let mut rs = resource.lock().await;
+            rs.hold_forks = true;
+        }
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        unsafe { libc::killpg(pid, libc::SIGSTOP) };
+
+        let cp = crate::checkpoint::capture(pid, &policy);
+
+        unsafe { libc::killpg(pid, libc::SIGCONT) };
+        unsafe { libc::kill(pid, libc::SIGCONT) };
+        if let Some(ref resource) = self.supervisor_resource {
+            let mut rs = resource.lock().await;
+            rs.hold_forks = false;
+            rs.held_notif_ids.clear();
+        }
+        cp
     }
 
     // ================================================================

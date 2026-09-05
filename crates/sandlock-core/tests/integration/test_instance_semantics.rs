@@ -163,3 +163,87 @@ async fn test_max_processes_default_bounds_whole_box() {
 fn process_is_alive(pid: i32) -> bool {
     !process_is_gone(pid)
 }
+
+/// F5.2 (M3 S3): a checkpoint image captures **one** address space. An exec
+/// session with more than one live child must refuse explicitly — silently
+/// storing one command while a sibling keeps running would make the restored
+/// box lie about what was snapshotted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_with_multiple_children_is_refused() {
+    let mut inst = SandboxInstance::launch_exec_only(
+        base_policy().build().unwrap().with_name("f5-ckpt-multi"),
+    )
+    .await
+    .expect("launch exec session");
+    let a = inst
+        .exec(&["sleep", "60"], ExecStdio::Null)
+        .await
+        .expect("exec A");
+    let b = inst
+        .exec(&["sleep", "60"], ExecStdio::Null)
+        .await
+        .expect("exec B");
+    assert_ne!(a.child_id, b.child_id);
+
+    let err = inst
+        .checkpoint()
+        .await
+        .expect_err("checkpoint with two live children must be refused");
+    assert!(
+        matches!(
+            &err,
+            sandlock_core::SandlockError::Runtime(SandboxRuntimeError::CheckpointMultipleChildren { live: 2 })
+        ),
+        "the refusal must name the live-child count exactly, got: {err:?}"
+    );
+
+    // Both children are untouched by the refusal and the session stays live.
+    assert_eq!(inst.phase(), InstancePhase::Live);
+    assert!(process_is_alive(a.pid));
+    assert!(process_is_alive(b.pid));
+
+    inst.kill_child(a.child_id, libc::SIGKILL).expect("kill A");
+    inst.kill_child(b.child_id, libc::SIGKILL).expect("kill B");
+    let _ = inst.wait_child(a.child_id).await;
+    let _ = inst.wait_child(b.child_id).await;
+    inst.shutdown().await.expect("shutdown");
+}
+
+/// F5.2 companion: the single-live-child shape keeps the legacy checkpoint
+/// semantics — the instance captures exactly that one address space (its
+/// host pid, registers and maps) and the child survives the capture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_single_live_child_captures_that_child() {
+    let mut inst = SandboxInstance::launch_exec_only(
+        base_policy().build().unwrap().with_name("f5-ckpt-single"),
+    )
+    .await
+    .expect("launch exec session");
+    let child = inst
+        .exec(&["sleep", "60"], ExecStdio::Null)
+        .await
+        .expect("exec the single live child");
+
+    let cp = inst
+        .checkpoint()
+        .await
+        .expect("checkpoint of the single live child must succeed");
+    assert_eq!(
+        cp.process_state.pid, child.pid,
+        "the checkpoint must capture the live child's host pid"
+    );
+    assert!(!cp.process_state.regs.is_empty(), "registers must be captured");
+    assert!(
+        !cp.process_state.memory_maps.is_empty(),
+        "memory maps must be captured"
+    );
+    assert!(
+        process_is_alive(child.pid),
+        "the child must still be running after the checkpoint"
+    );
+    assert_eq!(inst.phase(), InstancePhase::Live);
+
+    inst.kill_child(child.child_id, libc::SIGKILL).expect("kill child");
+    let _ = inst.wait_child(child.child_id).await;
+    inst.shutdown().await.expect("shutdown");
+}

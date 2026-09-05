@@ -93,6 +93,25 @@ pub enum SandboxRuntimeError {
         value: String,
     },
 
+    /// F5.2 (M3 S3): `checkpoint()` on an exec session that currently has
+    /// more than one live child. A checkpoint image captures **one** address
+    /// space; silently snapshotting a single command while its siblings keep
+    /// running would let a restore claim the whole box was captured. The
+    /// refusal is explicit and names the live count so callers can wait for
+    /// children before retrying.
+    #[error(
+        "cannot checkpoint an exec session with {live} live children: a checkpoint \
+         image captures one address space; wait for all but one child first"
+    )]
+    CheckpointMultipleChildren {
+        /// Number of live (not yet reaped) registered children.
+        live: u32,
+    },
+
+    /// F5.2: `checkpoint()` on an exec session with no live child to capture.
+    #[error("cannot checkpoint an exec session with no live child to capture")]
+    CheckpointNoLiveChild,
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
