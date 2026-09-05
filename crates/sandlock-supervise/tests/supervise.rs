@@ -899,6 +899,82 @@ fn test_supervise_fd_serve_launches_instance_and_serves_instance_verbs() {
     drop(host_stdin);
     drop(host_stderr);
 
+    // F4.1 over the fd transport: per-exec params travel in the exec frame
+    // args and are applied at execve (cwd + clean_env + env through the
+    // generation's instance).
+    let (host_stdin2, host_stdout2, host_stderr2, child_ends2) = make_exec_stdio();
+    let resp = roundtrip_frame_with_fds(
+        &mut worker,
+        &serde_json::json!({
+            "v": 1,
+            "verb": "exec",
+            "args": {
+                "argv": ["/usr/bin/env"],
+                "cwd": workdir.to_str().expect("workdir utf8"),
+                "clean_env": true,
+                "env": { "F4_SUPERVISE": "zeta" },
+            },
+        }),
+        &child_ends2,
+    );
+    for fd in child_ends2 {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "exec params: {resp:?}");
+    let params_child_id = resp["data"]["child_id"].as_u64().expect("params child id");
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({
+            "v": 1,
+            "verb": "wait_child",
+            "args": { "child_id": params_child_id },
+        }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "wait params child: {resp:?}");
+    assert_eq!(resp["data"]["code"], 0, "params child must exit 0: {resp:?}");
+    let mut params_out = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::fs::File::from(host_stdout2),
+        &mut params_out,
+    )
+    .expect("read params exec stdout");
+    assert_eq!(
+        params_out,
+        b"F4_SUPERVISE=zeta\n",
+        "per-exec cwd/env/clean_env must reach the cross-process child"
+    );
+    drop(host_stdin2);
+    drop(host_stderr2);
+
+    // S9 over the fd transport: a wider-than-ceiling grant is refused by the
+    // same host-side validation as the in-process exec surface.
+    let (_h0, _h1, _h2, child_ends3) = make_exec_stdio();
+    let resp = roundtrip_frame_with_fds(
+        &mut worker,
+        &serde_json::json!({
+            "v": 1,
+            "verb": "exec",
+            "args": {
+                "argv": ["true"],
+                "bind_ports": [65000],
+            },
+        }),
+        &child_ends3,
+    );
+    for fd in child_ends3 {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+    assert_eq!(resp["ok"], serde_json::Value::Bool(false), "wide exec must fail: {resp:?}");
+    let err = resp["err"].as_str().expect("error text");
+    assert!(
+        err.contains("ceiling") && err.contains("bind_ports"),
+        "cross-process S9 error must name the field: {err}"
+    );
+
     // The workload really ran and wrote its evidence.
     wait_until(
         Instant::now() + Duration::from_secs(15),

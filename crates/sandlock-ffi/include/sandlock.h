@@ -51,6 +51,13 @@ typedef struct sandlock_handler_t sandlock_handler_t;
 #define SANDLOCK_INSTANCE_ERR_NO_PTY 4
 
 /**
+ * F4.2 (S9): an exec request (or `update_network`) carried a per-exec
+ * parameter wider than the instance-time policy ceiling. EPERM-class: the
+ * error text names the offending field and value.
+ */
+#define SANDLOCK_INSTANCE_ERR_POLICY 5
+
+/**
  * `flags` bit for [`sandlock_action_set_inject_bytes`]: leave the injected
  * memfd writable (do not seal). Default (bit clear) seals it read-only.
  */
@@ -260,6 +267,39 @@ typedef struct {
   int stderr_fd;
   int pty_fd;
 } sandlock_instance_exec_result_t;
+
+/**
+ * F4.1: per-exec parameters for `sandlock_instance_exec_params`.
+ * Every pointer is optional; a NULL/zero field means "no per-exec change"
+ * for that dimension. `env` entries are `"NAME=VALUE"` strings;
+ * `extra_writable` entries are absolute paths; `bind_ports` is a u16 array.
+ */
+typedef struct {
+  /**
+   * Optional absolute chdir target before execve.
+   */
+  const char *cwd;
+  /**
+   * Nonzero: start the child from an empty environment and apply only
+   * `env`.
+   */
+  uint8_t clean_env;
+  /**
+   * `"NAME=VALUE"` environment entries.
+   */
+  const char *const *env;
+  uintptr_t env_count;
+  /**
+   * Absolute extra writable paths (S9: subset of the instance ceiling).
+   */
+  const char *const *extra_writable;
+  uintptr_t extra_writable_count;
+  /**
+   * TCP bind ports (S9: subset of the instance `net_allow_bind` ceiling).
+   */
+  const uint16_t *bind_ports;
+  uintptr_t bind_ports_count;
+} sandlock_instance_exec_params_t;
 
 /**
  * Opaque child-memory accessor handed to a C handler callback.
@@ -1593,6 +1633,45 @@ int sandlock_instance_exec(sandlock_instance_t *h,
                            unsigned int argc,
                            uint32_t stdio_mode,
                            sandlock_instance_exec_result_t *out);
+
+/**
+ * Exec one command inside the session with per-exec parameters (F4.1):
+ * `cwd`/`env`/`clean_env` apply at execve, and `extra_writable`/`bind_ports`
+ * are S9-validated against the instance-time policy ceiling. Same stdio
+ * modes and result shape as `sandlock_instance_exec`; pass a NULL `params`
+ * for the exact no-params semantics of the F3 symbol.
+ *
+ * # Safety
+ * `h`/`argv`/`out` as in `sandlock_instance_exec`; `params` NULL or a valid
+ * initialized params struct.
+ */
+int sandlock_instance_exec_params(sandlock_instance_t *h,
+                                  const char *const *argv,
+                                  unsigned int argc,
+                                  uint32_t stdio_mode,
+                                  const sandlock_instance_exec_params_t *params,
+                                  sandlock_instance_exec_result_t *out);
+
+/**
+ * F4.3 (S2): session network update. `ips` is the new outbound IP allow set
+ * (any port; an empty array denies all outbound). The update binds to new
+ * execs only; running children are copied into the caller's `stale` buffer
+ * (up to `stale_capacity` u64s) and the full count is written to
+ * `out_stale_count`. Returns `SANDLOCK_INSTANCE_OK` on success, the stable
+ * instance error code otherwise (a wider-than-ceiling request returns
+ * `SANDLOCK_INSTANCE_ERR_POLICY`).
+ *
+ * # Safety
+ * `h` must be a valid instance handle; `ips` must point to `ip_count` C
+ * strings (NULL with count 0 allowed); `stale`/`out_stale_count` must be
+ * valid when `stale_capacity > 0` / always respectively.
+ */
+int sandlock_instance_update_network(sandlock_instance_t *h,
+                                     const char *const *ips,
+                                     uintptr_t ip_count,
+                                     uint64_t *stale,
+                                     uintptr_t stale_capacity,
+                                     uintptr_t *out_stale_count);
 
 /**
  * Wait for an exec child to exit (blocking). `timeout_ms == 0` waits

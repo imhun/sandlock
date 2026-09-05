@@ -465,6 +465,21 @@ class _SandlockInstanceExecResult(ctypes.Structure):
     ]
 
 
+class _SandlockInstanceExecParams(ctypes.Structure):
+    """Mirror of `sandlock_instance_exec_params_t` in sandlock.h (F4.1)."""
+
+    _fields_ = [
+        ("cwd", ctypes.c_char_p),
+        ("clean_env", ctypes.c_uint8),
+        ("env", ctypes.POINTER(ctypes.c_char_p)),
+        ("env_count", ctypes.c_size_t),
+        ("extra_writable", ctypes.POINTER(ctypes.c_char_p)),
+        ("extra_writable_count", ctypes.c_size_t),
+        ("bind_ports", ctypes.POINTER(ctypes.c_uint16)),
+        ("bind_ports_count", ctypes.c_size_t),
+    ]
+
+
 _lib.sandlock_instance_launch.restype = _c_instance_p
 _lib.sandlock_instance_launch.argtypes = [_c_policy_p, ctypes.c_char_p]
 _lib.sandlock_instance_exec.restype = ctypes.c_int
@@ -474,6 +489,24 @@ _lib.sandlock_instance_exec.argtypes = [
     ctypes.c_uint,
     ctypes.c_uint32,
     ctypes.POINTER(_SandlockInstanceExecResult),
+]
+_lib.sandlock_instance_exec_params.restype = ctypes.c_int
+_lib.sandlock_instance_exec_params.argtypes = [
+    _c_instance_p,
+    ctypes.POINTER(ctypes.c_char_p),
+    ctypes.c_uint,
+    ctypes.c_uint32,
+    ctypes.POINTER(_SandlockInstanceExecParams),
+    ctypes.POINTER(_SandlockInstanceExecResult),
+]
+_lib.sandlock_instance_update_network.restype = ctypes.c_int
+_lib.sandlock_instance_update_network.argtypes = [
+    _c_instance_p,
+    ctypes.POINTER(ctypes.c_char_p),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_uint64),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_size_t),
 ]
 _lib.sandlock_instance_wait_child.restype = _c_result_p
 _lib.sandlock_instance_wait_child.argtypes = [

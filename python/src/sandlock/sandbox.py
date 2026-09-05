@@ -1856,6 +1856,7 @@ class SandboxInstance:
     _ERR_UNKNOWN_CHILD = 2
     _ERR_CHILD = 3
     _ERR_NO_PTY = 4
+    _ERR_POLICY = 5
 
     def __init__(self, policy: "Sandbox", name: str | None = None):
         from ._sdk import _lib
@@ -1878,6 +1879,12 @@ class SandboxInstance:
         self,
         cmd,
         stdio: ExecStdio | int = ExecStdio.PIPED,
+        *,
+        cwd: str | os.PathLike | None = None,
+        env: dict[str, str] | None = None,
+        clean_env: bool = False,
+        extra_writable: Sequence[str | os.PathLike] | None = None,
+        bind_ports: Sequence[int] | None = None,
     ) -> "ExecProcess":
         """Run ``cmd`` inside the session and return a self-owned
         :class:`ExecProcess`.
@@ -1887,6 +1894,25 @@ class SandboxInstance:
         (default piped). Concurrent children are independent: each gets its
         own registered child id and stdio.
 
+        F4.1 per-exec parameters (keyword-only, all optional):
+
+        * ``cwd`` — absolute chdir target applied before execve (must be
+          inside an instance fs grant);
+        * ``env`` — environment overrides applied before execve (additive
+          unless ``clean_env`` is set);
+        * ``clean_env`` — start the child from an empty environment and apply
+          only ``env``;
+        * ``extra_writable`` — absolute paths this child may write (must be a
+          subset of the instance's writable ceiling, never an ``fs_deny``'d
+          path);
+        * ``bind_ports`` — TCP ports this child may bind (must be inside the
+          instance's ``net_allow_bind`` ceiling).
+
+        Any request wider than the instance-time policy ceiling raises
+        :class:`PermissionError` (EPERM) — the ceiling never widens. (The
+        Rust/core surface names the offending field and value in its error
+        text; Python maps the same stable EPERM-class code.)
+
         Raises:
             RuntimeError: If the session is closed (the F5.4 S5 unified
                 closed-instance error — every later call raises the same
@@ -1894,7 +1920,13 @@ class SandboxInstance:
         """
         import ctypes
 
-        from ._sdk import _lib, _make_argv, _SandlockInstanceExecResult
+        from ._sdk import (
+            _encode,
+            _lib,
+            _make_argv,
+            _SandlockInstanceExecParams,
+            _SandlockInstanceExecResult,
+        )
 
         if self._handle is None:
             raise RuntimeError(self._closed_message())
@@ -1907,10 +1939,47 @@ class SandboxInstance:
             )
 
         argv, argc = _make_argv(list(cmd))
+        params = _SandlockInstanceExecParams()
+        if cwd is not None:
+            params.cwd = _encode(str(os.fspath(cwd)))
+        params.clean_env = 1 if clean_env else 0
+        if env:
+            if not isinstance(env, dict):
+                raise TypeError("exec env= requires a dict of str -> str")
+            encoded_env = [
+                _encode(f"{k}={v}")
+                for k, v in env.items()
+            ]
+            if encoded_env:
+                arr = (ctypes.c_char_p * len(encoded_env))(*encoded_env)
+                params.env = arr
+                params.env_count = len(encoded_env)
+        if extra_writable:
+            encoded_extra = [
+                _encode(str(os.fspath(p))) for p in extra_writable
+            ]
+            arr = (ctypes.c_char_p * len(encoded_extra))(*encoded_extra)
+            params.extra_writable = arr
+            params.extra_writable_count = len(encoded_extra)
+        if bind_ports:
+            ports = [int(p) for p in bind_ports]
+            arr = (ctypes.c_uint16 * len(ports))(*ports)
+            params.bind_ports = arr
+            params.bind_ports_count = len(ports)
         out = _SandlockInstanceExecResult()
-        rc = _lib.sandlock_instance_exec(self._handle, argv, argc, mode, ctypes.byref(out))
+        rc = _lib.sandlock_instance_exec_params(
+            self._handle,
+            argv,
+            argc,
+            mode,
+            ctypes.byref(params),
+            ctypes.byref(out),
+        )
         if rc != 0:
-            raise RuntimeError(self._error_message(rc, "exec"))
+            message = self._error_message(rc, "exec")
+            if rc == self._ERR_POLICY:
+                raise PermissionError(message)
+            raise RuntimeError(message)
         return ExecProcess(
             self,
             child_id=out.child_id,
@@ -1920,6 +1989,50 @@ class SandboxInstance:
             stderr_fd=out.stderr_fd,
             pty_fd=out.pty_fd,
         )
+
+    def update_network(self, ips: Sequence[str]) -> list[int]:
+        """F4.3 (S2): session outbound network update.
+
+        ``ips`` is the new outbound IP allow set (any port; an empty list
+        denies all outbound destinations). The update binds to **new execs
+        only**: children already running keep the policy they were created
+        under, and this method returns their child ids as the staleness
+        report.
+
+        An IP outside the instance-time destination ceiling raises
+        :class:`PermissionError` (EPERM) — the ceiling never widens.
+        """
+        import ctypes
+
+        from ._sdk import _encode, _lib
+
+        if self._handle is None:
+            raise RuntimeError(self._closed_message())
+        encoded = [_encode(str(ip)) for ip in ips]
+        if encoded:
+            arr = (ctypes.c_char_p * len(encoded))(*encoded)
+            ip_ptr = arr
+        else:
+            ip_ptr = None
+        cap = 4096
+        stale = (ctypes.c_uint64 * cap)()
+        out_count = ctypes.c_size_t()
+        rc = _lib.sandlock_instance_update_network(
+            self._handle,
+            ip_ptr,
+            len(encoded),
+            stale,
+            cap,
+            ctypes.byref(out_count),
+        )
+        if rc == self._ERR_POLICY:
+            raise PermissionError(
+                "update_network exceeds the instance policy ceiling (EPERM)"
+            )
+        if rc != 0:
+            raise RuntimeError(self._error_message(rc, "update_network"))
+        n = min(out_count.value, cap)
+        return list(stale[:n])
 
     def close(self) -> None:
         """Terminate the session and release the native handle.
@@ -1959,6 +2072,8 @@ class SandboxInstance:
             return self._closed_message()
         if rc == self._ERR_UNKNOWN_CHILD:
             return f"sandlock_instance_{verb}: unknown child id"
+        if rc == self._ERR_POLICY:
+            return f"sandlock_instance_{verb}: exec params exceed the instance policy ceiling (EPERM)"
         return f"sandlock_instance_{verb} failed (error code {rc})"
 
 
@@ -2044,6 +2159,13 @@ class ExecProcess:
         """The child PID while running, else ``None`` (after :meth:`wait`)."""
         with self._lock:
             return self._pid if self._result is None and self._pid > 0 else None
+
+    @property
+    def child_id(self) -> int:
+        """The registered child id this process owns in the instance's
+        per-child registry (the id used by ``wait_child``/``kill_child`` and
+        reported by :meth:`SandboxInstance.update_network` staleness)."""
+        return self._child_id
 
     def resize(self, rows: int, cols: int) -> None:
         """Resize the child's pty (TIOCSWINSZ). Raises RuntimeError if the

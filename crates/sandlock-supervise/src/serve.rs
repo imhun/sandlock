@@ -47,13 +47,14 @@
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::io::{OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use sandlock_core::control::{
     serve_fd_connection, serve_registered_once, write_response_frame, ControlHandler,
     ControlRequest, ControlResponse, ServeOutcome,
 };
-use sandlock_core::instance::{InstancePhase, SandboxInstance};
+use sandlock_core::instance::{ExecParams, InstancePhase, SandboxInstance};
 use sandlock_core::profile::sandbox_to_profile;
 use sandlock_core::result::ExitStatus;
 use sandlock_core::Sandbox;
@@ -298,7 +299,10 @@ impl Generation {
     /// registered child of the generation's instance and report its child id.
     /// `fds` arrive attached to the exec frame over SCM_RIGHTS (one protocol
     /// for both holders — the same `RunExec` frame the in-process executor
-    /// sends to `sandlock-init`).
+    /// sends to `sandlock-init`). F4.1 per-exec params (`cwd`/`env`/
+    /// `clean_env`/`extra_writable`/`bind_ports`) travel in the frame's args
+    /// and are validated against the instance ceiling host-side, exactly like
+    /// the in-process exec surface.
     fn handle_exec(
         &mut self,
         args: &serde_json::Value,
@@ -337,14 +341,48 @@ impl Generation {
         let child_fds: [OwnedFd; 3] = owned
             .try_into()
             .map_err(|_| "exec requires exactly 3 stdio fds".to_string())?;
+        let params = exec_params_from_args(args)?;
         let arg_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         let handle = self
             .rt
-            .block_on(instance.exec_with_fds(&arg_refs, child_fds))
+            .block_on(instance.exec_with_fds_params(&arg_refs, &params, child_fds))
             .map_err(|e| format!("instance exec failed: {e}"))?;
         Ok(serde_json::json!({
             "child_id": handle.child_id,
             "pid": handle.pid,
+        }))
+    }
+
+    /// Serve an `update_network` verb (F4.3/S2): the session's outbound IP
+    /// allow set changes for **new execs only**; running children keep their
+    /// exec-time policy and their child ids are returned as the staleness
+    /// report.
+    fn handle_update_network(
+        &mut self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let ips: Vec<std::net::IpAddr> = args
+            .get("ips")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str())
+                    .filter_map(|s| s.parse().ok())
+                    .collect()
+            })
+            .ok_or_else(|| "update_network requires an `ips` string array".to_string())?;
+        if ips.len() != args.get("ips").and_then(|v| v.as_array()).map_or(0, Vec::len) {
+            return Err("update_network: every `ips` entry must be an IP literal".to_string());
+        }
+        let instance = self.instance.as_mut().ok_or_else(|| {
+            "generation has no instance: update_network requires a launched session".to_string()
+        })?;
+        let report = self
+            .rt
+            .block_on(instance.update_network(&ips))
+            .map_err(|e| format!("instance update_network failed: {e}"))?;
+        Ok(serde_json::json!({
+            "stale_child_ids": report.stale_child_ids,
         }))
     }
 
@@ -386,6 +424,49 @@ impl Generation {
             .map_err(|e| format!("instance kill_child failed: {e}"))?;
         Ok(serde_json::json!({}))
     }
+}
+
+/// Decode F4.1 per-exec parameters from an `exec` verb's args object. Every
+/// field is optional; missing fields mean "no per-exec change" for that
+/// dimension. The core instance then runs the S9 subset validation, so a
+/// wider-than-ceiling grant over this cross-process route is refused
+/// identically to the in-process surface.
+fn exec_params_from_args(args: &serde_json::Value) -> Result<ExecParams, String> {
+    let mut params = ExecParams::default();
+    if let Some(cwd) = args.get("cwd").and_then(|v| v.as_str()) {
+        params.cwd = Some(PathBuf::from(cwd));
+    }
+    params.clean_env = args
+        .get("clean_env")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if let Some(env) = args.get("env").and_then(|v| v.as_object()) {
+        for (name, value) in env {
+            let value = value
+                .as_str()
+                .ok_or_else(|| format!("exec env {name:?} must be a string"))?;
+            params.env.push((name.clone(), value.to_string()));
+        }
+    }
+    if let Some(extra) = args.get("extra_writable").and_then(|v| v.as_array()) {
+        for entry in extra {
+            let s = entry
+                .as_str()
+                .ok_or_else(|| "exec extra_writable entries must be strings".to_string())?;
+            params.extra_writable.push(PathBuf::from(s));
+        }
+    }
+    if let Some(ports) = args.get("bind_ports").and_then(|v| v.as_array()) {
+        for port in ports {
+            let n = port
+                .as_u64()
+                .ok_or_else(|| "exec bind_ports entries must be integers".to_string())?;
+            let n = u16::try_from(n)
+                .map_err(|_| format!("exec bind_ports entry {n} is out of range"))?;
+            params.bind_ports.push(n);
+        }
+    }
+    Ok(params)
 }
 
 /// JSON form of an exec child's exit status for the `wait_child` verb.
@@ -499,6 +580,14 @@ impl ControlHandler for Generation {
             }
             "kill_child" => {
                 let resp = match self.handle_kill_child(&req.args) {
+                    Ok(data) => ok_response(data),
+                    Err(e) => err_response(&e),
+                };
+                let _ = write_response_frame(stream, &resp);
+                ServeOutcome::Continue
+            }
+            "update_network" => {
+                let resp = match self.handle_update_network(&req.args) {
                     Ok(data) => ok_response(data),
                     Err(e) => err_response(&e),
                 };

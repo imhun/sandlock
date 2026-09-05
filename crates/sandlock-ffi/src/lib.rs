@@ -3086,6 +3086,10 @@ pub const SANDLOCK_INSTANCE_ERR_UNKNOWN_CHILD: i32 = 2;
 pub const SANDLOCK_INSTANCE_ERR_CHILD: i32 = 3;
 /// resize_child on a child that has no pty.
 pub const SANDLOCK_INSTANCE_ERR_NO_PTY: i32 = 4;
+/// F4.2 (S9): an exec request (or `update_network`) carried a per-exec
+/// parameter wider than the instance-time policy ceiling. EPERM-class: the
+/// error text names the offending field and value.
+pub const SANDLOCK_INSTANCE_ERR_POLICY: i32 = 5;
 
 /// Result of `sandlock_instance_exec`: the registered child id, its pid, and
 /// the caller-owned host ends of the requested stdio (see the `stdio_mode`
@@ -3100,6 +3104,29 @@ pub struct sandlock_instance_exec_result_t {
     pub stdout_fd: c_int,
     pub stderr_fd: c_int,
     pub pty_fd: c_int,
+}
+
+/// F4.1: per-exec parameters for `sandlock_instance_exec_params`.
+/// Every pointer is optional; a NULL/zero field means "no per-exec change"
+/// for that dimension. `env` entries are `"NAME=VALUE"` strings;
+/// `extra_writable` entries are absolute paths; `bind_ports` is a u16 array.
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub struct sandlock_instance_exec_params_t {
+    /// Optional absolute chdir target before execve.
+    pub cwd: *const c_char,
+    /// Nonzero: start the child from an empty environment and apply only
+    /// `env`.
+    pub clean_env: u8,
+    /// `"NAME=VALUE"` environment entries.
+    pub env: *const *const c_char,
+    pub env_count: usize,
+    /// Absolute extra writable paths (S9: subset of the instance ceiling).
+    pub extra_writable: *const *const c_char,
+    pub extra_writable_count: usize,
+    /// TCP bind ports (S9: subset of the instance `net_allow_bind` ceiling).
+    pub bind_ports: *const u16,
+    pub bind_ports_count: usize,
 }
 
 impl Default for sandlock_instance_exec_result_t {
@@ -3124,6 +3151,9 @@ fn instance_error_code(e: &sandlock_core::SandlockError) -> i32 {
         }
         sandlock_core::SandlockError::Runtime(SandboxRuntimeError::UnknownChild(_)) => {
             SANDLOCK_INSTANCE_ERR_UNKNOWN_CHILD
+        }
+        sandlock_core::SandlockError::Runtime(SandboxRuntimeError::PolicyTooWide { .. }) => {
+            SANDLOCK_INSTANCE_ERR_POLICY
         }
         _ => SANDLOCK_INSTANCE_ERR_CHILD,
     }
@@ -3226,6 +3256,183 @@ pub unsafe extern "C" fn sandlock_instance_exec(
         pty_fd: handle.pty.map(|f| f.into_raw_fd()).unwrap_or(-1),
     };
     *out = res;
+    SANDLOCK_INSTANCE_OK
+}
+
+/// Read a C string array (`ptr[0..count]`) into owned Rust strings. A NULL
+/// array with count 0 yields an empty vector; count > 0 with NULL `ptr` is a
+/// caller contract violation and yields an error (defensive).
+unsafe fn read_c_string_array(
+    ptr: *const *const c_char,
+    count: usize,
+) -> Result<Vec<String>, ()> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() {
+        return Err(());
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let s = CStr::from_ptr(*ptr.add(i))
+            .to_str()
+            .map_err(|_| ())?
+            .to_string();
+        out.push(s);
+    }
+    Ok(out)
+}
+
+/// Decode an optional F4 per-exec-params struct into core [`ExecParams`].
+/// A NULL struct (or all-zero fields) is the no-params shape.
+///
+/// # Safety
+/// `params` must be NULL or a valid pointer to a fully initialized struct
+/// whose pointer fields follow the array conventions of
+/// [`sandlock_instance_exec_params_t`].
+unsafe fn exec_params_from_raw(
+    params: *const sandlock_instance_exec_params_t,
+) -> Result<sandlock_core::exec_params::ExecParams, String> {
+    use sandlock_core::exec_params::ExecParams;
+    let mut out = ExecParams::default();
+    if params.is_null() {
+        return Ok(out);
+    }
+    let p = &*params;
+    out.cwd = optional_name(p.cwd).map_err(|_| "exec cwd is not valid UTF-8".to_string())?
+        .map(std::path::PathBuf::from);
+    out.clean_env = p.clean_env != 0;
+    let env = read_c_string_array(p.env, p.env_count)
+        .map_err(|_| "invalid env array for exec params".to_string())?;
+    for kv in env {
+        let (k, v) = kv.split_once('=').ok_or_else(|| {
+            format!("exec env entry {kv:?} must be NAME=VALUE")
+        })?;
+        out.env.push((k.to_string(), v.to_string()));
+    }
+    let extra = read_c_string_array(p.extra_writable, p.extra_writable_count)
+        .map_err(|_| "invalid extra_writable array for exec params".to_string())?;
+    out.extra_writable = extra.into_iter().map(std::path::PathBuf::from).collect();
+    if p.bind_ports_count > 0 && p.bind_ports.is_null() {
+        return Err("invalid bind_ports array for exec params".to_string());
+    }
+    for i in 0..p.bind_ports_count {
+        out.bind_ports.push(*p.bind_ports.add(i));
+    }
+    Ok(out)
+}
+
+/// Exec one command inside the session with per-exec parameters (F4.1):
+/// `cwd`/`env`/`clean_env` apply at execve, and `extra_writable`/`bind_ports`
+/// are S9-validated against the instance-time policy ceiling. Same stdio
+/// modes and result shape as `sandlock_instance_exec`; pass a NULL `params`
+/// for the exact no-params semantics of the F3 symbol.
+///
+/// # Safety
+/// `h`/`argv`/`out` as in `sandlock_instance_exec`; `params` NULL or a valid
+/// initialized params struct.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_instance_exec_params(
+    h: *mut sandlock_instance_t,
+    argv: *const *const c_char,
+    argc: c_uint,
+    stdio_mode: u32,
+    params: *const sandlock_instance_exec_params_t,
+    out: *mut sandlock_instance_exec_result_t,
+) -> c_int {
+    if h.is_null() || argv.is_null() || out.is_null() {
+        return SANDLOCK_INSTANCE_ERR_CHILD;
+    }
+    let stdio = match exec_stdio_from_raw(stdio_mode) {
+        Some(s) => s,
+        None => return SANDLOCK_INSTANCE_ERR_CHILD,
+    };
+    let args = read_argv(argv, argc);
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let params = match exec_params_from_raw(params) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("sandlock_instance_exec_params: {msg}");
+            return SANDLOCK_INSTANCE_ERR_CHILD;
+        }
+    };
+    let h = &mut *h;
+    let result = block_on_runtime(&h.runtime, async {
+        h.instance.exec_params(&arg_refs, &params, stdio).await
+    });
+    let handle = match result {
+        Some(Ok(handle)) => handle,
+        Some(Err(e)) => return instance_error_code(&e),
+        None => return SANDLOCK_INSTANCE_ERR_CHILD,
+    };
+    use std::os::fd::IntoRawFd;
+    let res = sandlock_instance_exec_result_t {
+        child_id: handle.child_id,
+        pid: handle.pid,
+        stdin_fd: handle.stdin.map(|f| f.into_raw_fd()).unwrap_or(-1),
+        stdout_fd: handle.stdout.map(|f| f.into_raw_fd()).unwrap_or(-1),
+        stderr_fd: handle.stderr.map(|f| f.into_raw_fd()).unwrap_or(-1),
+        pty_fd: handle.pty.map(|f| f.into_raw_fd()).unwrap_or(-1),
+    };
+    *out = res;
+    SANDLOCK_INSTANCE_OK
+}
+
+/// F4.3 (S2): session network update. `ips` is the new outbound IP allow set
+/// (any port; an empty array denies all outbound). The update binds to new
+/// execs only; running children are copied into the caller's `stale` buffer
+/// (up to `stale_capacity` u64s) and the full count is written to
+/// `out_stale_count`. Returns `SANDLOCK_INSTANCE_OK` on success, the stable
+/// instance error code otherwise (a wider-than-ceiling request returns
+/// `SANDLOCK_INSTANCE_ERR_POLICY`).
+///
+/// # Safety
+/// `h` must be a valid instance handle; `ips` must point to `ip_count` C
+/// strings (NULL with count 0 allowed); `stale`/`out_stale_count` must be
+/// valid when `stale_capacity > 0` / always respectively.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_instance_update_network(
+    h: *mut sandlock_instance_t,
+    ips: *const *const c_char,
+    ip_count: usize,
+    stale: *mut u64,
+    stale_capacity: usize,
+    out_stale_count: *mut usize,
+) -> c_int {
+    if h.is_null() || out_stale_count.is_null() {
+        return SANDLOCK_INSTANCE_ERR_CHILD;
+    }
+    if ip_count > 0 && ips.is_null() {
+        return SANDLOCK_INSTANCE_ERR_CHILD;
+    }
+    if stale_capacity > 0 && stale.is_null() {
+        return SANDLOCK_INSTANCE_ERR_CHILD;
+    }
+    let mut allowed = Vec::with_capacity(ip_count);
+    for i in 0..ip_count {
+        let s = match CStr::from_ptr(*ips.add(i)).to_str() {
+            Ok(s) => s,
+            Err(_) => return SANDLOCK_INSTANCE_ERR_CHILD,
+        };
+        match s.parse::<std::net::IpAddr>() {
+            Ok(ip) => allowed.push(ip),
+            Err(_) => return SANDLOCK_INSTANCE_ERR_CHILD,
+        }
+    }
+    let h = &mut *h;
+    let result = block_on_runtime(&h.runtime, async {
+        h.instance.update_network(&allowed).await
+    });
+    let report = match result {
+        Some(Ok(report)) => report,
+        Some(Err(e)) => return instance_error_code(&e),
+        None => return SANDLOCK_INSTANCE_ERR_CHILD,
+    };
+    let n = report.stale_child_ids.len().min(stale_capacity);
+    for (i, id) in report.stale_child_ids.iter().take(n).enumerate() {
+        *stale.add(i) = *id;
+    }
+    *out_stale_count = report.stale_child_ids.len();
     SANDLOCK_INSTANCE_OK
 }
 

@@ -165,7 +165,16 @@ oci = 144     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e
               # 56 lib + 68 bin + 15 integration.rs + 2 reaper + 3 process
               # groups = 144).
 cli_build = 0 # workspace release build gate (no test binaries; 0 = build passed)
-python = 446  # fork S2.x-era python tests landed after the plan's 430/431
+python = 450  # F4 (M2 per-exec params + S9 + update_network): 446 -> 450, +4
+              # in the new tests/test_instance_exec_params.py
+              # (test_per_exec_cwd_and_env_apply,
+              # test_wider_policy_is_rejected,
+              # test_update_network_applies_to_new_exec_only_and_reports_
+              # staleness, test_per_exec_bind_port_reaches_listener);
+              # SandboxInstance.exec gained keyword-only cwd/env/clean_env/
+              # extra_writable/bind_ports, update_network(ips) returns the
+              # stale child ids, and wider requests raise PermissionError.
+              # fork S2.x-era python tests landed after the plan's 430/431
               # estimate. F3.3: 441 -> 445, +4 in tests/test_instance_exec.py
               # (test_exec_returns_self_owned_process,
               # test_exec_after_close_returns_same_error,
