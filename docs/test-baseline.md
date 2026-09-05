@@ -11,8 +11,14 @@
 #   2. root-mode phases: oci (`--oci-root`) and the supervise foreign-uid
 #      acceptance (`--supervise-root`), both as root in the same privileged
 #      container.
-core_lib = 791 # F1.4 (SL-8): +1 plan unit test pidfd_release_is_idempotent
-               # in resource.rs
+core_lib = 797 # F1.4 (SL-8): +1 plan unit test pidfd_release_is_idempotent
+               # in resource.rs.
+               # F3.1 (exec machinery lift): 791 -> 797, +6 unit tests moved
+               # verbatim with their code from sandlock-oci into
+               # core/src/init/{proto.rs,fdpass.rs} (frame decoder + Req/Resp/
+               # Signal round-trips + two SCM_RIGHTS round-trips). oci keeps
+               # the same tests re-hosted against the re-export seam, so its
+               # 144 stays exactly unchanged (relocation, not rewrite).
 core_integ = 494 # F2.1 (M0 lifecycle lift): 477 -> 481 (+4 lifecycle tests);
                  # F2.2 (shutdown seven-step order + idempotency): 481 -> 484,
                  # +3 in integration/test_instance_lifecycle.rs

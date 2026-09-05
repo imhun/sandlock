@@ -22,12 +22,15 @@
 //! - `exec` runs non-TTY only: `-t` / `--console-socket` are accepted for runc
 //!   compatibility but ignored (no PTY yet).
 
-mod fdpass;
 mod init;
 mod policy;
 mod spec;
 mod state;
 mod supervisor;
+
+// The fd-passing helpers moved into the core init module (F3.1); the name is
+// re-exported so the historical `fdpass::` paths in this file keep working.
+use init::fdpass;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};

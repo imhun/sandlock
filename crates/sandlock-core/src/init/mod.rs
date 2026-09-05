@@ -71,6 +71,7 @@
 //! (SL-5), see [`RecvFdGuard`].
 
 pub mod proto;
+pub mod fdpass;
 mod fdrecv;
 
 pub use proto::{Req, Resp, CONTROL_FD};

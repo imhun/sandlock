@@ -35,6 +35,7 @@ pub(crate) mod chroot;
 pub mod dry_run;
 pub mod control;
 pub mod instance;
+pub mod init;
 mod transparent_proxy;
 
 pub use error::SandlockError;
