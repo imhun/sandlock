@@ -449,6 +449,50 @@ _lib.sandlock_popen.argtypes = [
     ctypes.POINTER(ctypes.c_int),  # out_stderr_fd
 ]
 
+# SandboxInstance (F3.3): exec-capable session handle + per-child verbs
+_c_instance_p = ctypes.c_void_p
+
+class _SandlockInstanceExecResult(ctypes.Structure):
+    """Mirror of `sandlock_instance_exec_result_t` in sandlock.h."""
+
+    _fields_ = [
+        ("child_id", ctypes.c_uint64),
+        ("pid", ctypes.c_int32),
+        ("stdin_fd", ctypes.c_int32),
+        ("stdout_fd", ctypes.c_int32),
+        ("stderr_fd", ctypes.c_int32),
+        ("pty_fd", ctypes.c_int32),
+    ]
+
+
+_lib.sandlock_instance_launch.restype = _c_instance_p
+_lib.sandlock_instance_launch.argtypes = [_c_policy_p, ctypes.c_char_p]
+_lib.sandlock_instance_exec.restype = ctypes.c_int
+_lib.sandlock_instance_exec.argtypes = [
+    _c_instance_p,
+    ctypes.POINTER(ctypes.c_char_p),
+    ctypes.c_uint,
+    ctypes.c_uint32,
+    ctypes.POINTER(_SandlockInstanceExecResult),
+]
+_lib.sandlock_instance_wait_child.restype = _c_result_p
+_lib.sandlock_instance_wait_child.argtypes = [
+    _c_instance_p,
+    ctypes.c_uint64,
+    ctypes.c_uint64,
+]
+_lib.sandlock_instance_kill_child.restype = ctypes.c_int
+_lib.sandlock_instance_kill_child.argtypes = [_c_instance_p, ctypes.c_uint64, ctypes.c_int32]
+_lib.sandlock_instance_resize_child.restype = ctypes.c_int
+_lib.sandlock_instance_resize_child.argtypes = [
+    _c_instance_p,
+    ctypes.c_uint64,
+    ctypes.c_uint16,
+    ctypes.c_uint16,
+]
+_lib.sandlock_instance_free.restype = None
+_lib.sandlock_instance_free.argtypes = [_c_instance_p]
+
 # Result
 _lib.sandlock_result_exit_code.restype = ctypes.c_int
 _lib.sandlock_result_exit_code.argtypes = [_c_result_p]

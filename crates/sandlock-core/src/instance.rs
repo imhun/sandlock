@@ -362,15 +362,17 @@ impl SandboxInstance {
     ///
     /// `cmd` must be non-empty (argv[0] is the executable). On failure the
     /// session is cleaned up exactly as an abandoned `Sandbox` would be.
-    pub async fn launch_exec(
+    async fn launch_exec_inner(
         mut policy: crate::sandbox::Sandbox,
-        cmd: &[&str],
+        cmd: Option<&[&str]>,
     ) -> Result<SandboxInstance, SandlockError> {
-        if cmd.is_empty() {
-            return Err(SandboxRuntimeError::Child(
-                "empty command for exec session".into(),
-            )
-            .into());
+        if let Some(cmd) = cmd {
+            if cmd.is_empty() {
+                return Err(SandboxRuntimeError::Child(
+                    "empty command for exec session".into(),
+                )
+                .into());
+            }
         }
         let (daemon_ctl, child_ctl) = UnixStream::pair().map_err(SandboxRuntimeError::Io)?;
         // The confined init (and with it the RunMain workload, which inherits
@@ -419,56 +421,85 @@ impl SandboxInstance {
             children: HashMap::new(),
         }));
 
-        // Register the main workload as child id 0. If this fails the
-        // half-built session is dropped here; the exec-aware Drop backstop
-        // kills init and collapses whatever exists.
-        let argv: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
-        let reply = match link
-            .request(
+        // Register the main workload as child id 0 when the caller asked for
+        // one. If this fails the half-built session is dropped here; the
+        // exec-aware Drop backstop kills init and collapses whatever exists.
+        if let Some(cmd) = cmd {
+            let argv: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
+            let reply = match link
+                .request(
+                    0,
+                    &Req::RunMain {
+                        argv,
+                        env: vec![],
+                        cwd: None,
+                    },
+                    &[],
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    drop(rt);
+                    return Err(e);
+                }
+            };
+            let pid = match reply {
+                Resp::Started { pid } => pid,
+                Resp::Err { msg } => {
+                    drop(rt);
+                    return Err(SandboxRuntimeError::Child(msg).into());
+                }
+                other => {
+                    drop(rt);
+                    return Err(SandboxRuntimeError::Child(format!(
+                        "unexpected init reply to RunMain: {other:?}"
+                    ))
+                    .into());
+                }
+            };
+            let session = rt
+                .exec_session
+                .as_mut()
+                .expect("exec session installed before RunMain");
+            session.children.insert(
                 0,
-                &Req::RunMain {
-                    argv,
-                    env: vec![],
-                    cwd: None,
+                ExecChild {
+                    pid,
+                    pidfd: open_child_pidfd(pid),
+                    pty: None,
+                    status: None,
                 },
-                &[],
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                drop(rt);
-                return Err(e);
-            }
-        };
-        let pid = match reply {
-            Resp::Started { pid } => pid,
-            Resp::Err { msg } => {
-                drop(rt);
-                return Err(SandboxRuntimeError::Child(msg).into());
-            }
-            other => {
-                drop(rt);
-                return Err(SandboxRuntimeError::Child(format!(
-                    "unexpected init reply to RunMain: {other:?}"
-                ))
-                .into());
-            }
-        };
-        let session = rt
-            .exec_session
-            .as_mut()
-            .expect("exec session installed before RunMain");
-        session.children.insert(
-            0,
-            ExecChild {
-                pid,
-                pidfd: open_child_pidfd(pid),
-                pty: None,
-                status: None,
-            },
-        );
+            );
+        }
         Ok(rt)
+    }
+
+    /// Launch an **exec-capable** session with a main workload (child id 0),
+    /// and:
+    ///
+    /// * [`SandboxInstance::launch_exec`] — `cmd` runs as the session's main
+    ///   child, exactly as the F3.1 report maps M0's single process into the
+    ///   per-child table;
+    /// * [`SandboxInstance::launch_exec_only`] — no main process: the
+    ///   session starts with `sandlock-init` only and every command arrives
+    ///   through [`SandboxInstance::exec`] (the E2B S12 shape — no "main
+    ///   process exit ends the container" semantic; the session ends only on
+    ///   shutdown).
+    pub async fn launch_exec(
+        policy: crate::sandbox::Sandbox,
+        cmd: &[&str],
+    ) -> Result<SandboxInstance, SandlockError> {
+        Self::launch_exec_inner(policy, Some(cmd)).await
+    }
+
+    /// Launch an exec-only session (no main process; see
+    /// [`SandboxInstance::launch_exec`] for the distinction). `pid()` reports
+    /// `None` until the first `exec`.
+    pub async fn launch_exec_only(
+        policy: crate::sandbox::Sandbox,
+    ) -> Result<SandboxInstance, SandlockError> {
+        Self::launch_exec_inner(policy, None).await
     }
 
     /// Refuse a per-child verb when the session is not exec-capable.

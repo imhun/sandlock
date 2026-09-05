@@ -3057,6 +3057,291 @@ pub unsafe extern "C" fn sandlock_handle_restore_skipped_path(
 }
 
 // ----------------------------------------------------------------
+// SandboxInstance (F3.3): exec-capable session handle + per-child verbs
+// ----------------------------------------------------------------
+
+/// Opaque handle wrapping an exec-capable [`SandboxInstance`] plus a live
+/// multi-thread runtime (its supervisor tasks and the init reader task must
+/// keep progressing between FFI calls).
+///
+/// Field order matters for teardown: the instance is declared first, so
+/// dropping the handle runs the instance's synchronous kill-and-clean
+/// backstop while the runtime is still alive.
+#[allow(non_camel_case_types)]
+pub struct sandlock_instance_t {
+    instance: sandlock_core::instance::SandboxInstance,
+    runtime: tokio::runtime::Runtime,
+}
+
+/// Error code 0: success.
+pub const SANDLOCK_INSTANCE_OK: i32 = 0;
+/// The instance is closed (shut down, its exec link is Dead, or the init
+/// channel closed) — the F5.4 S5 unified code, reserved on F3.2's terms.
+/// Every subsequent exec/wait_child/kill_child returns this same code.
+pub const SANDLOCK_INSTANCE_ERR_CLOSED: i32 = 1;
+/// A per-child verb named a child id that was never registered.
+pub const SANDLOCK_INSTANCE_ERR_UNKNOWN_CHILD: i32 = 2;
+/// Any other child/protocol error (empty argv, init rejection, not an
+/// exec-capable session, io failure).
+pub const SANDLOCK_INSTANCE_ERR_CHILD: i32 = 3;
+/// resize_child on a child that has no pty.
+pub const SANDLOCK_INSTANCE_ERR_NO_PTY: i32 = 4;
+
+/// Result of `sandlock_instance_exec`: the registered child id, its pid, and
+/// the caller-owned host ends of the requested stdio (see the `stdio_mode`
+/// parameter). Fields with no stream are -1; the pty master is only set in
+/// PTY mode.
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub struct sandlock_instance_exec_result_t {
+    pub child_id: u64,
+    pub pid: i32,
+    pub stdin_fd: c_int,
+    pub stdout_fd: c_int,
+    pub stderr_fd: c_int,
+    pub pty_fd: c_int,
+}
+
+impl Default for sandlock_instance_exec_result_t {
+    fn default() -> Self {
+        sandlock_instance_exec_result_t {
+            child_id: 0,
+            pid: 0,
+            stdin_fd: -1,
+            stdout_fd: -1,
+            stderr_fd: -1,
+            pty_fd: -1,
+        }
+    }
+}
+
+/// Map a core error to the stable instance error code.
+fn instance_error_code(e: &sandlock_core::SandlockError) -> i32 {
+    use sandlock_core::error::SandboxRuntimeError;
+    match e {
+        sandlock_core::SandlockError::Runtime(SandboxRuntimeError::InstanceClosed) => {
+            SANDLOCK_INSTANCE_ERR_CLOSED
+        }
+        sandlock_core::SandlockError::Runtime(SandboxRuntimeError::UnknownChild(_)) => {
+            SANDLOCK_INSTANCE_ERR_UNKNOWN_CHILD
+        }
+        _ => SANDLOCK_INSTANCE_ERR_CHILD,
+    }
+}
+
+/// Map a raw stdio mode (0=inherit, 1=piped, 2=null, 3=pty) to [`ExecStdio`].
+fn exec_stdio_from_raw(mode: u32) -> Option<sandlock_core::instance::ExecStdio> {
+    match mode {
+        0 => Some(sandlock_core::instance::ExecStdio::Inherit),
+        1 => Some(sandlock_core::instance::ExecStdio::Piped),
+        2 => Some(sandlock_core::instance::ExecStdio::Null),
+        3 => Some(sandlock_core::instance::ExecStdio::Pty),
+        _ => None,
+    }
+}
+
+/// Launch an exec-capable (exec-only) session from a built policy sandbox.
+/// The session starts with the confined `sandlock-init` only — every command
+/// arrives through `sandlock_instance_exec` (the S12 shape: no main process
+/// whose exit ends the container; the session ends on shutdown/free).
+///
+/// Returns an opaque instance handle, or NULL on any failure (the caller
+/// frees it with `sandlock_instance_free`).
+///
+/// # Safety
+/// `policy` must be a valid policy pointer. `name` may be NULL to
+/// auto-generate an instance name.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_instance_launch(
+    policy: *const sandlock_sandbox_t,
+    name: *const c_char,
+) -> *mut sandlock_instance_t {
+    if policy.is_null() {
+        return ptr::null_mut();
+    }
+    let policy = &(*policy)._private;
+    let name = match optional_name(name) {
+        Ok(n) => n,
+        Err(_) => return ptr::null_mut(),
+    };
+    let rt = match build_live_runtime() {
+        Some(rt) => rt,
+        None => return ptr::null_mut(),
+    };
+    let sb = match name {
+        Some(ref n) => policy.clone().with_name(n.clone()),
+        None => policy.clone(),
+    };
+    let launched = block_on_runtime(&rt, sandlock_core::SandboxInstance::launch_exec_only(sb));
+    match launched {
+        Some(Ok(instance)) => Box::into_raw(Box::new(sandlock_instance_t {
+            instance,
+            runtime: rt,
+        })),
+        _ => ptr::null_mut(),
+    }
+}
+
+/// Exec one command inside the session with one stdio mode for all three
+/// streams (0=inherit, 1=piped, 2=null, 3=pty). Fills `out` with the child
+/// id, pid and caller-owned fds and returns `SANDLOCK_INSTANCE_OK`; on error
+/// returns the stable instance error code (and leaves `out` untouched).
+///
+/// # Safety
+/// `h` must be a valid instance handle; `argv` must point to `argc` C
+/// strings; `out` must be a valid pointer to a caller-owned result struct.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_instance_exec(
+    h: *mut sandlock_instance_t,
+    argv: *const *const c_char,
+    argc: c_uint,
+    stdio_mode: u32,
+    out: *mut sandlock_instance_exec_result_t,
+) -> c_int {
+    if h.is_null() || argv.is_null() || out.is_null() {
+        return SANDLOCK_INSTANCE_ERR_CHILD;
+    }
+    let stdio = match exec_stdio_from_raw(stdio_mode) {
+        Some(s) => s,
+        None => return SANDLOCK_INSTANCE_ERR_CHILD,
+    };
+    let args = read_argv(argv, argc);
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let h = &mut *h;
+    let result = block_on_runtime(&h.runtime, async {
+        h.instance.exec(&arg_refs, stdio).await
+    });
+    let handle = match result {
+        Some(Ok(handle)) => handle,
+        Some(Err(e)) => return instance_error_code(&e),
+        None => return SANDLOCK_INSTANCE_ERR_CHILD,
+    };
+    use std::os::fd::IntoRawFd;
+    let res = sandlock_instance_exec_result_t {
+        child_id: handle.child_id,
+        pid: handle.pid,
+        stdin_fd: handle.stdin.map(|f| f.into_raw_fd()).unwrap_or(-1),
+        stdout_fd: handle.stdout.map(|f| f.into_raw_fd()).unwrap_or(-1),
+        stderr_fd: handle.stderr.map(|f| f.into_raw_fd()).unwrap_or(-1),
+        pty_fd: handle.pty.map(|f| f.into_raw_fd()).unwrap_or(-1),
+    };
+    *out = res;
+    SANDLOCK_INSTANCE_OK
+}
+
+/// Wait for an exec child to exit (blocking). `timeout_ms == 0` waits
+/// indefinitely; a finite timeout kills the child (SIGKILL) on expiry and
+/// returns a TIMEOUT result, mirroring `sandlock_handle_wait_timeout`.
+/// Returns an opaque result handle (free with `sandlock_result_free`) whose
+/// stdout/stderr are empty — exec output streams to the caller's fds, not
+/// into the result. Returns NULL on error (e.g. unknown child id or a closed
+/// instance).
+///
+/// # Safety
+/// `h` must be a valid instance handle.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_instance_wait_child(
+    h: *mut sandlock_instance_t,
+    child_id: u64,
+    timeout_ms: u64,
+) -> *mut sandlock_result_t {
+    if h.is_null() {
+        return ptr::null_mut();
+    }
+    let h = &mut *h;
+    let dur = Duration::from_millis(timeout_ms);
+    let waited = block_on_runtime(&h.runtime, async {
+        if timeout_ms == 0 {
+            h.instance.wait_child(child_id).await
+        } else {
+            match tokio::time::timeout(dur, h.instance.wait_child(child_id)).await {
+                Ok(res) => res,
+                Err(_) => {
+                    // Timeout: kill the child, reap it, and report the
+                    // sandlock-enforced TIMEOUT status (the child's own
+                    // Killed status is not what timed the caller out).
+                    let _ = h.instance.kill_child(child_id, libc::SIGKILL);
+                    let _ = h.instance.wait_child(child_id).await;
+                    Ok(sandlock_core::ExitStatus::Timeout)
+                }
+            }
+        }
+    });
+    match waited {
+        Some(Ok(status)) => Box::into_raw(Box::new(sandlock_result_t {
+            _private: RunResult {
+                exit_status: status,
+                stdout: None,
+                stderr: None,
+            },
+        })),
+        _ => ptr::null_mut(),
+    }
+}
+
+/// Deliver `signum` to one registered exec child. Idempotent: a child whose
+/// exit was already reported is a no-op. Returns `SANDLOCK_INSTANCE_OK` on
+/// success, or a stable error code.
+///
+/// # Safety
+/// `h` must be a valid instance handle.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_instance_kill_child(
+    h: *mut sandlock_instance_t,
+    child_id: u64,
+    signum: i32,
+) -> c_int {
+    if h.is_null() {
+        return SANDLOCK_INSTANCE_ERR_CHILD;
+    }
+    let h = &mut *h;
+    match h.instance.kill_child(child_id, signum) {
+        Ok(()) => SANDLOCK_INSTANCE_OK,
+        Err(e) => instance_error_code(&e),
+    }
+}
+
+/// Resize the pty of an exec child (TIOCSWINSZ on the retained master).
+/// Returns `SANDLOCK_INSTANCE_OK`, `SANDLOCK_INSTANCE_ERR_NO_PTY` for a
+/// child exec'd without PTY stdio, or another stable error code.
+///
+/// # Safety
+/// `h` must be a valid instance handle.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_instance_resize_child(
+    h: *mut sandlock_instance_t,
+    child_id: u64,
+    rows: u16,
+    cols: u16,
+) -> c_int {
+    if h.is_null() {
+        return SANDLOCK_INSTANCE_ERR_CHILD;
+    }
+    let h = &mut *h;
+    match h.instance.resize_child(child_id, rows, cols) {
+        Ok(()) => SANDLOCK_INSTANCE_OK,
+        Err(sandlock_core::SandlockError::Runtime(
+            sandlock_core::error::SandboxRuntimeError::Child(ref msg),
+        )) if msg.contains("has no pty master") => SANDLOCK_INSTANCE_ERR_NO_PTY,
+        Err(e) => instance_error_code(&e),
+    }
+}
+
+/// Free an instance handle. Shuts the session down through the instance's
+/// synchronous backstop (registered child groups + init are SIGKILLed and
+/// reaped; caller-held stdio fds reach EOF as the write ends close).
+///
+/// # Safety
+/// `h` must be null or a valid instance handle; after this call the handle
+/// must not be used again.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_instance_free(h: *mut sandlock_instance_t) {
+    if !h.is_null() {
+        drop(Box::from_raw(h));
+    }
+}
+
+// ----------------------------------------------------------------
 // Platform query
 // ----------------------------------------------------------------
 

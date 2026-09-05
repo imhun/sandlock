@@ -116,6 +116,28 @@ class StdioMode(IntEnum):
     """Connect the stream to ``/dev/null``."""
 
 
+class ExecStdio(IntEnum):
+    """Stdio wiring for one :meth:`SandboxInstance.exec` child.
+
+    The values are the stable ABI discriminants shared with the C/Rust core
+    (`sandlock_instance_exec`). Unlike the per-stream :class:`StdioMode` of
+    :meth:`Sandbox.popen`, F3.2's `exec` applies one mode to all three
+    streams (``stdio | pty``); ``PTY`` additionally returns a host-side pty
+    master that :meth:`ExecProcess.resize` drives.
+    """
+
+    INHERIT = 0
+    """The child inherits the session process's stdio."""
+    PIPED = 1
+    """Connect all three streams to pipes; :class:`ExecProcess` owns the host
+    ends (``.stdin``/``.stdout``/``.stderr`` file objects)."""
+    NULL = 2
+    """Connect all three streams to ``/dev/null``."""
+    PTY = 3
+    """Connect all three streams to a pty slave; the master is returned and
+    ``ExecProcess.resize`` drives TIOCSWINSZ through it."""
+
+
 @dataclass(frozen=True)
 class Change:
     """A single filesystem change detected by dry-run."""
@@ -1806,6 +1828,327 @@ class Process:
                 "Process was not waited on or used as a context manager; "
                 "reaping the confined child. Use `with sandbox.popen(...)` or "
                 "call wait().",
+                ResourceWarning,
+                stacklevel=2,
+            )
+            self.kill()
+            self.wait()
+        except Exception:
+            pass
+
+
+class SandboxInstance:
+    """An exec-capable sandbox session (F3.2/F3.3).
+
+    Created from a policy :class:`Sandbox`, the session starts a confined
+    ``sandlock-init`` and every command arrives through
+    :meth:`SandboxInstance.exec`, which returns a self-owned
+    :class:`ExecProcess` per child. Unlike the one-shot :class:`Sandbox`
+    (one process per object, ``&'a mut``-style ownership), an instance holds
+    many children concurrently and each returned process owns its own child
+    registration — closing the instance kills and reaps them all.
+
+    ``name`` is optional (a unique name is generated when omitted).
+    """
+
+    # Stable FFI error codes (crates/sandlock-ffi/src/lib.rs).
+    _ERR_CLOSED = 1
+    _ERR_UNKNOWN_CHILD = 2
+    _ERR_CHILD = 3
+    _ERR_NO_PTY = 4
+
+    def __init__(self, policy: "Sandbox", name: str | None = None):
+        from ._sdk import _lib
+
+        if not isinstance(policy, Sandbox):
+            raise TypeError(
+                "SandboxInstance(policy=...) requires a Sandbox configuration "
+                f"object, got {type(policy).__name__}"
+            )
+        native = policy._ensure_native()
+        resolved = name if name is not None else None
+        self._policy = policy
+        self._handle = _lib.sandlock_instance_launch(
+            native.ptr, _encode(resolved) if resolved is not None else None
+        )
+        if not self._handle:
+            raise RuntimeError("sandlock_instance_launch failed")
+
+    def exec(
+        self,
+        cmd,
+        stdio: ExecStdio | int = ExecStdio.PIPED,
+    ) -> "ExecProcess":
+        """Run ``cmd`` inside the session and return a self-owned
+        :class:`ExecProcess`.
+
+        ``cmd`` is a non-empty sequence whose first element is the executable.
+        ``stdio`` applies one :class:`ExecStdio` mode to all three streams
+        (default piped). Concurrent children are independent: each gets its
+        own registered child id and stdio.
+
+        Raises:
+            RuntimeError: If the session is closed (the F5.4 S5 unified
+                closed-instance error — every later call raises the same
+                message), or the exec failed for another reason.
+        """
+        import ctypes
+
+        from ._sdk import _lib, _make_argv, _SandlockInstanceExecResult
+
+        if self._handle is None:
+            raise RuntimeError(self._closed_message())
+        if not isinstance(cmd, (list, tuple)) or not cmd:
+            raise ValueError("exec requires a non-empty argv sequence")
+        mode = int(stdio)
+        if mode not in (0, 1, 2, 3):
+            raise ValueError(
+                f"unknown ExecStdio value {stdio!r}: use INHERIT/PIPED/NULL/PTY"
+            )
+
+        argv, argc = _make_argv(list(cmd))
+        out = _SandlockInstanceExecResult()
+        rc = _lib.sandlock_instance_exec(self._handle, argv, argc, mode, ctypes.byref(out))
+        if rc != 0:
+            raise RuntimeError(self._error_message(rc, "exec"))
+        return ExecProcess(
+            self,
+            child_id=out.child_id,
+            pid=out.pid,
+            stdin_fd=out.stdin_fd,
+            stdout_fd=out.stdout_fd,
+            stderr_fd=out.stderr_fd,
+            pty_fd=out.pty_fd,
+        )
+
+    def close(self) -> None:
+        """Terminate the session and release the native handle.
+
+        Idempotent. Uses the native handle's synchronous teardown backstop
+        (registered child groups + init are SIGKILLed and reaped); caller-held
+        stdio fds reach EOF as their write ends close. A later ``exec`` raises
+        the unified closed-instance error.
+        """
+        from ._sdk import _lib
+
+        if self._handle is not None:
+            _lib.sandlock_instance_free(self._handle)
+            self._handle = None
+
+    def __enter__(self) -> "SandboxInstance":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _closed_message() -> str:
+        return (
+            "sandlock instance is closed (shut down or its exec link is dead); "
+            "no new work is accepted"
+        )
+
+    def _error_message(self, rc: int, verb: str) -> str:
+        if rc == self._ERR_CLOSED:
+            return self._closed_message()
+        if rc == self._ERR_UNKNOWN_CHILD:
+            return f"sandlock_instance_{verb}: unknown child id"
+        return f"sandlock_instance_{verb} failed (error code {rc})"
+
+
+class ExecProcess:
+    """A live confined child of a :class:`SandboxInstance` with caller-owned
+    stdio — the self-owned process handle returned by
+    :meth:`SandboxInstance.exec`.
+
+    API surface matches the one-shot :class:`Process` (``.stdin`` /
+    ``.stdout`` / ``.stderr`` file objects, ``pid``, ``wait(timeout)``,
+    ``kill()``, context manager), but ownership differs by design:
+
+    * the process is *not* a borrow of the instance — the instance can exec
+      more children while this one runs, and dropping the returned process
+      leaves the child running until the instance closes;
+    * ``kill()`` signals through the session registry (per-child pidfd /
+      group delivery), not a raw ``os.killpg`` on a pid the SDK cached;
+    * ``wait()`` frees nothing — the registration is the instance's — and is
+      idempotent via a cached :class:`Result`.
+    """
+
+    def __init__(
+        self,
+        instance: SandboxInstance,
+        child_id: int,
+        pid: int,
+        stdin_fd: int,
+        stdout_fd: int,
+        stderr_fd: int,
+        pty_fd: int,
+    ):
+        import os
+        import threading
+
+        self._instance = instance
+        self._child_id = child_id
+        self._pid = pid
+        self._lock = threading.Lock()
+        self._result: "Result | None" = None
+        self.stdin = self.stdout = self.stderr = self.pty = None
+        specs = ((stdin_fd, "wb"), (stdout_fd, "rb"), (stderr_fd, "rb"))
+        opened = []
+        try:
+            for fd, mode in specs:
+                opened.append(os.fdopen(fd, mode, buffering=0) if fd >= 0 else None)
+            if pty_fd >= 0:
+                opened.append(os.fdopen(pty_fd, "rb", buffering=0))
+            else:
+                opened.append(None)
+        except BaseException:
+            for stream in opened:
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+            for fd, _mode in specs[len(opened):]:
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            raise
+        self.stdin, self.stdout, self.stderr, self.pty = opened
+
+    @property
+    def pid(self) -> int | None:
+        """The child PID while running, else ``None`` (after :meth:`wait`)."""
+        with self._lock:
+            return self._pid if self._result is None and self._pid > 0 else None
+
+    def resize(self, rows: int, cols: int) -> None:
+        """Resize the child's pty (TIOCSWINSZ). Raises RuntimeError if the
+        child was not exec'd with :attr:`ExecStdio.PTY`."""
+        from ._sdk import _lib
+
+        with self._lock:
+            if self._result is not None:
+                return
+            rc = _lib.sandlock_instance_resize_child(
+                self._instance._handle, self._child_id, int(rows), int(cols)
+            )
+        if rc == SandboxInstance._ERR_NO_PTY:
+            raise RuntimeError("child has no pty master (exec without ExecStdio.PTY)")
+        if rc != 0:
+            raise RuntimeError(f"sandlock_instance_resize_child failed (code {rc})")
+
+    def kill(self) -> None:
+        """SIGKILL the child's whole command subtree through the session
+        registry. Idempotent: a child whose exit was already reported is a
+        no-op.
+
+        Raises:
+            RuntimeError: If the instance is closed and the child was never
+                reaped (a reaped child is already cached — no-op).
+        """
+        import signal
+        from ._sdk import _lib
+
+        with self._lock:
+            if self._result is not None:
+                return
+            rc = _lib.sandlock_instance_kill_child(
+                self._instance._handle, self._child_id, signal.SIGKILL
+            )
+        if rc != 0:
+            raise RuntimeError(self._instance._error_message(rc, "kill_child"))
+
+    def wait(self, timeout: float | None = None) -> "Result":
+        """Wait for the child to exit and return its :class:`Result`.
+
+        A still-open piped stdin is closed first so a reader child can exit.
+        The returned Result carries no captured stdout/stderr (they streamed
+        to ``.stdout``/``.stderr``). Idempotent: a second call returns the
+        cached Result.
+
+        Args:
+            timeout: Maximum seconds to wait. On timeout the child is killed
+                and a TIMEOUT Result is returned (never hangs), matching
+                :meth:`Sandbox.run` / :meth:`Process.wait` semantics.
+        """
+        from ._sdk import _lib, Result, ExitReason
+
+        with self._lock:
+            if self._result is not None:
+                return self._result
+        if self.stdin is not None and not self.stdin.closed:
+            try:
+                self.stdin.close()
+            except OSError:
+                pass
+
+        try:
+            timeout_ms = max(1, int(timeout * 1000)) if timeout is not None else 0
+            result_p = _lib.sandlock_instance_wait_child(
+                self._instance._handle, self._child_id, timeout_ms
+            )
+        except Exception:
+            raise RuntimeError("sandlock_instance_wait_child failed") from None
+        if not result_p:
+            raise RuntimeError("sandlock_instance_wait_child failed (no result)")
+
+        exit_code = _lib.sandlock_result_exit_code(result_p)
+        success = _lib.sandlock_result_success(result_p)
+        reason = ExitReason(_lib.sandlock_result_reason(result_p))
+        signal = _lib.sandlock_result_signal(result_p)
+        _lib.sandlock_result_free(result_p)
+        result = Result(
+            success=bool(success),
+            exit_code=exit_code,
+            reason=reason,
+            signal=signal,
+        )
+        with self._lock:
+            self._result = result
+        return result
+
+    def __enter__(self) -> "ExecProcess":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        # Terminate and reap a still-running child, then close the streams.
+        if self._result is None:
+            try:
+                self.kill()
+            except Exception:
+                pass
+            try:
+                self.wait()
+            except Exception:
+                pass
+        for stream in (self.stdin, self.stdout, self.stderr, self.pty):
+            if stream is not None and not stream.closed:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+    def __del__(self):
+        # Safety net: warn (like subprocess.Popen) and reap a child that was
+        # never waited on. The child registration is the instance's — closing
+        # this object only kills/waits this one child.
+        try:
+            if getattr(self, "_result", None) is not None:
+                return
+            import warnings
+
+            warnings.warn(
+                "ExecProcess was not waited on or used as a context manager; "
+                "killing the child. Use `with instance.exec(...)` or call wait().",
                 ResourceWarning,
                 stacklevel=2,
             )

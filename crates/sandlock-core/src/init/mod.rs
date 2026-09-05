@@ -600,13 +600,14 @@ pub fn run_init() {
                             replies.push(Resp::Started { pid });
                         }
                         Req::Shutdown => {
-                            if children.values().any(|c| c.kind == ChildKind::Main) {
-                                // Teardown: instance-level SIGKILL over the
-                                // child-group set (live + retained dead
-                                // groups), then exit the loop (the sandbox
-                                // Drop reaps init).
-                                signal_all_children(&children, &mut dead_groups, libc::SIGKILL);
-                            }
+                            // Teardown: instance-level SIGKILL over the
+                            // child-group set (live + retained dead groups),
+                            // then exit the loop (the sandbox Drop reaps
+                            // init). Unconditional since F3.2: an exec-only
+                            // session (no RunMain) must still collapse every
+                            // registered child on Shutdown; with an OCI-style
+                            // main present the behavior is unchanged.
+                            signal_all_children(&children, &mut dead_groups, libc::SIGKILL);
                             shutdown = true;
                         }
                         Req::Signal { signum } => {

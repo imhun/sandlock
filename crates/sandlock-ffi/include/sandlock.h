@@ -23,6 +23,34 @@ typedef struct sandlock_handler_t sandlock_handler_t;
 
 
 /**
+ * Error code 0: success.
+ */
+#define SANDLOCK_INSTANCE_OK 0
+
+/**
+ * The instance is closed (shut down, its exec link is Dead, or the init
+ * channel closed) — the F5.4 S5 unified code, reserved on F3.2's terms.
+ * Every subsequent exec/wait_child/kill_child returns this same code.
+ */
+#define SANDLOCK_INSTANCE_ERR_CLOSED 1
+
+/**
+ * A per-child verb named a child id that was never registered.
+ */
+#define SANDLOCK_INSTANCE_ERR_UNKNOWN_CHILD 2
+
+/**
+ * Any other child/protocol error (empty argv, init rejection, not an
+ * exec-capable session, io failure).
+ */
+#define SANDLOCK_INSTANCE_ERR_CHILD 3
+
+/**
+ * resize_child on a child that has no pty.
+ */
+#define SANDLOCK_INSTANCE_ERR_NO_PTY 4
+
+/**
  * `flags` bit for [`sandlock_action_set_inject_bytes`]: leave the injected
  * memfd writable (do not seal). Default (bit clear) seals it read-only.
  */
@@ -164,6 +192,17 @@ typedef struct sandlock_gather_t sandlock_gather_t;
 typedef struct sandlock_handle_t sandlock_handle_t;
 
 /**
+ * Opaque handle wrapping an exec-capable [`SandboxInstance`] plus a live
+ * multi-thread runtime (its supervisor tasks and the init reader task must
+ * keep progressing between FFI calls).
+ *
+ * Field order matters for teardown: the instance is declared first, so
+ * dropping the handle runs the instance's synchronous kill-and-clean
+ * backstop while the runtime is still alive.
+ */
+typedef struct sandlock_instance_t sandlock_instance_t;
+
+/**
  * Opaque handle wrapping a [`Pipeline`].
  */
 typedef struct sandlock_pipeline_t sandlock_pipeline_t;
@@ -206,6 +245,21 @@ typedef int32_t (*sandlock_policy_fn_t)(const sandlock_event_t *event,
 typedef void (*sandlock_init_fn_t)(void);
 
 typedef void (*sandlock_work_fn_t)(uint32_t clone_id);
+
+/**
+ * Result of `sandlock_instance_exec`: the registered child id, its pid, and
+ * the caller-owned host ends of the requested stdio (see the `stdio_mode`
+ * parameter). Fields with no stream are -1; the pty master is only set in
+ * PTY mode.
+ */
+typedef struct {
+  uint64_t child_id;
+  int32_t pid;
+  int stdin_fd;
+  int stdout_fd;
+  int stderr_fd;
+  int pty_fd;
+} sandlock_instance_exec_result_t;
 
 /**
  * Opaque child-memory accessor handed to a C handler callback.
@@ -448,6 +502,13 @@ sandlock_builder_t *sandlock_sandbox_builder_max_cpu(sandlock_builder_t *b, uint
  * # Safety
  * `b` must be a valid builder pointer.
  */
+sandlock_builder_t *sandlock_sandbox_builder_notify_rate_limit(sandlock_builder_t *b,
+                                                               uint32_t per_sec);
+
+/**
+ * # Safety
+ * `b` must be a valid builder pointer.
+ */
 sandlock_builder_t *sandlock_sandbox_builder_num_cpus(sandlock_builder_t *b, uint32_t n);
 
 /**
@@ -506,8 +567,9 @@ sandlock_builder_t *sandlock_sandbox_builder_port_remap(sandlock_builder_t *b, b
 /**
  * Run the sandboxed workload in a private PID namespace (`CLONE_NEWPID`):
  * the sandbox's first process is PID 1 inside its own namespace, foreign
- * PIDs are invisible, and `/proc` is filtered and renumbered to the
- * sandbox's own processes. Defaults to false.
+ * PIDs are invisible (`kill(pid, 0)` on host / other-sandbox processes
+ * returns `ESRCH`), and `/proc` is filtered and renumbered to the sandbox's
+ * own processes. Defaults to `false`.
  *
  * # Safety
  * `b` must be a valid builder pointer.
@@ -517,7 +579,9 @@ sandlock_builder_t *sandlock_sandbox_builder_pid_ns(sandlock_builder_t *b, bool 
 /**
  * Run the sandbox in its own network namespace (`CLONE_NEWNET` after the
  * user namespace): only loopback, brought up from inside the sandbox's
- * userns. Defaults to false (shared network namespace).
+ * userns. Defaults to `false` (shared network namespace). Independent of
+ * `fd_inject_connect`; with wildcard-domain rules the DNS gateway binds
+ * inside the sandbox's own netns.
  *
  * # Safety
  * `b` must be a valid builder pointer.
@@ -529,7 +593,7 @@ sandlock_builder_t *sandlock_sandbox_builder_net_isolation(sandlock_builder_t *b
  * on a fresh host-side socket and injects the connected fd into the sandbox
  * at the child's own socket fd number, so the trapped `connect()` returns 0
  * (normal success semantics) and the child's socket fd now refers to the
- * host-connected socket. Defaults to false (legacy on-behalf connect).
+ * host-connected socket. Defaults to `false` (legacy on-behalf connect).
  *
  * # Safety
  * `b` must be a valid builder pointer.
@@ -542,7 +606,8 @@ sandlock_builder_t *sandlock_sandbox_builder_fd_inject_connect(sandlock_builder_
  * host-loopback listener on `host_port` (>= 50005, the reserved inbound
  * mapping range); external connections to `host_port` are accepted by the
  * supervisor and the connected fd is injected as the sandbox's `accept()`
- * result. Requires net_isolation(true) and the seccomp supervisor.
+ * result. Requires `net_isolation(true)` and the seccomp supervisor
+ * (build-time fail-closed).
  *
  * # Safety
  * `b` must be a valid builder pointer.
@@ -575,6 +640,9 @@ sandlock_builder_t *sandlock_sandbox_builder_http_allow(sandlock_builder_t *b, c
 sandlock_builder_t *sandlock_sandbox_builder_http_deny(sandlock_builder_t *b, const char *rule);
 
 /**
+ * Declare a named credential loaded into the supervisor:
+ * `NAME=SOURCE` where SOURCE is `env:VAR`, `file:/path`, or `fd:N`.
+ *
  * # Safety
  * `b`, `name`, and `source` must be valid pointers.
  */
@@ -583,11 +651,14 @@ sandlock_builder_t *sandlock_sandbox_builder_credential(sandlock_builder_t *b,
                                                         const char *source);
 
 /**
+ * Add a credential-injection rule (the `--http-auth` grammar):
+ * `METHOD HOST/PATH AUTHSPEC CREDNAME [replace|add-only]`, where AUTHSPEC is
+ * `bearer | basic:<user> | header:<name> | apikey:<name> | query:<param>`.
+ *
  * # Safety
  * `b` and `rule` must be valid pointers.
  */
-sandlock_builder_t *sandlock_sandbox_builder_http_auth(sandlock_builder_t *b,
-                                                       const char *rule);
+sandlock_builder_t *sandlock_sandbox_builder_http_auth(sandlock_builder_t *b, const char *rule);
 
 /**
  * # Safety
@@ -621,12 +692,19 @@ sandlock_builder_t *sandlock_sandbox_builder_http_inject_ca(sandlock_builder_t *
 sandlock_builder_t *sandlock_sandbox_builder_http_ca_out(sandlock_builder_t *b, const char *path);
 
 /**
+ * Mask the outbound `Host`/authority for every request the HTTP ACL proxy
+ * forwards. The token ``${PORT}`` (if present) is replaced with the
+ * request's destination port.
+ *
  * # Safety
  * `b` and `mask` must be valid pointers.
  */
 sandlock_builder_t *sandlock_sandbox_builder_host_mask(sandlock_builder_t *b, const char *mask);
 
 /**
+ * Route all outbound TCP through a SOCKS5 proxy (`host:port` or
+ * `[v6]:port`), after allow/deny filtering.
+ *
  * # Safety
  * `b` and `address` must be valid pointers.
  */
@@ -634,6 +712,8 @@ sandlock_builder_t *sandlock_sandbox_builder_egress_proxy(sandlock_builder_t *b,
                                                           const char *address);
 
 /**
+ * Set the RFC 1929 username/password for the egress proxy.
+ *
  * # Safety
  * `b`, `username`, and `password` must be valid pointers.
  */
@@ -1482,6 +1562,87 @@ int sandlock_handle_restore_skipped_fd(const sandlock_handle_t *h, uintptr_t i);
  * `h` must be null or a valid handle.
  */
 char *sandlock_handle_restore_skipped_path(const sandlock_handle_t *h, uintptr_t i);
+
+/**
+ * Launch an exec-capable (exec-only) session from a built policy sandbox.
+ * The session starts with the confined `sandlock-init` only — every command
+ * arrives through `sandlock_instance_exec` (the S12 shape: no main process
+ * whose exit ends the container; the session ends on shutdown/free).
+ *
+ * Returns an opaque instance handle, or NULL on any failure (the caller
+ * frees it with `sandlock_instance_free`).
+ *
+ * # Safety
+ * `policy` must be a valid policy pointer. `name` may be NULL to
+ * auto-generate an instance name.
+ */
+sandlock_instance_t *sandlock_instance_launch(const sandlock_sandbox_t *policy, const char *name);
+
+/**
+ * Exec one command inside the session with one stdio mode for all three
+ * streams (0=inherit, 1=piped, 2=null, 3=pty). Fills `out` with the child
+ * id, pid and caller-owned fds and returns `SANDLOCK_INSTANCE_OK`; on error
+ * returns the stable instance error code (and leaves `out` untouched).
+ *
+ * # Safety
+ * `h` must be a valid instance handle; `argv` must point to `argc` C
+ * strings; `out` must be a valid pointer to a caller-owned result struct.
+ */
+int sandlock_instance_exec(sandlock_instance_t *h,
+                           const char *const *argv,
+                           unsigned int argc,
+                           uint32_t stdio_mode,
+                           sandlock_instance_exec_result_t *out);
+
+/**
+ * Wait for an exec child to exit (blocking). `timeout_ms == 0` waits
+ * indefinitely; a finite timeout kills the child (SIGKILL) on expiry and
+ * returns a TIMEOUT result, mirroring `sandlock_handle_wait_timeout`.
+ * Returns an opaque result handle (free with `sandlock_result_free`) whose
+ * stdout/stderr are empty — exec output streams to the caller's fds, not
+ * into the result. Returns NULL on error (e.g. unknown child id or a closed
+ * instance).
+ *
+ * # Safety
+ * `h` must be a valid instance handle.
+ */
+sandlock_result_t *sandlock_instance_wait_child(sandlock_instance_t *h,
+                                                uint64_t child_id,
+                                                uint64_t timeout_ms);
+
+/**
+ * Deliver `signum` to one registered exec child. Idempotent: a child whose
+ * exit was already reported is a no-op. Returns `SANDLOCK_INSTANCE_OK` on
+ * success, or a stable error code.
+ *
+ * # Safety
+ * `h` must be a valid instance handle.
+ */
+int sandlock_instance_kill_child(sandlock_instance_t *h, uint64_t child_id, int32_t signum);
+
+/**
+ * Resize the pty of an exec child (TIOCSWINSZ on the retained master).
+ * Returns `SANDLOCK_INSTANCE_OK`, `SANDLOCK_INSTANCE_ERR_NO_PTY` for a
+ * child exec'd without PTY stdio, or another stable error code.
+ *
+ * # Safety
+ * `h` must be a valid instance handle.
+ */
+int sandlock_instance_resize_child(sandlock_instance_t *h,
+                                   uint64_t child_id,
+                                   uint16_t rows,
+                                   uint16_t cols);
+
+/**
+ * Free an instance handle. Shuts the session down through the instance's
+ * synchronous backstop (registered child groups + init are SIGKILLed and
+ * reaped; caller-held stdio fds reach EOF as the write ends close).
+ *
+ * # Safety
+ * `h` must be null or a valid instance handle; after this call the handle
+ * must not be used again.
+ */
+void sandlock_instance_free(sandlock_instance_t *h);
 
 /**
  * Query the Landlock ABI version supported by the running kernel.
