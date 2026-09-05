@@ -173,6 +173,92 @@ async fn test_pid_ns_procfs_scope_narrows_to_child() {
     }
 }
 
+/// F5.4 (M3 S5): a fatal control-link failure (here: the confined
+/// `sandlock-init` is killed out from under the session) lands the instance
+/// in the distinct `Dead` state. Every later verb — exec, wait_child,
+/// kill_child, resize_child — returns the **same** `InstanceDead` error,
+/// never a different code and never a silent restart; `shutdown` still
+/// performs the cleanup tail and afterwards the verbs report the
+/// `InstanceClosed` code, so Dead and closed-by-shutdown stay
+/// distinguishable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_dead_state_surfaces_single_error_code() {
+    let mut inst = SandboxInstance::launch_exec_only(
+        base_policy().build().unwrap().with_name("f5-dead-code"),
+    )
+    .await
+    .expect("launch exec session");
+    let child = inst
+        .exec(&["sleep", "60"], ExecStdio::Null)
+        .await
+        .expect("exec child");
+    let init_pid = inst.control_pid().expect("confined init host pid");
+
+    // Fatal channel failure: init dies without a Shutdown frame and without
+    // the main-exit collapse sequence.
+    unsafe { libc::kill(init_pid, libc::SIGKILL) };
+    assert!(
+        poll_until(
+            || inst.phase() == InstancePhase::Dead,
+            Duration::from_secs(10)
+        )
+        .await,
+        "an unexpectedly terminated init must land the instance in Dead"
+    );
+
+    let e_exec = inst
+        .exec(&["sh", "-c", "exit 0"], ExecStdio::Null)
+        .await
+        .expect_err("exec after Dead must fail");
+    let e_wait = inst
+        .wait_child(child.child_id)
+        .await
+        .expect_err("wait_child after Dead must fail");
+    let e_kill = inst
+        .kill_child(child.child_id, libc::SIGKILL)
+        .expect_err("kill_child after Dead must fail");
+    let e_resize = inst
+        .resize_child(child.child_id, 40, 120)
+        .expect_err("resize_child after Dead must fail");
+
+    for e in [&e_exec, &e_wait, &e_kill, &e_resize] {
+        assert!(
+            matches!(
+                e,
+                sandlock_core::SandlockError::Runtime(SandboxRuntimeError::InstanceDead)
+            ),
+            "every post-Dead verb must return the unified InstanceDead code, got: {e:?}"
+        );
+    }
+    assert_eq!(format!("{e_exec}"), format!("{e_wait}"));
+    assert_eq!(format!("{e_wait}"), format!("{e_kill}"));
+    assert_eq!(format!("{e_kill}"), format!("{e_resize}"));
+
+    // Dead is observable on the stats surface, and shutdown still cleans up.
+    let stats = inst.stats().await;
+    assert_eq!(stats.instance_state, InstancePhase::Dead);
+    inst.shutdown().await.expect("shutdown from Dead must clean up");
+    assert_eq!(inst.phase(), InstancePhase::ShutDown);
+    assert!(
+        !inst.control_dir().expect("control dir").exists(),
+        "shutdown from Dead must still remove the control dir"
+    );
+
+    // After the cleanup tail the closed code is the *closed* one — Dead and
+    // InstanceClosed remain distinct (no silent state confusion).
+    let e_after = inst
+        .exec(&["sh", "-c", "exit 0"], ExecStdio::Null)
+        .await
+        .expect_err("exec after shutdown-from-Dead must fail");
+    assert!(
+        matches!(
+            &e_after,
+            sandlock_core::SandlockError::Runtime(SandboxRuntimeError::InstanceClosed)
+        ),
+        "post-shutdown verbs report InstanceClosed, got: {e_after:?}"
+    );
+}
+
 /// F5.1 (Q10): `max_processes` bounds the **whole box** — every exec child
 /// of one session shares the accounting, so command N+1 is refused while
 /// earlier commands still hold their process slots, and a slot released by a

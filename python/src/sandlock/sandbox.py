@@ -1859,6 +1859,7 @@ class SandboxInstance:
     _ERR_CHILD = 3
     _ERR_NO_PTY = 4
     _ERR_POLICY = 5
+    _ERR_DEAD = 6
 
     def __init__(self, policy: "Sandbox", name: str | None = None):
         from ._sdk import _lib
@@ -1916,9 +1917,10 @@ class SandboxInstance:
         text; Python maps the same stable EPERM-class code.)
 
         Raises:
-            RuntimeError: If the session is closed (the F5.4 S5 unified
-                closed-instance error — every later call raises the same
-                message), or the exec failed for another reason.
+            RuntimeError: If the session is closed or dead (every later call
+                raises the same message; Dead — a listener/reaper/channel
+                failure — is reported distinctly from a clean close, F5.4),
+                or the exec failed for another reason.
         """
         import ctypes
 
@@ -2065,13 +2067,23 @@ class SandboxInstance:
     @staticmethod
     def _closed_message() -> str:
         return (
-            "sandlock instance is closed (shut down or its exec link is dead); "
-            "no new work is accepted"
+            "sandlock instance is closed (shut down, or the init channel "
+            "closed after the main-exit container end); no new work is accepted"
+        )
+
+    @staticmethod
+    def _dead_message() -> str:
+        return (
+            "sandlock instance is dead (listener/reaper/control-channel "
+            "failure); every verb returns this code and the instance is never "
+            "silently relaunched"
         )
 
     def _error_message(self, rc: int, verb: str) -> str:
         if rc == self._ERR_CLOSED:
             return self._closed_message()
+        if rc == self._ERR_DEAD:
+            return self._dead_message()
         if rc == self._ERR_UNKNOWN_CHILD:
             return f"sandlock_instance_{verb}: unknown child id"
         if rc == self._ERR_POLICY:

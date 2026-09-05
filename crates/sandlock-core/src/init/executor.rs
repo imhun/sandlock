@@ -87,6 +87,12 @@ struct ExecLinkState {
     /// True once the channel closed (init exited / Shutdown completed):
     /// requests fail fast with the closed-instance error.
     terminated: bool,
+    /// F5.4: sticky record that the main workload's (child id 0) `Exited`
+    /// frame was routed before the channel terminated. init sends that frame
+    /// immediately before its deliberate main-exit collapse, so its presence
+    /// distinguishes a graceful container end (`Exited` phase) from an
+    /// unexpected init death (`Dead` phase).
+    main_exit_seen: bool,
     /// Per-request reply deadline.
     request_timeout: Duration,
 }
@@ -118,6 +124,7 @@ impl ExecLink {
                 early_exit_cap: DEFAULT_EARLY_EXIT_CAP,
                 dead: false,
                 terminated: false,
+                main_exit_seen: false,
                 request_timeout: DEFAULT_REQUEST_TIMEOUT,
             }),
         });
@@ -228,6 +235,19 @@ impl ExecLink {
     /// request. Used by the instance to observe the exec-mode terminal state.
     pub(crate) fn is_terminated(&self) -> bool {
         self.state.lock().unwrap().terminated
+    }
+
+    /// Whether the link was marked Dead by a request deadline (as opposed to
+    /// merely terminated by channel EOF).
+    pub(crate) fn is_dead(&self) -> bool {
+        self.state.lock().unwrap().dead
+    }
+
+    /// Whether the main child's (child id 0) `Exited` frame was routed before
+    /// the channel terminated — the signature of init's deliberate main-exit
+    /// collapse (F5.4).
+    pub(crate) fn main_exit_reported(&self) -> bool {
+        self.state.lock().unwrap().main_exit_seen
     }
 
     /// Drain every buffered early exit into `out` (used by shutdown so real
@@ -395,6 +415,9 @@ async fn reader_task(link: &std::sync::Arc<ExecLink>, mut reader: tokio::net::Un
                         continue;
                     }
                 };
+                if child_id == 0 {
+                    st.main_exit_seen = true;
+                }
                 let status = exit_status_from_resp(resp);
                 if let Some(tx) = st.exit_waiters.remove(&child_id) {
                     let _ = tx.send(status);

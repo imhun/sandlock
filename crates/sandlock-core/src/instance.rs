@@ -65,11 +65,12 @@ use crate::exec_params::ExecCeiling;
 ///   [`SandboxInstance::launch_exec_only`]: the confined direct child is
 ///   `sandlock-init`. In exec mode the session is **terminal when init
 ///   exits**: with a main child (id 0) that means the main workload's exit
-///   ended the container (init collapses every group and exits); without a
-///   main it means init died unexpectedly. The phase then reads `Exited` and
-///   every exec/wait/kill/resize verb returns the unified
-///   [`SandboxRuntimeError::InstanceClosed`] error; `shutdown` still cleans
-///   the session up and ends at `ShutDown`.
+///   ended the container (init collapses every group and exits) and the
+///   phase reads `Exited`; an init death with no main-exit collapse is a
+///   machinery failure and the phase reads `Dead` (F5.4). Every
+///   exec/wait/kill/resize verb returns the unified closed or dead error
+///   code accordingly; `shutdown` still cleans the session up and ends at
+///   `ShutDown`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstancePhase {
     /// Session live: it owns its supervisor tasks, control directory and
@@ -87,11 +88,19 @@ pub enum InstancePhase {
     /// a no-op (idempotent).
     ShutDown,
     /// Exec mode only: the confined `sandlock-init` control link terminated
-    /// on its own (the main child exited and init collapsed the container, or
-    /// init died unexpectedly). The session is over — every exec-mode verb
+    /// after the main child (id 0) exited and init collapsed the container.
+    /// This is the deliberate OCI-style container end — every exec-mode verb
     /// returns the unified closed-instance error, `children_live` reads 0,
     /// and a later `shutdown` only performs the resource cleanup tail.
     Exited,
+    /// Exec mode only (F5.4/M3 S5): the session machinery failed — the exec
+    /// control link exceeded a request deadline, `sandlock-init` terminated
+    /// without the main-exit collapse sequence, or the link reader hit a
+    /// fatal channel error. Every exec/wait/kill/resize verb returns the
+    /// unified [`SandboxRuntimeError::InstanceDead`] code; the instance is
+    /// never silently relaunched and `shutdown` still performs the cleanup
+    /// tail (ending at `ShutDown`).
+    Dead,
 }
 
 /// M0 instance stats snapshot (fork-plan F2.3; the §5.6 subset expressible
@@ -125,8 +134,8 @@ pub struct InstanceStats {
     /// (`Exited`) even before a verb re-synchronizes the stored phase.
     pub children_live: u32,
     /// The session's lifecycle phase (see [`InstancePhase`]) — `Live` /
-    /// `Draining` / `ShutDown`, plus exec-mode `Exited` (terminal on init
-    /// exit). The `Dead` error state with reason counters remains §5.6/F5.
+    /// `Draining` / `ShutDown`, plus exec-mode `Exited` (main-exit container
+    /// end) and `Dead` (listener/reaper/channel failure, F5.4).
     pub instance_state: InstancePhase,
 }
 
@@ -655,21 +664,26 @@ impl SandboxInstance {
     }
 
     /// Reconcile the stored phase/children when the exec-mode init control
-    /// link terminated on its own (main child exit collapsed the container,
-    /// or init died): drain any real buffered exit statuses into the child
-    /// caches, mark every remaining child `Killed` (children_live → 0), and
-    /// set the terminal `Exited` phase. Called at the entry of every
+    /// link dies (F5.4): a request deadline marked the link Dead, or the
+    /// channel terminated — either after the main child (id 0) exited and
+    /// init collapsed the container (`Exited`, the deliberate OCI-style
+    /// container end) or unexpectedly (`Dead`, a machinery failure). Real
+    /// buffered exit statuses are drained into the child caches first so
+    /// idempotent waits stay well-defined. Called at the entry of every
     /// exec-mode verb; read-only surfaces (`phase`, `stats`) observe the
     /// terminal state through the effective-phase check instead.
     fn enter_exec_terminal_if_needed(&mut self) {
         if self.phase != InstancePhase::Live || !self.is_exec_mode() {
             return;
         }
-        let terminated = self
-            .exec_session
-            .as_ref()
-            .map(|s| s.link.is_terminated())
-            .unwrap_or(false);
+        let link_state = self.exec_session.as_ref().map(|s| {
+            (s.link.is_dead(), s.link.is_terminated())
+        });
+        let (dead, terminated) = link_state.unwrap_or((false, false));
+        if dead {
+            self.phase = InstancePhase::Dead;
+            return;
+        }
         if !terminated {
             return;
         }
@@ -685,20 +699,38 @@ impl SandboxInstance {
                 }
             }
         }
-        self.phase = InstancePhase::Exited;
+        let main_exit_reported = self
+            .exec_session
+            .as_ref()
+            .map(|s| s.link.main_exit_reported())
+            .unwrap_or(false);
+        self.phase = if main_exit_reported {
+            InstancePhase::Exited
+        } else {
+            InstancePhase::Dead
+        };
     }
 
     /// Borrow the exec session, mapping a missing session to the unified
     /// closed-instance error once the instance left `Live` (a legacy session
     /// is only "not exec-capable" while it is live). An exec-mode session
     /// whose init link terminated reads as closed (`Exited` ⇒ every verb
-    /// fails with the same `InstanceClosed` error).
+    /// fails with the same `InstanceClosed` error) or dead (`Dead` ⇒ every
+    /// verb fails with the same `InstanceDead` error, F5.4).
+    fn closed_error(&self) -> SandboxRuntimeError {
+        if self.phase() == InstancePhase::Dead {
+            SandboxRuntimeError::InstanceDead
+        } else {
+            SandboxRuntimeError::InstanceClosed
+        }
+    }
+
     fn exec_ref(&self) -> Result<&ExecSession, SandlockError> {
         match self.exec_session.as_ref() {
             Some(session) if matches!(self.phase(), InstancePhase::Live) => Ok(session),
-            Some(_) => Err(SandboxRuntimeError::InstanceClosed.into()),
+            Some(_) => Err(self.closed_error().into()),
             None if matches!(self.phase(), InstancePhase::Live) => Err(Self::not_exec_capable()),
-            None => Err(SandboxRuntimeError::InstanceClosed.into()),
+            None => Err(self.closed_error().into()),
         }
     }
 
@@ -738,7 +770,7 @@ impl SandboxInstance {
     ) -> Result<ExecHandle, SandlockError> {
         self.enter_exec_terminal_if_needed();
         if self.phase != InstancePhase::Live {
-            return Err(SandboxRuntimeError::InstanceClosed.into());
+            return Err(self.closed_error().into());
         }
         if self.exec_session.is_none() {
             return Err(Self::not_exec_capable());
@@ -783,7 +815,7 @@ impl SandboxInstance {
     ) -> Result<ExecHandle, SandlockError> {
         self.enter_exec_terminal_if_needed();
         if self.phase != InstancePhase::Live {
-            return Err(SandboxRuntimeError::InstanceClosed.into());
+            return Err(self.closed_error().into());
         }
         if self.exec_session.is_none() {
             return Err(Self::not_exec_capable());
@@ -835,7 +867,21 @@ impl SandboxInstance {
                 .collect(),
             bind_ports: params.bind_ports.clone(),
         };
-        let reply = session.link.request(child_id, &req, &raw).await?;
+        // F5.4: a request-deadline failure marks the link Dead; the verb must
+        // surface the unified InstanceDead code (not the raw closed-instance
+        // error the executor returns for the failed request). Clone the link
+        // so the terminal re-synchronization can borrow &mut self.
+        let link = session.link.clone();
+        let reply = match link.request(child_id, &req, &raw).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.enter_exec_terminal_if_needed();
+                if self.phase() == InstancePhase::Dead {
+                    return Err(SandboxRuntimeError::InstanceDead.into());
+                }
+                return Err(e);
+            }
+        };
         drop(child_ends);
         let pid = match reply {
             Resp::Started { pid } => pid,
@@ -927,7 +973,7 @@ impl SandboxInstance {
     ) -> Result<NetworkStaleness, SandlockError> {
         self.enter_exec_terminal_if_needed();
         if self.phase != InstancePhase::Live {
-            return Err(SandboxRuntimeError::InstanceClosed.into());
+            return Err(self.closed_error().into());
         }
         if self.exec_session.is_none() {
             return Err(Self::not_exec_capable());
@@ -1138,7 +1184,7 @@ impl SandboxInstance {
     ) -> Result<crate::checkpoint::Checkpoint, SandlockError> {
         self.enter_exec_terminal_if_needed();
         if self.phase != InstancePhase::Live {
-            return Err(SandboxRuntimeError::InstanceClosed.into());
+            return Err(self.closed_error().into());
         }
         if self.exec_session.is_none() {
             return Err(Self::not_exec_capable());
@@ -2009,14 +2055,22 @@ impl SandboxInstance {
 
     /// The session's lifecycle phase (see [`InstancePhase`]).
     pub fn phase(&self) -> InstancePhase {
-        // Exec mode: an init control link that terminated on its own (main
-        // child exit collapsed the container, or init died) means the session
-        // is over even before a &mut verb re-synchronizes the stored phase —
-        // read-only surfaces observe the terminal `Exited` state directly.
+        // Exec mode: a link marked Dead by a request deadline, or a channel
+        // that terminated on its own, means the session is over even before a
+        // &mut verb re-synchronizes the stored phase — read-only surfaces
+        // observe the terminal state directly (`Dead` for a machinery
+        // failure, `Exited` for the main-exit container collapse; F5.4).
         if self.phase == InstancePhase::Live {
             if let Some(session) = self.exec_session.as_ref() {
+                if session.link.is_dead() {
+                    return InstancePhase::Dead;
+                }
                 if session.link.is_terminated() {
-                    return InstancePhase::Exited;
+                    return if session.link.main_exit_reported() {
+                        InstancePhase::Exited
+                    } else {
+                        InstancePhase::Dead
+                    };
                 }
             }
         }

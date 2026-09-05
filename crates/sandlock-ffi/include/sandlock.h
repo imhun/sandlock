@@ -28,9 +28,9 @@ typedef struct sandlock_handler_t sandlock_handler_t;
 #define SANDLOCK_INSTANCE_OK 0
 
 /**
- * The instance is closed (shut down, its exec link is Dead, or the init
- * channel closed) — the F5.4 S5 unified code, reserved on F3.2's terms.
- * Every subsequent exec/wait_child/kill_child returns this same code.
+ * The instance is closed (shut down, or the init channel closed after the
+ * main-exit container collapse). Every subsequent exec/wait_child/kill_child
+ * returns this same code.
  */
 #define SANDLOCK_INSTANCE_ERR_CLOSED 1
 
@@ -56,6 +56,15 @@ typedef struct sandlock_handler_t sandlock_handler_t;
  * error text names the offending field and value.
  */
 #define SANDLOCK_INSTANCE_ERR_POLICY 5
+
+/**
+ * F5.4 (M3 S5): the session machinery failed (exec-link request deadline,
+ * unexpected `sandlock-init` termination, fatal channel error). The
+ * instance is `Dead`; every subsequent verb returns this same code and the
+ * instance is never silently relaunched — distinct from
+ * `SANDLOCK_INSTANCE_ERR_CLOSED` (clean shutdown / main-exit container end).
+ */
+#define SANDLOCK_INSTANCE_ERR_DEAD 6
 
 /**
  * `flags` bit for [`sandlock_action_set_inject_bytes`]: leave the injected

@@ -3075,9 +3075,9 @@ pub struct sandlock_instance_t {
 
 /// Error code 0: success.
 pub const SANDLOCK_INSTANCE_OK: i32 = 0;
-/// The instance is closed (shut down, its exec link is Dead, or the init
-/// channel closed) — the F5.4 S5 unified code, reserved on F3.2's terms.
-/// Every subsequent exec/wait_child/kill_child returns this same code.
+/// The instance is closed (shut down, or the init channel closed after the
+/// main-exit container collapse). Every subsequent exec/wait_child/kill_child
+/// returns this same code.
 pub const SANDLOCK_INSTANCE_ERR_CLOSED: i32 = 1;
 /// A per-child verb named a child id that was never registered.
 pub const SANDLOCK_INSTANCE_ERR_UNKNOWN_CHILD: i32 = 2;
@@ -3090,6 +3090,12 @@ pub const SANDLOCK_INSTANCE_ERR_NO_PTY: i32 = 4;
 /// parameter wider than the instance-time policy ceiling. EPERM-class: the
 /// error text names the offending field and value.
 pub const SANDLOCK_INSTANCE_ERR_POLICY: i32 = 5;
+/// F5.4 (M3 S5): the session machinery failed (exec-link request deadline,
+/// unexpected `sandlock-init` termination, fatal channel error). The
+/// instance is `Dead`; every subsequent verb returns this same code and the
+/// instance is never silently relaunched — distinct from
+/// `SANDLOCK_INSTANCE_ERR_CLOSED` (clean shutdown / main-exit container end).
+pub const SANDLOCK_INSTANCE_ERR_DEAD: i32 = 6;
 
 /// Result of `sandlock_instance_exec`: the registered child id, its pid, and
 /// the caller-owned host ends of the requested stdio (see the `stdio_mode`
@@ -3148,6 +3154,9 @@ fn instance_error_code(e: &sandlock_core::SandlockError) -> i32 {
     match e {
         sandlock_core::SandlockError::Runtime(SandboxRuntimeError::InstanceClosed) => {
             SANDLOCK_INSTANCE_ERR_CLOSED
+        }
+        sandlock_core::SandlockError::Runtime(SandboxRuntimeError::InstanceDead) => {
+            SANDLOCK_INSTANCE_ERR_DEAD
         }
         sandlock_core::SandlockError::Runtime(SandboxRuntimeError::UnknownChild(_)) => {
             SANDLOCK_INSTANCE_ERR_UNKNOWN_CHILD

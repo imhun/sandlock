@@ -64,6 +64,20 @@ pub enum SandboxRuntimeError {
     #[error("instance is closed (shut down or its exec link is dead); no new work is accepted")]
     InstanceClosed,
 
+    /// F5.4 (M3 S5): the session's machinery died — the exec control link
+    /// exceeded a request deadline, `sandlock-init` terminated unexpectedly
+    /// (no Shutdown frame, no main-exit collapse), or the link reader hit a
+    /// fatal channel error. The instance is `InstancePhase::Dead`; every
+    /// later `exec`/`wait_child`/`kill_child`/`resize_child` returns this
+    /// same code, and the instance is never silently relaunched. Callers
+    /// distinguish it from [`SandboxRuntimeError::InstanceClosed`] (a clean
+    /// shutdown / main-exit container end) and rebuild the box.
+    #[error(
+        "instance is dead (listener/reaper/control-channel failure); every verb returns \
+         this code and the instance is never silently relaunched"
+    )]
+    InstanceDead,
+
     /// A per-child verb named a child id that was never registered by this
     /// session's executor (F1.2 announced-registry checking). The id is
     /// reported exactly so callers can distinguish a stale handle from a
