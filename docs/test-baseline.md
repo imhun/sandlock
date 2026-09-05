@@ -58,7 +58,17 @@ core_lib = 822 # F6.2 review I1/I2: 821 -> 822, +1 unit test
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 529 # F7 (P4): 526 -> 529, +3 chroot + net_isolation +
+core_integ = 531 # F8 (P6 design tradeoffs): 529 -> 531, +2 tradeoff-pin
+                 # tests in integration/test_network.rs
+                 # (test_injected_connect_reports_synthetic_addresses,
+                 # test_nonblocking_connect_reports_einprogress) pinning the
+                 # documented current behavior — injected connects report
+                 # host-side peer/local (no synthetic address view) and the
+                 # fd-inject connect path never surfaces EINPROGRESS
+                 # (host-side completion, SO_SNDTIMEO bound). Both close
+                 # fork-plan §F8 (P6) as documented design tradeoffs; see
+                 # docs/e2b-integration.md §2 P6 / §3.10.
+                 # F7 (P4): 526 -> 529, +3 chroot + net_isolation +
                  # net_bind_map mirror tests in integration/test_net_isolate.rs
                  # (mcp roundtrip / epoll loop / poll loop under chroot). The
                  # P4 "combined shape fails" premise was refuted by exhaustive

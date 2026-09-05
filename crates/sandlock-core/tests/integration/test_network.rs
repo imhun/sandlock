@@ -1,6 +1,9 @@
 use sandlock_core::{Sandbox};
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
+
+use crate::net_fixture::WorkerLocalHost;
 
 fn temp_file(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("sandlock-test-net-{}-{}", name, std::process::id()))
@@ -11,6 +14,212 @@ fn base_policy() -> sandlock_core::SandboxBuilder {
         .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
         .fs_read("/etc").fs_read("/proc").fs_read("/dev")
         .fs_write("/tmp")
+}
+
+// ============================================================
+// P6/F8: injected-connect address views + nonblocking-connect
+// semantics (documented design tradeoffs — see
+// docs/e2b-integration.md §2 P6 / §3.10).
+//
+// Both matrix tests pin the *current documented behavior* as a
+// regression record: they run GREEN today and go RED if a future
+// change implements synthetic address views or EINPROGRESS
+// forwarding without updating the tradeoff entry.
+// ============================================================
+
+/// Synthetic wildcard-domain destination range (10.250.0.2..10.250.255.254).
+fn is_synthetic(ip: &str) -> bool {
+    let Ok(ip) = ip.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let n = u32::from(ip);
+    (0x0afa_0002..=0x0afa_fffe).contains(&n)
+}
+
+/// Accept at most one connection before `deadline`; never blocks the suite
+/// forever when the connect under test fails before reaching the listener.
+fn accept_one_bounded(
+    listener: &TcpListener,
+    deadline: std::time::Instant,
+) -> Option<std::net::TcpStream> {
+    let _ = listener.set_nonblocking(true);
+    while std::time::Instant::now() < deadline {
+        match listener.accept() {
+            Ok((conn, _)) => return Some(conn),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// P6/F8 tradeoff pin #1: an fd-injected connect is executed on a fresh
+/// host-side socket, so the sandbox's `getsockname()`/`getpeername()`
+/// report the *host* endpoints of the injected socket — the resolved real
+/// peer (fixture `198.18.0.x`) and the host-chosen local address — not the
+/// synthetic `10.250.0.0/16` destination the sandbox's DNS gave it. This
+/// is the documented design tradeoff (no per-sandbox address/port space
+/// exists in the shared-netns path to fabricate a backed local view from,
+/// and the sandbox has no seccomp interception point for `getpeername`).
+/// A synthetic-view implementation must flip this test's expectations
+/// together with docs/e2b-integration.md §3.10.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_injected_connect_reports_synthetic_addresses() {
+    let host = WorkerLocalHost::setup("conn.example.com");
+    let listener = TcpListener::bind((host.addr(), 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    let server = std::thread::spawn(move || {
+        if let Some(mut conn) = accept_one_bounded(&listener, deadline) {
+            let _ = conn.write_all(b"OK");
+        }
+    });
+
+    let mut policy = base_policy()
+        .fd_inject_connect(true)
+        .net_allow(format!("*.example.com:{}", port))
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import socket\n",
+        "ip = socket.gethostbyname('conn.example.com')\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "s.settimeout(5)\n",
+        "s.connect((ip, {port}))\n",
+        "peer = s.getpeername()\n",
+        "local = s.getsockname()\n",
+        "print('RESOLVED:' + ip)\n",
+        "print(f'PEER:{{peer[0]}}:{{peer[1]}}')\n",
+        "print(f'LOCAL:{{local[0]}}:{{local[1]}}')\n",
+        "s.close()\n",
+    ), port = port);
+
+    let result = policy.run(&["python3", "-c", &script]).await.unwrap();
+    let out = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default()).into_owned();
+    let err = String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default()).into_owned();
+    assert!(
+        result.success(),
+        "injected wildcard connect failed: exit={:?} out={out} err={err}",
+        result.code()
+    );
+    server.join().unwrap();
+
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 3, "unexpected output: {out} err={err}");
+    let resolved = lines[0]
+        .strip_prefix("RESOLVED:")
+        .expect("first line must be RESOLVED:<ip>, got: {out}");
+    assert!(
+        is_synthetic(resolved),
+        "wildcard subdomain must resolve to a synthetic IP (the sandbox view), got: {out}"
+    );
+    // Tradeoff pin: the connected socket reports the real host peer and a
+    // host-side local address, never the synthetic destination above.
+    assert_eq!(
+        lines[1],
+        format!("PEER:{}:{port}", host.addr()),
+        "getpeername must expose the host-side peer under the documented \
+         tradeoff, got: {out} err={err}"
+    );
+    let local = lines[2]
+        .strip_prefix("LOCAL:")
+        .expect("third line must be LOCAL:<ip>:<port>, got: {out}");
+    let (local_ip, local_port) = local.rsplit_once(':').expect("LOCAL must be ip:port");
+    assert_eq!(
+        local_ip,
+        host.addr().to_string(),
+        "getsockname must expose the host-side local address under the \
+         documented tradeoff, got: {out} err={err}"
+    );
+    let local_port: u16 = local_port
+        .parse()
+        .expect("LOCAL port must be numeric, got: {out}");
+    assert_ne!(local_port, 0, "host-side local port must be assigned: {out}");
+}
+
+/// P6/F8 tradeoff pin #2: on the fd-injection path the trapped `connect()`
+/// is answered only after the supervisor's host-side connect completes
+/// (the injected fd replaces the child's socket before the response), so a
+/// non-blocking client never observes `EINPROGRESS` — the syscall returns
+/// the final result (0 here) after host-side completion. The supervisor's
+/// blocking wait is bounded by the child's mirrored `SO_SNDTIMEO` (pinned
+/// by `connect.rs::tests::mirror_child_connect_timeout_copies_so_sndtimeo`).
+/// This is the documented design tradeoff (EINPROGRESS-forwarding needs an
+/// async host connect + deferred fd injection, incompatible with the
+/// one-response seccomp notification model — see docs/e2b-integration.md
+/// §3.10). A real EINPROGRESS implementation must flip this expectation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_nonblocking_connect_reports_einprogress() {
+    let out = temp_file("f8-einprogress");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    let server = std::thread::spawn(move || {
+        if let Some(mut conn) = accept_one_bounded(&listener, deadline) {
+            let mut buf = [0u8; 4];
+            if conn.read_exact(&mut buf).is_ok() {
+                let _ = conn.write_all(&buf);
+            }
+        }
+    });
+
+    let mut policy = base_policy()
+        .fd_inject_connect(true)
+        .net_allow(format!("127.0.0.1:{}", port))
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import ctypes, socket, struct\n",
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+        "libc.connect.restype = ctypes.c_int\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+        "s.setblocking(False)\n", // O_NONBLOCK: native semantics would allow EINPROGRESS
+        "tv = struct.pack('ll', 2, 0)\n",
+        "s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, tv)\n", // supervisor bound
+        "fd = s.fileno()\n",
+        "addr = struct.pack('<H', socket.AF_INET) + struct.pack('!H', {port}) + socket.inet_aton('127.0.0.1') + b'\\x00' * 8\n",
+        "buf = ctypes.create_string_buffer(addr)\n",
+        "ctypes.set_errno(0)\n",
+        "ret = libc.connect(fd, buf, len(addr))\n",
+        "err = ctypes.get_errno()\n",
+        "if ret != 0:\n",
+        "  open('{out}', 'w').write(f'ret={{ret}} err={{err}}')\n",
+        "  s.close()\n",
+        "  raise SystemExit(0)\n",
+        // The injected fd is O_NONBLOCK; give recv a bounded wait for the echo.
+        "s.settimeout(3)\n",
+        "s.sendall(b'ping')\n",
+        "data = s.recv(4)\n",
+        "s.close()\n",
+        "open('{out}', 'w').write(f'ret=0 err=0 echo={{data.decode()}}')\n",
+    ), out = out.display(), port = port);
+
+    let result = policy
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "nonblocking injected connect failed: exit={:?}",
+        result.code()
+    );
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    server.join().unwrap();
+
+    // Documented tradeoff: EINPROGRESS is never surfaced on this path — the
+    // nonblocking client's connect returns the final success (0) only after
+    // the supervisor-side host connect has completed, and the echo round-trip
+    // over the injected fd succeeds.
+    assert_eq!(
+        content, "ret=0 err=0 echo=ping",
+        "nonblocking connect must be completed host-side and return 0 (never \
+         EINPROGRESS) under the documented tradeoff, got: {content:?}"
+    );
 }
 
 // ============================================================

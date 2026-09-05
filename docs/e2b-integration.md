@@ -27,7 +27,7 @@
 | R1 | 通配域名解析 `NetTarget::HostWildcard`（deny 时拒绝域名） | network ACL 层 | ✅ | — |
 | R2 | 合成地址 `SyntheticDns`（`10.250.0.0/16`，LRU 4096） | 同上 | ✅ | — |
 | R3/R4 | connect/send 连接判定 + SSRF 护栏 | connect & send 路径 | ✅ | 护栏放行段可配（本环境 DNS 被改写为 `198.18.x`） |
-| 默认无特权路径 | 每沙箱 loopback DNS 网关（`127.0.0.x:53`）+ `resolv.conf` memfd + connect/send 豁免 + netlink 合成视图（虚拟 eth0 `192.0.2.1/24`、`2001:db8::1/64`） | network / procfs | ✅ 全绿 | getsockname/getpeername 仍显示宿主地址；非阻塞 connect 无 `EINPROGRESS` |
+| 默认无特权路径 | 每沙箱 loopback DNS 网关（`127.0.0.x:53`）+ `resolv.conf` memfd + connect/send 豁免 + netlink 合成视图（虚拟 eth0 `192.0.2.1/24`、`2001:db8::1/64`） | network / procfs | ✅ 全绿 | 出站已连接 socket 的 getsockname/getpeername 显示宿主地址；fd-inject 形态非阻塞 connect 无 `EINPROGRESS` —— 均为**设计取舍**（F8 闭环，见 §3.10） |
 | R8–R11 | credential injection（`http_inject`，FFI `credential`/`http_auth`）、`host_mask`（只改 wire `Host`）、HTTP matcher 支持 `*.suffix`、HTTPS MITM 复用同一 handler | transparent_proxy + FFI + Python + CLI | ✅ | **同一 matcher 多 header 注入**曾 first-match-wins，已去 `break` 改为全量应用（同 header 后者覆盖，AddOnly 不变） |
 | R12–R14 | SOCKS5 on-behalf 出口（`egress_proxy`）替代 LD_PRELOAD：RFC1928/1929、poll 驱动、10s 超时、fail closed、ATYP=domain/IPv4/IPv6；代理端点由 supervisor 代拨且**不进** `net_allow` | `network/egress.rs` | ✅ 7 单测 + 3 hermetic 集成 | — |
 | S1.1 | PID namespace（`pid_ns`，`CLONE_NEWPID` 两级 fork；procfs 按 ns pid 重编号；on-behalf `/proc` 只读白名单；freeze/thaw/checkpoint/throttle/tty/stat 全覆盖） | `pid_ns` 开关，默认 false | ✅ lib/integration | CLI `--pid-ns` 早期未接运行时 builder，已随 S3 收尾 |
@@ -46,7 +46,7 @@
 | **P3** ✅（commit `17ee48d`） | `_HANDLED_FIELDS` 登记 `notify_rate_limit`（**一行**） | 低（但污染每条日志） | 字段其实**已生效**：`_sdk.py:1217` 调 `sandlock_sandbox_builder_notify_rate_limit`；集合 `_sdk.py:1138` 起漏了名字 ⇒ 每次建沙箱都打假告警。**已修**：名字已登记入 `_HANDLED_FIELDS`，假告警消除；python 全量 431 待 F0.1 基座落地后登记 |
 | **P4** ✅（F7 regression pins，commit `4e78c98`） | 修 T4：`net_isolation` + chroot（镜像 rootfs）下 MCP 入站端口映射起不来 | 中（该形态是 E2B 生产形态之一） | **fork 侧前提证伪 + 回归 pin（非代码修复）**：chroot + `net_isolation` + `net_bind_map` 三合一形态经 9 种忠实构造（HEAD 与 T4 观测时代 `be387c7`）验证可用；新增 3 条镜像测试（mcp/epoll/poll under chroot，core_integ 529）。e2b 侧 T4 有真实 image-rootfs + netns 失败记录（strict-1 实跑，2026-09-03，与 §3.3 一致）；残差可能在 envd gateway 接线层，需 e2b 侧以 `E2B_BASE_IMAGE` + `xfail(run=True)` 复测，登记为 E2B follow-up，见 §3.3 |
 | **P5** ✅（F6.2） | `fs_mount` 目前只接受目录根（单文件/设备节点会以 `ENOTDIR` 失效）⇒ 调用方只能整树挂 `/dev`，进而**必须**下发 `fs_denied` 挡 `/dev/shm`，正好踩 SL-1。希望支持单节点挂载，或提供"最小可用 /dev（ptmx/pts/null/urandom）"构造 helper | 中（消除 SL-1 触发面） | **已落地**：单文件/chardev 单节点 bind-mount（`resolv.conf`、`/dev/null` 形态不再 ENOTDIR，ro 保持）+ `minimal_dev()` helper（`ptmx/pts/null/urandom/zero/tty`），调用方可省整树 `/dev` 挂载与 `/dev/shm` carve-out；F6.1 chroot A档用例已改经 helper 构造 `/dev`。详见 §3.1 |
-| **P6** | 无特权默认路径的细节补齐：`getsockname/getpeername` 反映合成视图、非阻塞 `connect` 的 `EINPROGRESS` 语义 | 低 | 已知限制条目化 |
+| **P6** ✅（F8 设计取舍） | 无特权默认路径的细节补齐：`getsockname/getpeername` 反映合成视图、非阻塞 `connect` 的 `EINPROGRESS` 语义 | 低 | **设计取舍 + 文档条目**（非代码修复）：注入连接按宿主侧视图执行（peer/local 为真实宿主端点）；fd-inject 形态的 connect 由宿主侧阻塞完成、子进程 `SO_SNDTIMEO` 为上界、不向客户端报 `EINPROGRESS`。矩阵两条用例 pin 当前文档化行为（core_integ 529→531）。详见 §3.10 |
 | **P7** | wheel 矩阵补 cp310 / cp312–313（沿用 zig 交叉编译流程） | 低 | E2B 运行时已统一 3.14 |
 | **P8** | 上游 PR 推送（需有写权限的 token）+ 合入后 E2B 回切官方 wheel | 中 | 阻塞在权限，不在技术 |
 | **P9** ✅**已采纳，见 §8** | 支持**一沙箱一实例**：`Sandbox.spawn(cmd, cwd=None, env=None) -> Process`（不占用"单活进程"busy 标记、每个 Process 自持 handle、并发上限由 `max_processes` 内核核算）+ per-exec `cwd`/`env` 覆盖（见 §3.7 评估） | 中（做进程级 checkpoint / 开 `pid_ns` 的前置） | E2B 当前不需要，故未催 |
@@ -266,6 +266,49 @@ child 退出但其孙子持有 stdout 时，attached `exec` 被吊住约 30 s �
 
 完整分析（13 条攻击面、归属分级、会话生命周期状态机、`shutdown()` 顺序、放行门槛与测试矩阵）见
 [`sandbox-exec-security.md`](sandbox-exec-security.md)。
+
+### 3.10 P6：`getsockname/getpeername` 合成视图与非阻塞 connect `EINPROGRESS`（设计取舍，F8 闭环）
+
+**结论**：两条均按「设计取舍 + 文档条目」收口，不做代码修复（fork-plan §F8，2026-09-05）。
+矩阵用例
+`crates/sandlock-core/tests/integration/test_network.rs::test_injected_connect_reports_synthetic_addresses`
+与 `...::test_nonblocking_connect_reports_einprogress` 作为回归 pin 固定**当前文档化行为**
+（现在即绿；未来若实现合成视图或 EINPROGRESS 转发，必须连同本条目一起翻转断言），
+core_integ 529→531。
+
+**1) getsockname/getpeername 合成视图 —— 取舍**
+
+- 实测（HEAD `7183884`，uid 65534，`fd_inject_connect` on/off 两形态）：沙箱 DNS 把
+  `conn.example.com` 解析成合成 `10.250.0.2` 后 connect，沙箱内 `getpeername()` 返回
+  宿主侧真实 peer（fixture `198.18.0.99:<port>`），`getsockname()` 返回宿主侧本地地址
+  （同为 `198.18.0.99` + 宿主临时端口）——合成目的地址不反映到连接视图。
+- 机制证据：注入连接在宿主侧执行，注入 fd 的内核视图就是宿主视图；`getpeername` 目前
+  **没有任何 seccomp 拦截点**（notif 列表只有 `getsockname`，见
+  `seccomp_plan.rs` 的 `NETLINK_NOTIF_SYSCALLS`/`PORT_REMAP_SYSCALLS`）。要造假
+  peer/local 需要新增 syscall trap + 逐 (pid, fd) 合成地址登记 + dup/fork/close 全
+  生命周期镜像；而共享 netns 默认路径没有沙箱自有地址/端口空间可报（netlink 合成 eth0
+  `192.0.2.1` 不可 bind，伪造本地视图会让复用该地址的应用坏掉）。bind/listen 侧的虚拟
+  端口视图已由 `port_remap` 的 getsockname 拦截覆盖；**出站已连接 socket 没有**对应的
+  虚拟地址空间。
+- 用户可见语义：沙箱内对被中介的出站连接调用 `getsockname/getpeername` 看到的是真实
+  宿主端点。Sandlock 对被中介连接的契约是「策略放行过的连接」，不承诺合成地址视图。
+
+**2) 非阻塞 connect EINPROGRESS —— 取舍（仅限 fd-inject 形态）**
+
+- fd-inject 路径（S2.1/S2.2）的 seccomp 通知模型是「一次 connect 一条响应」：supervisor
+  必须在响应前完成宿主侧 connect 并把已连接 fd 注入（`SECCOMP_IOCTL_NOTIF_ADDFD` 需要
+  pending 通知；响应后没有后续 hook），因此子进程永远看不到 `EINPROGRESS`。
+  `new_host_socket`（`network/connect.rs`）把子进程 `SO_SNDTIMEO` 镜像到宿主 socket
+  （`mirror_child_connect_timeout`，lib 单测 pin），作为阻塞上界——supervisor 不会卡在
+  内核默认 TCP 超时。
+- 真实 EINPROGRESS 转发需要「先回 EINPROGRESS → 后台宿主 connect → 稍后注入 fd 并合成
+  可写事件」，并覆盖 poll/select/send 全生命周期，属特性级重构，超出低优先补齐范围；
+  还会破坏「注入 connect 必须返回 0」（CPython `socket.connect()` 兼容，既有回归 pin）。
+- 默认共享 netns 的 legacy dup 路径不受此限：connect 在子进程自己的 socket 对象上执行，
+  内核继续异步握手，`EINPROGRESS` 原生透传（`test_net_isolate.rs` 的 `connect_script`
+  注释已记录）。取舍范围仅限 fd-inject 形态。
+- 用户可见语义：fd-inject 形态下非阻塞 client 的 connect 调用会阻塞到宿主侧完成 /
+  `SO_SNDTIMEO` 到期，返回最终 errno（0 / ETIMEDOUT 等），永不为 `EINPROGRESS`。
 
 ## 4. E2B 侧当前缓解（不改 fork）
 
