@@ -85,7 +85,11 @@ pub(super) async fn connect_on_behalf(
             let pfs = ctx.policy_fn.lock().await;
             pfs.live_policy.clone()
         };
-        let effective = ns.effective_network_policy(notif.pid, protocol, live_policy.as_ref());
+        // F4.4: per-child (pgid-bound) exec policy wins for children exec'd
+        // under a session network update; everything else keeps the shared
+        // live/static instance policy path.
+        let effective =
+            ns.effective_network_policy_for_pid(notif.pid, protocol, live_policy.as_ref());
         // Wildcard-domain path: a synthetic destination must resolve back
         // to a hostname the supervisor itself registered. A direct connect
         // to an unregistered synthetic address is refused, so the synthetic

@@ -31,7 +31,8 @@
 //! control-dir removal → port/budget/log return), fully idempotent and with
 //! a configurable grace window.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -45,6 +46,7 @@ use crate::init::executor::{open_child_pidfd, ExecLink};
 use crate::init::{Req, Resp, CONTROL_FD};
 use crate::result::{ExitStatus, RunResult};
 use crate::sandbox::{BranchAction, SharedCow};
+use crate::seccomp::notif::{NetworkPolicy, PortAllow};
 
 pub use crate::exec_params::ExecParams;
 use crate::exec_params::ExecCeiling;
@@ -125,6 +127,18 @@ pub struct InstanceStats {
     /// `Draining` / `ShutDown`, plus exec-mode `Exited` (terminal on init
     /// exit). The `Dead` error state with reason counters remains §5.6/F5.
     pub instance_state: InstancePhase,
+}
+
+/// Result of a session network update (fork-plan F4.3/S2).
+///
+/// A session-level `update_network` binds to **new execs only**: the policy
+/// is captured per child at exec time (F4.4), so children already running
+/// keep the policy they were created under and are reported here as stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkStaleness {
+    /// Child ids of running (not yet reaped) children that keep their
+    /// exec-time network policy — the update does not apply to them.
+    pub stale_child_ids: Vec<u64>,
 }
 
 /// A per-child token assigned by an exec-capable session's executor. Child
@@ -308,6 +322,14 @@ pub(crate) struct ExecSession {
     next_child_id: u64,
     /// Per-child registry: id -> pid/pidfd/exit cache.
     children: HashMap<u64, ExecChild>,
+    /// F4.3: the session network policy to bind to the **next** exec child
+    /// (set by `update_network`). `None` = children use the instance default
+    /// (shared live/static policy path). Running children are never rebound.
+    next_net_policy: Option<crate::seccomp::notif::NetworkPolicy>,
+    /// Generation of `next_net_policy`: bumped on every `update_network`.
+    /// Each exec child records the generation it was bound under; staleness
+    /// compares it to the current generation.
+    next_net_gen: u64,
 }
 
 /// One registered child of an exec-capable session.
@@ -321,6 +343,10 @@ pub(crate) struct ExecChild {
     pty: Option<OwnedFd>,
     /// Reaped exit status, cached for idempotent `wait_child`.
     status: Option<ExitStatus>,
+    /// F4.3: session network-policy generation this child was bound under
+    /// (0 = instance default). `update_network` reports children whose
+    /// generation is older than the new one as stale.
+    net_gen: u64,
 }
 
 impl SandboxInstance {
@@ -448,6 +474,8 @@ impl SandboxInstance {
             link: link.clone(),
             next_child_id: 1,
             children: HashMap::new(),
+            next_net_policy: None,
+            next_net_gen: 0,
         }));
 
         // Register the main workload as child id 0 when the caller asked for
@@ -498,6 +526,7 @@ impl SandboxInstance {
                     pidfd: open_child_pidfd(pid),
                     pty: None,
                     status: None,
+                    net_gen: 0,
                 },
             );
         }
@@ -743,6 +772,23 @@ impl SandboxInstance {
                 .into());
             }
         };
+        // F4.3/F4.4: bind the announced child to the session network policy
+        // current at exec time (an `update_network` in flight between the
+        // request and the announcement applies to this exec — the request
+        // was sent under the policy generation we read here). Running
+        // children are never rebound by a later update.
+        let (next_policy, net_gen) = {
+            let session = self
+                .exec_session
+                .as_ref()
+                .expect("exec session presence checked by callers");
+            (session.next_net_policy.clone(), session.next_net_gen)
+        };
+        if let Some(policy) = next_policy {
+            if let Some(network) = self.supervisor_network.as_ref() {
+                network.lock().await.bind_child_policy(pid, policy);
+            }
+        }
         let session = self
             .exec_session
             .as_mut()
@@ -762,6 +808,7 @@ impl SandboxInstance {
                 // the handle's master either way.
                 pty: registry_pty,
                 status: None,
+                net_gen,
             },
         );
         Ok(ExecHandle {
@@ -772,6 +819,87 @@ impl SandboxInstance {
             stderr: host.stderr,
             pty: host.pty,
         })
+    }
+
+    /// F4.3 (S2): session-level outbound network update.
+    ///
+    /// `allowed_ips` is the new outbound IP allow set (any port; an empty set
+    /// denies all outbound destinations). The update binds to **new execs
+    /// only**: every child currently running keeps the policy it was created
+    /// under, and the returned [`NetworkStaleness`] names those children.
+    /// The request must be a subset of the instance-time destination ceiling
+    /// (S9): a requested IP not granted by the static TCP allowlist — or a
+    /// ceiling whose port-scoped rules cannot express an IP-any-port subset —
+    /// is refused with the named EPERM-class `PolicyTooWide` error.
+    ///
+    /// Online tightening through `PolicyFnState.live_policy` (the policy-fn
+    /// `restrict_network` path) is deliberately untouched: it is the
+    /// instance-wide, event-driven tightening channel, while this verb is the
+    /// session-scoped, new-exec-only channel. Binding decisions for children
+    /// exec'd under an update come from their per-child policy (F4.4), never
+    /// from a sibling's or from later updates.
+    pub async fn update_network(
+        &mut self,
+        allowed_ips: &[IpAddr],
+    ) -> Result<NetworkStaleness, SandlockError> {
+        self.enter_exec_terminal_if_needed();
+        if self.phase != InstancePhase::Live {
+            return Err(SandboxRuntimeError::InstanceClosed.into());
+        }
+        if self.exec_session.is_none() {
+            return Err(Self::not_exec_capable());
+        }
+        let binding = self.session_network_binding(allowed_ips).await?;
+        let gen = {
+            let session = self
+                .exec_session
+                .as_mut()
+                .expect("exec session presence checked above");
+            session.next_net_policy = Some(binding);
+            session.next_net_gen += 1;
+            session.next_net_gen
+        };
+        let mut stale: Vec<u64> = self
+            .exec_session
+            .as_ref()
+            .expect("exec session presence checked above")
+            .children
+            .iter()
+            .filter(|(_, child)| child.status.is_none() && child.net_gen < gen)
+            .map(|(id, _)| *id)
+            .collect();
+        stale.sort_unstable();
+        Ok(NetworkStaleness {
+            stale_child_ids: stale,
+        })
+    }
+
+    /// Validate `allowed_ips` against the instance static TCP ceiling and
+    /// build the per-child allowlist policy new execs will be bound to.
+    async fn session_network_binding(
+        &self,
+        allowed_ips: &[IpAddr],
+    ) -> Result<NetworkPolicy, SandlockError> {
+        let network = self
+            .supervisor_network
+            .as_ref()
+            .ok_or_else(|| {
+                SandboxRuntimeError::Child(
+                    "update_network: session has no supervisor network state".into(),
+                )
+            })?
+            .clone();
+        let ns = network.lock().await;
+        for ip in allowed_ips {
+            if !network_ceiling_allows(&ns.tcp_policy, *ip) {
+                return Err(SandboxRuntimeError::PolicyTooWide {
+                    field: "update_network",
+                    value: ip.to_string(),
+                }
+                .into());
+            }
+        }
+        Ok(ip_only_allowlist(allowed_ips))
     }
 
     /// Wait for an exec child to exit (F3.2). Resolves on the child's
@@ -1794,6 +1922,53 @@ impl SandboxInstance {
     /// session is live and is released by [`SandboxInstance::shutdown`].
     pub fn dns_gateway_addr(&self) -> Option<std::net::Ipv4Addr> {
         self.dns_gateway_addr
+    }
+}
+
+/// S9 ceiling check for an `update_network` request: is `ip` inside the
+/// instance's static TCP destination ceiling at any-port granularity?
+///
+/// * `Unrestricted`/`DenyList` ceilings are default-allow — any requested IP
+///   is a subset (the binding can only narrow them);
+/// * an `AllowList` grants `ip` only through an explicit
+///   `PortAllow::Any` entry (a port-scoped entry cannot express an
+///   IP-any-port subset, so the request would silently widen ports and is
+///   refused); any-IP-port rules have the same granularity problem and are
+///   refused for non-empty updates;
+/// * the empty update (deny all) is always a subset and is accepted by the
+///   caller without consulting this helper.
+fn network_ceiling_allows(tcp: &NetworkPolicy, ip: IpAddr) -> bool {
+    match tcp {
+        NetworkPolicy::Unrestricted | NetworkPolicy::DenyList { .. } => true,
+        NetworkPolicy::AllowList {
+            per_ip,
+            cidrs,
+            any_ip_ports,
+            ..
+        } => {
+            if !any_ip_ports.is_empty() {
+                return false;
+            }
+            if matches!(per_ip.get(&ip.to_canonical()), Some(PortAllow::Any)) {
+                return true;
+            }
+            cidrs.iter().any(|(net, allow)| {
+                net.contains(ip) && matches!(allow, PortAllow::Any)
+            })
+        }
+    }
+}
+
+/// IP-only allowlist policy (any port to each listed IP) used to bind an
+/// exec child to an `update_network` policy. Mirrors the legacy `policy_fn`
+/// IP-override representation so the existing verdict path applies unchanged.
+fn ip_only_allowlist(ips: &[IpAddr]) -> NetworkPolicy {
+    let per_ip = ips.iter().map(|&ip| (ip, PortAllow::Any)).collect();
+    NetworkPolicy::AllowList {
+        per_ip,
+        cidrs: Vec::new(),
+        any_ip_ports: HashSet::new(),
+        wildcard_domains: Vec::new(),
     }
 }
 

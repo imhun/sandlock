@@ -24,6 +24,8 @@ use sandlock_core::error::SandboxRuntimeError;
 use sandlock_core::instance::{ExecParams, ExecStdio, SandboxInstance};
 use sandlock_core::result::ExitStatus;
 use sandlock_core::{Sandbox, SandlockError};
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 
 fn base_policy() -> sandlock_core::SandboxBuilder {
     Sandbox::builder()
@@ -331,5 +333,180 @@ async fn test_per_exec_bind_port_reaches_listener() {
 
     let status = inst.wait_child(h.child_id).await.expect("wait child");
     assert_eq!(status, ExitStatus::Code(0));
+    inst.shutdown().await.expect("shutdown");
+}
+
+/// Spawn a daemon-side loopback sink listener at `ip`; every successful TCP
+/// connect is accepted and recorded. Returns (port, accept log).
+fn spawn_sink_listener(ip: IpAddr) -> (u16, Arc<Mutex<Vec<String>>>) {
+    let listener = std::net::TcpListener::bind((ip, 0)).expect("bind sink listener");
+    let port = listener.local_addr().unwrap().port();
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&log);
+    std::thread::spawn(move || {
+        listener.set_nonblocking(true).expect("nonblocking sink");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+                    seen.lock().unwrap().push(peer);
+                    drop(stream);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (port, log)
+}
+
+/// Matrix F4.3/F4.4 case: `update_network` binds to **new execs only** and
+/// reports staleness for running children; the child bound at exec keeps its
+/// own network policy, so a narrow sibling can never inherit (or be denied
+/// by) a wide sibling's decisions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_update_network_applies_to_new_exec_only_and_reports_staleness() {
+    let (port_lo, log_lo) = spawn_sink_listener("127.0.0.1".parse().unwrap());
+    let (port_hi, log_hi) = spawn_sink_listener("127.0.0.2".parse().unwrap());
+
+    // Any-port destination ceiling over loopback: update_network may narrow
+    // it per child, and the pre-update child keeps the full ceiling.
+    let policy = base_policy().net_allow("*");
+    let mut inst = launch_exec_only_tmp(policy).await;
+
+    let dir = scratch("net-update");
+    std::fs::create_dir_all(&dir).expect("create net-update dir");
+    let a_go1 = dir.join("a-go1");
+    let a_go2 = dir.join("a-go2");
+    let a_out = dir.join("a-out");
+    let b_out = dir.join("b-out");
+    std::fs::create_dir_all(&a_out).expect("create A output dir");
+    std::fs::create_dir_all(&b_out).expect("create B output dir");
+
+    // Child A runs *before* the update: it must keep the wide exec-time
+    // policy even after `update_network` narrows the session. Its connects
+    // are marker-gated so they happen after the update and after sibling B
+    // was bound to the narrow policy.
+    let a_script = format!(
+        concat!(
+            "import os, socket, time\n",
+            "def wait(f):\n",
+            "    while not os.path.exists(f):\n",
+            "        time.sleep(0.05)\n",
+            "def probe(ip, port, out):\n",
+            "    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "    s.settimeout(3)\n",
+            "    try:\n",
+            "        s.connect((ip, port))\n",
+            "        open(out, 'w').write('OK')\n",
+            "    except OSError as e:\n",
+            "        open(out, 'w').write('ERR%d' % e.errno)\n",
+            "    finally:\n",
+            "        s.close()\n",
+            "wait('{go1}')\n",
+            "probe('127.0.0.1', {p_lo}, '{o_lo}')\n",
+            "wait('{go2}')\n",
+            "probe('127.0.0.2', {p_hi}, '{o_hi}')\n",
+        ),
+        go1 = a_go1.display(),
+        go2 = a_go2.display(),
+        p_lo = port_lo,
+        p_hi = port_hi,
+        o_lo = a_out.join("lo").display(),
+        o_hi = a_out.join("hi").display(),
+    );
+    let a = inst
+        .exec_params(&["/usr/bin/python3", "-c", &a_script], &ExecParams::default(), ExecStdio::Null)
+        .await
+        .expect("exec pre-update child A");
+
+    // Session-level update: new execs only. A is still running under the old
+    // policy, so the API must report A as stale.
+    let stale = inst
+        .update_network(&["127.0.0.1".parse::<IpAddr>().unwrap()])
+        .await
+        .expect("update_network narrows the session to loopback-low");
+    assert!(
+        stale.stale_child_ids.contains(&a.child_id),
+        "running pre-update child A must be reported stale, got {stale:?}"
+    );
+
+    // Child B execs after the update: bound to the narrow policy — loopback
+    // 127.0.0.1 only. Its connect to the wide sibling's 127.0.0.2 listener
+    // must be refused even though the *instance* ceiling still allows it.
+    let b_script = format!(
+        concat!(
+            "import socket\n",
+            "def probe(ip, port, out):\n",
+            "    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "    s.settimeout(3)\n",
+            "    try:\n",
+            "        s.connect((ip, port))\n",
+            "        open(out, 'w').write('OK')\n",
+            "    except OSError as e:\n",
+            "        open(out, 'w').write('ERR%d' % e.errno)\n",
+            "    finally:\n",
+            "        s.close()\n",
+            "probe('127.0.0.1', {p_lo}, '{o_lo}')\n",
+            "probe('127.0.0.2', {p_hi}, '{o_hi}')\n",
+        ),
+        p_lo = port_lo,
+        p_hi = port_hi,
+        o_lo = b_out.join("lo").display(),
+        o_hi = b_out.join("hi").display(),
+    );
+    let b = inst
+        .exec_params(&["/usr/bin/python3", "-c", &b_script], &ExecParams::default(), ExecStdio::Null)
+        .await
+        .expect("exec post-update child B");
+
+    let status_b = inst.wait_child(b.child_id).await.expect("wait child B");
+    assert_eq!(status_b, ExitStatus::Code(0));
+    assert_eq!(
+        std::fs::read_to_string(b_out.join("lo")).unwrap_or_default(),
+        "OK",
+        "post-update child B may reach its bound 127.0.0.1 destination"
+    );
+    assert_eq!(
+        std::fs::read_to_string(b_out.join("hi")).unwrap_or_default(),
+        "ERR111",
+        "post-update child B must be denied the wide child's destination (ECONNREFUSED)"
+    );
+
+    // Release A's two marker gates: A connects after B's narrow binding is
+    // live, proving the running child kept its exec-time (wide) policy.
+    std::fs::write(&a_go1, b"go").expect("release A gate 1");
+    std::fs::write(&a_go2, b"go").expect("release A gate 2");
+    let status_a = inst.wait_child(a.child_id).await.expect("wait child A");
+    assert_eq!(status_a, ExitStatus::Code(0));
+    assert_eq!(
+        std::fs::read_to_string(a_out.join("lo")).unwrap_or_default(),
+        "OK",
+        "pre-update child A keeps its loopback-low grant"
+    );
+    assert_eq!(
+        std::fs::read_to_string(a_out.join("hi")).unwrap_or_default(),
+        "OK",
+        "pre-update child A keeps its wide 127.0.0.2 grant after the update"
+    );
+
+    // Both listeners were actually reached exactly as the policies allowed:
+    // low by A + B, high by A only.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let low = log_lo.lock().unwrap().len();
+        let high = log_hi.lock().unwrap().len();
+        if low == 2 && high == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(log_lo.lock().unwrap().len(), 2, "low listener: A + B");
+    assert_eq!(log_hi.lock().unwrap().len(), 1, "high listener: A only");
+
+    let _ = std::fs::remove_dir_all(&dir);
     inst.shutdown().await.expect("shutdown");
 }

@@ -168,7 +168,7 @@ async fn resolve_send_destination(
         let pfs = ctx.policy_fn.lock().await;
         pfs.live_policy.clone()
     };
-    let effective = ns.effective_network_policy(pid, protocol, live_policy.as_ref());
+    let effective = ns.effective_network_policy_for_pid(pid, protocol, live_policy.as_ref());
     drop(ns);
     destination_verdict_with_host(&effective, ip, dest_port, hostname.as_deref())?;
     let Some(host) = hostname else {

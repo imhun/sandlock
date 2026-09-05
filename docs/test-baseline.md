@@ -11,7 +11,11 @@
 #   2. root-mode phases: oci (`--oci-root`) and the supervise foreign-uid
 #      acceptance (`--supervise-root`), both as root in the same privileged
 #      container.
-core_lib = 803 # F4.1/F4.2 (M2 per-exec params + S9): 799 -> 803, +4 unit
+core_lib = 805 # F4.3/F4.4 (M2 update_network staleness + per-child network
+               # binding): 803 -> 805, +2 unit tests in seccomp/state.rs
+               # (bound_child_policy_wins_over_shared_static_policy,
+               # sibling_group_never_shares_a_bound_policy).
+               # F4.1/F4.2 (M2 per-exec params + S9): 799 -> 803, +4 unit
                # tests in the new core/src/exec_params.rs (S9 ceiling
                # validation: in-ceiling accepts, wider extra_writable refuses,
                # fs_deny never overridable, out-of-ceiling cwd/bind_ports
@@ -28,7 +32,12 @@ core_lib = 803 # F4.1/F4.2 (M2 per-exec params + S9): 799 -> 803, +4 unit
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 506 # F4.1/F4.2 (M2 per-exec params + S9): 503 -> 506, +3 in the
+core_integ = 507 # F4.3/F4.4 (M2 update_network staleness + per-child
+                 # network binding): 506 -> 507, +1 in
+                 # integration/test_instance_exec_params.rs
+                 # (test_update_network_applies_to_new_exec_only_and_
+                 # reports_staleness). F4.1/F4.2 (M2 per-exec params + S9):
+                 # 503 -> 506, +3 in the
                  # new integration/test_instance_exec_params.rs
                  # (test_per_exec_cwd_and_env_apply,
                  # test_wider_policy_is_rejected,

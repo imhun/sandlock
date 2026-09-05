@@ -516,6 +516,16 @@ pub struct NetworkState {
     /// carry no ports, so every entry uses `PortAllow::Any` and the
     /// effective check is IP-only.
     pub icmp_policy: crate::seccomp::notif::NetworkPolicy,
+    /// F4.4 (fork-plan §4.5): per-child session network policies keyed by the
+    /// exec child's **process-group id** (init makes every exec child its own
+    /// pgid leader, and descendants stay in that group unless they setsid
+    /// away). A child exec'd after a session `update_network` is bound here
+    /// to its exec-time policy; siblings and later updates can never change
+    /// it. Processes with no entry (pre-update exec children and legacy M0
+    /// sessions) fall through to the instance default path. Entries live for
+    /// the session — a pgid may outlive its direct child while descendants
+    /// stay in the group, and the map is bounded by the exec registry.
+    pub child_policies: HashMap<i32, crate::seccomp::notif::NetworkPolicy>,
     /// Port binding and remapping tracker.
     pub port_map: crate::port_remap::PortMap,
     /// `--net-deny-bind`: TCP ports the sandbox may NOT bind (default-allow
@@ -574,6 +584,7 @@ impl NetworkState {
             tcp_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
             udp_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
             icmp_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
+            child_policies: HashMap::new(),
             port_map: crate::port_remap::PortMap::new(),
             bind_deny_ports: HashSet::new(),
             pid_ip_overrides: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -613,25 +624,15 @@ impl NetworkState {
         live_policy: Option<&std::sync::Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>>>,
     ) -> crate::seccomp::notif::NetworkPolicy {
         use crate::sandbox::Protocol;
-        use crate::seccomp::notif::{NetworkPolicy, PortAllow};
-        let ip_only_allow = |ips: &HashSet<std::net::IpAddr>| {
-            let per_ip = ips.iter().map(|&ip| (ip, PortAllow::Any)).collect();
-            NetworkPolicy::AllowList {
-                per_ip,
-                cidrs: Vec::new(),
-                any_ip_ports: HashSet::new(),
-                wildcard_domains: Vec::new(),
-            }
-        };
         if let Ok(overrides) = self.pid_ip_overrides.read() {
             if let Some(ips) = overrides.get(&pid) {
-                return ip_only_allow(ips);
+                return ip_only_allow_policy(ips);
             }
         }
         if let Some(lp) = live_policy {
             if let Ok(live) = lp.read() {
                 if !live.allowed_ips.is_empty() {
-                    return ip_only_allow(&live.allowed_ips);
+                    return ip_only_allow_policy(&live.allowed_ips);
                 }
             }
         }
@@ -640,6 +641,99 @@ impl NetworkState {
             Protocol::Udp => self.udp_policy.clone(),
             Protocol::Icmp => self.icmp_policy.clone(),
         }
+    }
+
+    /// F4.4: bind `policy` to the exec child whose process group is `pgid`.
+    /// Called by the instance when an exec child is announced (the child's
+    /// pid == its pgid). Only children exec'd under a session `update_network`
+    /// get an entry — a later update cannot reach them, and a sibling in
+    /// another group never shares the entry.
+    pub fn bind_child_policy(&mut self, pgid: i32, policy: crate::seccomp::notif::NetworkPolicy) {
+        self.child_policies.insert(pgid, policy);
+    }
+
+    /// Resolve the notif pid's process group (the pid of the exec child whose
+    /// subtree it belongs to; threads share their process's pgid) and return
+    /// that child's bound session policy, if any. `getpgid` runs on a frozen
+    /// notif target, so the pgid cannot race between the syscall and this
+    /// read.
+    pub fn child_policy_for_pid(&self, pid: u32) -> Option<crate::seccomp::notif::NetworkPolicy> {
+        let pgid = unsafe { libc::getpgid(pid as i32) };
+        if pgid <= 0 {
+            return None;
+        }
+        self.child_policy_for_pgid(pgid)
+    }
+
+    /// Lookup by an already-resolved process-group id (unit-testable and
+    /// used by the pid-resolving wrapper above).
+    pub fn child_policy_for_pgid(
+        &self,
+        pgid: i32,
+    ) -> Option<crate::seccomp::notif::NetworkPolicy> {
+        self.child_policies.get(&pgid).cloned()
+    }
+
+    /// Effective policy for a syscall made by `pid`, honoring the F4.4
+    /// per-child binding: per-PID policy-fn override > bound child policy >
+    /// live policy > instance static policy. A bound child's exec-time policy
+    /// is authoritative over the shared live/static state, so a session
+    /// `update_network` that narrows the *next* exec never bleeds into an
+    /// already-running child, and a wide sibling can never grant a narrow one
+    /// access through the shared state.
+    pub fn effective_network_policy_for_pid(
+        &self,
+        pid: u32,
+        protocol: crate::sandbox::Protocol,
+        live_policy: Option<&std::sync::Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>>>,
+    ) -> crate::seccomp::notif::NetworkPolicy {
+        if let Ok(overrides) = self.pid_ip_overrides.read() {
+            if let Some(ips) = overrides.get(&pid) {
+                return ip_only_allow_policy(ips);
+            }
+        }
+        let pgid = unsafe { libc::getpgid(pid as i32) };
+        if pgid > 0 {
+            if let Some(bound) = self.child_policy_for_pgid(pgid) {
+                return bound;
+            }
+        }
+        self.effective_network_policy(pid, protocol, live_policy)
+    }
+
+    /// Effective policy for a whole process group (the exec-child subtree):
+    /// bound child policy wins over the shared live/static instance policy;
+    /// an unbound group keeps the instance default.
+    pub fn effective_network_policy_for_pgid(
+        &self,
+        pgid: i32,
+        protocol: crate::sandbox::Protocol,
+    ) -> crate::seccomp::notif::NetworkPolicy {
+        if let Some(bound) = self.child_policy_for_pgid(pgid) {
+            return bound;
+        }
+        // No pid to check per-PID overrides against at group granularity;
+        // live/static remain the default for unbound groups.
+        match protocol {
+            crate::sandbox::Protocol::Tcp => self.tcp_policy.clone(),
+            crate::sandbox::Protocol::Udp => self.udp_policy.clone(),
+            crate::sandbox::Protocol::Icmp => self.icmp_policy.clone(),
+        }
+    }
+}
+
+/// Build the legacy IP-only allowlist policy (any port to each listed IP)
+/// used by per-PID overrides and live-policy snapshots.
+fn ip_only_allow_policy(
+    ips: &HashSet<std::net::IpAddr>,
+) -> crate::seccomp::notif::NetworkPolicy {
+    use crate::seccomp::notif::{NetworkPolicy, PortAllow};
+    let per_ip = ips.iter().map(|&ip| (ip, PortAllow::Any)).collect();
+    NetworkPolicy::AllowList {
+        per_ip,
+        cidrs: Vec::new(),
+        any_ip_ports: HashSet::new(),
+        wildcard_domains: Vec::new(),
     }
 }
 
@@ -1040,5 +1134,53 @@ mod tests {
         let key = idx.register(self_pid).unwrap();
         idx.prune_dead();
         assert_eq!(idx.key_for(self_pid), Some(key));
+    }
+
+    // ============================================================
+    // F4.4 per-child network binding (fork-plan §4.5)
+    // ============================================================
+
+    fn tcp_allow(ips: &[&str]) -> crate::seccomp::notif::NetworkPolicy {
+        use crate::seccomp::notif::{NetworkPolicy, PortAllow};
+        let per_ip = ips
+            .iter()
+            .map(|s| (s.parse().unwrap(), PortAllow::Any))
+            .collect();
+        NetworkPolicy::AllowList {
+            per_ip,
+            cidrs: Vec::new(),
+            any_ip_ports: HashSet::new(),
+            wildcard_domains: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn bound_child_policy_wins_over_shared_static_policy() {
+        let mut ns = NetworkState::new();
+        ns.tcp_policy = tcp_allow(&["10.0.0.1", "10.0.0.2"]);
+        // The session update narrows child pgid 4242 to 10.0.0.1 only.
+        ns.bind_child_policy(4242, tcp_allow(&["10.0.0.1"]));
+
+        let bound =
+            ns.effective_network_policy_for_pgid(4242, crate::sandbox::Protocol::Tcp);
+        assert!(bound.allows("10.0.0.1".parse().unwrap(), 443));
+        assert!(
+            !bound.allows("10.0.0.2".parse().unwrap(), 443),
+            "the bound child's exec-time policy must not be widened by the shared ceiling"
+        );
+    }
+
+    #[test]
+    fn sibling_group_never_shares_a_bound_policy() {
+        let mut ns = NetworkState::new();
+        ns.tcp_policy = tcp_allow(&["10.0.0.1", "10.0.0.2"]);
+        ns.bind_child_policy(4242, tcp_allow(&["10.0.0.1"]));
+
+        // Sibling group 4243 has no entry: it keeps the instance default and
+        // is never narrowed (or granted) by child 4242's binding.
+        let sibling =
+            ns.effective_network_policy_for_pgid(4243, crate::sandbox::Protocol::Tcp);
+        assert!(sibling.allows("10.0.0.2".parse().unwrap(), 443));
+        assert!(ns.child_policy_for_pgid(4243).is_none());
     }
 }
