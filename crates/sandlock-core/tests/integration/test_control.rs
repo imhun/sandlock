@@ -1729,7 +1729,12 @@ fn test_path_mode_peer_uid_mismatch_closes() {
         }
     }
     let outcome = serve.join().expect("serve thread");
-    assert_eq!(outcome, ServeOutcome::Shutdown);
+    assert_eq!(
+        outcome,
+        ServeOutcome::PeerGone,
+        "a peer outside the allowlist is an abnormal end (closed without a \
+         response), never a clean generation end"
+    );
 
     // Positive control: the same-uid special case (empty allowlist = self)
     // serves the same peer.
@@ -1826,7 +1831,11 @@ fn test_registered_path_channel_accepts_allowlisted_peer_with_token() {
 
     let (first, second) = serve.join().expect("serve thread");
     assert_eq!(first, ServeOutcome::Continue);
-    assert_eq!(second, ServeOutcome::Shutdown);
+    assert_eq!(
+        second,
+        ServeOutcome::PeerGone,
+        "a refused peer (no token) is an abnormal end, never Shutdown"
+    );
 }
 
 /// A sibling sandbox cannot reach a registered control channel: the hashed

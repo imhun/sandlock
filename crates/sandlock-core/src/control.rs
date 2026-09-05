@@ -904,10 +904,12 @@ pub fn list_live_sandboxes() -> Result<Vec<(String, i32)>, std::io::Error> {
     Ok(live)
 }
 
-/// True when `dir`'s file name is the per-sandbox `<fnv1a16(name)>.d` shape
-/// (16 lowercase hex digits plus `.d`).  `list_live_sandboxes` uses this to
-/// distinguish sandbox state dirs from any other directory that may share
-/// the control root.
+/// True when `dir`'s file name is the per-sandbox `<fnv1a_hex(name)>.d`
+/// shape (16 ASCII hex digits plus `.d`, either case — the runtime's own
+/// `fnv1a_hex` emits lowercase, and the check accepts uppercase hex too so
+/// a foreign directory is never misclassified on case alone).
+/// `list_live_sandboxes` uses this to distinguish sandbox state dirs from
+/// any other directory that may share the control root.
 fn is_sandbox_state_dir(dir: &Path) -> bool {
     let name = match dir.file_name().and_then(|n| n.to_str()) {
         Some(n) => n,
@@ -1213,6 +1215,13 @@ pub trait ControlHandler {
 /// `token` is the channel token every verb must carry; `allow` is the peer
 /// uid allowlist (empty = same-uid-only special case).  Returns `None` only
 /// when `accept` itself failed.
+///
+/// Outcome semantics match the persistent transports: only a `shutdown`
+/// verb returns [`ServeOutcome::Shutdown`]; an abnormal connection end
+/// (peer uid outside the allowlist, EOF without a request, parse/version
+/// refusal, or token refusal) returns [`ServeOutcome::PeerGone`] — a slot's
+/// accept loop treats that as one refused connection and keeps serving the
+/// next one (only a `shutdown` verb ends the generation).
 pub fn serve_registered_once(
     listener: &std::os::unix::net::UnixListener,
     token: &str,
@@ -1310,6 +1319,13 @@ pub fn serve_fd_connection(
 /// connection is closed after the refusal.  The fd-handoff transport serves
 /// its single persistent stream in [`serve_fd_connection`], where the
 /// descriptor itself is the credential and the only gate is the token.
+///
+/// Abnormal ends (peer uid mismatch, EOF, parse/version/token refusal) all
+/// return [`ServeOutcome::PeerGone`] — never `Shutdown`, so a caller cannot
+/// mistake a refused or vanished peer for a clean generation end.  In the
+/// registered path's one-request-per-connection model that `PeerGone` closes
+/// exactly this connection; the slot's accept loop decides whether to keep
+/// accepting.
 pub fn serve_connection(
     mut stream: std::os::unix::net::UnixStream,
     expected_token: Option<&str>,
@@ -1318,14 +1334,14 @@ pub fn serve_connection(
 ) -> ServeOutcome {
     if allowed_peer_uids.is_empty() {
         if !peer_uid_allowed(&stream, &[]) {
-            return ServeOutcome::Shutdown;
+            return ServeOutcome::PeerGone;
         }
     } else if !peer_uid_allowed(&stream, allowed_peer_uids) {
-        return ServeOutcome::Shutdown;
+        return ServeOutcome::PeerGone;
     }
 
     let Some(body) = read_request_body(&mut stream) else {
-        return ServeOutcome::Shutdown;
+        return ServeOutcome::PeerGone;
     };
 
     let req: ControlRequest = match serde_json::from_slice(&body) {
@@ -1338,7 +1354,7 @@ pub fn serve_connection(
                 err: Some(format!("parse error: {}", e)),
             };
             let _ = write_response_frame(&mut stream, &resp);
-            return ServeOutcome::Shutdown;
+            return ServeOutcome::PeerGone;
         }
     };
 
@@ -1350,7 +1366,7 @@ pub fn serve_connection(
             err: Some(format!("unsupported protocol version: {}", req.v)),
         };
         let _ = write_response_frame(&mut stream, &resp);
-        return ServeOutcome::Shutdown;
+        return ServeOutcome::PeerGone;
     }
 
     // Channel token: on the dual transports every verb carries the channel
@@ -1373,7 +1389,7 @@ pub fn serve_connection(
                 )),
             };
             let _ = write_response_frame(&mut stream, &resp);
-            return ServeOutcome::Shutdown;
+            return ServeOutcome::PeerGone;
         }
     }
 
@@ -1466,6 +1482,29 @@ impl RegisteredPathChannel {
     /// single-machine special case), which the server enforces via
     /// `SO_PEERCRED == getuid()`.
     pub fn bind(name: &str, allowed_peer_uids: Vec<u32>) -> std::io::Result<Self> {
+        let token = generate_token()?;
+        Self::bind_with_token(name, allowed_peer_uids, &token)
+    }
+
+    /// Bind a registered channel for `name` with a caller-provided token.
+    ///
+    /// The deployer-agreed variant of [`RegisteredPathChannel::bind`]: a
+    /// route-B slot started out-of-band (transport 2) must use the same
+    /// token the worker side was provisioned with — a token generated inside
+    /// the slot could never be learned by the worker.  `token` must be
+    /// non-empty (an empty token would silently disable the channel's second
+    /// auth layer whenever a caller passes `None` as the expected token).
+    pub fn bind_with_token(
+        name: &str,
+        allowed_peer_uids: Vec<u32>,
+        token: &str,
+    ) -> std::io::Result<Self> {
+        if token.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "registered channel token must be non-empty",
+            ));
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1483,10 +1522,9 @@ impl RegisteredPathChannel {
             // though it does not own the slot dir: make the socket
             // world-connectable (auth is the allowlist + token, not DAC).
             std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o666))?;
-            let token = generate_token()?;
             Ok(RegisteredPathChannel {
                 name: name.to_string(),
-                token,
+                token: token.to_string(),
                 allowed_peer_uids,
                 listener,
                 sock_path,
@@ -1495,7 +1533,7 @@ impl RegisteredPathChannel {
         }
         #[cfg(not(unix))]
         {
-            let _ = (name, allowed_peer_uids);
+            let _ = (name, allowed_peer_uids, token);
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "control channels require unix sockets",

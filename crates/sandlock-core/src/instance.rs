@@ -107,6 +107,33 @@ pub struct InstanceStats {
     pub instance_state: InstancePhase,
 }
 
+/// One configured inbound (S2.5 `net_bind_map`) mapping with its live
+/// listener state — the supervise `ports` verb's per-entry view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InboundMapping {
+    /// The port the sandbox binds and listens on inside its netns.
+    pub sandbox_port: u16,
+    /// The host-loopback port the supervisor listens on for this mapping
+    /// (reserved 50005+ range).
+    pub host_port: u16,
+    /// Whether a live host-side listener currently exists for this mapping
+    /// (the sandbox called `listen()` on `sandbox_port` and the supervisor's
+    /// S2.5 listener is up and being served).
+    pub live: bool,
+}
+
+/// Live network-port snapshot for a sandbox session (the supervise `ports`
+/// verb surface): configured inbound mappings plus the live port-remap
+/// table. Both halves come from the supervisor-side `NetworkState`, so the
+/// report reflects the request-time truth rather than a static registry.
+#[derive(Debug, Clone, Default)]
+pub struct InstancePorts {
+    /// Configured inbound mappings, sorted by sandbox port.
+    pub inbound: Vec<InboundMapping>,
+    /// Live virtual → real port-remap table (`port_remap`).
+    pub port_remap: std::collections::HashMap<u16, u16>,
+}
+
 /// Session-scoped runtime state, present only while the sandbox is running.
 ///
 /// M0 keeps the single-slot shape of the historical `Runtime` block
@@ -872,6 +899,41 @@ impl SandboxInstance {
             children_live,
             instance_state: self.phase,
         }
+    }
+
+    /// Snapshot the session's live port surface (fork-plan F2b.3 `ports`
+    /// verb): configured S2.5 inbound mappings with live-listener state and
+    /// the live `port_remap` virtual→real table.
+    ///
+    /// Reports an empty snapshot when the supervisor network state does not
+    /// exist yet (the session was never launched, or ran without a
+    /// supervisor) — the caller distinguishes that via
+    /// [`SandboxInstance::phase`]/its own launch bookkeeping.
+    pub async fn ports(&self) -> InstancePorts {
+        let mut inbound: Vec<InboundMapping> = Vec::new();
+        let mut port_remap = std::collections::HashMap::new();
+        if let Some(ref net) = self.supervisor_network {
+            let ns = net.lock().await;
+            let mut configured: Vec<(u16, u16)> = ns
+                .inbound_map
+                .iter()
+                .map(|(&sandbox_port, &host_port)| (sandbox_port, host_port))
+                .collect();
+            configured.sort_unstable();
+            for (sandbox_port, host_port) in configured {
+                let live = ns
+                    .inbound
+                    .values()
+                    .any(|listener| listener.sandbox_port == sandbox_port);
+                inbound.push(InboundMapping {
+                    sandbox_port,
+                    host_port,
+                    live,
+                });
+            }
+            port_remap = ns.port_map.virtual_to_real.clone();
+        }
+        InstancePorts { inbound, port_remap }
     }
 
     /// The session's (single, M0) process PID, or `None` before launch. Remains
