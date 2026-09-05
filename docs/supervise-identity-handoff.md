@@ -286,6 +286,12 @@ the same bytes:
   of each arch's binary plus the `HEAD` commit the run built from. Take wheel,
   standalone binary, and manifest from the **same** release directory — they
   are the same bytes; a mixed-commit pair fails the release self-proof below.
+  Note the asymmetry on purpose: the supervise fingerprint is **anchored at
+  build time** (the manylinux builder toolchain differs from the dev container,
+  so the bytes cannot be re-derived inside the verify container the way the FFI
+  symbol set can). `python/verify-wheel.sh` therefore refuses stale manifests —
+  rebuild the wheels from the tip before verifying (release discipline,
+  `docs/e2b-integration.md` §3.4).
 
 Release self-proof (extended F0.2 verifier): build the tip release lib
 in-container, then run

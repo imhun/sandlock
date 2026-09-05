@@ -51,6 +51,33 @@ These are deliberately opt-in and independent of the PR's default paths.
 When pushing, they can be included in the same PR or split into a follow-up
 per upstream preference.
 
+**Fork-plan 2026-09 additions carried on the same branch (F0–F9, all local —
+scope note for the PR, see `fork-plan-2026-09.md` and `e2b-integration.md`):**
+
+- **`SandboxInstance` (M0–M3)** — explicit long-lived per-sandbox instance with
+  `shutdown()`, `stats()`, per-child `exec`/`wait_child`/`kill_child`/`resize_child`
+  (init machinery lifted from `sandlock-oci` into `core::init`, oci re-uses the
+  same code), per-exec `cwd`/`env`/`extra_writable`/`bind_ports` with S9
+  subset validation, whole-box `max_processes` default 256, multi-child
+  checkpoint refusal, `pid_ns` coexistence with per-child `/proc` scope,
+  unified `InstanceDead`, idle/`T_max` lifetime.
+- **route-B `sandlock-supervise`** — one mediator process per sandbox whose
+  euid is the sandbox's host uid (identity by construction), dual control
+  transport (registered path + fd handoff), full-field policy entry,
+  foreign-uid acceptance; ships in wheels with a HEAD-pinned fingerprint.
+- **`mediation_run_as` (SL-1/P1/P2)** — mediation identity is bound to the
+  owning process; a root in-process remap with path mediation is refused
+  fail-closed (`caller` default); explicit `supervisor` tier warns and counts.
+- **`fs_mount` single-node mounts + `minimal_dev()` (P5)** — file/chardev
+  bind-mount leaves (no more `ENOTDIR`), read-only preserved, mount-point
+  write family protected with `EBUSY`; a six-node `/dev` helper removes the
+  whole-tree `/dev` requirement.
+- **security pre-work M0′ (SL-4/5/6/7/8 + frame cap + deadline)** — all closed
+  with red→green tests (see `docs/sandbox-exec-security.md` §7).
+
+Release-note style behavior changes are summarized in `docs/CHANGELOG.md`;
+per-suite baselines live in `docs/test-baseline.md`.
+
 ## Commits (all on `upstream-pr/netns-free-clean`)
 
 - `d3a28cc` Block A (domain wildcards + loopback DNS gateway) + Block B
@@ -77,7 +104,11 @@ excluded.
 
 All green **as an unprivileged user** (uid 65534; the container entrypoint
 does the one-time root prep — sysctl for the `:53` gateway + pre-seeded
-`198.18.0.x`/`/etc/hosts` fixtures — then drops privileges):
+`198.18.0.x`/`/etc/hosts` fixtures — then drops privileges). Final fork-plan
+full gate (2026-09-05) is green for every label — non-root suites plus the
+root-mode `oci`/`supervise_root`/`mediation_2uid` tiers and a rebuilt+verified
+two-arch wheel; authoritative numbers and logs:
+`docs/test-baseline.md` and `tmp/sdd/f9-gate-*.log` / `f9-wheel-*.log`.
 
 ```text
 sandlock-core lib:       770 passed, 0 failed
@@ -120,4 +151,6 @@ git push origin upstream-pr/netns-free-clean
 > 子模块形式固定在本仓库 `third_party/sandlock`；改动先提交到子模块并 push，
 > 再开 PR。**推送暂缓（用户指示 2026-09-01）**：本地 tip 现为 `d6940de`
 > （含 S1/S2 增强），验证基线 lib `788 passed` / integration `465 passed` /
-> Python `440 passed`（uid 65534）；推送与开 PR 待用户解除约束后执行。
+> Python `440 passed`（uid 65534）；**F0–F9 收口后（2026-09-05）本地 tip 为 F9 多
+> commit 链（见 git log / `tmp/sdd/f9-report.md`），验证基线以 `docs/test-baseline.md`
+> 实测为准**；推送与开 PR 仍待有写权限的 token 与用户解除约束后执行。
