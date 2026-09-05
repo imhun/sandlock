@@ -2,6 +2,12 @@
 
 Branch: `upstream-pr/netns-free-clean`（本地，不推送）。进度：`.superpowers/sdd/progress.md`。顺序：F6.1 → F6.2（F7/F8 随后）。
 
+> **状态（F9 收口，2026-09-05）：F6.1/F6.2 全部 complete + reviewed**：SL-1 断言+拒绝
+> `b62e201`、`mediation_run_as` 全栈 `dd5a7e8`、B/C 档验收 `7f81314`、review fix
+> `75bbe0b`；fs_mount 单节点 + minimal_dev `de2f749`、e2b/baseline `dc0edf3`、I1/I2 fix
+> `6fcb8e2`。mediation_2uid = 5；残留（link EBUSY 直击、rmdir-at-mount-point、no-clobber
+> 回归等）见 `docs/fork-plan-followups.md`。
+
 ## F6.1（SL-1，plan 已给步骤级，读 §F6.1 全文）
 - 形态事实：中介跑在持有实例的进程内 ⇒ 中介身份 = 该进程 euid；B 档下天然正确，SL-1 三个症状不存在 ⇒ 本任务 = "断言 + 拒绝" + B 档跨 uid 硬证据。
 - A 档（同 uid 行为正确）+ B 档 `test_two_supervisors_distinct_uids_isolate_files`（uid X/Y 各自 supervise 写同一 1777+sticky 共享目录：Y 不可删 X 文件 EPERM、Y chmod X 文件 EPERM、X 自己 chmod 生效）+ C 档 fail-closed（root in-process mediation 拒绝；`mediation_run_as=supervisor` 显式档建箱成功但 WARN + stats 计数；对照组 caps-kept-would-leak）。

@@ -2,6 +2,12 @@
 
 Branch: `upstream-pr/netns-free-clean`（本地，不推送）。进度：`.superpowers/sdd/progress.md`。顺序：F4.1 → F4.2 → F4.3 → F4.4（同任务多 commit，评审按范围）。
 
+> **状态（F9 收口，2026-09-05）：F4 全部 complete + reviewed（两轮 fix）**：per-exec
+> params + S9 `b58b634`；update_network/per-child 网络 `9f959f1`；FFI/Python/supervise
+> 面 `c5d1108`；review fixes `902e522`（I1–I4）与 `e5c7214`（C1/R2）。架构 seam
+> （per-child 正向收窄、credential 归因、port-aware update_network）见
+> `docs/fork-plan-followups.md` FUP-16。
+
 ## 总纲（plan §F4 + sandbox-exec-security §7 M2）
 
 - F4.1 `exec(argv, cwd, env, extra_writable, bind_ports)`：execve 前 chdir + envp 构造；`clean_env` 语义逐 exec 保持。

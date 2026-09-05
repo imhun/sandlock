@@ -2,6 +2,11 @@
 
 Branch: `upstream-pr/netns-free-clean`（本地，不推送）。进度：`.superpowers/sdd/progress.md`。顺序：F3.1 → F3.2 → F3.3（同任务多 commit；F4/F5 随后，F2b.4/.5 在 F5 后）。
 
+> **状态（F9 收口，2026-09-05）：F3.1–F3.3 全部 complete + reviewed**：init 搬家
+> `d063437`（oci-root 144 精确不变）、per-child exec `4411c7b`、FFI/Python 面 `3d42bc7`、
+> review fix `3fa0b95`（exec-mode 终态 / deadline 孤儿 / drop 契约）。seam 单归属维持
+> 双份复挂（决策 + follow-up 见 `docs/fork-plan-followups.md` FUP-02）。
+
 ## 总纲（plan §F3 + sandbox-exec-security §7 M1）
 
 - B 档下 exec 调用方 = 宿主 worker、被调方 = sandlock-supervise ⇒ child 句柄与 stdio 交付须同时支持同进程（旧 API/单测）与跨进程（F2b.2 fd 交接）；帧协议只写一套。

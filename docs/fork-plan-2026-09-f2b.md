@@ -2,6 +2,12 @@
 
 Branch: `upstream-pr/netns-free-clean`（本地提交，不推送）。进度账本：`.superpowers/sdd/progress.md`。顺序：F2b.1 → F2b.2 → F2b.3 → F2b.4 → F2b.5（与 F3–F5 共用 instance API；F2b.4/.5 在 F3–F5 后收口）。
 
+> **状态（F9 收口，2026-09-05）：F2b.1–F2b.5 全部 complete + reviewed**：全字段入口
+> `3339c12`；双传输 `990ae5b`..`06c6878`；身份契约 + 外 uid 全功能 `6ea02a7`..`3afc9dd`；
+> 成本量化 `799fc8f`（supervise_cost = 3，容量表 `docs/supervise-capacity.md`）；
+> 交付物 `51b64ad`（wheel 内 supervise + standalone + HEAD 钉住指纹）。残留/建议见
+> `docs/fork-plan-followups.md`（fd root 用例、退出顺序、release profile、REAP_POLL_MS 等）。
+
 ## 已确认决策（2026-09-04 用户拍板，plan 引用）
 
 - B 档：per-uid 隔离——服务中介进程本身 = 该沙箱 host uid；特权只存在于 create 那一下。
@@ -29,7 +35,8 @@ Branch: `upstream-pr/netns-free-clean`（本地提交，不推送）。进度账
 
 ## Task F2b.4：预算与自证（B 档成本量化）— F3–F5 后
 
-- 每沙箱 supervise RSS 预算（plan ≤8MB 期望）；slot 池内存/pid 预算；test_supervise_cost.rs 用例。
+- 每沙箱 supervise RSS 预算（plan 早期 "≤8MB" 期望已由实测替代：空载 ≈4.2–4.5 MB、
+  每 slot 边际 ≈0.5 MB，见 `docs/supervise-capacity.md`）；slot 池内存/pid 预算；test_supervise_cost.rs 用例。
 
 ## Task F2b.5：交付物形态 — F3–F5 后
 

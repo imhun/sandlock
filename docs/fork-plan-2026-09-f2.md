@@ -2,6 +2,10 @@
 
 Branch: `upstream-pr/netns-free-clean`（本地提交，不推送）。进度账本：`.superpowers/sdd/progress.md`。顺序：F2.1 → F2.2 → F2.3（F2b 阶段另文档/随行展开）。
 
+> **状态（F9 收口，2026-09-05）：F2.1–F2.3 全部 complete + reviewed**：M0 SandboxInstance
+> `57f543c`..`ed06453`、shutdown 七步幂等 `117e10b`+`879c257`、stats 面 `2cb1d99`；
+> core_integ 477→488；F2.1 review minors（B-2/B-3/B-5/B-7）已在 F2.2 内关闭。
+
 ## 设计总纲（来自 docs/sandbox-exec-security.md §5 与 plan §F2）
 
 - M0 目标：把 `ResourceState`、notif/throttle/loadavg、control listener、控制目录+token、DNS 网关、PolicyFn/Network/Procfs/COW 状态的生命周期从"create/run 内联 + wait() 一次性收尾"上提到显式 `SandboxInstance`；`Sandbox::run/popen/spawn` 内部改走"一次性 instance"，外部语义与 ABI 不变；新增 instance API（exec/wait_child/kill_child/shutdown 的形态在 M0 立骨架，exec 语义下沉属 M1）。

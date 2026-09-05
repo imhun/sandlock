@@ -3,7 +3,13 @@
 Branch: `upstream-pr/netns-free-clean`（本地提交，不推送）。进度账本：`.superpowers/sdd/progress.md`。每任务：TDD 红→绿 → 实现子代理 → task reviewer → ledger。
 顺序（plan §F1）：F1.1 → F1.2 → F1.3 → F1.4 → F1.5 → F1.7 → F1.8 → F1.6。
 
-## F1.1 SL-4 控制 fd CLOEXEC（in progress）
+> **状态（F9 收口，2026-09-05）：F1.1–F1.8 全部 complete + reviewed。**
+> M0′ 已清零：SL-4 `3d804b1`、H1/H2 `c5a0fe7`、SL-7 `95608be`+`ceaa069`、SL-8 `f0b3d78`、
+> SL-6 `793aaf3`+`e85d031`、SECE-6 `4b7f7d0`+`d2bd459`、deadline `df5d77a`、SL-5 `0f51fce`；
+> oci-root 144、全门各档终局复验绿（logs `tmp/sdd/f9-*`）；各任务计数已随 commit 登记
+> `docs/test-baseline.md`。本阶段行文保留为原始计划。
+
+## F1.1 SL-4 控制 fd CLOEXEC（complete）
 
 - 落点 A：`crates/sandlock-core/src/sandbox.rs:2317-2319` — `for &(target,source) in extra_fds { dup2 }` 用 POSIX dup2 清掉结果 fd 的 `FD_CLOEXEC`。
 - 改动：target >= 3 的 extra_fds 用 `dup3(source, target, O_CLOEXEC)`；target 0/1/2 保持可继承（stdio）。

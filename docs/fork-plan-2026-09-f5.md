@@ -2,6 +2,11 @@
 
 Branch: `upstream-pr/netns-free-clean`（本地，不推送）。进度：`.superpowers/sdd/progress.md`。顺序：F5.1 → F5.2 → F5.3 → F5.4 → F5.5（同任务多 commit；评审按范围）。
 
+> **状态（F9 收口，2026-09-05）：F5.1–F5.5 全部 complete + reviewed（fix 轮后 clean）**：
+> 整箱 256 `b56fcbe`；checkpoint 拒 `a5c7f3b`；pid_ns+instance `2c016bd`；InstanceDead
+> `d67a363`；idle/T_max `8e22c5d`；argv-safety gate fix `e5c049c`；review fix `1321ba0`
+> （I1–I3 + minors）。行为变化已入 `docs/CHANGELOG.md`。
+
 ## 总纲（plan §F5 + sandbox-exec-security §7 M3）
 
 - F5.1（Q10，风险最大）`max_processes` 从"每命令 64"变"整箱 64" ⇒ 默认上调（建议 256）+ CHANGELOG/release note；lib 单测断言新默认，integration 断言"整箱第 N+1 个 fork 被拒"。

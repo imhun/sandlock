@@ -6,6 +6,13 @@
 
 **Goal:** 在 fork 内一次性交付全部未完成目标 —— 安全前置 `SL-4/5/6/7/8` + 进程组/帧上限/deadline（M0′）、每沙箱一实例 `M0–M3`、路径中介身份 `P1/P2`、`fs_mount` 细粒度 `P5`、`net_isolation`+chroot 入站映射 `P4`、`P6` 已知限制补齐、**路线 B：supervisor 进程化（`sandlock-supervise`，2026-09-04 用户已确认）** —— per-uid 隔离与 SL-1 由构造解决；`P3` 一行修复在 F0.3 —— 每一项都带本仓库内的红→绿测试，且 fork 三套基线（lib 788 / integration 465 / python 430）零回退。
 
+> **基线口径（F9 收口，2026-09-05）**：文中的 `788 / 465 / 430` 是 2026-09-03 计划期的
+> fork 历史基线，**已被 F0.1 起的逐套实测替代**；当前权威数字按套件/档位登记在
+> `docs/test-baseline.md`（终局复验：core_lib 822 / core_integ 531 / ffi 98 / cli 98 /
+> supervise 36 / supervise_cost 3 / cli_build 0 / python 454 + root 档 oci 144 /
+> supervise_root 2 / mediation_2uid 5，logs `tmp/sdd/f9-*`），全文"零回退"表述一律以
+> test-baseline 的实测口径为准。
+
 **Architecture:** 四条独立可交付的主线，按"能不能立刻在 fork 内验证"排序：(1) **F0 独立性基座** —— 把"完整套件一键跑 + wheel 构建 + 与 tip 一致性自证"收进本仓库，后续每条主线的验收都复用它；(2) **F1 安全门槛 M0′** —— 全部是既有代码的正确性/鉴权缺陷，可在当前 `sandlock-oci` 路径上先跑红，不依赖实例化改造；(3) **F2–F5 实例化 M0→M3** —— 三层边界（Policy / Instance / Child）落地，`exec` 从 `sandlock-oci` **下沉复用**到 core，不新写；(4) **F2b supervisor 进程化（路线 B，2026-09-04 用户已确认）**（特权只在 create，服务中介的进程 euid == 沙箱 host uid）—— 它把 SL-1 从“修中介身份”变成“不需要修”，并把 SL-7 的控制通道从文件系统改成 create 时交接的 fd；(5) **F6–F7 文件身份断言与形态补齐**（SL-1 fail-closed / P5 / P4）—— 与主线 2/3 正交，可并行。
 
 **Tech Stack:** Rust 2021（`sandlock-core` / `sandlock-ffi` / `sandlock-cli` / `sandlock-oci`）、Landlock + seccomp `USER_NOTIF`、`pidfd` / `SCM_RIGHTS` / `SO_PEERCRED`、tokio、cbindgen（C 头文件）、PyO3 + ctypes Python 绑定（`python/src/sandlock`）、Go SDK（`go/`，经 pkg-config 链接 `libsandlock_ffi.so`）、zig 交叉编译 manylinux_2_34 wheel、GitHub Actions（`ci.yml`）。
@@ -14,7 +21,10 @@
 
 - 运行时基线分支 `upstream-pr/netns-free-clean`：**全程无 root 可用**；非 root（uid 65534 / `nobody`）必须能跑完整套验证（`b6ef050` 已固化，`tests/integration/net_fixture.rs` 提供无特权网络前置）。
 - 允许 root 增益路径（`RunAs` 任意 host uid 需 root/CAP_SETUID）必须 **fail closed**，不得把 root-only 能力变成默认路径的前提（`sandbox.rs:2087-2104` 现有拒绝即范式）。
-- 基线数字（Linux 容器 / 非 root）：lib `788`、integration `465`、python `430`；`cargo test --release --workspace` 另含 ffi/cli/oci 套件。**任何一条既有测试都不许改断言迁就新行为**，除非该行为正是本任务的目标，且改动在提交信息里点名。
+- 基线数字（Linux 容器 / 非 root）：历史计划期 lib `788` / integration `465` / python `430`；
+  **实测口径以 `docs/test-baseline.md` 为准**（F0.1 起每套件精确比对，F9 终局复验数字见文首注记）；
+  `cargo test --release --workspace` 另含 ffi/cli/oci 套件。**任何一条既有测试都不许改断言迁就新行为**，
+  除非该行为正是本任务的目标，且改动在提交信息里点名。
 - 测试规范：断言精确（退出码、属主 uid、错误码、计数逐一对齐，禁"包含即可"）；**禁 skip 掩盖能力缺失**（环境不满足就 fail 并打印取证输出）；日志驱动排查，不靠猜。
 - Landlock 与 seccomp 只能加严：per-exec 只能**收窄**策略，放宽必须在实例创建时定死上限、越界**显式拒绝**（`sandbox-exec-security.md` §4.3 / S9）。
 - 新增 FFI 符号必须同批更新：`crates/sandlock-ffi/src/lib.rs` → `cbindgen` 重生成 `crates/sandlock-ffi/include/sandlock.h`（CI 的 `cbindgen-header` job 会比对）→ Python ctypes 绑定 → C 冒烟用例（`crates/sandlock-ffi/tests/c/`）。
@@ -28,21 +38,28 @@
 
 | 套件 | 命令 | 基线 | 承载本计划哪些验收 |
 |---|---|---|---|
-| core lib | `cargo test -p sandlock-core --offline --lib` | 788 | `ResourceState`/pidfd 记账、帧协议、DAC 判定纯函数 |
-| core integration | `cargo test -p sandlock-core --offline --test integration -- --test-threads=1` | 465 | SL-4/6/7/8、SECE-6、M0–M3、SL-1、P4、P5 |
-| ffi | `cargo test -p sandlock-ffi --offline` | 基线待登记 | 新 FFI 符号（`instance_exec` 等）、C 冒烟、`fs_mount` |
-| cli | `cargo test -p sandlock-cli --offline` | 基线待登记 | 新开关的 CLI→builder 接线（`--pid-ns` 漏接线的教训不得重演） |
-| oci | `cargo test -p sandlock-oci --offline -- --test-threads=1`（9 例） | 基线待登记 | SL-4/5/6/8 与 `early_exits`/deadline 的**现状可跑红**探针 |
-| python | `cd python && pip install -e . && pytest tests/ -v` | 430 | P3、`SandboxInstance.exec`、控制面鉴权、中介身份 |
+| core lib | `cargo test -p sandlock-core --offline --lib` | **822**（见 test-baseline） | `ResourceState`/pidfd 记账、帧协议、DAC 判定纯函数 |
+| core integration | `cargo test -p sandlock-core --offline --test integration -- --test-threads=1` | **531** | SL-4/6/7/8、SECE-6、M0–M3、SL-1、P4、P5、P6 pin |
+| ffi | `cargo test -p sandlock-ffi --offline` | **98** | 新 FFI 符号（`instance_exec` 等）、C 冒烟、`fs_mount` |
+| cli | `cargo test -p sandlock-cli --offline` | **98** | 新开关的 CLI→builder 接线（`--pid-ns` 漏接线的教训不得重演；`--mediation-run-as`/`--fs-mount` 已真接线） |
+| cli_build | `cargo build --release --workspace --locked` | **0**（build 通过） | workspace release 构建门（F0.4 教训） |
+| supervise | `cargo test -p sandlock-supervise --offline --lib --test supervise` | **36** | F2b 全字段入口/双传输/exec 面（非 root 档） |
+| supervise_cost | `cargo test -p sandlock-supervise --offline --release --test supervise_cost -- --test-threads=1` | **3** | F2b.4 成本预算 |
+| supervise_root | `scripts/test-all.sh --supervise-root`（root） | **2** | F2b.3 外 uid 真执行验收 |
+| mediation_2uid | `scripts/test-all.sh --mediation-2uid`（root） | **5** | F6.1 B/C 档跨 uid 硬证据 + CLI wiring |
+| oci | `cargo test -p sandlock-oci --offline -- --test-threads=1`（root 档） | **144** | SL-4/5/6/8 与 `early_exits`/deadline 探针 + init 搬家证明 |
+| python | `python3 -m pytest python/tests -q`（sandlock-dev 内） | **454** | P3、`SandboxInstance.exec`、控制面鉴权、中介身份 |
 | go | `make install-go-lib && cd go && go test ./...` | CI 现有 | 新符号不破坏 pkg-config 链接 |
 
-> 登记基线：F0.1 用一次全量运行把 ffi/cli/oci/go 的实测数写进 `docs/test-baseline.md`，之后脚本按精确数字比对（缺一个用例就红）。
+> 登记基线：F0.1 起每次全量运行把各套件实测数写进 `docs/test-baseline.md`，`scripts/test-all.sh`
+> 按精确数字比对（缺一个用例就红；跳过的用例同样红）。上表数字为 F9 终局复验值（2026-09-05），
+> 历史 788/465/430 见文首注记。
 
 ## 2. 覆盖矩阵（目标 → 任务 → 新增测试）
 
 | 目标 | 任务 | 新增测试（文件 :: 用例） | 套件 |
 |---|---|---|---|
-| SL-4 控制 fd 泄漏 | F1.1 | `integration/test_fd_inherit.rs :: test_control_socket_not_inherited_by_user_process`、`test_extra_fds_are_cloexec`、`test_stdio_still_inheritable`；`oci/tests/integration.rs :: test_forged_exit_frame_cannot_fake_success` | integration + oci |
+| SL-4 控制 fd 泄漏 | F1.1 | `integration/test_fd_inherit.rs :: test_control_socket_not_inherited_by_user_process`、`test_extra_fds_are_cloexec`、`test_stdio_still_inheritable` | integration |
 | §10 H1/H2 `early_exits` | F1.2 | `oci/tests/integration.rs :: test_unknown_pid_exit_frame_bounded`、`lib: supervisor::tests :: early_exits_cap_drops_overflow` | oci + lib |
 | SL-7 控制面鉴权 + 身份 | F1.3 + **F2b.2** | `integration/test_control.rs :: test_peer_uid_mismatch_closes`、`test_sibling_sandbox_cannot_read_other_policy`、`test_name_conflict_refuses_preempt`、`test_verb_without_token_rejected` | integration + python |
 | SL-8 `proc_count` 泄漏 | F1.4 | `integration/test_resource.rs :: test_setsid_orphan_returns_proc_count`、`test_proc_count_matches_live_after_orphan_storm`；`lib: resource::tests :: pidfd_release_is_idempotent` | integration + lib |
@@ -59,9 +76,14 @@
 | M3 语义/默认/兜底 | F5 | `integration/test_instance_semantics.rs :: test_max_processes_default_bounds_whole_box`、`test_checkpoint_with_multiple_children_is_refused`、`test_dead_state_surfaces_single_error_code`、`test_idle_timeout_drains_and_shuts_down`、`test_pid_ns_procfs_scope_narrows_to_child`；`integration/test_pid_ns.rs :: test_init_reaps_ns_pid_1_exit` | integration + lib |
 | SL-1 中介身份（P1/P2） | F6.1 | A 档 `test_nonroot_created_file_owned_by_self`、`test_denied_path_still_denied`；**B 档 `test_two_supervisors_distinct_uids_isolate_files`（跨 uid 硬证据）**；C 档 `test_root_inprocess_mediation_is_refused` + `..._with_caps_kept_would_leak`（降级档自证） | integration（A/B 两档都要跑） |
 | `fs_mount` 细粒度（P5） | F6.2 | `ffi/tests/fs_mount.rs :: test_mount_single_file_node`、`test_mount_chardev_node`；`python/tests/test_fs_mount.py :: test_minimal_dev_helper`（该文件已存在） | ffi + python |
-| `net_isolation`+chroot 入站（P4/T4） | F7 | `integration/test_net_isolate.rs :: test_mcp_inbound_mapping_under_chroot_and_net_isolation`（当前该形态即失败 ⇒ 新增即红） | integration |
-| `notify_rate_limit` 假告警（P3/T2） | F0.3 | `python/tests/test_sandbox.py :: TestUnwiredFieldWarning::test_notify_rate_limit_is_declared_handled` | python |
+| `net_isolation`+chroot 入站（P4/T4） | F7 | `integration/test_net_isolate.rs :: test_mcp_inbound_mapping_under_chroot_and_net_isolation` + epoll/poll under chroot 两镜像用例（**F7 以"前提证伪 + 回归 pin"收口**：HEAD 与 T4 观测时代 9 种忠实构造全绿，无核心缺陷可修，非 RED→GREEN；E2B 侧复测为 out-of-fork follow-up，见 e2b-integration §3.3） | integration |
+| `notify_rate_limit` 假告警（P3/T2） | F0.3 | `python/tests/test_sandbox.py :: TestUnwiredFieldWarning::test_notify_rate_limit_is_declared_handled`（commit `17ee48d`） | python |
 | `getsockname`/`EINPROGRESS`（P6） | F8 | `integration/test_network.rs :: test_injected_connect_reports_synthetic_addresses`、`test_nonblocking_connect_reports_einprogress` | integration |
+
+> 矩阵订正（F9 收口）：F1.1 行原附的 `oci/tests/integration.rs :: test_forged_exit_frame_cannot_fake_success`
+> 是计划期命名，从未以该名落地；伪造 Exited 帧不可伪造成功的 pin 实为 F1.2 行的
+> `supervisor::tests::test_unknown_pid_exit_frame_bounded`（commit `c5a0fe7`，lib/bin 双目标）。
+> 其余各行的用例名在 F9 终审时与 git 历史逐条核对，均真实存在。
 
 粒度说明：F0 与 F6.1 给到步骤级（含可直接落盘的代码），其余阶段给到"落点 file:line + 新增用例名 + 验收断言"的组粒度。每条主线开工前按 `writing-plans` 拆一次步骤级 plan，写进 `docs/fork-plan-2026-09-<phase>.md`，避免一次背六个阶段的细节。
 
@@ -291,7 +313,10 @@ python = 430
 - **回收策略（已确认）：轮转槽位池（2026-09-04）**，但要把上一轮的算例改正一处 —— **复用窗口不是 `M/N`**。
   立论基础就是「中介身份恒等于持有实例进程的 euid」，所以 slot 进程的 uid **只能在启动时定死**，段大小 M 不拉长窗口：同一 uid 要再服务一个沙箱，必须等它当前这个沙箱结束并重启该进程 ⇒ **窗口 = 同时存活的 slot 数 N**。M 的作用只剩「保证同一时刻 uid 唯一 + 审计区分度 + 不与别的身份撞号」。
   把窗口做大只有两条路：
-  - **W1（默认）**：增大 N，用 N × F2b.4 的 ≤8 MB 预算换窗口（N=100 ⇒ 窗口 100 代）。部署形态就是 ① 的 slot 池，运行期零特权。
+  - **W1（默认）**：增大 N，用 N × F2b.4 实测的**每 slot 边际 PSS ≈ 0.5 MB**（空载单进程
+    ≈ 4.2–4.5 MB）换窗口（N=100 ⇒ 窗口 100 代 ≈ 50–55 MB；容量口径与账本项见
+    `docs/supervise-capacity.md` §3/§5 —— 早期 "≤8 MB" 是无实测的推断，已在 2026-09-05
+    正式复采后作废，本行系 F9 收口修正的残留引用）。部署形态就是 ① 的 slot 池，运行期零特权。
   - **W2（可选升级）**：slot 服务完即退出，由部署层以**新 uid** 重启 ⇒ 窗口 = M（段内轮转）。前提是「谁有权以新 uid 起进程」：k8s 下控制面用 SA 建 Pod（`runAsUser` 取新号）可行；裸机下需要一个能降权的 runner（即 ②/③/④ 的特权组件）；静态 compose 的 `user:` 做不到运行期变更（部署期渲染模板可以，但那等于回到 N）。
   - **⛔ 被排除的第三条**：让一个 uid 为 W 的 slot 在运行时给每个沙箱映射新的 host uid（② 的多 entry map）。那样中介仍跑在 W 里 ⇒ C 档复活、SL-1 原样回来。此路必须在代码与文档里写死为禁止，防止将来被当成「省内存的优化」走回去。
   两条共同的硬不变式（W1 下同 uid 必然复用，所以不是可选项）：
@@ -464,43 +489,69 @@ supervise 存在/ELF 架构/sha256 三方一致（缺失/篡改即红点名）+ 
 | **B** 每沙箱一个 supervisor 进程，其 euid == 该沙箱 host uid（F2b） | 天然正确**且** per-uid 成立 | 加"两 supervisor 不同 uid"的跨箱用例；中介线程不再需要任何身份技巧 | ✅ 已确认路线（2026-09-04 用户拍板） |
 | **C** 单个中介进程持 `CAP_SETUID` + 每沙箱 `RunAs(X)`（今天测试容器测出的那档；= 方案 R） | **不正确，除非补每线程降权** | **显式不支持**：create 时检测到"本进程 euid==0 且 `host_uid != 0` 且启用了路径中介"⇒ 拒绝建箱（沿用 `sandbox.rs:2087-2104` 的 fail-closed 范式），错误信息指名"请用 `sandlock-supervise` 把实例交给 uid X 的进程，或显式 `mediation_run_as=supervisor` 承认降级" | ⛔ 默认拒绝 |
 
-- [ ] **Step 1 A 档测试**（`integration/test_mediation_identity.rs`，非 root）：`fs_denied` 非空 ⇒ 必走代执行；沙箱内 `openat(O_CREAT,0644)`（显式 `umask(0)`）⇒ 宿主 `stat` 断言 `st_uid == 本进程 euid`、`st_mode == 0o100644`；沙箱内 `chmod 0600` 自己文件 ⇒ 宿主侧看到新 mode；`fs_denied` 目标仍 `EACCES`（防"改身份顺手放宽白名单"）。
-- [ ] **Step 2 B 档测试（本任务的正题）**：`test_two_supervisors_distinct_uids_isolate_files` —— 以 uid X/Y 各起一个 `sandlock-supervise`（`setpriv` 或自映射 userns），双方都允许写同一共享目录（1777+sticky）：X 建的文件 Y 可读不可删（`EPERM`）、Y 的 `chmod` 不能改 X 的文件（`EPERM`）、X 自己的 `chmod` 生效。这是 SL-1 "修好了"的**唯一硬证据**，A 档测不出来（同 uid 无从区分）。
-- [ ] **Step 3 C 档 fail-closed**：实现 + `test_root_inprocess_mediation_is_refused`（断言 create 返回那个明确错误，且 `mediation_run_as=supervisor` 显式声明后**建箱成功但 WARN 且计入 `stats()`**）。对照组 `test_root_inprocess_mediation_with_caps_kept_would_leak`（仅在显式 `supervisor` 档下运行，用来证明"降级档确实降级"，不是装饰）。
-- [ ] **Step 4 `mediation_run_as`**：`caller`（默认；A/B 档等价，C 档被拒）/ `supervisor`（兼容档，显式）。builder + Policy + FFI setter + cbindgen + CLI `--mediation-run-as` + Python 绑定，CLI→运行时 builder 必须真接线（别重演 `--pid-ns` 漏接线）。
-- [ ] **Step 5 两档都进验收**：`scripts/test-all.sh --mediation-2uid`（有第二 uid 时跑 B 档，没有就打印"B 档缺档"并让 baseline 对账失败，不许伪装 skip）；`docs/test-baseline.md` 分档登记。这一步顺带修掉"生产非 root、测试 root"的错位。
-- [ ] **Step 6** chroot 与 COW 两形态各补同断言（`test_chroot.rs`、`test_cow.rs`）；F6.2 的最小 `/dev` helper 落地后，chroot 那份改成**不下发 `fs_denied` 也通过**。
-- [ ] **Step 7** 提交 `fix(notif): bind mediation identity to the owning process; refuse root in-process remap (P1/P2, SL-1)`；`e2b-integration.md` §3.1 标「已修（构造消除，见 §8 B 档）」，§2 P1/P2 状态改为"由 F2b 取代，仅保留 fail-closed"。
+- [x] **Step 1 A 档测试**（`integration/test_mediation_identity.rs`，非 root）：`fs_denied` 非空 ⇒ 必走代执行；沙箱内 `openat(O_CREAT,0644)`（显式 `umask(0)`）⇒ 宿主 `stat` 断言 `st_uid == 本进程 euid`、`st_mode == 0o100644`；沙箱内 `chmod 0600` 自己文件 ⇒ 宿主侧看到新 mode；`fs_denied` 目标仍 `EACCES`（防"改身份顺手放宽白名单"）。
+- [x] **Step 2 B 档测试（本任务的正题）**：`test_two_supervisors_distinct_uids_isolate_files` —— 以 uid X/Y 各起一个 `sandlock-supervise`（`setpriv` 或自映射 userns），双方都允许写同一共享目录（1777+sticky）：X 建的文件 Y 可读不可删（`EPERM`）、Y 的 `chmod` 不能改 X 的文件（`EPERM`）、X 自己的 `chmod` 生效。这是 SL-1 "修好了"的**唯一硬证据**，A 档测不出来（同 uid 无从区分）。
+- [x] **Step 3 C 档 fail-closed**：实现 + `test_root_inprocess_mediation_is_refused`（断言 create 返回那个明确错误，且 `mediation_run_as=supervisor` 显式声明后**建箱成功但 WARN 且计入 `stats()`**）。对照组 `test_root_inprocess_mediation_with_caps_kept_would_leak`（仅在显式 `supervisor` 档下运行，用来证明"降级档确实降级"，不是装饰）。
+- [x] **Step 4 `mediation_run_as`**：`caller`（默认；A/B 档等价，C 档被拒）/ `supervisor`（兼容档，显式）。builder + Policy + FFI setter + cbindgen + CLI `--mediation-run-as` + Python 绑定，CLI→运行时 builder 必须真接线（别重演 `--pid-ns` 漏接线）。
+- [x] **Step 5 两档都进验收**：`scripts/test-all.sh --mediation-2uid`（有第二 uid 时跑 B 档，没有就打印"B 档缺档"并让 baseline 对账失败，不许伪装 skip）；`docs/test-baseline.md` 分档登记。这一步顺带修掉"生产非 root、测试 root"的错位。
+- [x] **Step 6** chroot 与 COW 两形态各补同断言（`test_chroot.rs`、`test_cow.rs`）；F6.2 的最小 `/dev` helper 落地后，chroot 那份改成**不下发 `fs_denied` 也通过**。
+- [x] **Step 7** 提交 `fix(notif): bind mediation identity to the owning process; refuse root in-process remap (P1/P2, SL-1)`；`e2b-integration.md` §3.1 标「已修（构造消除，见 §8 B 档）」，§2 P1/P2 状态改为"由 F2b 取代，仅保留 fail-closed"。
 
 > 定级沿用 §3.1：SL-1 是多租户 DAC 隔离缺陷，不是 Landlock 逃逸。C 档从"修"改成"拒"，是因为把它修对需要 per-thread 降 cap + `setfsuid` 一整套技巧且极易与 tokio 多线程互踩，而 B 档用进程边界一次性拿到同样的性质、还顺手解掉 SL-7 与 §3.8。
+
+**正式落地（2026-09-05，Task F6.1）**：commit `b62e201`（core 拒绝 + A 档断言）、
+`dd5a7e8`（mediation_run_as 全栈 + FFI/cbindgen + CLI 真接线）、`7f81314`（B/C 档验收 +
+runner 分层 baseline）、`75bbe0b`（review I1 policy_fn 谓词）。mediation_2uid = 5，
+e2b-integration §3.1/§2 P1/P2 已终审（F9）。
 
 ### Task F6.2（P5）：`fs_mount` 支持单节点 + 最小 `/dev` helper
 
 **Files:** `fs_mount` 的实现点与 `crates/sandlock-ffi/tests/fs_mount.rs`（已存在）、`python/tests/test_fs_mount.py`（已存在）、`crates/sandlock-cli` 的 `--fs-mount` 接线
 
-- [ ] 先写失败测试：`fs_mount("/etc/resolv.conf", ...)` 与字符设备节点（`/dev/null`）当前以 `ENOTDIR` 失效 ⇒ 断言 `mount` 成功且沙箱内读到预期内容/`openat` 成功。
-- [ ] 实现 bind-mount 单节点路径（BindMount 支持 file/chardev，父目录预创建策略与 `deterministic_dirs` 对齐），并提供 `minimal_dev()` helper（`ptmx`+`pts`+`null`+`urandom`+`zero`+`tty`），让调用方**不再需要整树挂 `/dev`** ⇒ 直接消除 SL-1 的最大触发面。
-- [ ] 提交并把 §2 P5 标 ✅；F6.1 的 chroot 用例改用它构造 `/dev`，验证 `fs_denied` 可省。
+- [x] 先写失败测试：`fs_mount("/etc/resolv.conf", ...)` 与字符设备节点（`/dev/null`）当前以 `ENOTDIR` 失效 ⇒ 断言 `mount` 成功且沙箱内读到预期内容/`openat` 成功。
+- [x] 实现 bind-mount 单节点路径（BindMount 支持 file/chardev，父目录预创建策略与 `deterministic_dirs` 对齐），并提供 `minimal_dev()` helper（`ptmx`+`pts`+`null`+`urandom`+`zero`+`tty`），让调用方**不再需要整树挂 `/dev`** ⇒ 直接消除 SL-1 的最大触发面。
+- [x] 提交并把 §2 P5 标 ✅；F6.1 的 chroot 用例改用它构造 `/dev`，验证 `fs_denied` 可省。
+
+**正式落地（2026-09-05，Task F6.2）**：commit `de2f749`（单节点 + minimal_dev + CLI
+`--fs-mount` 接线）、`dc0edf3`（e2b/baseline 登记）、`6fcb8e2`（review I1/I2：挂载点
+写家族 EBUSY 防宿主源被删 + 文档对齐）。ffi 98 / python 454 / cli 98；残留（link EBUSY
+直击测试、目录挂载点 rmdir 等）见 `docs/fork-plan-followups.md`。
 
 ## 阶段 F7（P4 / E2B 侧称 T4）：`net_isolation` + chroot 下 MCP 入站映射起不来
 
 **Files:** `crates/sandlock-core/src/network/*`（`net_bind_map` / `port_mappings` 路径）、chroot 建立顺序（`sandbox.rs` chroot + listener 启动顺序）、`integration/test_net_isolate.rs`、`test_port_remap.rs`
 
-- [ ] 先写失败用例（矩阵 F7 行）：chroot + `net_isolation` + `port_mappings` ⇒ listener 起来、宿主侧映射端口 connect 成功、`poll/epoll` 可读性合成生效（纯 sandlock 形态今天 3/3 通过 ⇒ 可作为对照组同时保留）。
-- [ ] 定位：对照两形态差异（chroot 后 `control_dir`/`/dev/shm` 路径可见性、bind 端口池、`net_allow_bind_port` 探针）把根因写进提交信息；禁"靠调整测试期望"绕过。
-- [ ] 提交 `fix(net): inbound port mapping under chroot + net_isolation (P4)`。
+- [x] 先写失败用例（矩阵 F7 行）：chroot + `net_isolation` + `port_mappings` ⇒ listener 起来、宿主侧映射端口 connect 成功、`poll/epoll` 可读性合成生效（纯 sandlock 形态今天 3/3 通过 ⇒ 可作为对照组同时保留）。
+- [x] 定位：对照两形态差异（chroot 后 `control_dir`/`/dev/shm` 路径可见性、bind 端口池、`net_allow_bind_port` 探针）把根因写进提交信息；禁"靠调整测试期望"绕过。
+- [x] 提交 `fix(net): inbound port mapping under chroot + net_isolation (P4)`。
+
+**正式落地（2026-09-05，Task F7）**：前提证伪（非修复）—— commit `4e78c98`（+3 镜像
+回归 pin + 9 种忠实构造证据）、`da9c3a7`/`7183884`（e2b §2/§3.3 归因修正与收口）；
+E2B 侧 `E2B_BASE_IMAGE` + `xfail(run=True)` 复测是 out-of-fork follow-up（e2b-integration
+§3.3 / `docs/fork-plan-followups.md` FUP-E1）。
 
 ## 阶段 F8（P6）：无特权默认路径的两个已知限制
 
 - `getsockname`/`getpeername` 反映合成视图（今天返回宿主地址）；非阻塞 `connect` 的 `EINPROGRESS` 语义（今天宿主侧阻塞，`SO_SNDTIMEO` 为上界）。各一条 integration 用例 + §2 P6 状态更新。定位为低优先，但**不得再留在"未知"里**：做完或明确记为"设计取舍 + 文档条目"二选一。
 
+**正式落地（2026-09-05，Task F8）**：两条均按「设计取舍 + 文档条目 + 回归 pin」收口
+（非代码修复）—— commit `c8f76d4`（+2 矩阵 pin、§3.10 机制/语义、§2 P6 终态）；
+core_integ 529→531。E2B 默认形态 legacy dup 的原生 EINPROGRESS 不受影响（取舍仅限
+fd-inject 形态，详见 e2b-integration §3.10）。
+
 ## 阶段 F9：文档与交付收口
 
-- [ ] `scripts/test-all.sh` + `python/build-wheels.sh --verify` 全绿，数字登记进 `docs/test-baseline.md`（含本计划新增用例数）。
-- [ ] `docs/e2b-integration.md`：§1 落地表新增 M0–M3/SL-1/P5 行；§2 P1–P6 全部改状态；§3.1/3.2/3.3/3.8/3.9 标「已修（commit）」；§5 验证矩阵刷新日期与数字。
-- [ ] `docs/sandbox-exec-security.md`：§7 M0′ 标"已清零"，§4 各条目标注修复 commit。
-- [ ] `upstream-pr-netns-free.md`：PR 范围补上新增能力（`SandboxInstance`/`exec`/`mediation_run_as`/`fs_mount` 单节点），推送仍标"待有写权限的 token"。
-- [ ] `CHANGELOG` / release note：`max_processes` 语义与默认值变更（Q10）、`mediation_run_as` 默认切换、ABI 增量符号清单。
+- [x] `scripts/test-all.sh` + `python/build-wheels.sh --verify` 全绿，数字登记进 `docs/test-baseline.md`（含本计划新增用例数）。
+- [x] `docs/e2b-integration.md`：§1 落地表新增 M0–M3/SL-1/P5 行；§2 P1–P6 全部改状态；§3.1/3.2/3.3/3.8/3.9 标「已修（commit）」；§5 验证矩阵刷新日期与数字。
+- [x] `docs/sandbox-exec-security.md`：§7 M0′ 标"已清零"，§4 各条目标注修复 commit。
+- [x] `upstream-pr-netns-free.md`：PR 范围补上新增能力（`SandboxInstance`/`exec`/`mediation_run_as`/`fs_mount` 单节点），推送仍标"待有写权限的 token"。
+- [x] `CHANGELOG` / release note：`max_processes` 语义与默认值变更（Q10）、`mediation_run_as` 默认切换、ABI 增量符号清单。
+
+**收口报告与终验（2026-09-05，Task F9）**：closure 清单/逐条改动/终局门禁与 wheel
+数字/concerns 见 `tmp/sdd/f9-report.md`；全量门禁与 wheel 重建日志
+`tmp/sdd/f9-gate-*.log`、`f9-wheel-*.log`；跨任务 Minor 收口与 Open follow-ups 清单见
+`docs/fork-plan-followups.md`；发布级行为变化见 `docs/CHANGELOG.md`。本计划 F0–F8 全部
+任务 complete（进度账本 `.superpowers/sdd/progress.md`，各 commit 范围可查 git log）。
 
 ## 放行门槛（fork 侧）
 

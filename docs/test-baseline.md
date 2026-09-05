@@ -10,7 +10,16 @@
 #      ffi, cli, cli_build, python — `sh scripts/test-all.sh`
 #   2. root-mode phases: oci (`--oci-root`) and the supervise foreign-uid
 #      acceptance (`--supervise-root`), both as root in the same privileged
-#      container.
+#      container — plus mediation_2uid (`--mediation-2uid`) and the release
+#      supervise_cost label inside the non-root phase.
+#
+# Final fork-plan full-gate re-verification (F9, 2026-09-05): every label below
+# re-run green at the F9 tip in sandlock-dev:latest (--privileged, repo mounted
+# at /src) — logs tmp/sdd/f9-gate-nonroot.log / f9-oci-root.log /
+# f9-supervise-root.log / f9-mediation-2uid.log; wheels rebuilt and verified at
+# the same tip (tmp/sdd/f9-wheel-build.log / f9-wheel-verify.log). Counts are
+# unchanged from the per-task registrations below; this header is the dated
+# confirmation for the fork-plan closure.
 core_lib = 822 # F6.2 review I1/I2: 821 -> 822, +1 unit test
                # (sandbox::tests::minimal_dev_registers_exactly_the_six_dev_
                # nodes) pinning the minimal_dev() six-node rw set.

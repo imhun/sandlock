@@ -207,6 +207,10 @@ dispatch table 重建、DNS 网关起停、控制目录/socket 建删、`ChaCha8
 
 ### 4.1 SECE-1 / **SL-4（High，接线前必修）**：宿主控制 socket 泄漏进每一个用户进程
 
+**✅ 已修（F1.1，commit `3d804b1`）**：`target >= 3` 的 `extra_fds` 改 `dup3(O_CLOEXEC)`，
+`sandlock-init` spawn 用户进程前对控制 fd 再 `fcntl(FD_CLOEXEC)` 兜第二道；探测/伪造帧
+用例见 `docs/e2b-integration.md` §3.9 表格（本标题下为原始分析）。
+
 **证据链（全部现状代码）**
 
 1. `sandlock-oci/src/supervisor.rs:341` `UnixStream::pair()` 取子端；**无论 std 的 pair 是否自带 `SOCK_CLOEXEC` 都无关紧要** —— 下一步的 `dup2` 一定清掉它；
@@ -253,6 +257,10 @@ fd 3，所以沙箱进程持有的是 **init 那一端**。于是「写」进的
 
 ### 4.2 SECE-2 / **SL-5（Low-Medium 攻击面 / 必修正确性）**：fd 不关 + 帧边界按字节流猜
 
+**✅ 已修（F1.6，commit `0f51fce`）**：控制协议改显式分帧（magic/version/type/LE u32 len，
+64 KiB cap，拒超长/截断/坏 magic），每个 receive 出口分支经 RAII 关闭 fd，泄漏计数
+`init_recv_fd_leaks` 打点；oci-root 144 保持。
+
 `init/mod.rs:118-207` 的三条路径拿到 `fds` 却不关：解析失败（`Err(e) => send(Err); continue`）、
 EOF `break`、以及 `RunMain`（忽略 fds 但没关）。`Resp::Err` 之后 fds 就漏在 init 里。
 
@@ -276,6 +284,10 @@ EOF `break`、以及 `RunMain`（忽略 fds 但没关）。`Resp::Err` 之后 fd
 
 ### 4.3 SECE-3（High，设计层）：per-exec 策略只能是"子集"，否则就是 fail-open
 
+**✅ 已按 S9 落地（F4，commit `b58b634`/`c5d1108`，review fixes `902e522`/`e5c7214`）**：
+exec 越出实例上限 ⇒ `EPERM`/`PolicyTooWide` 点名字段；on-behalf 注 fd 走同一 choke point。
+per-child **正向**收窄非内核可强制（共享 Landlock 域）属架构 seam，见 follow-ups。
+
 `§1.3` 的硬不对称落到工程上只有三种可选实现，其中两种有安全含义：
 
 | 做法 | 安全后果 |
@@ -290,6 +302,10 @@ EOF `break`、以及 `RunMain`（忽略 fds 但没关）。`Resp::Err` 之后 fd
 契约测试要覆盖"第二条命令请求更宽策略 ⇒ 被拒"，而不是静默变宽。
 
 ### 4.4 SECE-4（**下调：条件性，只在开 `pid_ns` 后成立**）：on-behalf `/proc` 元数据与"root 替你读兄弟"
+
+**✅ 已修（F5.3，commit `2c016bd`）**：开 `pid_ns` 后 on-behalf `/proc` 白名单按 `PidKey`
+收窄到本 child 子树（兄弟 cmdline/status 不可读）；回归用例
+`test_pid_ns_procfs_scope_narrows_to_child`。
 
 `procfs.rs:196-231` 的白名单（`status/stat/cmdline/io/...`，明确排除 `environ/mem/smaps/pagemap/fd/N`）
 写得很克制，理由就写在注释里：*"An on-behalf open with the supervisor's credentials would otherwise
@@ -316,6 +332,10 @@ bypass the sandbox's own Landlock deny list and ptrace restrictions"*。问题�
 
 ### 4.5 SECE-5（Medium-High）：网络/凭据状态是实例级的，per-exec 网络策略必须绑 pid
 
+**✅ 已修（F4.3/F4.4，commit `9f959f1` + `e5c7214`）**：网络判定按 pid 血缘绑定
+（ancestor-chain 解析 + 缓存，未归因 fail-closed），`update_network` 只绑新 exec 并回报
+staleness。credential/HTTP-ACL 的 per-child 归属仍是 seam（代理无 child 归因），见 follow-ups。
+
 `NetworkState`、`SyntheticDns` LRU、HTTP ACL 代理、`http_inject` 的 supervisor-only secret、
 `host_mask`、`net_allow_bind`/`port_remap` 全部挂在实例（`NotifPolicy`/`Runtime`）。
 拦截响应虽然带 `notif.pid`（`ProcessIndex` 已能定身份），但**策略本身没有 per-child 维度**。
@@ -328,6 +348,10 @@ bypass the sandbox's own Landlock deny list and ptrace restrictions"*。问题�
   DNS 合成表要按 child 记录归属，避免窄命令拿到宽命令解析出的合成 IP。
 
 ### 4.6 SECE-6（**High，已实测证实**）：进程组语义 —— 一条命令能杀整箱
+
+**✅ 已修（F1.7，commit `4b7f7d0` + fix `d2bd459`）**：每个 child 自成进程组，实例级
+kill/teardown 遍历组集合（killpg 先行 + 逃逸者 pidfd_send_signal 兜底），supervisor 无任意
+pid 信号 verb；三条 integration 用例 pin。
 
 `killpg` 三兄弟（B1）之外，还有一处**今天就存在、合并后放大**的坑：E2B 的 PTY 桥在中间进程里
 `os.setsid()`（`envd_service/executors/sandlock.py:52-58`）⇒ 真正的用户命令**脱离了实例的进程组**，
@@ -349,6 +373,10 @@ PTY 桥的 `setsid` 要么去掉，要么由实例显式登记该会话的组；
 
 ### 4.7 SECE-7（**High，已实测证实**）：配额中毒 —— `proc_count` 靠"有人 wait"才归还
 
+**✅ 已修（F1.4，commit `f0b3d78`）**：fork 登记即持 pidfd，归还以 pidfd 退出为权威，
+`handle_wait` 幂等；对账暴露为 `stats()`（proc_count vs live watchers/drift）；孤儿风暴
+回归用例绿。
+
 `handle_fork` +1，`handle_wait` -1（`resource.rs:126/545-560`），内存那条路是稳的
 （pidfd watcher → `cleanup_pid` → `release_charge`，`notif.rs:2706-2733`）。
 但**进程数没有退出事件兜底**：今天的回收时机等价于"命令进程被它的父进程 wait"。
@@ -369,6 +397,9 @@ PTY 桥的 `setsid` 要么去掉，要么由实例显式登记该会话的组；
 
 ### 4.8 SECE-8（Medium → **实测下调**：合并额外开销 ~5%）：单一 notif 循环与节流耦合
 
+**保持原判（不修）**：实测为合并额外开销 ~5%，非正确性缺陷；节流与 notif 循环的失效
+模式由 F1.8/F5.4（deadline → Dead）与 F5.5（idle/T_max 兜底）覆盖。
+
 `supervisor()` 明确"Notifications are processed sequentially (not spawned)"
 （`notif.rs:2593-2646`），`notify_rate_limit` 是这条循环上的每秒窗口计数（超限就 `sleep`）。
 合并后：**A 命令的 open/connect 洪水会拖慢 B 命令的每一个被拦截 syscall**，
@@ -388,6 +419,10 @@ PTY 桥的 `setsid` 要么去掉，要么由实例显式登记该会话的组；
 
 ### 4.9 SECE-9（Medium）：listener 卡死/退出的失效模式要定义，不能靠"随进程消失"
 
+**✅ 已定义 + 已修（F1.8 `df5d77a` → 每请求 deadline + Dead；F5.4 `d67a363` → 统一
+`InstanceDead`/FFI code 6；F5.5 `8e22c5d` → idle `T_idle`/`T_max`）**：后续 exec/wait/kill
+同码 fail-fast，不静默重启；supervise 单代次 + shutdown 显式退出。
+
 按 `seccomp_unotify(2)`，通知投递不出去时该 syscall 失败（ENOSYS/`SET_OWNER` 相关错误），
 所以**保密性是 fail closed 的**（`connect`/`open` 直接被拒），但合并后代价从"一条命令报错"
 变成"整箱所有命令同时报错且已经跑着的进程可能卡在拦截点上"。
@@ -398,6 +433,11 @@ PTY 桥的 `setsid` 要么去掉，要么由实例显式登记该会话的组；
 `exec`/`wait_child` 返回**明确错误码**，宿主据此**重建沙箱**（§8 S5），不做静默重启。
 
 ### 4.10 SECE-10（**High，跨沙箱读取已实测**）：控制目录名字 = 沙箱 id + 控制协议无鉴权
+
+**✅ 已修（F1.3，commit `95608be` + `ceaa069`；F2b.2 双传输加固 `990ae5b`..`06c6878`）**：
+控制根迁出 /dev/shm、目录名 FNV-1a 哈希、0700 + token + starttime 活性证明；`SO_PEERCRED`
+不匹配即断开；同名冲突拒绝而非抢占（create 期 pid-less 一律 Ambiguous，回收只走显式
+ps/list 剪枝）。
 
 `control.rs:130-147`：目录存在 → `kill(supervisor_pid, 0)` 判活 → **判死就 `remove_dir_all` 抢占**。
 合并后 `name` 用 `sandbox_id`，两个放大：
@@ -434,6 +474,10 @@ OTHER config N => ok=True ...   OTHER ports M => ok=True   SELF config P => ok=T
 
 ### 4.11 SECE-11（Medium）：freeze/checkpoint 的范围与静默丢数据
 
+**✅ 已按 F5.2 处理（commit `a5c7f3b`）**：多 child 时 `checkpoint()` 显式拒绝
+（`CheckpointMultipleChildren`）；单 child legacy 捕获语义不变；单死 child ⇒
+`CheckpointNoLiveChild`（review fix `1321ba0` 内）。文档化："超时动词不可回滚"。
+
 `freeze()` = `hold_forks=true`（实例全局）+ `killpg`（组级，见 B1）；
 checkpoint 的 restore-stub 面向**单个地址空间**。合并后若不定语义，最坏情形是
 "用户以为快照了整箱，实际只存了第一条命令"。**必做**：多 child 时**显式拒绝** checkpoint（§8 S3），
@@ -441,6 +485,11 @@ freeze 拆成 per-child（冻结一条命令的树）与 per-sandbox（全部）
 明确选后者并保证网关一起冻结/恢复。
 
 ### 4.12 SECE-12（Low-Medium，审计项）：init 的 fork 安全性与凭据驻留
+
+**✅ 收窄 + 审计完成**：F1.5 `793aaf3` 使 init 为 subreaper 并回收收养孤儿；F1.7
+`4b7f7d0` 每 child 独立进程组 + 定向信号；F6.1 `b62e201` 中介身份绑定（mediation 身份 =
+持有进程 euid，root in-process remap fail-closed）。fork 不安装 setuid/凭据驻留组件
+（F2b.3 契约 `docs/supervise-identity-handoff.md`）。
 
 - `init::spawn()` 在 `fork()` 之后调用 `set_var`/`Vec`/`CString`/`execvp`（glibc 会 malloc），
   而 init 里**有并发 reaper 线程**（`init/mod.rs:161-207`）⇒ 多线程进程 fork 后只做非
@@ -454,6 +503,10 @@ freeze 拆成 per-child（冻结一条命令的树）与 per-sandbox（全部）
   （§3.7 末注），`command-logs.jsonl` 的归属更难查 ⇒ **P1/P2 先于 exec 落地**。
 
 ### 4.13 SECE-13 / **SL-6（Medium-High，OCI-live）**：`sandlock-init` 不是 reaper，收养的孤儿变僵尸
+
+**✅ 已修（F1.5，commit `793aaf3` + `e85d031`）**：`run_init` 主循环
+`waitpid(-1, WNOHANG)` sweep + 按 child 表路由 + `PR_SET_CHILD_SUBREAPER`；孤儿风暴用例
+`test_adopted_orphan_is_reaped`/`test_no_defunct_after_double_fork`。
 
 `run_init` 的回收全部是"**对特定 pid 起一个线程 `wait_exit(pid)`**"
 （`init/mod.rs:152-159` 主 workload、`:190-198` exec 出来的 child），
@@ -485,6 +538,11 @@ Jupyter kernel、`nohup … &`）在中间进程退出后，其退出**永远不
 
 ### 4.14 SECE-14（**已实测**）：`setsid` 残留进程能活过 `delete`，且还能用已打开的 fd 干活
 
+**✅ 收口**：F1.4 `f0b3d78`（pidfd 权威归还，孤儿不再永久占配额）+ F2.2
+`117e10b`/`879c257`（shutdown 七步：组集合扫尾 + 关宿主 stdio + abort 任务 + 身份核验后
+清目录）+ F2b 单代次（显式 shutdown 后 exit(0)）；"fd 持有者收尾不吊死"由 F3.2 用例
+`test_grandchild_holding_stdout_does_not_hang_wait_or_shutdown` 覆盖。
+
 V7 实测：主容器 `delete --force` 之后 —— supervisor 进程消失（`135/144: GONE`），
 但 setsid 孤儿 `158` 仍 `state=S` 存活；它在"宿主已经不在了"的状态下继续执行并报告：
 
@@ -510,6 +568,10 @@ new open FAIL Function not implemented(38)        # 新 openat 走 user-notif �
   不满足就告警（§5.6）。
 
 ### 4.15 沙箱内兄弟可见性矩阵（实测，决定"合并把内边界塌到哪一档"）
+
+**记录性矩阵**：开 `pid_ns` 后的 /proc 可见性已按 §4.4 处理（F5.3 `2c016bd`）；
+无 pid_ns 形态保持"可打扰、不可窥探"实测结论；实例化后 per-child 进程组/信号面见
+F1.7/F4（§4.6/§4.5）。
 
 同一实例内两条命令互相探测（§10.3 W1/X1）：
 
@@ -652,6 +714,18 @@ new open FAIL Function not implemented(38)        # 新 openat 走 user-notif �
 
 沿用 §8 的 M0–M4，但把安全前置单列，并**明确 gate**：
 
+**执行状态（2026-09-05，fork-plan F9 收口）**：
+
+- **M0′：已清零 ✅**（fork-plan F1.1–F1.8 全部落地并红→绿：SL-4 `3d804b1`、
+  H1/H2 `c5a0fe7`、SL-7 `95608be`+`ceaa069`（另 F2b.2 双传输加固）、SL-8 `f0b3d78`、
+  SL-6 `793aaf3`+`e85d031`、SECE-6 `4b7f7d0`+`d2bd459`、deadline `df5d77a`、
+  SL-5 `0f51fce`）。oci-root 144、全门各档在 F9 终局复验全绿（logs `tmp/sdd/f9-*`）。
+- **M0/M1/M2/M3：已完成 ✅**（fork-plan F2/F3/F4/F5：`57f543c`..`2cb1d99`、
+  `d063437`..`3fa0b95`、`b58b634`..`e5c7214`、`b56fcbe`..`1321ba0`；route-B
+  supervise 与成本/交付物在 F2b.1–F2b.5）。
+- **M4（E2B 接线）：fork 范围外 ⏸** —— 见 e2b-integration §8 / §2 P9；
+  fork 侧 follow-up 汇总在 `docs/fork-plan-followups.md`。
+
 - **M0′（fork 侧安全前置，先于一切）**：`run_init` 的 `waitpid(-1, WNOHANG)` 收养回收（SL-6）+ `extra_fds` 落位加 `FD_CLOEXEC`（SL-4）+
   宿主侧**通道凭据校验**（`reader_task` 只认 init 写的帧）+ `early_exits` 上限/只认已登记 pid（§10 H1/H2）+
   `InitLink::request()` 每请求 deadline（`supervisor.rs:75-95` 无超时）+
@@ -661,14 +735,14 @@ new open FAIL Function not implemented(38)        # 新 openat 走 user-notif �
   **控制 socket 鉴权**：`SO_PEERCRED` 不匹配即断开 + 身份 token + verb 分级（§4.10，**实测跨箱 `config` 已成功**）。
   验收：§5.7 的"fd 3 探测 / 伪造退出码 / 未知 pid 内存 / 杀一条 / 孤儿"用例先过
   —— 前三条**现在就能在本机 OCI 路径上跑红**（§10），不必等 core。
-- **M0**：`ResourceState`、listener、控制目录、DNS 网关生命周期从 create 路径提到 instance（行为不变）。
+- **M0** ✅：`ResourceState`、listener、控制目录、DNS 网关生命周期从 create 路径提到 instance（行为不变）。
   验收：fork 三套全绿 + E2B 全量不变（基线 `867 passed / 1 skipped / 2 xfailed`）。
-- **M1**：init 循环与 `proto`/`fdpass` 从 `sandlock-oci` 下沉到 core，`instance.exec()/wait_child()/kill_child()`
+- **M1** ✅：init 循环与 `proto`/`fdpass` 从 `sandlock-oci` 下沉到 core，`instance.exec()/wait_child()/kill_child()`
   + child id + stdio 交付（不开放给 E2B）。验收：并发 exec、fd 归属、双 wait 幂等、stdin 关闭不死锁。
-- **M2**：per-exec `cwd/env/extra_writable/bind_ports` + **子集校验**（S9）+ S2 的 staleness 语义 +
+- **M2** ✅：per-exec `cwd/env/extra_writable/bind_ports` + **子集校验**（S9）+ S2 的 staleness 语义 +
   网络策略绑 pid（§4.5）。
-- **M3**：S1 默认值联动（`max_processes` 64→按沙箱上调）、S3/S4 拒绝或支持、S5–S7 与 S8/S11/S13。
-- **M4（E2B 接线）**：**先只做"网关 + 命令"半合并**（§5.5），把 §3.8 的超卖探针改成断言；
+- **M3** ✅：S1 默认值联动（`max_processes` 64→按沙箱上调）、S3/S4 拒绝或支持、S5–S7 与 S8/S11/S13。
+- **M4（E2B 接线，fork 范围外）**：**先只做"网关 + 命令"半合并**（§5.5），把 §3.8 的超卖探针改成断言；
   稳定后放开并发命令 exec，同步调 `_CommandGate` 与容量文档（`docs/SCALING.md`、
   `docs/resource-contention.md`），关闭 §3.8。
 

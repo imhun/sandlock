@@ -2,6 +2,14 @@
 
 Branch: `upstream-pr/netns-free-clean`（本地，不推送）。进度：`.superpowers/sdd/progress.md`。顺序：F7 → F8 → F9。
 
+> **状态（F9 收口，2026-09-05）**：
+> - F7（P4）：**前提证伪 + 回归 pin 关闭**（非代码修复）—— commit `4e78c98`（+3 镜像
+>   pin）+ `da9c3a7`/`7183884`（e2b §2/§3.3 归因修正）。E2B 复测为 out-of-fork
+>   follow-up（`docs/fork-plan-followups.md` FUP-E1）。
+> - F8（P6）：**设计取舍 + 文档条目 + 回归 pin 关闭**—— commit `c8f76d4`（+2 pin，
+>   core_integ 531）。
+> - F9：本阶段收口完成（closure 清单与终验见 `tmp/sdd/f9-report.md`）。
+
 ## F7（P4）：net_isolation + chroot 下 MCP 入站映射起不来
 
 - Files: core network/*（net_bind_map/port_mappings 路径）、sandbox.rs chroot + listener 顺序、integration/test_net_isolate.rs、test_port_remap.rs。
