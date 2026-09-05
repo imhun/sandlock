@@ -1584,6 +1584,10 @@ impl Sandbox {
                 exec_session: None,
                 policy_image: None,
                 pid_ns_map: None,
+                lifetime: crate::instance::InstanceLifetime::default(),
+                launched_at: std::time::Instant::now(),
+                idle_since: None,
+                expired: None,
             }));
             clones.push(clone_sb);
         }
@@ -1696,6 +1700,10 @@ impl Sandbox {
             exec_session: None,
             policy_image: None,
             pid_ns_map: None,
+            lifetime: crate::instance::InstanceLifetime::default(),
+            launched_at: std::time::Instant::now(),
+            idle_since: None,
+            expired: None,
         }));
         Ok(())
     }

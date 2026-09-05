@@ -158,6 +158,48 @@ pub struct NetworkStaleness {
 /// init channel).
 pub type ChildId = u64;
 
+/// Session lifetime policy (F5.5 / M3 S7): idle reclaim and a forced maximum
+/// lifetime for exec-capable sessions.
+///
+/// * `idle_timeout` — with the child table empty **and** no `wait_child`
+///   subscriber, the instance is eligible for idle reclaim. When the
+///   condition holds continuously for `T_idle`, the session drains
+///   (`Draining`, then `ShutDown` on the next verb or an explicit
+///   `shutdown`). A new exec resets the clock; a live child keeps the
+///   session ineligible (a running workload is never "idle").
+/// * `max_lifetime` — a hard cap measured from launch: when it elapses the
+///   session drains even with a live child (the "forced rolling rebuild"
+///   that catches slow in-session leaks). `None` disables a knob.
+///
+/// Defaults: 15 minutes idle (the `E2B_INSTANCE_IDLE_TIMEOUT_S` precedent
+/// from docs §5.5) and 24 hours maximum lifetime. Override per launch with
+/// [`SandboxInstance::launch_exec_only_with_lifetime`] /
+/// [`SandboxInstance::launch_exec_with_lifetime`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstanceLifetime {
+    /// Idle reclaim window (`None` disables idle reclaim).
+    pub idle_timeout: Option<Duration>,
+    /// Forced maximum session lifetime measured from launch (`None`
+    /// disables the cap).
+    pub max_lifetime: Option<Duration>,
+}
+
+impl Default for InstanceLifetime {
+    fn default() -> Self {
+        Self {
+            idle_timeout: Some(Duration::from_secs(15 * 60)),
+            max_lifetime: Some(Duration::from_secs(24 * 60 * 60)),
+        }
+    }
+}
+
+/// Why a session lifetime expired (F5.5), kept for observability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LifetimeExpiry {
+    Idle,
+    MaxLifetime,
+}
+
 /// Stdio wiring for one `exec` child.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecStdio {
@@ -332,6 +374,17 @@ pub struct SandboxInstance {
     /// the registry. `None` for non-pid-ns sessions (announced pids are
     /// already host pids).
     pub(crate) pid_ns_map: Option<Arc<RwLock<crate::procfs::PidNsMap>>>,
+    /// F5.5: lifetime policy (idle reclaim + forced max lifetime).
+    pub(crate) lifetime: InstanceLifetime,
+    /// F5.5: instant the session was launched — the `T_max` clock base.
+    pub(crate) launched_at: std::time::Instant,
+    /// F5.5: when the idle condition (child table empty and no wait_child
+    /// subscriber) most recently became true and stayed true. `None` while a
+    /// child is live or a waiter is pending.
+    pub(crate) idle_since: Option<std::time::Instant>,
+    /// F5.5: set once a lifetime expiry has been acted on, so repeated
+    /// evaluations and drains stay idempotent.
+    pub(crate) expired: Option<LifetimeExpiry>,
 }
 
 /// Lifecycle state of the session's single (M0) child.
@@ -456,6 +509,7 @@ impl SandboxInstance {
     async fn launch_exec_inner(
         mut policy: crate::sandbox::Sandbox,
         cmd: Option<&[&str]>,
+        lifetime: InstanceLifetime,
     ) -> Result<SandboxInstance, SandlockError> {
         // F4.2 (S9): the ceiling is fixed from the policy *before* anything
         // mutates it — every later exec request is validated against this
@@ -523,6 +577,8 @@ impl SandboxInstance {
                 leader,
             ))));
         }
+        rt.lifetime = lifetime;
+        rt.launched_at = std::time::Instant::now();
         rt.exec_session = Some(Box::new(ExecSession {
             link: link.clone(),
             next_child_id: 1,
@@ -596,6 +652,7 @@ impl SandboxInstance {
                 network.lock().await.bind_exec_child(pid, None);
             }
         }
+        rt.refresh_idle_state();
         Ok(rt)
     }
 
@@ -614,7 +671,17 @@ impl SandboxInstance {
         policy: crate::sandbox::Sandbox,
         cmd: &[&str],
     ) -> Result<SandboxInstance, SandlockError> {
-        Self::launch_exec_inner(policy, Some(cmd)).await
+        Self::launch_exec_with_lifetime(policy, cmd, InstanceLifetime::default()).await
+    }
+
+    /// [`SandboxInstance::launch_exec`] with an explicit lifetime policy
+    /// (F5.5 idle reclaim / forced `T_max`; see [`InstanceLifetime`]).
+    pub async fn launch_exec_with_lifetime(
+        policy: crate::sandbox::Sandbox,
+        cmd: &[&str],
+        lifetime: InstanceLifetime,
+    ) -> Result<SandboxInstance, SandlockError> {
+        Self::launch_exec_inner(policy, Some(cmd), lifetime).await
     }
 
     /// Launch an exec-only session (no main process; see
@@ -624,7 +691,16 @@ impl SandboxInstance {
     pub async fn launch_exec_only(
         policy: crate::sandbox::Sandbox,
     ) -> Result<SandboxInstance, SandlockError> {
-        Self::launch_exec_inner(policy, None).await
+        Self::launch_exec_only_with_lifetime(policy, InstanceLifetime::default()).await
+    }
+
+    /// [`SandboxInstance::launch_exec_only`] with an explicit lifetime policy
+    /// (F5.5 idle reclaim / forced `T_max`; see [`InstanceLifetime`]).
+    pub async fn launch_exec_only_with_lifetime(
+        policy: crate::sandbox::Sandbox,
+        lifetime: InstanceLifetime,
+    ) -> Result<SandboxInstance, SandlockError> {
+        Self::launch_exec_inner(policy, None, lifetime).await
     }
 
     /// Refuse a per-child verb when the session is not exec-capable.
@@ -725,6 +801,75 @@ impl SandboxInstance {
         }
     }
 
+    /// F5.5: whether the idle condition currently holds — the exec child
+    /// table is empty (every registered child reaped) and no `wait_child`
+    /// exit waiter is pending.
+    fn idle_eligible(&self) -> bool {
+        self.exec_session
+            .as_ref()
+            .map(|s| {
+                s.children.values().all(|c| c.status.is_some())
+                    && !s.link.has_exit_waiters()
+            })
+            .unwrap_or(true)
+    }
+
+    /// F5.5: recompute the idle clock after any mutation of the child table
+    /// or the waiter set. A live child or a pending waiter clears the clock;
+    /// the clock starts when the table becomes empty and stays empty.
+    fn refresh_idle_state(&mut self) {
+        if !self.is_exec_mode()
+            || self.phase != InstancePhase::Live
+            || self.expired.is_some()
+        {
+            return;
+        }
+        if self.idle_eligible() {
+            if self.idle_since.is_none() {
+                self.idle_since = Some(std::time::Instant::now());
+            }
+        } else {
+            self.idle_since = None;
+        }
+    }
+
+    /// F5.5: the lifetime expiry that has fired (if any). `T_max` is checked
+    /// from `launched_at` and wins over idle; idle needs `idle_since` set.
+    fn lifetime_expiry(&self) -> Option<LifetimeExpiry> {
+        if let Some(expiry) = self.expired {
+            return Some(expiry);
+        }
+        if let Some(max) = self.lifetime.max_lifetime {
+            if self.launched_at.elapsed() >= max {
+                return Some(LifetimeExpiry::MaxLifetime);
+            }
+        }
+        if let Some(idle) = self.lifetime.idle_timeout {
+            if let Some(since) = self.idle_since {
+                if since.elapsed() >= idle {
+                    return Some(LifetimeExpiry::Idle);
+                }
+            }
+        }
+        None
+    }
+
+    /// F5.5: called at the entry of every async verb while the session is
+    /// `Live`. If a lifetime expiry fired, mark the session expired, run the
+    /// `Draining → shutdown` tail (idle: children already reaped, fast;
+    /// `T_max`: live children are collapsed by the drain), and return the
+    /// refusal error the verb must surface. `None` = no expiry, proceed.
+    async fn drain_if_lifetime_expired(&mut self) -> Option<SandlockError> {
+        self.refresh_idle_state();
+        let expiry = self.lifetime_expiry()?;
+        self.expired = Some(expiry);
+        self.phase = InstancePhase::Draining;
+        let _ = self
+            .shutdown_with_grace(Duration::from_millis(300))
+            .await;
+        Some(SandboxRuntimeError::InstanceClosed.into())
+    }
+
     fn exec_ref(&self) -> Result<&ExecSession, SandlockError> {
         match self.exec_session.as_ref() {
             Some(session) if matches!(self.phase(), InstancePhase::Live) => Ok(session),
@@ -772,6 +917,9 @@ impl SandboxInstance {
         if self.phase != InstancePhase::Live {
             return Err(self.closed_error().into());
         }
+        if let Some(err) = self.drain_if_lifetime_expired().await {
+            return Err(err);
+        }
         if self.exec_session.is_none() {
             return Err(Self::not_exec_capable());
         }
@@ -816,6 +964,9 @@ impl SandboxInstance {
         self.enter_exec_terminal_if_needed();
         if self.phase != InstancePhase::Live {
             return Err(self.closed_error().into());
+        }
+        if let Some(err) = self.drain_if_lifetime_expired().await {
+            return Err(err);
         }
         if self.exec_session.is_none() {
             return Err(Self::not_exec_capable());
@@ -937,6 +1088,7 @@ impl SandboxInstance {
                 net_gen,
             },
         );
+        self.refresh_idle_state();
         Ok(ExecHandle {
             child_id,
             pid,
@@ -974,6 +1126,9 @@ impl SandboxInstance {
         self.enter_exec_terminal_if_needed();
         if self.phase != InstancePhase::Live {
             return Err(self.closed_error().into());
+        }
+        if let Some(err) = self.drain_if_lifetime_expired().await {
+            return Err(err);
         }
         if self.exec_session.is_none() {
             return Err(Self::not_exec_capable());
@@ -1082,6 +1237,12 @@ impl SandboxInstance {
     /// the waiter hanging.
     pub async fn wait_child(&mut self, child_id: ChildId) -> Result<ExitStatus, SandlockError> {
         self.enter_exec_terminal_if_needed();
+        if self.phase != InstancePhase::Live {
+            return Err(self.closed_error().into());
+        }
+        if let Some(err) = self.drain_if_lifetime_expired().await {
+            return Err(err);
+        }
         let session = self.exec_ref()?;
         let child = session
             .children
@@ -1102,6 +1263,7 @@ impl SandboxInstance {
                 child.status = Some(status.clone());
             }
         }
+        self.refresh_idle_state();
         Ok(status)
     }
 
@@ -1185,6 +1347,9 @@ impl SandboxInstance {
         self.enter_exec_terminal_if_needed();
         if self.phase != InstancePhase::Live {
             return Err(self.closed_error().into());
+        }
+        if let Some(err) = self.drain_if_lifetime_expired().await {
+            return Err(err);
         }
         if self.exec_session.is_none() {
             return Err(Self::not_exec_capable());
@@ -2072,6 +2237,12 @@ impl SandboxInstance {
                         InstancePhase::Dead
                     };
                 }
+            }
+            // F5.5: a fired lifetime expiry reads as Draining even before a
+            // &mut verb runs the teardown tail (exec sessions only — legacy
+            // one-shot sessions are driven to shutdown by their wait).
+            if self.is_exec_mode() && self.lifetime_expiry().is_some() {
+                return InstancePhase::Draining;
             }
         }
         self.phase

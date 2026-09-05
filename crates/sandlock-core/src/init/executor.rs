@@ -250,6 +250,13 @@ impl ExecLink {
         self.state.lock().unwrap().main_exit_seen
     }
 
+    /// Whether any `wait_child` exit waiter is currently registered
+    /// (F5.5 idle eligibility: a pending subscriber keeps the session
+    /// non-idle).
+    pub(crate) fn has_exit_waiters(&self) -> bool {
+        !self.state.lock().unwrap().exit_waiters.is_empty()
+    }
+
     /// Drain every buffered early exit into `out` (used by shutdown so real
     /// exit statuses are preserved before the session closes).
     pub(crate) fn drain_early_exits(&self, out: &mut HashMap<u64, ExitStatus>) {

@@ -21,12 +21,11 @@
 //!   on-behalf `/proc` whitelist only serves a child's own subtree; a
 //!   sibling's `cmdline`/`status` reads return EACCES.
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use sandlock_core::error::SandboxRuntimeError;
-use sandlock_core::instance::{ExecStdio, InstancePhase, SandboxInstance};
+use sandlock_core::instance::{ExecStdio, InstanceLifetime, InstancePhase, SandboxInstance};
 use sandlock_core::Sandbox;
 
 fn base_policy() -> sandlock_core::SandboxBuilder {
@@ -59,31 +58,7 @@ fn process_is_gone(pid: i32) -> bool {
     r != 0
 }
 
-fn process_is_zombie(pid: i32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return true; // gone is not a zombie
-    };
-    let after = stat.rsplit_once(") ").map(|(_, rest)| rest).unwrap_or("");
-    after.split_whitespace().next() == Some("Z")
-}
-
-/// Host pid of the confined `sandlock-init` (the exec session's direct child
-/// when `pid_ns` is off): the parent of every registered exec child.
-fn init_host_pid_of(child_pid: i32) -> Option<i32> {
-    let stat = std::fs::read_to_string(format!("/proc/{child_pid}/stat")).ok()?;
-    let after = stat.rsplit_once(") ")?.1;
-    after.split_whitespace().nth(1)?.parse().ok()
-}
-
 static MARKER_SEQ: AtomicU64 = AtomicU64::new(1);
-
-fn marker_path(tag: &str) -> PathBuf {
-    let seq = MARKER_SEQ.fetch_add(1, Ordering::Relaxed);
-    PathBuf::from(format!(
-        "/tmp/sandlock-f5-{tag}-{}-{seq}",
-        std::process::id()
-    ))
-}
 
 /// F5.3 (M3 S4): with `pid_ns` on, the on-behalf `/proc` whitelist serves a
 /// child only its **own subtree** — reading a sibling's `cmdline` must fail
@@ -257,6 +232,164 @@ async fn test_dead_state_surfaces_single_error_code() {
         ),
         "post-shutdown verbs report InstanceClosed, got: {e_after:?}"
     );
+}
+
+/// F5.5 (M3 S7): after the child table empties (and no wait_child subscriber
+/// remains), a persistent `T_idle` drains the instance — the phase reads
+/// `Draining`, the next verb performs the shutdown tail (children_live 0,
+/// control dir gone, `ShutDown`), and the drain is idempotent. A live child
+/// resets the clock: a session with a running workload must never idle out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_idle_timeout_drains_and_shuts_down() {
+    let short_idle = InstanceLifetime {
+        idle_timeout: Some(Duration::from_millis(400)),
+        max_lifetime: None,
+    };
+
+    // Phase 1: children churn, the table empties, T_idle elapses -> Draining
+    // and the next verb completes the shutdown tail.
+    let mut inst = SandboxInstance::launch_exec_only_with_lifetime(
+        base_policy().build().unwrap().with_name("f5-idle-churn"),
+        short_idle,
+    )
+    .await
+    .expect("launch exec session with short idle");
+    let child = inst
+        .exec(&["sh", "-c", "exit 0"], ExecStdio::Null)
+        .await
+        .expect("exec a short-lived child");
+    let status = inst.wait_child(child.child_id).await.expect("reap child");
+    assert_eq!(status, sandlock_core::result::ExitStatus::Code(0));
+    assert_eq!(inst.phase(), InstancePhase::Live, "no idle yet");
+
+    assert!(
+        poll_until(
+            || inst.phase() == InstancePhase::Draining,
+            Duration::from_secs(10),
+        )
+        .await,
+        "an empty child table with no wait subscribers must drain after T_idle"
+    );
+    let dir = inst.control_dir().expect("control dir").clone();
+    let err = inst
+        .exec(&["sh", "-c", "exit 0"], ExecStdio::Null)
+        .await
+        .expect_err("exec after idle drain must be refused");
+    assert!(
+        matches!(
+            err,
+            sandlock_core::SandlockError::Runtime(SandboxRuntimeError::InstanceClosed)
+        ),
+        "the idle drain refuses new work with the closed code"
+    );
+    assert_eq!(
+        inst.phase(),
+        InstancePhase::ShutDown,
+        "the refused verb must drive the idle drain to completion"
+    );
+    assert!(!dir.exists(), "the idle drain must remove the control dir");
+    let stats = inst.stats().await;
+    assert_eq!(stats.children_live, 0);
+    let err2 = inst
+        .exec(&["sh", "-c", "exit 0"], ExecStdio::Null)
+        .await
+        .expect_err("a second post-drain verb must fail identically");
+    assert!(matches!(
+        err2,
+        sandlock_core::SandlockError::Runtime(SandboxRuntimeError::InstanceClosed)
+    ));
+    inst.shutdown().await.expect("shutdown after drain is idempotent");
+    assert_eq!(inst.phase(), InstancePhase::ShutDown);
+
+    // Phase 2: a live child must reset the idle clock — the session stays
+    // Live for well over T_idle while the workload runs, and a second exec
+    // still lands.
+    let mut live = SandboxInstance::launch_exec_only_with_lifetime(
+        base_policy().build().unwrap().with_name("f5-idle-live-child"),
+        short_idle,
+    )
+    .await
+    .expect("launch second session");
+    let keeper = live
+        .exec(&["sleep", "30"], ExecStdio::Null)
+        .await
+        .expect("exec the live keeper child");
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(
+        live.phase(),
+        InstancePhase::Live,
+        "a live child must prevent the idle drain"
+    );
+    let second = live
+        .exec(&["sh", "-c", "exit 0"], ExecStdio::Null)
+        .await
+        .expect("exec must still work while a child is live");
+    let second_status = live.wait_child(second.child_id).await.expect("reap");
+    assert_eq!(second_status, sandlock_core::result::ExitStatus::Code(0));
+
+    // The keeper child also keeps the T_idle clock from draining once the
+    // short-lived child's exit is reaped... then kill the keeper, reap it,
+    // and the box drains.
+    live.kill_child(keeper.child_id, libc::SIGKILL).expect("kill keeper");
+    let _ = live.wait_child(keeper.child_id).await;
+    assert!(
+        poll_until(
+            || live.phase() == InstancePhase::Draining,
+            Duration::from_secs(10),
+        )
+        .await,
+        "once the last child is reaped the idle drain must fire again"
+    );
+    let _ = live
+        .exec(&["true"], ExecStdio::Null)
+        .await
+        .expect_err("post-drain exec refused");
+    assert_eq!(live.phase(), InstancePhase::ShutDown);
+}
+
+/// F5.5 (M3 S7): `T_max` is a forced lifetime cap — even with a live child
+/// the instance drains when the cap elapses, and repeated observations stay
+/// idempotent (no double teardown).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_max_lifetime_forces_shutdown_with_live_child() {
+    let short_max = InstanceLifetime {
+        idle_timeout: None,
+        max_lifetime: Some(Duration::from_millis(500)),
+    };
+    let mut inst = SandboxInstance::launch_exec_only_with_lifetime(
+        base_policy().build().unwrap().with_name("f5-max-lifetime"),
+        short_max,
+    )
+    .await
+    .expect("launch exec session with short max lifetime");
+    let child = inst
+        .exec(&["sleep", "60"], ExecStdio::Null)
+        .await
+        .expect("exec a live child");
+
+    assert!(
+        poll_until(
+            || inst.phase() == InstancePhase::Draining,
+            Duration::from_secs(10),
+        )
+        .await,
+        "T_max must force the instance to Draining even with a live child"
+    );
+    let err = inst
+        .exec(&["sh", "-c", "exit 0"], ExecStdio::Null)
+        .await
+        .expect_err("exec after T_max must be refused");
+    assert!(matches!(
+        err,
+        sandlock_core::SandlockError::Runtime(SandboxRuntimeError::InstanceClosed)
+    ));
+    assert_eq!(inst.phase(), InstancePhase::ShutDown);
+    assert!(
+        !process_is_alive(child.pid),
+        "the forced T_max drain must kill the live child"
+    );
+    inst.shutdown().await.expect("shutdown after T_max is idempotent");
+    assert_eq!(inst.phase(), InstancePhase::ShutDown);
 }
 
 /// F5.1 (Q10): `max_processes` bounds the **whole box** — every exec child

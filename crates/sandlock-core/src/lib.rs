@@ -47,7 +47,7 @@ pub use sandbox::{
     BindPorts, Confinement, ConfinementBuilder, Process, Sandbox, SandboxBuilder, StdioMode,
     DEFAULT_MAX_PROCESSES,
 };
-pub use instance::{InstancePhase, SandboxInstance};
+pub use instance::{InstanceLifetime, InstancePhase, SandboxInstance};
 pub use result::{RunResult, ExitStatus};
 pub use pipeline::{Stage, Pipeline, Gather};
 pub use transaction::{AbortReason, Transaction, TxnDisposition, TxnError, TxnOutcome};
