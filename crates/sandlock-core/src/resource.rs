@@ -141,48 +141,70 @@ pub(crate) async fn handle_fork(
 ///
 /// `counted` marks a birth-registered, fork-counted child (argv-safety fork
 /// events only): its pidfd watcher owns the exactly-once `proc_count`
-/// release on exit. Lazy registrations (root, threads, never-birth-tracked
-/// children) pass `false` and keep the wait4-side release semantics.
+/// release on exit. Lazy registrations (root and never-birth-tracked
+/// children — plus thread notifications, which register their TGID leader
+/// without a counted slot) pass `false` and keep the wait4-side release
+/// semantics.
 ///
 /// With `policy_fn` active, fork-like syscalls additionally register
 /// new child processes at creation time via ptrace fork events, before
 /// the child can run user code. Without `policy_fn`, lazy registration
 /// is enough because no argv-based security decision is exposed.
 ///
+/// **Registration is per thread group (F12):** `ProcessIndex` holds at most
+/// one entry per TGID, keyed by the thread-group leader's pid. A
+/// notification may arrive from any thread of the group, so a non-leader
+/// tid is never registered under its own key: if its leader is already
+/// tracked the notification routes to that entry, and if not, the leader
+/// itself is registered (its pidfd + start_time). Every lookup on the raw
+/// tid (`key_for`, `entry_for`, `addr_space_state`, `contains`) resolves to
+/// the leader's entry, so handlers need no per-tid state.
+///
 /// The fast path is a single `RwLock` read: if the pid is already
-/// tracked, we trust the entry. PID-identity correctness comes from
-/// the per-child pidfd watcher — a process can't issue notifications
-/// after it has exited, and the kernel won't recycle a PID until the
-/// parent has waited (which we observe), so a stale entry has no
-/// window in which to be hit. We deliberately do *not* re-stat
-/// /proc/<pid>/stat on every notification.
+/// tracked (directly, or through its leader), we trust the entry.
+/// PID-identity correctness comes from the per-child pidfd watcher — a
+/// process can't issue notifications after it has exited, and the kernel
+/// won't recycle a PID until the parent has waited (which we observe), so a
+/// stale entry has no window in which to be hit. We deliberately do *not*
+/// re-stat /proc/<pid>/stat on every notification.
 pub(crate) fn register_pid_if_new(ctx: &Arc<SupervisorCtx>, pid: i32, counted: bool) -> bool {
     if ctx.processes.contains(pid) {
         return true;
     }
 
-    let pidfd = match crate::sys::syscall::pidfd_open(pid as u32, 0) {
-        Ok(fd) => fd,
+    // Resolve the registration target: the thread-group leader's pid. A
+    // direct `pidfd_open(pid, 0)` only succeeds for a thread-group leader
+    // (or a single-threaded process), so a failure means the task is a
+    // non-leader thread — or the leader raced us out of existence.
+    let (target, pidfd) = match crate::sys::syscall::pidfd_open(pid as u32, 0) {
+        Ok(fd) => (pid, fd),
         Err(_) => {
-            // clone3 can create CLONE_THREAD tasks. Linux 6.9 added
-            // PIDFD_THREAD so pidfd_open works for non-leader TIDs too.
-            const PIDFD_THREAD: u32 = libc::O_EXCL as u32;
-            match crate::sys::syscall::pidfd_open(pid as u32, PIDFD_THREAD) {
-                Ok(fd) => fd,
+            let Some(tgid) = read_tgid_of_tid(pid) else {
+                return false; // process gone between the probe and this open
+            };
+            if tgid == pid {
+                return false; // a leader's direct open failed: it is gone
+            }
+            if ctx.processes.contains(tgid) {
+                // The leader became tracked since the probe: route to it.
+                return true;
+            }
+            match crate::sys::syscall::pidfd_open(tgid as u32, 0) {
+                Ok(fd) => (tgid, fd),
                 Err(_) => {
-                    if matches!(read_tgid_of_tid(pid), Some(tgid) if ctx.processes.contains(tgid)) {
-                        return true;
-                    }
-                    return false; // old kernel or process gone
+                    // The whole thread group is gone (a non-leader tid can
+                    // outlive nothing of its group once /proc stops
+                    // answering), or the leader is not openable.
+                    return false;
                 }
             }
         }
     };
 
     let key = match if counted {
-        ctx.processes.register_counted(pid)
+        ctx.processes.register_counted(target)
     } else {
-        ctx.processes.register(pid)
+        ctx.processes.register(target)
     } {
         Some(k) => k,
         None => return false, // process exited between pidfd_open and stat read
@@ -195,9 +217,10 @@ pub(crate) fn register_pid_if_new(ctx: &Arc<SupervisorCtx>, pid: i32, counted: b
 
 pub(crate) async fn register_child_if_new(ctx: &Arc<SupervisorCtx>, pid: i32) {
     // Lazy registration from a notification: the pid may be the root, a
-    // thread, or a fork child that was never birth-registered. It did not go
-    // through the argv-safety fork-event path, so its proc_count release (if
-    // any) stays on the wait4 side — never mark it `counted`.
+    // thread (routed to its TGID leader, F12), or a fork child that was
+    // never birth-registered. It did not go through the argv-safety
+    // fork-event path, so its proc_count release (if any) stays on the
+    // wait4 side — never mark it `counted`.
     let _ = register_pid_if_new(ctx, pid, false);
 }
 
@@ -1326,5 +1349,161 @@ mod tests {
                  with no second release from the watcher cleanup"
             );
         }
+    }
+
+    /// F12: a notification from a non-leader thread must register the
+    /// thread-group leader (never a tid key) when the leader is not yet
+    /// tracked — one TGID = one ProcessIndex entry.
+    #[tokio::test]
+    async fn thread_notification_registers_single_leader_entry() {
+        let ctx = fake_supervisor_ctx(false);
+        let leader = std::process::id() as i32;
+
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+            tid_tx.send(tid).unwrap();
+            // Stay alive: register_pid_if_new reads /proc for the leader.
+            let _ = stop_rx.recv();
+        });
+        let tid = tid_rx.recv().unwrap();
+        assert_ne!(tid, leader, "helper must be a real non-leader thread");
+
+        assert!(
+            register_pid_if_new(&ctx, tid, false),
+            "a thread notification with an untracked leader must register the leader"
+        );
+
+        assert_eq!(
+            ctx.processes.len(),
+            1,
+            "a thread notification must create exactly one entry (the leader's)"
+        );
+        let key = ctx
+            .processes
+            .key_for(tid)
+            .expect("the thread tid must resolve to the leader's key");
+        assert_eq!(
+            key.pid, leader,
+            "the registered key must be the thread-group leader's pid, not the tid"
+        );
+        assert_eq!(ctx.processes.key_for(leader), Some(key));
+        assert!(
+            ctx.processes.contains(leader) && ctx.processes.contains(tid),
+            "leader and its threads must both count as tracked"
+        );
+
+        let _ = stop_tx.send(());
+        thread.join().unwrap();
+    }
+
+    /// F12: a thread notification for an already-tracked leader must be a
+    /// no-op — never a second key for the same TGID.
+    #[tokio::test]
+    async fn thread_notification_never_adds_second_key_for_tracked_leader() {
+        let ctx = fake_supervisor_ctx(false);
+        let leader = std::process::id() as i32;
+        let leader_key = ctx.processes.register(leader).expect("leader registers");
+
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+            tid_tx.send(tid).unwrap();
+            let _ = stop_rx.recv();
+        });
+        let tid = tid_rx.recv().unwrap();
+        assert_ne!(tid, leader, "helper must be a real non-leader thread");
+
+        assert!(
+            register_pid_if_new(&ctx, tid, false),
+            "a thread of a tracked leader must be routable"
+        );
+        assert_eq!(
+            ctx.processes.len(),
+            1,
+            "registering a thread of a tracked leader must not add a tid key"
+        );
+        assert_eq!(ctx.processes.key_for(tid), Some(leader_key));
+
+        let _ = stop_tx.send(());
+        thread.join().unwrap();
+    }
+
+    /// F12 lifecycle: when a thread notification registers the leader, the
+    /// single leader-keyed entry (and its pidfd watcher) must be cleaned up
+    /// exactly when the whole thread group exits — no per-tid residue, no
+    /// entry left behind by threads that were never keys of their own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn thread_notified_group_cleans_up_single_entry_on_exit() {
+        use std::path::Path;
+        use std::process::{Command, Stdio};
+
+        let ctx = fake_supervisor_ctx(false);
+        let python = if Path::new("/usr/local/bin/python3").exists() {
+            "/usr/local/bin/python3"
+        } else {
+            "python3"
+        };
+        // A threaded holder whose non-leader thread stays alive.
+        let mut holder = Command::new(python)
+            .args([
+                "-c",
+                "import threading,time\n\
+                 def spin():\n\
+                 \x20   time.sleep(60)\n\
+                 t=threading.Thread(target=spin,daemon=True)\n\
+                 t.start()\n\
+                 time.sleep(60)\n",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn threaded holder");
+        let holder_pid = holder.id() as i32;
+
+        // Wait until the non-leader thread exists.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let thread_tid = loop {
+            if let Ok(tids) = std::fs::read_dir(format!("/proc/{}/task", holder_pid)) {
+                if let Some(tid) = tids
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter_map(|n| n.parse::<i32>().ok())
+                    .find(|t| *t != holder_pid)
+                {
+                    break tid;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "holder never created its thread"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+
+        // Register from the thread's notification: one leader-keyed entry.
+        assert!(register_pid_if_new(&ctx, thread_tid, false));
+        assert_eq!(ctx.processes.len(), 1);
+        assert_eq!(ctx.processes.key_for(thread_tid).map(|k| k.pid), Some(holder_pid));
+
+        // Kill the whole group, reap it, and let the pidfd watcher clean up.
+        unsafe {
+            libc::kill(holder_pid, libc::SIGKILL);
+        }
+        let _ = holder.wait();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ctx.processes.len() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "leader entry never cleaned up after thread-group exit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!ctx.processes.contains(thread_tid));
+        assert!(ctx.processes.key_for(thread_tid).is_none());
     }
 }

@@ -24,11 +24,12 @@
 //! `ProcessIndex` before it can run user code. The exec freeze can
 //! therefore enumerate every tracked TGID, walk `/proc/<tgid>/task`,
 //! and `PTRACE_SEIZE` + `PTRACE_INTERRUPT` every TID that could mutate
-//! argv. Index keys are normalized to their thread-group leaders first:
-//! a thread that issued a mediated syscall is lazily registered under its
-//! own tid, so the raw key set can name one TGID several times — freezing
-//! must visit each TGID exactly once or the second pass would try to seize
-//! an already-frozen TID (`EPERM`; F11).
+//! argv. Index keys are normalized to their thread-group leaders first.
+//! Since F12 the runtime registers at most one entry per TGID (under the
+//! leader's pid), but the normalization stays as defense-in-depth: a
+//! defensive shape (or a future caller) that registers a non-leader tid
+//! directly must not make the freeze visit one TGID twice — the second pass
+//! would try to seize an already-frozen TID (`EPERM`; F11).
 //!
 //! # Sibling vs peer cleanup
 //!
@@ -296,14 +297,16 @@ pub(crate) fn freeze_sandbox_for_execve(
 ) -> Result<SandboxFreeze, FreezeError> {
     let no_pending = |error| FreezeError { error, pending_tids: Vec::new() };
     let caller_tgid = read_tgid_of_tid(caller_tid).map_err(no_pending)?;
-    // Normalize every index key to its thread-group leader. A non-leader
-    // thread that issued a mediated syscall is lazily registered under its
-    // own tid (register_pid_if_new), so the raw key set can contain several
-    // keys for one TGID. Walking each key as a separate "tgid" would
-    // re-enumerate the same /proc/<tgid>/task once per key and PTRACE_SEIZE
-    // an already-frozen TID on the second pass — EPERM, denying the execve
-    // (F11). Freezing is per thread group: every thread that can mutate
-    // argv is discovered by the /proc/<tgid>/task walk of its leader.
+    // Normalize every index key to its thread-group leader. Since F12 the
+    // runtime registers one entry per TGID (under the leader's pid), but a
+    // defensive shape — or a future caller — can still place a non-leader
+    // tid key next to its leader (register_pid_if_new no longer does, but
+    // freeze is written to tolerate it). Walking each key as a separate
+    // "tgid" would re-enumerate the same /proc/<tgid>/task once per key and
+    // PTRACE_SEIZE an already-frozen TID on the second pass — EPERM,
+    // denying the execve (F11). Freezing is per thread group: every thread
+    // that can mutate argv is discovered by the /proc/<tgid>/task walk of
+    // its leader.
     let mut tgids: HashSet<i32> = HashSet::new();
     for pid in processes.pids_snapshot() {
         match crate::seccomp::state::read_tgid_of_tid(pid) {
@@ -664,9 +667,9 @@ mod tests {
         let _ = caller.wait();
     }
 
-    /// F11 regression: `ProcessIndex` can hold a lazily-registered non-leader
-    /// thread key next to its thread-group leader (a thread that issued a
-    /// mediated syscall is registered under its own tid). The freeze must
+    /// F11 regression: `ProcessIndex` can hold a non-leader thread key next
+    /// to its thread-group leader (the pre-F12 lazy registration shape; F12
+    /// removed that runtime path but freeze stays tolerant). The freeze must
     /// resolve keys to unique TGIDs so one thread group is never walked and
     /// seized twice — the second pass would `PTRACE_SEIZE` an already-frozen
     /// TID and fail with EPERM, denying the execve.
@@ -675,8 +678,9 @@ mod tests {
         use std::process::{Command, Stdio};
 
         // A threaded "peer": python3 with one daemon thread. The thread TID
-        // is registered as a *separate* ProcessIndex key, exactly like the
-        // lazy registration of a mediated-syscall thread.
+        // is registered as a *separate* ProcessIndex key — a deliberate
+        // defensive shape that freeze must keep tolerating (F12 removed the
+        // runtime path that produced it, not the freeze's tolerance).
         let python = if std::path::Path::new("/usr/local/bin/python3").exists() {
             "/usr/local/bin/python3"
         } else {

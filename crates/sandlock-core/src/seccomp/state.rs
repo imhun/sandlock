@@ -175,6 +175,17 @@ pub struct PerProcessState {
 /// inserted here before they can run user code; this makes the index
 /// complete for argv-safety freezes.
 ///
+/// The runtime keeps **one entry per thread group (TGID)**, keyed by the
+/// thread-group leader's pid (F12): a notification from any thread resolves
+/// to its leader's key and state via [`ProcessIndex::key_for`] /
+/// [`ProcessIndex::entry_for`] / [`ProcessIndex::addr_space_state`] /
+/// [`ProcessIndex::contains`], so the raw key set is also the raw TGID set.
+/// There are no per-tid entries, no per-thread watchers, and every
+/// enumeration point (`pids_snapshot`, `dead_keys`, `len`) counts process
+/// groups rather than threads. (`register` still accepts a tid when a caller
+/// deliberately constructs a defensive shape — e.g. freeze's duplicate-key
+/// unit test — but the notification path never does.)
+///
 /// Maps the kernel's numeric `pid` (the value that arrives in seccomp
 /// notifications) to the canonical `PidKey` plus an
 /// `Arc<AsyncMutex<PerProcessState>>` holding everything per-process.
@@ -237,6 +248,25 @@ pub(crate) struct ProcessRelease {
     pub released: std::sync::atomic::AtomicBool,
 }
 
+/// Resolve the registry entry for a raw notification pid.
+///
+/// A pid that is itself a key always wins (defensive shapes can still
+/// register a tid directly). Otherwise a non-leader thread resolves to its
+/// thread-group leader's entry — the runtime registers one entry per TGID
+/// under the leader's pid (F12) — so every lookup from any thread of a
+/// tracked process lands on the same key/state. Returns `None` for a
+/// completely unknown pid or an unreadable `/proc/<pid>/status`.
+fn entry_for_raw(map: &HashMap<i32, ProcessEntry>, pid: i32) -> Option<&ProcessEntry> {
+    if let Some(entry) = map.get(&pid) {
+        return Some(entry);
+    }
+    let tgid = read_tgid_of_tid(pid)?;
+    if tgid == pid {
+        return None;
+    }
+    map.get(&tgid)
+}
+
 impl ProcessIndex {
     pub fn new() -> Self {
         Self {
@@ -244,16 +274,21 @@ impl ProcessIndex {
         }
     }
 
-    /// Register a process with a non-counted slot (root, threads, and lazy
+    /// Register a process with a non-counted slot (root and lazy
     /// registrations; the release, if any, happens on the wait4 side).
+    ///
+    /// The runtime notification path (`register_pid_if_new`) only ever
+    /// passes thread-group leaders here (F12); the generic form remains for
+    /// defensive/unit-test shapes that register a tid directly.
     pub fn register(&self, pid: i32) -> Option<PidKey> {
         self.register_with(pid, false)
     }
 
     /// Register a birth-tracked, fork-counted child whose pidfd watcher owns
     /// the exactly-once `proc_count` release on exit. Used by the argv-safety
-    /// ptrace fork-event path, where every counted child is registered before
-    /// it can run user code.
+    /// ptrace fork-event path, where every counted child (always a new TGID
+    /// leader — `CLONE_THREAD` births are never counted) is registered
+    /// before it can run user code.
     pub(crate) fn register_counted(&self, pid: i32) -> Option<PidKey> {
         self.register_with(pid, true)
     }
@@ -265,8 +300,6 @@ impl ProcessIndex {
     fn register_with(&self, pid: i32, counted: bool) -> Option<PidKey> {
         let start_time = read_pid_start_time(pid)?;
         let key = PidKey { pid, start_time };
-        // Unreadable /proc means the task is its own address space as far
-        // as accounting is concerned: better local than misrouted.
         let tgid = read_tgid_of_tid(pid).unwrap_or(pid);
         let entry = ProcessEntry {
             key,
@@ -311,11 +344,11 @@ impl ProcessIndex {
     /// The cwd cell to read or write for `pid`.
     ///
     /// A task without an entry of its own falls back to its
-    /// thread-group leader: `pidfd_open` on a non-leader tid needs
-    /// `PIDFD_THREAD` (Linux 6.9), so `register_pid_if_new` can leave a
-    /// thread unregistered. Since threads share one `fs_struct`, the
-    /// leader's cell is the correct answer for them, not an
-    /// approximation. Only that miss pays for the extra /proc read.
+    /// thread-group leader: the runtime registers one entry per TGID under
+    /// the leader's pid, so a thread's tid is never a key of its own (F12).
+    /// Since threads share one `fs_struct`, the leader's cell is the correct
+    /// answer for them, not an approximation. Only that miss pays for the
+    /// extra /proc read.
     fn cwd_cell(&self, pid: i32) -> Option<SharedCwd> {
         if let Ok(guard) = self.inner.read() {
             if let Some(entry) = guard.get(&pid) {
@@ -349,25 +382,31 @@ impl ProcessIndex {
     }
 
     /// Look up the canonical PidKey for a notification's raw pid.
-    /// Returns None if this pid was never registered (e.g. pidfd_open
-    /// failed at fork) — callers should fall back to a no-op.
+    /// An unregistered non-leader thread resolves to its thread-group
+    /// leader's key (F12). Returns None only for a pid whose thread group
+    /// was never registered — callers should fall back to a no-op.
     pub fn key_for(&self, pid: i32) -> Option<PidKey> {
-        self.inner.read().ok()?.get(&pid).map(|e| e.key)
+        let guard = self.inner.read().ok()?;
+        entry_for_raw(&guard, pid).map(|e| e.key)
     }
 
     /// Look up both the PidKey and the per-process state handle for
-    /// `pid`. Returns None if the pid isn't tracked. The caller locks
-    /// the returned `Arc<AsyncMutex<…>>` to read or mutate.
+    /// `pid`. An unregistered non-leader thread resolves to its thread-group
+    /// leader's entry (F12), so threads share one state handle with the
+    /// leader. Returns None if the pid's thread group isn't tracked. The
+    /// caller locks the returned `Arc<AsyncMutex<…>>` to read or mutate.
     pub fn entry_for(&self, pid: i32) -> Option<(PidKey, Arc<AsyncMutex<PerProcessState>>)> {
-        self.inner
-            .read()
-            .ok()?
-            .get(&pid)
-            .map(|e| (e.key, Arc::clone(&e.state)))
+        let guard = self.inner.read().ok()?;
+        entry_for_raw(&guard, pid).map(|e| (e.key, Arc::clone(&e.state)))
     }
 
     /// Per-process state plus the exit-release slot, for the pidfd-watcher /
     /// GC cleanup path. Returns None if the pid isn't tracked.
+    ///
+    /// Cleanup always runs against an exact map key (the leader's pid in the
+    /// runtime shape), so this deliberately does **not** resolve threads to
+    /// leaders: a watcher key and the entry it cleans up must be the same
+    /// key, or a recycled-pid guard could release the wrong slot.
     pub(crate) fn entry_for_cleanup(
         &self,
         pid: i32,
@@ -389,24 +428,43 @@ impl ProcessIndex {
     /// space — charging each thread separately would let every thread's
     /// first brk go free and would credit a live heap back when one
     /// thread exits. Falls back to the task's own entry when the leader
-    /// is untracked.
+    /// is untracked. With the runtime's leader-only registration (F12), an
+    /// unregistered tid resolves through `/proc/<tid>/status` to its
+    /// leader's entry; the task's own entry fallback only applies to
+    /// defensive shapes that register a tid directly.
     pub fn addr_space_state(&self, pid: i32) -> Option<Arc<AsyncMutex<PerProcessState>>> {
         let guard = self.inner.read().ok()?;
-        let entry = guard.get(&pid)?;
-        if entry.tgid != pid {
-            if let Some(leader) = guard.get(&entry.tgid) {
-                return Some(Arc::clone(&leader.state));
+        match guard.get(&pid) {
+            Some(entry) => {
+                if entry.tgid != pid {
+                    if let Some(leader) = guard.get(&entry.tgid) {
+                        return Some(Arc::clone(&leader.state));
+                    }
+                }
+                Some(Arc::clone(&entry.state))
+            }
+            None => {
+                let tgid = read_tgid_of_tid(pid)?;
+                if tgid == pid {
+                    return None;
+                }
+                guard.get(&tgid).map(|e| Arc::clone(&e.state))
             }
         }
-        Some(Arc::clone(&entry.state))
     }
 
-    /// Cheap tracked-process test — used by /proc virtualization to
-    /// gate access to `/proc/<pid>/...` paths and by getdents filtering.
+    /// Tracked-process test — used by /proc virtualization to gate access
+    /// to `/proc/<pid>/...` paths and by getdents filtering.
+    ///
+    /// A non-leader thread of a tracked TGID counts as tracked (it resolves
+    /// to its leader), so a sandbox process's threads stay visible and
+    /// readable in its virtualized `/proc` exactly like on kernels where
+    /// threads could never be registered (F12). Only a pid whose whole
+    /// thread group is untracked (or unreadable /proc) returns false.
     pub fn contains(&self, pid: i32) -> bool {
         self.inner
             .read()
-            .map(|g| g.contains_key(&pid))
+            .map(|g| entry_for_raw(&g, pid).is_some())
             .unwrap_or(false)
     }
 
@@ -1279,11 +1337,12 @@ mod tests {
     }
 
     #[test]
-    fn an_unregistered_thread_uses_its_leader_cwd() {
-        // pidfd_open on a non-leader tid needs PIDFD_THREAD (Linux 6.9), so
-        // register_pid_if_new can leave a thread without an entry of its own.
-        // It still shares the leader's fs_struct, so its chdir must land in
-        // the leader's cell rather than vanish.
+    fn a_thread_without_its_own_key_uses_its_leader_cwd() {
+        // F12: the runtime never registers a non-leader thread under its own
+        // tid — one TGID has exactly one ProcessIndex entry (the leader's).
+        // A thread still shares the leader's fs_struct, so its chdir must
+        // land in the leader's cell, and its tid must count as tracked via
+        // the leader.
         let leader = unsafe { libc::getpid() };
         let idx = ProcessIndex::new();
         idx.register(leader).expect("leader registers");
@@ -1296,12 +1355,69 @@ mod tests {
             let _ = stop_rx.recv();
         });
         let tid = tid_rx.recv().unwrap();
-        // Deliberately not registered.
-        assert!(!idx.contains(tid));
+        // Deliberately not registered under its own tid.
+        assert_eq!(idx.len(), 1, "a thread of a tracked leader has no key of its own");
+        assert!(
+            idx.contains(tid),
+            "a thread must count as tracked through its thread-group leader"
+        );
 
         idx.set_virtual_cwd(tid, PathBuf::from("/workspace"));
         assert_eq!(idx.virtual_cwd(tid), Some(PathBuf::from("/workspace")));
         assert_eq!(idx.virtual_cwd(leader), Some(PathBuf::from("/workspace")));
+
+        let _ = stop_tx.send(());
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn thread_of_tracked_leader_resolves_to_leaders_entry() {
+        // F12: one index entry per thread group. A non-leader thread is never
+        // registered under its own tid by the runtime; every lookup on its
+        // tid must resolve to the leader's entry (same key, same state Arc,
+        // same address-space accounting target).
+        let leader = unsafe { libc::getpid() };
+        let idx = ProcessIndex::new();
+        let leader_key = idx.register(leader).expect("leader registers");
+
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+            tid_tx.send(tid).unwrap();
+            let _ = stop_rx.recv();
+        });
+        let tid = tid_rx.recv().unwrap();
+        assert_ne!(tid, leader, "helper must be a real non-leader thread");
+
+        // Deliberately not registered under its own tid.
+        assert_eq!(idx.len(), 1, "no tid key may exist for the helper thread");
+
+        assert!(
+            idx.contains(tid),
+            "a thread of a tracked TGID must count as tracked via its leader"
+        );
+        assert_eq!(
+            idx.key_for(tid),
+            Some(leader_key),
+            "key lookup on a thread tid must return the leader's PidKey"
+        );
+        let (tid_key, tid_state) = idx.entry_for(tid).expect("entry_for resolves via leader");
+        assert_eq!(tid_key, leader_key);
+        let (_, leader_state) = idx.entry_for(leader).expect("leader entry present");
+        assert!(
+            Arc::ptr_eq(&tid_state, &leader_state),
+            "thread and leader must share one PerProcessState"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &idx
+                    .addr_space_state(tid)
+                    .expect("addr_space_state resolves via leader"),
+                &leader_state
+            ),
+            "memory accounting for a thread must target the leader's state"
+        );
 
         let _ = stop_tx.send(());
         thread.join().unwrap();
