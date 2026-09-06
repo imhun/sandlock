@@ -1172,12 +1172,16 @@ pub(crate) async fn handle_chroot_write(
         // A mount point is a policy object, not a name the guest owns. Real
         // bind mounts refuse unlink(2) at the mount point with EBUSY; here,
         // resolving the leaf to its host source and unlinking it would delete
-        // the HOST object behind the mount (I1/P5 review). rmdir is excluded:
-        // a directory mount point's rmdir exposure is pre-existing and out of
-        // this task's scope, and a file/chardev leaf already fails rmdir
-        // natively (ENOTDIR on the host source).
-        if !is_dir && ctx.mount_leaf_host(&vp).is_some() {
-            return NotifAction::Errno(libc::EBUSY);
+        // the HOST object behind the mount (I1/P5 review). rmdir of a
+        // *directory* mount point is refused the same way (F13): without the
+        // guard, an empty host directory behind the mount could be deleted
+        // through the sandbox view. rmdir of a file/chardev leaf falls
+        // through — the host rmdir below reports ENOTDIR exactly like the
+        // kernel would for a non-directory.
+        if let Some(host_leaf) = ctx.mount_leaf_host(&vp) {
+            if !is_dir || host_leaf.is_dir() {
+                return NotifAction::Errno(libc::EBUSY);
+            }
         }
 
         {

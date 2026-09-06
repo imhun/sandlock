@@ -648,6 +648,109 @@ fn test_rw_mount_point_resists_unlink_and_rename() {
     let _ = fs::remove_dir_all(&host_dir);
 }
 
+/// Hard-linking FROM a writable single-file mount point is refused with
+/// EBUSY, exactly like unlink/rename at the same leaf (I1/P5 review, direct
+/// pin): a hard link to the host source would give the sandbox a second name
+/// for the HOST object behind the mount.
+#[test]
+fn test_rw_mount_point_resists_link() {
+    let rootfs = build_test_rootfs("mount-point-link");
+    let host_dir = temp_dir("mount-point-link-host");
+    let host_file = host_dir.join("resolv.conf");
+    let content = "nameserver 127.0.0.11\n";
+    fs::write(&host_file, content).unwrap();
+
+    // rw mount + writable /etc prefix: can_write passes on both sides, so
+    // EBUSY is the guard that stops the guest from aliasing the host source.
+    let policy =
+        build_single_node_policy(&rootfs, "/etc/resolv.conf", &host_file, false, &["/etc"]);
+
+    let ln = run_in_sandbox(
+        policy,
+        &["rootfs-helper", "ln", "/etc/resolv.conf", "/etc/resolv-link.conf"],
+    );
+    assert!(
+        !ln.success,
+        "hard-linking a mount point source must fail: stdout={} stderr={}",
+        ln.stdout, ln.stderr,
+    );
+    assert_eq!(
+        ln.stderr,
+        "ln: /etc/resolv-link.conf: Device or resource busy\n",
+        "link at a mount point must surface EBUSY with the exact helper error",
+    );
+    assert_eq!(
+        fs::read_to_string(&host_file).unwrap(),
+        content,
+        "the refused link must not touch the host file",
+    );
+    assert!(
+        !host_dir.join("resolv-link.conf").exists(),
+        "the refused link must not create a host file under the new name",
+    );
+
+    unsafe { sandlock_sandbox_free(policy) };
+    let _ = fs::remove_dir_all(&rootfs);
+    let _ = fs::remove_dir_all(&host_dir);
+}
+
+/// rmdir of a *directory* bind-mount point must be refused with EBUSY like
+/// a real kernel bind mount (F13 / FUP-05): the pre-F13 handler routed
+/// rmdir (unlinkat AT_REMOVEDIR) straight to the host source, so an empty
+/// host directory behind the mount could be deleted through the sandbox.
+/// Regular directories *inside* the mount stay fully usable.
+#[test]
+fn test_directory_mount_point_rmdir_is_refused() {
+    let rootfs = build_test_rootfs("dir-mount-rmdir");
+    let host_dir = temp_dir("dir-mount-rmdir-host");
+    let policy = build_single_node_policy(&rootfs, "/work", &host_dir, false, &[]);
+
+    // Control: a regular directory inside the rw directory mount still
+    // mkdir/rmdir normally — only the mount point itself is a policy object.
+    let mk = run_in_sandbox(policy, &["rootfs-helper", "mkdir", "/work/inner"]);
+    assert!(
+        mk.success,
+        "mkdir inside a rw directory mount must succeed: exit={} stderr={}",
+        mk.code, mk.stderr,
+    );
+    assert!(
+        host_dir.join("inner").is_dir(),
+        "the sandbox mkdir must land in the host directory behind the mount",
+    );
+    let rm_inner = run_in_sandbox(policy, &["rootfs-helper", "rmdir", "/work/inner"]);
+    assert!(
+        rm_inner.success,
+        "rmdir of a regular directory inside the mount must succeed: exit={} stderr={}",
+        rm_inner.code, rm_inner.stderr,
+    );
+    assert!(
+        !host_dir.join("inner").exists(),
+        "the sandbox rmdir must remove the inner host directory",
+    );
+
+    // The mount point itself must resist rmdir, and the host directory (now
+    // empty, so a host rmdir would otherwise succeed) must survive.
+    let rm = run_in_sandbox(policy, &["rootfs-helper", "rmdir", "/work"]);
+    assert!(
+        !rm.success,
+        "rmdir of a directory mount point must fail: stdout={} stderr={}",
+        rm.stdout, rm.stderr,
+    );
+    assert_eq!(
+        rm.stderr,
+        "rmdir: /work: Device or resource busy\n",
+        "rmdir at a directory mount point must surface EBUSY with the exact helper error",
+    );
+    assert!(
+        host_dir.is_dir(),
+        "rmdir must not delete the host directory behind the mount",
+    );
+
+    unsafe { sandlock_sandbox_free(policy) };
+    let _ = fs::remove_dir_all(&rootfs);
+    let _ = fs::remove_dir_all(&host_dir);
+}
+
 /// A single-file mount leaf resolves through the mount before the rootfs, so
 /// a virtual parent chain missing from the rootfs does not block a direct
 /// open of the mounted node (I2/P5 review pin: no parent precreate mechanism
@@ -729,10 +832,10 @@ fn read_only_mount_allows_reads_and_denies_writes() {
         "creating /ro/created.txt must fail under a read-only mount: stdout={} stderr={}",
         r.stdout, r.stderr,
     );
-    assert!(
-        r.stderr.contains("Permission denied"),
-        "write to a read-only mount must be denied with EACCES, got stderr={:?}",
+    assert_eq!(
         r.stderr,
+        "write: /ro/created.txt: Permission denied\n",
+        "write to a read-only mount must be denied with EACCES and the exact helper error",
     );
     assert!(
         !ro_host.join("created.txt").exists(),
