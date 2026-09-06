@@ -57,6 +57,9 @@ const UID_Y: u32 = 65532;
 const HOST_UID_A: u32 = 10000;
 const HOST_UID_B: u32 = 10001;
 
+/// Non-root euid for the F14 file-cap launcher fixture (route-B ③ shape).
+const CAPS_UID: u32 = 65533;
+
 fn supervise_bin() -> &'static str {
     env!("CARGO_BIN_EXE_sandlock-supervise")
 }
@@ -446,6 +449,19 @@ fn refusal_msg(host_uid: u32) -> String {
     )
 }
 
+/// F14: the non-root file-cap launcher shape is refused with a message that
+/// names the capability (so deployment can tell "euid 0" from
+/// "non-root effective CAP_SETUID/CAP_SETGID").
+fn caps_refusal_msg(euid: u32, host_uid: u32) -> String {
+    format!(
+        "mediation_run_as=caller refused: in-process path mediation would run as euid {euid} \
+         with effective CAP_SETUID/CAP_SETGID while the sandbox's host uid is {host_uid}; \
+         on-behalf files would be owned by the mediator, not the sandbox (SL-1). Run \
+         sandlock-supervise as uid {host_uid} (route B), or pass \
+         mediation_run_as=supervisor to explicitly accept the downgrade"
+    )
+}
+
 fn assert_run_refused(err: SandlockError, expected: &str) {
     match err {
         SandlockError::Runtime(sandlock_core::error::SandboxRuntimeError::Child(msg)) => {
@@ -527,6 +543,89 @@ async fn test_root_inprocess_mediation_is_refused() {
         after,
         before + 1,
         "the supervisor-tier launch must be counted in stats() exactly once"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// F14 (route-B ③ 前置): a non-root process whose executable carries
+/// `cap_setuid,cap_setgid+eip` (the file-cap launcher shape) holds effective
+/// CAP_SETUID/CAP_SETGID at a non-zero euid — the same privileged cross-uid
+/// remap capability the C档 gate refuses for euid 0. The default `caller`
+/// tier must fail closed at the gate with the capability-aware message
+/// BEFORE any fork, instead of falling through to the late "unprivileged
+/// supervisor cannot map" refusal (which assumes a caps-free caller and
+/// would become an SL-1-class leak the moment the remap path honored caps).
+#[test]
+fn test_nonroot_file_cap_launcher_is_refused_like_c_tier() {
+    root_phase_env_check();
+    let dir = dac_tmp_dir("caps-c-tier");
+    let deny = dir.join("secret.txt");
+    std::fs::write(&deny, "secret\n").expect("write deny target");
+
+    // Stamp the route-B ③ file-cap launcher capability set on a scratch copy
+    // of the CLI (eip => effective CAP_SETUID/CAP_SETGID after exec).
+    let capped = dir.join("sandlock-capable");
+    std::fs::copy(cli_bin(), &capped).expect("copy CLI to scratch for file caps");
+    let cap = Command::new("setcap")
+        .args(["cap_setuid,cap_setgid+eip", capped.to_str().unwrap()])
+        .output()
+        .expect("run setcap");
+    assert!(
+        cap.status.success(),
+        "setcap failed: {}",
+        String::from_utf8_lossy(&cap.stderr)
+    );
+
+    let mut base_args: Vec<String> = vec![
+        "run".into(),
+        "-r".into(),
+        "/usr".into(),
+        "-r".into(),
+        "/lib".into(),
+        "-r".into(),
+        "/bin".into(),
+        "-r".into(),
+        "/etc".into(),
+        "-r".into(),
+        "/proc".into(),
+        "-r".into(),
+        "/dev".into(),
+        "-w".into(),
+        dir.to_string_lossy().into_owned(),
+        "--fs-deny".into(),
+        deny.to_string_lossy().into_owned(),
+        "--user".into(),
+        format!("{HOST_UID_A}:{HOST_UID_A}"),
+    ];
+    if Path::new("/lib64").exists() {
+        base_args.push("-r".into());
+        base_args.push("/lib64".into());
+    }
+    base_args.push("--".into());
+    base_args.push("true".into());
+
+    let r = Command::new("setpriv")
+        .arg("--reuid")
+        .arg(CAPS_UID.to_string())
+        .arg("--regid")
+        .arg(CAPS_UID.to_string())
+        .arg("--clear-groups")
+        .arg(&capped)
+        .args(&base_args)
+        .output()
+        .expect("run the file-cap launcher at a non-root euid");
+
+    let err = String::from_utf8_lossy(&r.stderr);
+    assert!(
+        !r.status.success(),
+        "the file-cap launcher shape must be refused under the default caller tier"
+    );
+    let line = err.lines().next().unwrap_or_default();
+    assert_eq!(
+        line.strip_prefix("Error: process error: child process error: "),
+        Some(caps_refusal_msg(CAPS_UID, HOST_UID_A).as_str()),
+        "the CLI must surface the capability-aware C档 refusal, got: {err}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

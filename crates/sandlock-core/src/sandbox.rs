@@ -186,15 +186,58 @@ impl std::str::FromStr for MediationRunAs {
     }
 }
 
-/// C档 fail-closed gate (fork-plan F6.1 Step 3): refuse in-process path
-/// mediation when the mediator is root but the sandbox runs at a different
-/// non-zero host uid — the mediated syscalls would run as root and every
-/// per-uid DAC boundary (ownership, `chmod`, sticky) would be wrong.
+/// C档 fail-closed gate (fork-plan F6.1 Step 3; F14 extends the trigger from
+/// euid 0 to non-root effective CAP_SETUID/SETGID): refuse in-process path
+/// mediation when the mediator would run the sandbox at a *different*
+/// non-zero host uid — the mediated syscalls would run as the mediator
+/// (euid 0, or a non-root euid holding effective CAP_SETUID/CAP_SETGID — the
+/// route-B ③ file-cap launcher shape) and every per-uid DAC boundary
+/// (ownership, `chmod`, sticky) would be wrong. Same-uid mediation
+/// (host_uid == mediator euid) never remaps and is untouched.
 ///
 /// Pure decision helper (unit-tested); the spawn site applies it with the
-/// process's live euid/host uid and the resolved mediation features.
-pub(crate) fn mediation_remap_is_refused(euid: u32, host_uid: u32, mediation_active: bool) -> bool {
-    mediation_active && euid == 0 && host_uid != 0
+/// process's live euid, effective privileged-remap capability, the sandbox's
+/// host uid and the resolved mediation features.
+pub(crate) fn mediation_remap_is_refused(
+    euid: u32,
+    host_uid: u32,
+    mediation_active: bool,
+    privileged_remap_caps: bool,
+) -> bool {
+    mediation_active
+        && host_uid != 0
+        && (euid == 0 || (privileged_remap_caps && host_uid != euid))
+}
+
+/// True when this process's effective capability set would let it remap a
+/// sandbox to an arbitrary host uid while euid is non-zero — the route-B ③
+/// file-cap launcher shape (`cap_setuid,cap_setgid+eip` grants effective
+/// CAP_SETUID/CAP_SETGID on exec). Reads `CapEff` from `/proc/self/status`;
+/// capabilities are process-static after exec unless the process changes
+/// them itself, so the read is stable for the process lifetime.
+///
+/// euid 0 is handled separately by [`mediation_remap_is_refused`] (kept
+/// fail-closed even if root dropped its caps), so this helper only needs to
+/// recognize the non-root-with-caps shape.
+fn effective_caps_allow_privileged_remap() -> bool {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+    for line in status.lines() {
+        if let Some(hex) = line.strip_prefix("CapEff:") {
+            let Ok(mask) = u64::from_str_radix(hex.trim(), 16) else {
+                return false;
+            };
+            // Capability numbering is a stable Linux UAPI
+            // (include/uapi/linux/capability.h): CAP_SETGID = 6,
+            // CAP_SETUID = 7. libc does not expose these constants on every
+            // supported toolchain, so the bit positions are written out.
+            const CAP_SETUID_BIT: u64 = 1 << 7;
+            const CAP_SETGID_BIT: u64 = 1 << 6;
+            return mask & (CAP_SETUID_BIT | CAP_SETGID_BIT) != 0;
+        }
+    }
+    false
 }
 
 /// Whether this sandbox can exercise supervisor-side path mediation at
@@ -2128,12 +2171,20 @@ impl Sandbox {
         // to write the child's uid/gid maps: `unshare(CLONE_NEWUSER)` strips
         // the child's capabilities in the parent user namespace, so a child
         // can only ever map its own euid — the single-entry map `0 -> host_uid`
-        // needs the parent to hold CAP_SETUID/CAP_SETGID there (root).  The
-        // pipes exist exactly when `RunAs` differs from our own identity and
-        // we are privileged.
+        // needs the parent to hold CAP_SETUID/CAP_SETGID there (euid 0, or a
+        // non-root euid with effective CAP_SETUID/CAP_SETGID — route-B ③
+        // file-cap launcher, F14).  The pipes exist exactly when `RunAs`
+        // differs from our own identity and we are privileged.
         let real_uid = unsafe { libc::getuid() };
         let real_gid = unsafe { libc::getgid() };
-        let privileged_userns = unsafe { libc::geteuid() } == 0;
+        // F14: "can perform a privileged cross-uid remap" is a capability
+        // question, not an euid question. euid 0 qualifies, and so does a
+        // non-root euid holding effective CAP_SETUID/CAP_SETGID (the route-B
+        // ③ file-cap launcher shape). A caps-free non-root supervisor stays
+        // unprivileged: the single-entry map can only cover its own euid.
+        let mediator_euid = unsafe { libc::geteuid() };
+        let privileged_remap_caps = effective_caps_allow_privileged_remap();
+        let privileged_userns = mediator_euid == 0 || privileged_remap_caps;
         let userns_remap =
             matches!(self.user, Some(run_as) if run_as.uid != real_uid || run_as.gid != real_gid);
 
@@ -2189,18 +2240,18 @@ impl Sandbox {
             ),
         };
 
-        // C档 fail-closed (fork-plan F6.1 Step 3, SL-1 / P1+P2): the
-        // seccomp-notify mediator runs in THIS process, so mediated path
-        // operations carry this process's euid.  When this process is root
-        // (euid 0) and the sandbox is remapped to a different host uid
-        // (`RunAs` through the privileged single-entry userns map), a
-        // default `caller` tier would create/modify files as root — the
-        // SL-1 owner/chmod/sticky failure class.  Refuse before fork, with
-        // the route-B remedy (run a `sandlock-supervise` process as the
+        // C档 fail-closed (fork-plan F6.1 Step 3, SL-1 / P1+P2; F14 extends
+        // the trigger from euid 0 to non-root effective CAP_SETUID/SETGID):
+        // the seccomp-notify mediator runs in THIS process, so mediated path
+        // operations carry this process's identity.  When this process can
+        // remap the sandbox to a different host uid (`RunAs` through the
+        // privileged userns map) and runs on-behalf path operations, a
+        // default `caller` tier would create/modify files as the mediator —
+        // the SL-1 owner/chmod/sticky failure class.  Refuse before fork,
+        // with the route-B remedy (run a `sandlock-supervise` process as the
         // sandbox's host uid) or the explicit `supervisor` downgrade named
         // in the error.  The explicit tier is allowed but loud: a warning
         // plus a `stats()` counter, so the downgrade is never silent.
-        let mediator_euid = unsafe { libc::geteuid() };
         let mediation_active = mediation_active_for(
             self.no_supervisor,
             resolved.features.fs_denies,
@@ -2208,26 +2259,48 @@ impl Sandbox {
             resolved.features.cow,
             resolved.features.policy_fn,
         );
-        if mediation_remap_is_refused(mediator_euid, host_uid, mediation_active) {
+        if mediation_remap_is_refused(
+            mediator_euid,
+            host_uid,
+            mediation_active,
+            privileged_remap_caps,
+        ) {
             match self.mediation_run_as {
                 MediationRunAs::Caller => {
+                    // Distinguish the two privileged shapes for deployment
+                    // troubleshooting: euid 0 vs a non-root file-cap
+                    // launcher holding effective CAP_SETUID/CAP_SETGID.
+                    let privilege_clause = if mediator_euid == 0 {
+                        "as euid 0".to_string()
+                    } else {
+                        format!(
+                            "as euid {} with effective CAP_SETUID/CAP_SETGID",
+                            mediator_euid
+                        )
+                    };
                     return Err(SandboxRuntimeError::Child(format!(
                         "mediation_run_as=caller refused: in-process path mediation would run \
-                         as euid {} while the sandbox's host uid is {}; on-behalf files would \
-                         be owned by the mediator, not the sandbox (SL-1). Run \
-                         sandlock-supervise as uid {} (route B), or pass \
+                         {privilege_clause} while the sandbox's host uid is {host_uid}; \
+                         on-behalf files would be owned by the mediator, not the sandbox \
+                         (SL-1). Run sandlock-supervise as uid {host_uid} (route B), or pass \
                          mediation_run_as=supervisor to explicitly accept the downgrade",
-                        mediator_euid, host_uid, host_uid,
                     ))
                     .into());
                 }
                 MediationRunAs::Supervisor => {
+                    let privilege_clause = if mediator_euid == 0 {
+                        "as euid 0".to_string()
+                    } else {
+                        format!(
+                            "as euid {} with effective CAP_SETUID/CAP_SETGID",
+                            mediator_euid
+                        )
+                    };
                     eprintln!(
                         "sandlock: warning: mediation_run_as=supervisor: in-process path \
-                         mediation runs as euid {} while the sandbox's host uid is {}; \
-                         on-behalf files are owned by the mediator, not the sandbox (SL-1 \
-                         downgrade accepted explicitly)",
-                        mediator_euid, host_uid,
+                         mediation runs {privilege_clause} while the sandbox's host uid is \
+                         {host_uid}; on-behalf files are owned by the mediator, not the \
+                         sandbox (SL-1 downgrade accepted explicitly)"
                     );
                     note_supervisor_tier_launch();
                 }

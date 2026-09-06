@@ -581,28 +581,61 @@ fn mediation_run_as_supervisor_roundtrips_through_builder_and_serde() {
     assert_eq!(back.mediation_run_as, MediationRunAs::Supervisor);
 }
 
-/// Truth table for the C档 fail-closed gate: only a *root* in-process
-/// mediator whose sandbox runs at a different non-zero host uid, with path
-/// mediation active, is refused under `caller`.  Same-uid A/B mediation,
-/// non-root supervisors, host uid 0 sandboxes, and no-mediation configs are
-/// all untouched.
+/// Truth table for the C档 fail-closed gate: only a mediator that can remap
+/// the sandbox to a different non-zero host uid — euid 0, or a non-root euid
+/// holding effective CAP_SETUID/CAP_SETGID (the route-B ③ file-cap launcher
+/// shape, F14) — with path mediation active is refused under `caller`.
+/// Same-uid A/B mediation, caps-free non-root supervisors, host uid 0
+/// sandboxes, and no-mediation configs are all untouched.
 #[test]
 fn mediation_identity_gate_refuses_only_root_remap_with_mediation() {
-    let refused = |euid: u32, host_uid: u32, mediation: bool| {
-        crate::sandbox::mediation_remap_is_refused(euid, host_uid, mediation)
+    let refused = |euid: u32, host_uid: u32, mediation: bool, caps: bool| {
+        crate::sandbox::mediation_remap_is_refused(euid, host_uid, mediation, caps)
     };
 
     // C档: root supervisor remapping to a non-zero host uid with mediation.
-    assert!(refused(0, 10000, true));
-    assert!(refused(0, 1, true));
+    assert!(refused(0, 10000, true, false));
+    assert!(refused(0, 10000, true, true));
+    assert!(refused(0, 1, true, false));
     // Same-uid A/B mediation is never refused...
-    assert!(!refused(65534, 65534, true));
-    assert!(!refused(1000, 1000, true));
-    assert!(!refused(0, 0, true), "host uid 0 needs no remap at all");
-    // ...nor is a non-root supervisor (it cannot remap; RunAs refuses
-    // separately), nor root without mediation (nothing runs on-behalf).
-    assert!(!refused(65534, 10000, true));
-    assert!(!refused(0, 10000, false));
+    assert!(!refused(65534, 65534, true, false));
+    assert!(!refused(65534, 65534, true, true));
+    assert!(!refused(1000, 1000, true, false));
+    assert!(!refused(0, 0, true, false), "host uid 0 needs no remap at all");
+    // ...nor is a caps-free non-root supervisor (it cannot remap; RunAs
+    // refuses separately), nor root without mediation (nothing runs
+    // on-behalf).
+    assert!(!refused(65534, 10000, true, false));
+    assert!(!refused(0, 10000, false, false));
+    // F14: a non-root euid holding effective CAP_SETUID/CAP_SETGID can
+    // perform the same privileged cross-uid remap as euid 0 and is refused.
+    assert!(refused(65533, 10000, true, true));
+    assert!(refused(1000, 20000, true, true));
+    assert!(!refused(65533, 10000, true, false));
+    assert!(!refused(65533, 10000, false, true));
+    assert!(!refused(65533, 0, true, true), "host uid 0 needs no remap");
+}
+
+/// F14 pure decision: the capability dimension is orthogonal to euid — a
+/// non-root caps holder is refused exactly like euid 0, while the same euid
+/// without caps stays untouched (the separate unprivileged-userns refusal in
+/// context.rs covers it later, with a different message).
+#[test]
+fn mediation_identity_gate_refuses_nonroot_effective_caps_remap() {
+    let refused = |euid: u32, host_uid: u32, mediation: bool, caps: bool| {
+        crate::sandbox::mediation_remap_is_refused(euid, host_uid, mediation, caps)
+    };
+
+    // The route-B ③ launcher shape (euid != 0 + effective caps) is refused
+    // for any non-zero remap target when mediation is active.
+    assert!(refused(65533, 10000, true, true));
+    assert!(refused(1000, 1000 + 1, true, true));
+    // Host uid 0 needs no remap even with caps.
+    assert!(!refused(65533, 0, true, true));
+    // No mediation / no caps / same-uid remain untouched.
+    assert!(!refused(65533, 10000, false, true));
+    assert!(!refused(65533, 10000, true, false));
+    assert!(!refused(65533, 65533, true, true));
 }
 
 /// I1 review fix: the on-behalf open gate is `has_denied_paths()` on the
@@ -631,18 +664,21 @@ fn mediation_active_covers_policy_fn_deny_capability() {
     assert!(mediation_remap_is_refused(
         0,
         10000,
-        mediation_active_for(false, false, false, false, true)
+        mediation_active_for(false, false, false, false, true),
+        false,
     ));
     // Non-root and no-mediation composites stay untouched.
     assert!(!mediation_remap_is_refused(
         65534,
         65534,
-        mediation_active_for(false, false, false, false, true)
+        mediation_active_for(false, false, false, false, true),
+        false,
     ));
     assert!(!mediation_remap_is_refused(
         0,
         10000,
-        mediation_active_for(false, false, false, false, false)
+        mediation_active_for(false, false, false, false, false),
+        false,
     ));
 }
 
