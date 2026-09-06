@@ -42,7 +42,7 @@ mediation_2uid 8（见 §3.1 与 §5 的 F10 行）。
 | E7 前置 | 运行时基线移除 per-sandbox netns/veth（`network/netns.rs`、test_netns、`netns` flag/FFI/Python 全删），通配走无特权共享路径 | — | ✅ | netns 集成测试仅存于 `feature/network-socks5` |
 | M6 | cp314 双架构 wheel + 私有 index 安装；fork build.rs 加 `-mcmodel=large`（manylinux gcc-toolset-14 下 restore-stub 32 位绝对重定位溢出） | 构建 | ✅ | cp310 / 3.12–3.13 未做 |
 | 测试 | 非 root 测试入口 `b6ef050`（`Dockerfile.test-runner` 里 `/usr/bin/python3 → /usr/local/bin/python3` 之类由 E2B 侧镜像负责） | python 测试 | ✅ 430 passed | — |
-| M0 每沙箱一实例（fork-plan F2） | `SandboxInstance` 持 ResourceState / notif / 控制目录+token / DNS 网关；`Sandbox::run/popen/spawn` 走一次性实例（外部语义与 ABI 不变）；`shutdown()` 七步固定顺序且幂等；stats 露出 `proc_count_vs_live`/`children_live`/`instance_state` | `instance.rs`（F2.1–F2.3） | ✅ commit `57f543c`..`2cb1d99`（core_integ 477→488；全门绿） | §8 M4（E2B 接线）未动，属 E2B 侧 |
+| M0 每沙箱一实例（fork-plan F2） | `SandboxInstance` 持 ResourceState / notif / 控制目录+token / DNS 网关；`Sandbox::run/popen/spawn` 走一次性实例（外部语义与 ABI 不变）；`shutdown()` 七步固定顺序且幂等；stats 露出 `proc_count_vs_live`/`children_live`/`instance_state` | `instance.rs`（F2.1–F2.3） | ✅ commit `57f543c`..`2cb1d99`（core_integ 477→488；全门绿） | §8 M4（E2B 接线）已由 E2B Task 1–11 于 2026-09-06 收口（见 §8 与 §7.6） |
 | M1 `exec` 下沉 + child 句柄（fork-plan F3） | init/proto/fdpass 从 `sandlock-oci` 原样搬入 `core::init`（oci 走 re-export seam，oci-root 144 精确不变）；per-child `exec/wait_child/kill_child/resize_child` + SCM_RIGHTS stdio；FFI `sandlock_instance_*`（launch/exec/wait/kill/resize/free，F4 再加 exec_params/update_network，cbindgen 同步）；Python `SandboxInstance.exec() -> ExecProcess` | core::init + supervise 双传输 + FFI/Python | ✅ commit `d063437`、`4411c7b`、`3d42bc7` + fix `3fa0b95` | supervise 主退出顺序竞态等见 `docs/fork-plan-followups.md` |
 | M2 per-exec 参数 + 子集校验（fork-plan F4） | per-exec `cwd/env/extra_writable/bind_ports`（execve 前 chdir/envp）；S9 单 choke point（越出实例上限 ⇒ EPERM/`PolicyTooWide`）；`update_network` 只绑新 exec + staleness 回报；per-child 网络按 pid 血缘、未归因 fail-closed | `exec_params.rs` + network 按 pgid 绑定 | ✅ commit `b58b634`、`9f959f1`、`c5d1108` + fixes `902e522`/`e5c7214` | per-child 正向收窄非内核可强制等 seam 见 follow-ups |
 | M3 语义/默认/兜底（fork-plan F5） | 整箱 `max_processes` 默认 **256**（Q10）；多 child `checkpoint()` 显式拒绝；`pid_ns`+实例并存（PidKey 收窄 on-behalf /proc、init reaper）；统一 `InstanceDead`（FFI code 6 / python 消息）；idle `T_idle`/`T_max` | core + FFI/Python 错误面 | ✅ commit `b56fcbe`..`1321ba0`（F5.1–F5.5 + review fix） | **用户可见行为变化**已入 CHANGELOG（默认值/拒绝/Dead/寿命） |
@@ -153,6 +153,13 @@ keyed on `E2B_BASE_IMAGE` 的 `xfail(strict=True, run=False)`，故该用例此�
 `tests/contract/test_mcp_netns.py::test_mcp_full_path_under_net_isolation`；若仍失败，
 在 worker 栈定位（gateway stderr / 宿主映射端口快照）；修好前 §2 P4 的 E2B 侧 xfail 保持不动。
 
+**FUP-E1 关闭（2026-09-06，E2B Task 10/11）**：T4 根因 = envd 侧 base-image 组成
+（slim rootfs 无 `/usr/local/bin/mcp-gateway` → ENOENT exit 2），非 fork；改用本仓库
+`Dockerfile.mcp-base` 构建的 MCP-capable 基镜像 `python-mcp:3.14` 后，
+`test_mcp_full_path_under_net_isolation` 在 image-rootfs + netns 档通过，xfail 已摘除；
+E2B 全量门禁（Task 11）复跑全绿。基镜像构建与运行要求见 E2B 仓库
+`docs/HANDOFF.md`「M4 收口」与 `tests/contract/test_mcp_netns.py` 模块头。
+
 ### 3.4 wheel 与 tip 的一致性：fork 侧符号级自证 + supervise 指纹（已落地，F0.2 / F2b.5）
 
 wheel 产物时间戳早于 tip 提交，无法从文件本身判定；F0.2 起 fork 自己拥有 wheel 构建，产物与 tip 的
@@ -239,11 +246,15 @@ root 属主，实例复用只会把这个错位从"每条命令"变成"整个沙
 ### 3.8 内存/CPU/进程配额是按**实例**而非按沙箱（实测会超卖）
 
 **已修（fork 侧 M0–M3 落地，2026-09-05；commit `57f543c`（M0 SandboxInstance）..
-`1321ba0`（M3 语义 review fix），E2B §8 采纳的"一沙箱一实例 + exec"由 fork 交付，
-执行边界 = 产品边界 ⇒ 超卖由构造消除）**：下面保留的是 2026-09-03 的实测证据（历史
-形态：E2B 每条命令一个实例）。E2B 侧接上 §8 M4（gateway + 命令都走同一实例的 exec）
-后，内存/CPU/进程数按**实例**记账即按**沙箱**记账；fork 侧配套默认/语义见 §2 P9 采纳、
-`docs/fork-plan-2026-09.md` 阶段 F2–F5 与 CHANGELOG。
+`1321ba0`（M3 语义 review fix）；E2B 侧 §8 M4 接线 2026-09-06 收口（Task 1–11）——
+`SandlockExecutor` 每沙箱一只 exec-only `SandboxInstance`，命令与 MCP 网关都经
+`instance.exec()`，执行边界 = 产品边界 ⇒ 超卖由构造消除）**：下面保留的是 2026-09-03
+的实测证据（历史形态：E2B 每条命令一个实例）。E2B 侧落地后内存/CPU/进程数按**实例**
+记账即按**沙箱**记账；fork 侧配套默认/语义见 §2 P9 采纳、`docs/fork-plan-2026-09.md`
+阶段 F2–F5 与 CHANGELOG。两个 fork-blocked 边界登记在 E2B `docs/task-backlog.md`
+「M4 收口后的 open follow-ups」：fork F11（多线程进程存在后 argv-safety exec 冻结
+EPERM——FUP-E3 网关+命令变体依赖其修复）与网关 ledger headroom（512M 箱内 MCP server
+子进程仅剩 ~180M）。
 
 `max_memory` 由 `crates/sandlock-core/src/resource.rs` 在 `brk`/`mmap` 的 USER_NOTIF 里记账，
 账本挂在**该 Sandbox 实例**的运行时状态上（同实例内父+子会一起算，所以限额本身是有效的）。
@@ -381,8 +392,9 @@ core_integ 529→531。
 
 | 套件 | 结果 |
 |---|---|
-| E2B 全量（Linux 容器，镜像 rootfs + netns + XFS + npm + strict；2026-09-03 实测，E2B 侧） | `867 passed / 1 skipped / 2 xfailed / 0 failed / 0 error` |
-| E2B 全量（macOS 宿主，unit+contract+sdk python/js+security；2026-09-03 实测，E2B 侧） | `813 passed / 53 skipped / 0 failed` |
+| E2B 全量 gate A（Linux 容器，image-rootfs python-mcp:3.14 + netns + XFS + npm + strict；2026-09-06 实测，E2B 侧，log `tmp/m4-full-gate-a.log`） | `925 passed / 1 skipped / 1 xfailed(T5) / 0 failed / 0 error`（历史 09-03 行已被取代） |
+| E2B 全量 gate B（Linux 容器，pure sandlock + netns + strict；2026-09-06 实测，E2B 侧，log `tmp/m4-full-gate-b.log`） | `921 passed / 3 skipped / 3 failed`（3 failed = pre-existing pure-shape migration trio，`4f34e55` 复现，非 fork/M4 回归；E2B FUP） |
+| E2B 全量（macOS 宿主，unit+contract+sdk python/js+security；2026-09-06 实测，E2B 侧，log `tmp/m4-full-gate-macos.log`） | `865 passed / 58 skipped / 0 failed / 0 error` |
 | fork 全量门禁非 root 档（F9 终局，2026-09-05，sandlock-dev:latest 特权容器） | core_lib `822` / core_integ `531` / ffi `98` / cli `98` / supervise `36` / supervise_cost `3` / cli_build `0` / python `454`（log `tmp/sdd/f9-gate-nonroot.log`） |
 | fork 全量门禁 root 档（F9 终局，2026-09-05，同容器 root 阶段） | oci-root `144` / supervise_root `2` / mediation_2uid `5`（log `tmp/sdd/f9-oci-root.log`、`f9-supervise-root.log`、`f9-mediation-2uid.log`） |
 | fork wheel 自证（F9 终局重建，2026-09-05） | `python/build-wheels.sh` 双架构 + `python/verify-wheel.sh` 全绿（FFI 符号双向相等 + supervise 指纹三方一致 + `--uid` 拒绝冒烟；清单 HEAD = F9 tip）（log `tmp/sdd/f9-wheel-build.log`、`f9-wheel-verify.log`） |
@@ -426,6 +438,14 @@ fork 侧复跑命令（非 root 全程，入口脚本做一次性 root 准备）
 > §2 P9 采纳。余下的 **M4（E2B 接线：SandlockExecutor 持实例、`_CommandGate` 保留、
 > 控制目录名 sandbox_id + token、超卖探针改断言）在 E2B 仓库执行**，不在 fork 范围；
 > fork 侧文档与 follow-up 见 `docs/fork-plan-followups.md`。
+
+> **E2B M4 收口（2026-09-06，Task 1–11）**：上段"余下的 M4"已在 E2B 仓库全部落地——
+> `SandlockExecutor` 每沙箱一只 exec-only `SandboxInstance`（命令与网关都 exec），
+> 控制目录名用 sandbox_id + token，`update_network` 按 D4=A（S2 收窄/409），
+> `minimal_dev`、`max_processes=256`、§3.8 超卖探针转断言（FUP-E3 sibling-exec 形态）；
+> fork 核心冻结（wheel = b955ae9）不变。gate A（image-rootfs）+ macOS 全量 0 failed；
+> gate B pure 形态 3 条 migration 为既有缺陷（E2B FUP，非 fork/M4 回归）。详见 E2B
+> `docs/HANDOFF.md`「M4 收口」。
 
 > 决策：一个 E2B 沙箱 = 一个长命 sandlock 实例，命令是"往这个实例里 exec 一个进程"。
 > 目的：让**执行边界 = 产品边界**，§3.8 的内存/CPU/进程数超卖从根上消失。
@@ -501,13 +521,20 @@ socket，宿主只拿 fd）；Python 增量：`SandboxInstance.exec(...)` 返回
 - **M3**：S1 默认值调整、S3/S4 的拒绝或支持、S5/S6/S7 的生命周期与泄漏兜底。
 - **M4**：E2B 接线（`SandlockExecutor` 持 instance、`_CommandGate` 保留、控制目录名用 sandbox_id
   + 身份 token），并把 §3.8 的超卖探针从"记录"改成**断言**（第二条命令申请应被拒）。
+  ✅ 完成（E2B Task 1–11，2026-09-06；FUP-E3 sibling-exec 断言已落
+  `tests/contract/test_memory_quota_boxed.py`；网关+命令变体 fork-blocked → F11）。
 
 ### 7.6 需要 E2B 同步做的
 
-instance 持有与释放时机（delete/kill/migrate/evict/worker 重启）；`_build_sandbox` 的 per-command
-字段改走 `exec` 参数；`max_processes` 默认与容量联动（S1）；`update_network` 按 S2 落地并改契约测试；
-`command-logs.jsonl` 与 SL-1 复测（S6）；`docs/SCALING.md`、`resource-contention.md` 里
-"按沙箱预留 = 按实例核算"的一致性说明随之关闭 §3.8。
+**已完成（E2B Task 1–11，2026-09-06；提交与门禁见 E2B `docs/HANDOFF.md`「M4 收口」）**：
+instance 持有与释放时机（delete/kill/migrate/evict/worker 重启 → `close()` 幂等收口，
+closed/dead 重建一次）；`_build_sandbox` 的 per-command 字段改走 `exec` 参数
+（`cwd/env/clean_env/bind_ports`，PTY 用 `ExecStdio.PTY`）；`max_processes` 整箱默认
+256 与节点容量联动（`2048/256=8`）；`update_network` 按 S2 落地（D4=A：收窄可应用、
+放宽/翻转 409 不落库、staleness 日志）并同步契约测试；`minimal_dev` 替换整树 /dev；
+`docs/SCALING.md` / `resource-contention.md` 的"按沙箱预留 = 按实例核算"一致性说明已随
+M4 关闭 §3.8。残余：T5（route-B 前置，strict xfail）与 E2B 侧 follow-up
+（pure-shape workspace 属主对齐、远程 pause/resume 投递），见 E2B `docs/task-backlog.md`。
 
 ### 7.65 已评估的替代入口：直接把 `sandlock-oci` 当主入口（2026-09-04）
 
