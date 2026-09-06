@@ -1,4 +1,4 @@
-# Open follow-ups — sandlock fork（fork-plan-2026-09 F0–F9 收口后）
+# Open follow-ups — sandlock fork（fork-plan-2026-09 F0–F10 收口后）
 
 > 来源：各任务评审报告与 `.superpowers/sdd/progress.md` 的 Minor/residual 汇总
 > （F9 逐条处置，见 `tmp/sdd/f9-report.md` 的 closure 清单）。每条 = 来源（task/commit）、
@@ -139,6 +139,14 @@
 
 ## 已处置（F9 内完成，追溯用）
 
+- **F10（2026-09-06，本地提交）**：supervisor × chroot × 特权 RunAs 的
+  create/launch 回归（E2B M4 每沙箱 uid 形态）——`confine_child` 对特权 remap
+  形态把真实 chdir + NO_NEW_PRIVS + Landlock 前置到 userns remap 之前，root
+  0700 镜像缓存不再令 create/exec EACCES；非 remap / netns 自映射 / pid-ns
+  形态顺序不变；默认 `caller` C 档 fail-closed 不变。验收：root 档
+  `mediation_2uid` 5→8、非 root 档 `core_integ` 531→532（新
+  `test_instance_chroot.rs`）；报告 `tmp/sdd/f10-report.md`。E2B 侧待 wheel
+  重建后复跑探针（§3.1 F10 段）。
 - 文档级修正（F9 commit，见 `tmp/sdd/f9-report.md`）：plan/f2b 的 "≤8MB" 残留引用；
   fork-plan §1 套件表基线刷新；§2 矩阵 F1.1 行幻影 oci 用例归属订正；e2b §0/§1/§2/
   §3.1/3.3/3.8/3.9/§3.10/§5/§8 终审；sandbox-exec-security §4/§7 修复 commit 标注；

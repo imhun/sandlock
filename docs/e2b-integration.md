@@ -5,7 +5,8 @@
 > `sandlock-e2b/docs/HANDOFF.md`, which now only points here.
 >
 > 维护方：E2B（`sandlock-e2b`）。本文是该 fork 的**已做改动 / 待做方案 / 未解决问题**的唯一事实源。
-> 最后更新：2026-09-05（fork-plan F0–F9 全部收口，本文 §1/§2/§3.x/§5 已按真实 commit 终审）
+> 最后更新：2026-09-06（fork-plan F0–F9 于 2026-09-05 收口；F10 于 2026-09-06
+> 修复 supervisor × chroot × 特权 RunAs 的 create/launch 回归，本文 §0/§2/§3.1/§5 已更新）
 
 ## 0. 基线与硬约束
 
@@ -22,7 +23,8 @@
 （2026-09-03 计划期数字，**已被 F0.1 起的逐套实测替代**——当前全量数字按套件/档位登记在
 `docs/test-baseline.md`，F9 终局复验：core_lib 822 / core_integ 531 / ffi 98 / cli 98 /
 supervise 36 / supervise_cost 3 / cli_build 0 / python 454，root 档 oci 144 /
-supervise_root 2 / mediation_2uid 5，见 §5）。
+supervise_root 2 / mediation_2uid 5，见 §5）。F10（2026-09-06）：core_integ 532、
+mediation_2uid 8（见 §3.1 与 §5 的 F10 行）。
 
 ## 1. 已落地的修改方案（fork 侧）
 
@@ -44,15 +46,15 @@ supervise_root 2 / mediation_2uid 5，见 §5）。
 | M1 `exec` 下沉 + child 句柄（fork-plan F3） | init/proto/fdpass 从 `sandlock-oci` 原样搬入 `core::init`（oci 走 re-export seam，oci-root 144 精确不变）；per-child `exec/wait_child/kill_child/resize_child` + SCM_RIGHTS stdio；FFI `sandlock_instance_*`（launch/exec/wait/kill/resize/free，F4 再加 exec_params/update_network，cbindgen 同步）；Python `SandboxInstance.exec() -> ExecProcess` | core::init + supervise 双传输 + FFI/Python | ✅ commit `d063437`、`4411c7b`、`3d42bc7` + fix `3fa0b95` | supervise 主退出顺序竞态等见 `docs/fork-plan-followups.md` |
 | M2 per-exec 参数 + 子集校验（fork-plan F4） | per-exec `cwd/env/extra_writable/bind_ports`（execve 前 chdir/envp）；S9 单 choke point（越出实例上限 ⇒ EPERM/`PolicyTooWide`）；`update_network` 只绑新 exec + staleness 回报；per-child 网络按 pid 血缘、未归因 fail-closed | `exec_params.rs` + network 按 pgid 绑定 | ✅ commit `b58b634`、`9f959f1`、`c5d1108` + fixes `902e522`/`e5c7214` | per-child 正向收窄非内核可强制等 seam 见 follow-ups |
 | M3 语义/默认/兜底（fork-plan F5） | 整箱 `max_processes` 默认 **256**（Q10）；多 child `checkpoint()` 显式拒绝；`pid_ns`+实例并存（PidKey 收窄 on-behalf /proc、init reaper）；统一 `InstanceDead`（FFI code 6 / python 消息）；idle `T_idle`/`T_max` | core + FFI/Python 错误面 | ✅ commit `b56fcbe`..`1321ba0`（F5.1–F5.5 + review fix） | **用户可见行为变化**已入 CHANGELOG（默认值/拒绝/Dead/寿命） |
-| SL-1/P1/P2 路径中介身份（fork-plan F6.1） | A 档（同 uid 属主正确）+ B 档（两 supervise 不同 uid 真内核隔离硬证据）+ C 档 fail-closed（root 进程内 remap + 路径中介 ⇒ 建箱前拒绝）；`mediation_run_as=caller|supervisor` 贯穿 builder/Policy/FFI+cbindgen/CLI/Python/supervise 全字段 | notif/builder + 全栈 | ✅ commit `b62e201`、`dd5a7e8`、`7f81314` + fix `75bbe0b` | `--pid-ns` CLI 旧漏线等见 follow-ups |
+| SL-1/P1/P2 路径中介身份（fork-plan F6.1，F10 收口） | A 档（同 uid 属主正确）+ B 档（两 supervise 不同 uid 真内核隔离硬证据）+ C 档 fail-closed（root 进程内 remap + 路径中介 ⇒ 建箱前拒绝）；`mediation_run_as=caller|supervisor` 贯穿 builder/Policy/FFI+cbindgen/CLI/Python/supervise 全字段；F10 修复显式 supervisor 逃生门下 chroot × 特权 RunAs 的 create/launch 回归（remap 前做 chdir + Landlock） | notif/builder + 全栈 | ✅ commit `b62e201`、`dd5a7e8`、`7f81314` + fix `75bbe0b`；F10 本地提交 | `--pid-ns` CLI 旧漏线等见 follow-ups |
 | P5 `fs_mount` 单节点 + `minimal_dev`（fork-plan F6.2） | 单文件/chardev bind-mount（不再 ENOTDIR、ro 保持、写家族 EBUSY 防宿主源被删/移）；`minimal_dev()`（`ptmx/pts/null/urandom/zero/tty`）免整树挂 /dev 与 `/dev/shm` carve-out | core + FFI + CLI `--fs-mount` + Python | ✅ commit `de2f749`、`dc0edf3` + fix `6fcb8e2`（ffi 98、python 454） | link-at-mount-point 直击测试、目录挂载点 rmdir 等见 follow-ups |
 
 ## 2. 待实施的修改方案（E2B 提出，需要改 fork）
 
 | 编号 | 方案 | 优先级 | 说明 |
 |---|---|---|---|
-| **P1** | **SL-1 修法**：路径中介必须以**调用方身份**执行（`setfsuid/setfsgid(caller)` 包住被中介的 syscall，或 `openat(O_CREAT)` 后 `fchown` 回调用 uid）；`unlinkat/renameat2/fchmodat/fchownat` 需按**调用方**复现内核 DAC 判定（owner / sticky / `CAP_FOWNER` 相对该 inode 所在 mount 的 userns），不成立返回 EPERM | 高（多租户隔离） | **F9 终态：由 F2b 取代，仅保留 fail-closed**（route B 的 supervise 进程 euid == 沙箱 host uid ⇒ 原修法不再需要；`mediation_run_as=caller` 下 root 进程内 remap + 路径中介在 spawn 前被拒）。F6.1 commit `b62e201` + B/C 档验收 `7f81314` + fix `75bbe0b`。详见 §3.1 |
-| **P2** | 提供 `mediation_run_as = caller \| supervisor` 开关，便于既有依赖 COW/chroot 语义的调用方渐进迁移 | 中 | **F9 终态：已落地**（F6.1，commit `b62e201`/`dd5a7e8`）：builder / Policy / profile / FFI+cbindgen / CLI `--mediation-run-as` / Python / supervise 全字段清单；显式 `supervisor` 档 WARN + `stats()` 计数。详见 §3.1 |
+| **P1** | **SL-1 修法**：路径中介必须以**调用方身份**执行（`setfsuid/setfsgid(caller)` 包住被中介的 syscall，或 `openat(O_CREAT)` 后 `fchown` 回调用 uid）；`unlinkat/renameat2/fchmodat/fchownat` 需按**调用方**复现内核 DAC 判定（owner / sticky / `CAP_FOWNER` 相对该 inode 所在 mount 的 userns），不成立返回 EPERM | 高（多租户隔离） | **F10 终态：由 F2b 取代，仅保留 fail-closed**（route B 的 supervise 进程 euid == 沙箱 host uid ⇒ 原修法不再需要；`mediation_run_as=caller` 下 root 进程内 remap + 路径中介在 spawn 前被拒）。F6.1 commit `b62e201` + B/C 档验收 `7f81314` + fix `75bbe0b`；F10 修复 supervisor 逃生门下 chroot × 特权 RunAs 的 create/launch 回归。详见 §3.1 |
+| **P2** | 提供 `mediation_run_as = caller \| supervisor` 开关，便于既有依赖 COW/chroot 语义的调用方渐进迁移 | 中 | **F10 终态：已落地**（F6.1，commit `b62e201`/`dd5a7e8`）：builder / Policy / profile / FFI+cbindgen / CLI `--mediation-run-as` / Python / supervise 全字段清单；显式 `supervisor` 档 WARN + `stats()` 计数；**F10 前该逃生门在 chroot × root-0700 缓存 × 特权 RunAs 形态仍 create/launch 失败，F10 修复后可用**（`confine_child` 前置 chdir+Landlock 到 remap 前，仅特权 remap 形态）。详见 §3.1 |
 | **P3** ✅（commit `17ee48d`） | `_HANDLED_FIELDS` 登记 `notify_rate_limit`（**一行**） | 低（但污染每条日志） | **F9 终态：已修**：名字已登记入 `_HANDLED_FIELDS`，假告警消除；python 全量 454 已在 F0.1 基座 + F9 终局实测登记（`docs/test-baseline.md`） |
 | **P4** ✅（F7 前提证伪 + 回归 pin，commit `4e78c98`；文档 `da9c3a7`/`7183884`） | 修 T4：`net_isolation` + chroot（镜像 rootfs）下 MCP 入站端口映射起不来 | 中（该形态是 E2B 生产形态之一） | **F9 终态：fork 侧已闭环（非代码修复）**：chroot + `net_isolation` + `net_bind_map` 三合一形态经 9 种忠实构造（HEAD 与 T4 观测时代 `be387c7`）验证可用；新增 3 条镜像测试（mcp/epoll/poll under chroot，core_integ 529）。e2b 侧 T4 有真实 image-rootfs + netns 失败记录（strict-1 实跑，2026-09-03，与 §3.3 一致）；残差可能在 envd gateway 接线层，需 e2b 侧以 `E2B_BASE_IMAGE` + `xfail(run=True)` 复测 —— **显式 out-of-fork follow-up**（见 §3.3 / `docs/fork-plan-followups.md` FUP-E1） |
 | **P5** ✅（F6.2，commit `de2f749` + fix `6fcb8e2`） | `fs_mount` 目前只接受目录根（单文件/设备节点会以 `ENOTDIR` 失效）⇒ 调用方只能整树挂 `/dev`，进而**必须**下发 `fs_denied` 挡 `/dev/shm`，正好踩 SL-1。希望支持单节点挂载，或提供"最小可用 /dev（ptmx/pts/null/urandom）"构造 helper | 中（消除 SL-1 触发面） | **F9 终态：已修**：单文件/chardev 单节点 bind-mount（`resolv.conf`、`/dev/null` 形态不再 ENOTDIR，ro 保持、挂载点写家族 EBUSY）+ `minimal_dev()` helper（`ptmx/pts/null/urandom/zero/tty`），调用方可省整树 `/dev` 挂载与 `/dev/shm` carve-out；F6.1 chroot A档用例已改经 helper 构造 `/dev`（全程不下发 `fs_denied`）。详见 §3.1 |
@@ -102,6 +104,25 @@ carve-out，SL-1 的最大触发面由构造消除。另注：对挂载点本身
 unlink/rename/link 按真实 bind-mount 语义返回 `EBUSY`（防 nofollow 写家族
 直取宿主源删/移宿主文件）；目录挂载点的 `rmdir` 暴露为既有问题，不在 F6.2
 范围内。
+
+**F10 收口（2026-09-06，supervisor × chroot × 特权 RunAs 的逃生门真实可用）**：
+E2B M4 实测发现，显式 `supervisor` 档在 **chroot + root holder + `RunAs(非 0)`**
+形态下仍然 create/launch 失败（FFI/Python 只吐泛化
+`sandlock_create failed`/`sandlock_instance_launch failed`；Rust 层真实错误 =
+child 死于 notif-fd 前：`sandlock child: chdir: Permission denied (os error 13)`）。
+根因不在中介身份，而在 **remap 之后 confined child 用沙箱 host uid 去走真实
+路径**：镜像 rootfs 缓存（root 0700，不对外可遍历）使 `chdir` 到
+`rootfs/cwd` EACCES（建箱失败）；绕过 chdir 后，Landlock 规则构建的
+`exists()`/path_beneath 探测同样全部 EACCES ⇒ 空 ruleset 在 exec 期 deny-all。
+修法（fork 本地提交，F10）：**仅对特权 remap 形态**，把 `confine_child` 的真实
+`chdir` + `NO_NEW_PRIVS` + Landlock 前置到 userns remap 之前（Landlock 层跨
+userns 只增不减，限制不削弱）；非 remap / netns 自映射 / pid-ns 形态顺序不变
+（netns 自映射必须先在 Landlock 前写自身 `/proc/self/uid_map`）。默认 `caller`
+C 档 fail-closed 不变。回归用例：root 档 `mediation_2uid` 新增 one-shot
+`RunAs(10000)`、instance `RunAs(10000)`、instance uid-0 三个 restrictive-cache
+验收（5→8），非 root 档新增 `test_instance_chroot.rs` 同 uid exec-only 验收
+（core_integ 531→532）。**E2B 侧需在 fork wheel 重建后复跑 §8/M4 探针**
+（`tmp/mediation_probe.py` / `tmp/instance_probe.py`；修复已按探针根因对应）。
 
 ### 3.2 `notify_rate_limit` 假告警（Low）
 
@@ -365,6 +386,9 @@ core_integ 529→531。
 | fork 全量门禁非 root 档（F9 终局，2026-09-05，sandlock-dev:latest 特权容器） | core_lib `822` / core_integ `531` / ffi `98` / cli `98` / supervise `36` / supervise_cost `3` / cli_build `0` / python `454`（log `tmp/sdd/f9-gate-nonroot.log`） |
 | fork 全量门禁 root 档（F9 终局，2026-09-05，同容器 root 阶段） | oci-root `144` / supervise_root `2` / mediation_2uid `5`（log `tmp/sdd/f9-oci-root.log`、`f9-supervise-root.log`、`f9-mediation-2uid.log`） |
 | fork wheel 自证（F9 终局重建，2026-09-05） | `python/build-wheels.sh` 双架构 + `python/verify-wheel.sh` 全绿（FFI 符号双向相等 + supervise 指纹三方一致 + `--uid` 拒绝冒烟；清单 HEAD = F9 tip）（log `tmp/sdd/f9-wheel-build.log`、`f9-wheel-verify.log`） |
+| fork 全量门禁非 root 档（F10 终局，2026-09-06，sandlock-dev:latest 特权容器） | core_lib `822` / core_integ `532` / ffi `98` / cli `98` / supervise `36` / supervise_cost `3` / cli_build `0` / python `454`（log `tmp/sdd/f10-gate-nonroot.log`） |
+| fork 全量门禁 root 档（F10 终局，2026-09-06，同容器 root 阶段） | oci-root `144` / supervise_root `2` / mediation_2uid `8`（log `tmp/sdd/f10-oci-root.log`、`f10-supervise-root.log`、`f10-mediation-2uid.log`） |
+| E2B 探针（mediation/instance，F10 修复后需 tip wheel 重建验证） | fork 源码侧按探针根因修复并落 Rust 回归用例；wheel 重建后复跑 `tmp/mediation_probe.py` / `tmp/instance_probe.py`（预期：one-shot chroot+RunAs(1000)+supervisor 与 instance uid0/1000/65534+supervisor 全过；caller+RunAs(≠holder) 仍 C 档拒绝） |
 
 逐套件权威数字与历史注释见 `docs/test-baseline.md`（F9 终局已复核；本计划新增用例数
 已随各 commit 登记）。E2B 侧两行是 E2B 仓库 2026-09-03 的实测，fork F0–F9 期间未复跑

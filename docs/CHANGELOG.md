@@ -1,13 +1,24 @@
-# CHANGELOG — sandlock fork（fork-plan-2026-09，F0–F9）
+# CHANGELOG — sandlock fork（fork-plan-2026-09，F0–F10）
 
 > 范围：`upstream-pr/netns-free-clean`（本地提交，未推送）。本文件以 release-note 语义
-> 汇总 fork-plan F0–F9（2026-09-04/05）的特性、修复与**用户可见行为变化**；每条可追溯到
+> 汇总 fork-plan F0–F10（2026-09-04/06）的特性、修复与**用户可见行为变化**；每条可追溯到
 > commit（短 hash 见正文，完整链 `git log dab4087..HEAD` 与任务报告 `tmp/sdd/f*-report.md`）。
 > 每套件实测基线见 `docs/test-baseline.md`；跨任务遗留见 `docs/fork-plan-followups.md`；
 > E2B 集成状态见 `docs/e2b-integration.md`。
 
 ## 行为变化（升级 / 接线前必读）
 
+- **`mediation_run_as=supervisor` × chroot × 特权 RunAs 的 create/launch 回归修复**
+  （F10，本地提交）：E2B M4 每沙箱 uid 形态下（root holder 把沙箱 remap 到非零
+  host uid、rootfs 缓存放 root 0700 目录），`Sandbox.run`/exec-only
+  `SandboxInstance` 在 create/launch 阶段以
+  `read notif fd from child: pipe closed` 失败——根因是 confined child 在 userns
+  remap 把身份降到沙箱 host uid **之后**才做真实 `chdir` 与 Landlock 规则路径探测，
+  无法穿越只对 holder 开放的镜像缓存目录（chdir EACCES → 建箱失败；Landlock 规则全
+  被跳过 → 空 ruleset 在 exec 期 deny-all）。修法：仅对特权 remap 形态，把
+  chdir + NO_NEW_PRIVS + Landlock 前置到 remap 之前（Landlock 层跨 userns 迁移
+  只增不减，不削弱限制）；非 remap / netns 自映射 / pid-ns 形态保持原顺序。
+  默认 `caller` + root + RunAs(≠holder) + 路径中介的 C 档 fail-closed **不变**。
 - **`max_processes` 语义从"每命令 64"改为"整箱/实例上限"，默认 256**（F5.1，commit
   `b56fcbe`）。单实例整棵进程树共享一份配额；fork 超限在沙箱内被拒。exec 会话的
   fork-slot 由权威 pidfd 路径归还（顺带修复 argv-safety 冻结/线程迁移 hang，
@@ -107,9 +118,9 @@ sandlock_instance_free                              # F3.3
 
 ## 测试 / 验证基座
 
-- 全量门禁 = 非 root 档（core_lib 822 / core_integ 531 / ffi 98 / cli 98 /
+- 全量门禁 = 非 root 档（core_lib 822 / core_integ 532 / ffi 98 / cli 98 /
   supervise 36 / supervise_cost 3 / cli_build 0 / python 454）+ root 档
-  （oci 144 / supervise_root 2 / mediation_2uid 5）+ `--wheels`；
+  （oci 144 / supervise_root 2 / mediation_2uid 8）+ `--wheels`；
   数字逐 commit 登记 `docs/test-baseline.md`，脚本缺一即红、skip 即红。
 - 本计划新增用例全部随阶段 commit 落盘（红→绿证据在 `tmp/sdd/f*-red*.log`，
   终局全绿 `tmp/sdd/f9-gate-*.log`）。
