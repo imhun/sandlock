@@ -4,7 +4,7 @@ use sandlock_core::sandbox::ByteSize;
 use std::net::{IpAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn temp_file(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("sandlock-test-policyfn-{}-{}", name, std::process::id()))
@@ -240,6 +240,108 @@ async fn test_policy_fn_deny_by_argv() {
     let result = policy.clone().run_interactive(&["echo", "malicious"],
     ).await.unwrap();
     assert!(!result.success(), "execve with 'malicious' in argv should be denied");
+}
+
+/// F11 root-cause regression: the argv-safety exec freeze must tolerate a
+/// multithreaded peer already living in the instance.
+///
+/// An exec-only session with an active `policy_fn` runs in argv-safety mode:
+/// every tracked TGID is enumerated and every TID found under
+/// `/proc/<tgid>/task` is ptrace-frozen before execve argv is exposed. A
+/// thread created by the sandbox process itself (clone(CLONE_THREAD)) is
+/// *not* birth-tracked (threads do not count toward `max_processes`), but a
+/// thread that performs a mediated brk/mmap is lazily registered in
+/// `ProcessIndex` under its own tid. The pre-F11 freeze treated that key as
+/// an independent TGID and walked the same thread group twice; the second
+/// `PTRACE_SEIZE` of an already-frozen TID failed with EPERM and the later
+/// exec was denied — the child dies with init's exec-failure exit 127. The
+/// second exec must instead succeed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_instance_exec_after_threaded_peer_succeeds() {
+    use sandlock_core::instance::{ExecStdio, SandboxInstance};
+    use sandlock_core::result::ExitStatus;
+
+    let seq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let ready = format!("/tmp/sandlock-f11-ready-{}-{seq}", std::process::id());
+    let release = format!("/tmp/sandlock-f11-release-{}-{seq}", std::process::id());
+    // Main thread spawns one real thread (clone(CLONE_THREAD)). The daemon
+    // thread performs a mediated mmap (memory accounting notifies the
+    // supervisor), which lazily registers its TID in ProcessIndex next to
+    // the thread-group leader — the pre-F11 freeze then walks the same TGID
+    // twice and the second PTRACE_SEIZE of an already-frozen TID fails
+    // EPERM, denying every later exec. The main writes the ready file only
+    // after the thread is up; a short settle lets the registration land.
+    let helper = format!(
+        concat!(
+            "import os, threading, time\n",
+            "def spin():\n",
+            "    buf = bytearray(8 * 1024 * 1024)\n",
+            "    buf[0] = 1\n",
+            "    while True:\n",
+            "        time.sleep(1)\n",
+            "t = threading.Thread(target=spin, daemon=True)\n",
+            "t.start()\n",
+            "open('{ready}', 'w').write('ready\\n')\n",
+            "while not os.path.exists('{release}'):\n",
+            "    time.sleep(0.02)\n",
+        ),
+        ready = ready,
+        release = release,
+    );
+
+    let policy = base_policy()
+        // Memory accounting mediates brk/mmap, which is what makes the
+        // helper thread's allocation register its TID in ProcessIndex.
+        .max_memory(ByteSize::mib(512))
+        .policy_fn(|_event, _ctx| Verdict::Allow)
+        .build()
+        .unwrap();
+
+    let mut inst = SandboxInstance::launch_exec_only(policy)
+        .await
+        .expect("launch exec-only instance");
+
+    let _helper_h = inst
+        .exec(&["/usr/local/bin/python3", "-c", &helper], ExecStdio::Null)
+        .await
+        .expect("exec threaded helper");
+
+    // Wait until the helper has proven its thread is up, so the freeze below
+    // really walks a multithreaded TGID.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !std::path::Path::new(&ready).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "threaded helper never reported ready"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Give the thread's mmap notification time to round-trip through the
+    // supervisor so its lazy ProcessIndex registration is observable.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let second = inst
+        .exec(&["/bin/true"], ExecStdio::Null)
+        .await
+        .expect("exec after a threaded peer must be accepted");
+    let status = inst
+        .wait_child(second.child_id)
+        .await
+        .expect("wait for second exec");
+    assert_eq!(
+        status,
+        ExitStatus::Code(0),
+        "exec after a threaded peer must succeed: the argv-safety freeze has \
+         to cover non-leader TIDs of tracked TGIDs"
+    );
+
+    std::fs::write(&release, b"go").expect("release threaded helper");
+    let _ = inst.shutdown().await;
+    let _ = std::fs::remove_file(&ready);
+    let _ = std::fs::remove_file(&release);
 }
 
 /// Test event has host/port metadata for connect.

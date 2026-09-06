@@ -28,7 +28,13 @@
 # test_instance_chroot.rs non-root same-uid exec-only acceptance) and +3
 # mediation_2uid (root RunAs(10000)/uid0 restrictive-cache acceptance) —
 # logs tmp/sdd/f10-*.
-core_lib = 822 # F6.2 review I1/I2: 821 -> 822, +1 unit test
+core_lib = 823 # F11 (2026-09-06): 822 -> 823, +1 unit test in
+               # freeze.rs (freeze_deduplicates_thread_group_keys) pinning
+               # the TGID-key normalization of the argv-safety exec freeze
+               # (a lazily-registered non-leader thread key next to its
+               # leader must not make the freeze seize one thread group
+               # twice — EPERM on the second pass, F11).
+               # F6.2 review I1/I2: 821 -> 822, +1 unit test
                # (sandbox::tests::minimal_dev_registers_exactly_the_six_dev_
                # nodes) pinning the minimal_dev() six-node rw set.
                # F6.1 review I1: 820 -> 821, +1 unit test
@@ -75,7 +81,15 @@ core_lib = 822 # F6.2 review I1/I2: 821 -> 822, +1 unit test
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 532 # F10: 531 -> 532, +1 in the new integration/
+core_integ = 533 # F11 (2026-09-06): 532 -> 533, +1 argv-safety root-cause
+                 # regression in integration/test_policy_fn.rs
+                 # (test_instance_exec_after_threaded_peer_succeeds): an
+                 # exec-only instance whose threaded helper registers its
+                 # worker TID (mediated mmap) must still accept a later
+                 # exec — the second exec died exit 127 with "argv-safety
+                 # freeze failed ... PTRACE_SEIZE ... Operation not
+                 # permitted" on the F11 pre-fix tip.
+                 # F10: 531 -> 532, +1 in the new integration/
                  # test_instance_chroot.rs
                  # (test_instance_exec_only_chroot_supervisor_same_uid_
                  # launch_and_exec) — mainless exec-only instance over a

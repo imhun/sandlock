@@ -24,7 +24,11 @@
 //! `ProcessIndex` before it can run user code. The exec freeze can
 //! therefore enumerate every tracked TGID, walk `/proc/<tgid>/task`,
 //! and `PTRACE_SEIZE` + `PTRACE_INTERRUPT` every TID that could mutate
-//! argv.
+//! argv. Index keys are normalized to their thread-group leaders first:
+//! a thread that issued a mediated syscall is lazily registered under its
+//! own tid, so the raw key set can name one TGID several times — freezing
+//! must visit each TGID exactly once or the second pass would try to seize
+//! an already-frozen TID (`EPERM`; F11).
 //!
 //! # Sibling vs peer cleanup
 //!
@@ -130,7 +134,10 @@ fn seize_and_interrupt(tid: i32) -> io::Result<SeizeOutcome> {
         if err.raw_os_error() == Some(libc::ESRCH) {
             return Ok(SeizeOutcome::NotNeeded); // already exited
         }
-        return Err(err);
+        return Err(io::Error::new(
+            err.kind(),
+            format!("PTRACE_SEIZE tid {tid}: {err}"),
+        ));
     }
     // PTRACE_SEIZE succeeded; from here, any error path must DETACH
     // before returning so we don't leave the task traced-but-running.
@@ -144,7 +151,10 @@ fn seize_and_interrupt(tid: i32) -> io::Result<SeizeOutcome> {
         if err.raw_os_error() == Some(libc::ESRCH) {
             return Ok(SeizeOutcome::NotNeeded);
         }
-        return Err(err);
+        return Err(io::Error::new(
+            err.kind(),
+            format!("PTRACE_INTERRUPT tid {tid}: {err}"),
+        ));
     }
 
     // Bounded reap. A runnable task stops within a scheduling quantum; the
@@ -263,12 +273,14 @@ impl std::fmt::Display for FreezeError {
 /// the supervisor reads it for `policy_fn` and before the kernel
 /// re-reads it.
 ///
-/// Walks every TGID in `processes`, enumerates each TGID's threads via
-/// `/proc/<tgid>/task/`, and `PTRACE_SEIZE` + `PTRACE_INTERRUPT`s
-/// every TID except `caller_tid`. Sibling threads of `caller_tid` and
-/// peer threads in other TGIDs are both covered. `processes` is
-/// complete for `policy_fn` runs because fork-like syscalls are tracked
-/// before new children can run.
+/// Walks every *unique* TGID in `processes`, enumerates each TGID's
+/// threads via `/proc/<tgid>/task/`, and `PTRACE_SEIZE` +
+/// `PTRACE_INTERRUPT`s every TID except `caller_tid`. Sibling threads of
+/// `caller_tid` and peer threads in other TGIDs are both covered. Keys are
+/// resolved to their thread-group leaders (a lazily-registered thread key
+/// resolves to its leader's TGID) so one thread group is never walked or
+/// seized twice. `processes` is complete for `policy_fn` runs because
+/// fork-like syscalls are tracked before new children can run.
 ///
 /// Strict semantics: if any task refuses to be frozen, every
 /// already-frozen task is detached and the error is propagated. The
@@ -284,7 +296,28 @@ pub(crate) fn freeze_sandbox_for_execve(
 ) -> Result<SandboxFreeze, FreezeError> {
     let no_pending = |error| FreezeError { error, pending_tids: Vec::new() };
     let caller_tgid = read_tgid_of_tid(caller_tid).map_err(no_pending)?;
-    let mut tgids: HashSet<i32> = processes.pids_snapshot();
+    // Normalize every index key to its thread-group leader. A non-leader
+    // thread that issued a mediated syscall is lazily registered under its
+    // own tid (register_pid_if_new), so the raw key set can contain several
+    // keys for one TGID. Walking each key as a separate "tgid" would
+    // re-enumerate the same /proc/<tgid>/task once per key and PTRACE_SEIZE
+    // an already-frozen TID on the second pass — EPERM, denying the execve
+    // (F11). Freezing is per thread group: every thread that can mutate
+    // argv is discovered by the /proc/<tgid>/task walk of its leader.
+    let mut tgids: HashSet<i32> = HashSet::new();
+    for pid in processes.pids_snapshot() {
+        match crate::seccomp::state::read_tgid_of_tid(pid) {
+            Some(tgid) => {
+                tgids.insert(tgid);
+            }
+            // The task exited between the snapshot and the read: nothing of
+            // it remains to freeze. Keeping the raw pid is harmless — the
+            // /proc walk below will simply fail and skip it.
+            None => {
+                tgids.insert(pid);
+            }
+        }
+    }
     tgids.insert(caller_tgid);
 
     let mut sibling_tids: Vec<i32> = Vec::new();
@@ -627,6 +660,104 @@ mod tests {
         detach_peers(&outcome.peer_tids);
         let _ = peer.kill();
         let _ = peer.wait();
+        let _ = caller.kill();
+        let _ = caller.wait();
+    }
+
+    /// F11 regression: `ProcessIndex` can hold a lazily-registered non-leader
+    /// thread key next to its thread-group leader (a thread that issued a
+    /// mediated syscall is registered under its own tid). The freeze must
+    /// resolve keys to unique TGIDs so one thread group is never walked and
+    /// seized twice — the second pass would `PTRACE_SEIZE` an already-frozen
+    /// TID and fail with EPERM, denying the execve.
+    #[test]
+    fn freeze_deduplicates_thread_group_keys() {
+        use std::process::{Command, Stdio};
+
+        // A threaded "peer": python3 with one daemon thread. The thread TID
+        // is registered as a *separate* ProcessIndex key, exactly like the
+        // lazy registration of a mediated-syscall thread.
+        let python = if std::path::Path::new("/usr/local/bin/python3").exists() {
+            "/usr/local/bin/python3"
+        } else {
+            "python3"
+        };
+        let mut holder = Command::new(python)
+            .args([
+                "-c",
+                "import threading,time\n\
+                 def spin():\n\
+                 \x20   time.sleep(60)\n\
+                 t=threading.Thread(target=spin,daemon=True)\n\
+                 t.start()\n\
+                 time.sleep(60)\n",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn threaded holder");
+        let holder_pid = holder.id() as i32;
+
+        // Wait until the daemon thread exists so the freeze faces a real
+        // non-leader TID.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let thread_tid = loop {
+            if let Ok(tids) = list_threads_of_tgid(holder_pid) {
+                if let Some(t) = tids.into_iter().find(|t| *t != holder_pid) {
+                    break t;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "holder python never created its thread"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        // The "execve caller", a separate descendant of this test process.
+        let mut caller = Command::new("/bin/sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn caller sleep");
+        let caller_pid = caller.id() as i32;
+
+        // Both the leader and the non-leader thread are registered under
+        // their own keys (the pre-F11 duplicate shape).
+        let processes = ProcessIndex::new();
+        processes
+            .register(holder_pid)
+            .expect("register holder leader");
+        processes
+            .register(thread_tid)
+            .expect("register holder thread key");
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let outcome = freeze_sandbox_for_execve(&processes, caller_pid)
+            .expect("freeze must tolerate duplicate thread-group keys");
+        // Every TID of the holder TGID is frozen exactly once.
+        let holder_tids = list_threads_of_tgid(holder_pid).expect("list holder tids");
+        for tid in &holder_tids {
+            assert!(
+                outcome.peer_tids.contains(tid),
+                "holder tid {tid} must be frozen as a peer: {:?}",
+                outcome.peer_tids
+            );
+        }
+        assert_eq!(
+            outcome.peer_tids.len(),
+            holder_tids.len(),
+            "each holder TID must be frozen exactly once: {:?}",
+            outcome.peer_tids
+        );
+
+        detach_peers(&outcome.peer_tids);
+        let _ = holder.kill();
+        let _ = holder.wait();
         let _ = caller.kill();
         let _ = caller.wait();
     }
