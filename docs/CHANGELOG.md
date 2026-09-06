@@ -1,13 +1,26 @@
-# CHANGELOG — sandlock fork（fork-plan-2026-09，F0–F10）
+# CHANGELOG — sandlock fork（fork-plan-2026-09，F0–F11）
 
 > 范围：`upstream-pr/netns-free-clean`（本地提交，未推送）。本文件以 release-note 语义
-> 汇总 fork-plan F0–F10（2026-09-04/06）的特性、修复与**用户可见行为变化**；每条可追溯到
+> 汇总 fork-plan F0–F11（2026-09-04/06）的特性、修复与**用户可见行为变化**；每条可追溯到
 > commit（短 hash 见正文，完整链 `git log dab4087..HEAD` 与任务报告 `tmp/sdd/f*-report.md`）。
 > 每套件实测基线见 `docs/test-baseline.md`；跨任务遗留见 `docs/fork-plan-followups.md`；
 > E2B 集成状态见 `docs/e2b-integration.md`。
 
 ## 行为变化（升级 / 接线前必读）
 
+- **argv-safety exec 冻结兼容实例内多线程进程**（F11，本地提交）：E2B 探针实测
+  线程化网关/uvicorn 一旦存活，后续每条命令 exec 都被拒
+  （`argv-safety freeze failed ... PTRACE_SEIZE ... Operation not permitted`
+  → child exit 127）。根因不是"线程未被 birth-track 而不可 seize"，而是
+  `ProcessIndex` 会为发出过被中介 syscall 的非 leader 线程**额外登记一个以线程
+  tid 为 key 的条目**（与 leader 同 TGID）；exec 冻结按 index key 逐个当作独立
+  TGID 走 `/proc/<tgid>/task`，同一线程组被枚举两次，第二次
+  `PTRACE_SEIZE` 命中的正是本冻结刚冻结的 TID ⇒ EPERM ⇒ 拒 exec。修法：冻结前
+  把 index keys 归一化为唯一 TGID（`freeze.rs`），每个线程组只冻结一次；
+  TOCTOU 不变量不变（argv 写入者 = 同 TGID 兄弟线程 + 异 TGID peer，仍全部
+  冻结到 NOTIF_SEND 之后），线程数/进程数语义、birth-track 与计费规则不动。
+  用户可见变化：多线程进程存在后，exec-only 实例的后续 exec 恢复成功（E2B
+  FUP-E3 网关+命令变体的 fork 侧阻塞解除）。
 - **`mediation_run_as=supervisor` × chroot × 特权 RunAs 的 create/launch 回归修复**
   （F10，本地提交）：E2B M4 每沙箱 uid 形态下（root holder 把沙箱 remap 到非零
   host uid、rootfs 缓存放 root 0700 目录），`Sandbox.run`/exec-only

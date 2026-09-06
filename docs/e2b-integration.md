@@ -6,7 +6,9 @@
 >
 > 维护方：E2B（`sandlock-e2b`）。本文是该 fork 的**已做改动 / 待做方案 / 未解决问题**的唯一事实源。
 > 最后更新：2026-09-06（fork-plan F0–F9 于 2026-09-05 收口；F10 于 2026-09-06
-> 修复 supervisor × chroot × 特权 RunAs 的 create/launch 回归，本文 §0/§2/§3.1/§5 已更新）
+> 修复 supervisor × chroot × 特权 RunAs 的 create/launch 回归，本文 §0/§2/§3.1/§5 已更新；
+> F11 于 2026-09-06 修复 argv-safety exec freeze × 多线程进程树
+> （FUP-E3 网关+命令变体的 fork 侧阻塞，本文 §3.8/§5/§8 已更新）。
 
 ## 0. 基线与硬约束
 
@@ -24,7 +26,8 @@
 `docs/test-baseline.md`，F9 终局复验：core_lib 822 / core_integ 531 / ffi 98 / cli 98 /
 supervise 36 / supervise_cost 3 / cli_build 0 / python 454，root 档 oci 144 /
 supervise_root 2 / mediation_2uid 5，见 §5）。F10（2026-09-06）：core_integ 532、
-mediation_2uid 8（见 §3.1 与 §5 的 F10 行）。
+mediation_2uid 8（见 §3.1 与 §5 的 F10 行）。F11（2026-09-06）：core_lib 823、
+core_integ 533（root 档三套不变；见 §3.8/§5/§8 的 F11 行）。
 
 ## 1. 已落地的修改方案（fork 侧）
 
@@ -254,7 +257,14 @@ root 属主，实例复用只会把这个错位从"每条命令"变成"整个沙
 阶段 F2–F5 与 CHANGELOG。两个 fork-blocked 边界登记在 E2B `docs/task-backlog.md`
 「M4 收口后的 open follow-ups」：fork F11（多线程进程存在后 argv-safety exec 冻结
 EPERM——FUP-E3 网关+命令变体依赖其修复）与网关 ledger headroom（512M 箱内 MCP server
-子进程仅剩 ~180M）。
+子进程仅剩 ~180M）。**fork F11 已于 2026-09-06 修复（fork 本地提交，见
+`docs/fork-plan-followups.md` 已处置段 / CHANGELOG）：根因是冻结把 ProcessIndex
+里懒登记的线程 tid key 当成独立 TGID 重复枚举同一线程组，第二次
+PTRACE_SEIZE 命中已冻结 TID 而 EPERM；修法为冻结前归一化为唯一 TGID。E2B 真栈
+探针（`e2b-sandlock-test:latest` + `tmp/fup3_thread_probe.py`）已由 fork 侧验证
+RED→GREEN（`third_party/sandlock/tmp/sdd/f11-e2b-red.log` /
+`f11-e2b-green.log`）。**E2B 侧待 wheel 重建后复跑 FUP-E3 网关+命令变体**（ledger
+headroom 那条边界仍 open，见 §5 F11 行）。
 
 `max_memory` 由 `crates/sandlock-core/src/resource.rs` 在 `brk`/`mmap` 的 USER_NOTIF 里记账，
 账本挂在**该 Sandbox 实例**的运行时状态上（同实例内父+子会一起算，所以限额本身是有效的）。
@@ -400,6 +410,9 @@ core_integ 529→531。
 | fork wheel 自证（F9 终局重建，2026-09-05） | `python/build-wheels.sh` 双架构 + `python/verify-wheel.sh` 全绿（FFI 符号双向相等 + supervise 指纹三方一致 + `--uid` 拒绝冒烟；清单 HEAD = F9 tip）（log `tmp/sdd/f9-wheel-build.log`、`f9-wheel-verify.log`） |
 | fork 全量门禁非 root 档（F10 终局，2026-09-06，sandlock-dev:latest 特权容器） | core_lib `822` / core_integ `532` / ffi `98` / cli `98` / supervise `36` / supervise_cost `3` / cli_build `0` / python `454`（log `tmp/sdd/f10-gate-nonroot.log`） |
 | fork 全量门禁 root 档（F10 终局，2026-09-06，同容器 root 阶段） | oci-root `144` / supervise_root `2` / mediation_2uid `8`（log `tmp/sdd/f10-oci-root.log`、`f10-supervise-root.log`、`f10-mediation-2uid.log`） |
+| fork 全量门禁非 root 档（F11 终局，2026-09-06，sandlock-dev:latest 特权容器） | core_lib `823` / core_integ `533` / ffi `98` / cli `98` / supervise `36` / supervise_cost `3` / cli_build `0` / python `454`（log `tmp/sdd/f11-gate-nonroot.log`） |
+| fork 全量门禁 root 档（F11 终局，2026-09-06，同容器 root 阶段） | oci-root `144` / supervise_root `2` / mediation_2uid `8`（log `tmp/sdd/f11-oci-root.log`、`f11-supervise-root.log`、`f11-mediation-2uid.log`） |
+| E2B 真栈探针（argv-safety × 多线程，F11） | fork 侧在 `e2b-sandlock-test:latest` 真栈复跑 `tmp/fup3_thread_probe.py`（E2B 仓库探针，只读挂载）：RED（wheel 基线）`argv-safety freeze failed for pid 26: PTRACE_SEIZE tid 22: Operation not permitted` → B exit 127（`tmp/sdd/f11-e2b-red.log`）；GREEN（F11 debug .so 热替换）B exit 0 / stdout `b-ok\n`（`f11-e2b-green.log`）。正式 wheel 重建 + E2B 全量复跑由控制器执行 |
 | E2B 探针（mediation/instance，F10 修复后需 tip wheel 重建验证） | fork 源码侧按探针根因修复并落 Rust 回归用例；wheel 重建后复跑 `tmp/mediation_probe.py` / `tmp/instance_probe.py`（预期：one-shot chroot+RunAs(1000)+supervisor 与 instance uid0/1000/65534+supervisor 全过；caller+RunAs(≠holder) 仍 C 档拒绝） |
 
 逐套件权威数字与历史注释见 `docs/test-baseline.md`（F9 终局已复核；本计划新增用例数
@@ -443,7 +456,10 @@ fork 侧复跑命令（非 root 全程，入口脚本做一次性 root 准备）
 > `SandlockExecutor` 每沙箱一只 exec-only `SandboxInstance`（命令与网关都 exec），
 > 控制目录名用 sandbox_id + token，`update_network` 按 D4=A（S2 收窄/409），
 > `minimal_dev`、`max_processes=256`、§3.8 超卖探针转断言（FUP-E3 sibling-exec 形态）；
-> fork 核心冻结（wheel = b955ae9）不变。gate A（image-rootfs）+ macOS 全量 0 failed；
+> fork 核心在 F10 冻结（wheel = b955ae9）；F11（2026-09-06）修复 argv-safety
+> exec freeze × 多线程进程树后，控制器将按 F11 tip 重建 wheel 并复跑
+> FUP-E3 网关+命令变体（fork 侧真栈探针已 RED→GREEN，见 §5 F11 行）。
+> gate A（image-rootfs）+ macOS 全量 0 failed；
 > gate B pure 形态 3 条 migration 为既有缺陷（E2B FUP，非 fork/M4 回归）。详见 E2B
 > `docs/HANDOFF.md`「M4 收口」。
 
@@ -523,6 +539,10 @@ socket，宿主只拿 fd）；Python 增量：`SandboxInstance.exec(...)` 返回
   + 身份 token），并把 §3.8 的超卖探针从"记录"改成**断言**（第二条命令申请应被拒）。
   ✅ 完成（E2B Task 1–11，2026-09-06；FUP-E3 sibling-exec 断言已落
   `tests/contract/test_memory_quota_boxed.py`；网关+命令变体 fork-blocked → F11）。
+  **fork F11 已修（2026-09-06，fork 本地提交）**：多线程进程存在后 argv-safety
+  exec 冻结 EPERM 的根因（线程 tid 懒登记导致同一 TGID 被冻结两次）已在 fork
+  修复并落 Rust 回归（core_lib 823 / core_integ 533，见 §5 F11 行）；E2B 侧
+  网关+命令变体待 fork wheel 重建后由控制器复跑。
 
 ### 7.6 需要 E2B 同步做的
 

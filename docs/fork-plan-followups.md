@@ -1,4 +1,4 @@
-# Open follow-ups — sandlock fork（fork-plan-2026-09 F0–F10 收口后）
+# Open follow-ups — sandlock fork（fork-plan-2026-09 F0–F11 收口后）
 
 > 来源：各任务评审报告与 `.superpowers/sdd/progress.md` 的 Minor/residual 汇总
 > （F9 逐条处置，见 `tmp/sdd/f9-report.md` 的 closure 清单）。每条 = 来源（task/commit）、
@@ -137,8 +137,22 @@
 - **FUP-E3 E2B 复验 §3.8 超卖消除** — M4 落地后按 e2b-integration §3.8 探针重测
   （gateway + 并发命令同实例）。
 
-## 已处置（F9 内完成，追溯用）
+## 已处置（F9–F11 内完成，追溯用）
 
+- **F11（2026-09-06，本地提交）**：argv-safety exec freeze × 多线程进程树
+  （E2B M4 FUP-E3 网关+命令变体的 fork 侧阻塞）。根因：`ProcessIndex` 为发过
+  被中介 syscall 的线程以 tid 为 key 懒登记（与 leader 同 TGID），exec 冻结把
+  index keys 逐个当独立 TGID 走 `/proc/<tgid>/task` ⇒ 同一线程组枚举两次，
+  第二次 `PTRACE_SEIZE` 命中已冻结 TID ⇒ EPERM ⇒ 后续 exec 全拒（exit 127）。
+  修法：`freeze.rs` 冻结前把 keys 归一化为唯一 TGID，每线程组只冻结一次；
+  TOCTOU 不变量与线程/进程语义不变（线程不做 birth-track、不计数——不需要，
+  冻结本就按 `/proc/<tgid>/task` 发现全部线程）。验收：core_lib 822→823
+  （`freeze_deduplicates_thread_group_keys`）、core_integ 532→533
+  （`test_instance_exec_after_threaded_peer_succeeds`）；E2B 真栈探针
+  （`e2b-sandlock-test:latest` + `tmp/fup3_thread_probe.py`）RED
+  `PTRACE_SEIZE tid N: Operation not permitted` → GREEN `exit 0`；
+  报告 `tmp/sdd/f11-report.md`。E2B 侧 FUP-E3 网关+命令变体待控制器重建
+  wheel 后复跑。
 - **F10（2026-09-06，本地提交）**：supervisor × chroot × 特权 RunAs 的
   create/launch 回归（E2B M4 每沙箱 uid 形态）——`confine_child` 对特权 remap
   形态把真实 chdir + NO_NEW_PRIVS + Landlock 前置到 userns remap 之前，root
