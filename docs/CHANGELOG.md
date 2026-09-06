@@ -1,13 +1,25 @@
-# CHANGELOG — sandlock fork（fork-plan-2026-09，F0–F11）
+# CHANGELOG — sandlock fork（fork-plan-2026-09，F0–F12）
 
 > 范围：`upstream-pr/netns-free-clean`（本地提交，未推送）。本文件以 release-note 语义
-> 汇总 fork-plan F0–F11（2026-09-04/06）的特性、修复与**用户可见行为变化**；每条可追溯到
+> 汇总 fork-plan F0–F12（2026-09-04/06）的特性、修复与**用户可见行为变化**；每条可追溯到
 > commit（短 hash 见正文，完整链 `git log dab4087..HEAD` 与任务报告 `tmp/sdd/f*-report.md`）。
 > 每套件实测基线见 `docs/test-baseline.md`；跨任务遗留见 `docs/fork-plan-followups.md`；
 > E2B 集成状态见 `docs/e2b-integration.md`。
 
 ## 行为变化（升级 / 接线前必读）
 
+- **ProcessIndex 改为每 TGID 一个 entry（建模收口，F12，本地提交）**：发出过被
+  中介 syscall 的非 leader 线程不再以线程 tid 懒登记独立 entry（Linux 6.9+
+  `PIDFD_THREAD` 路径删除）——线程通知一律解析并路由到其 TGID leader 的 entry；
+  leader 未跟踪时以 leader pid 注册（pidfd + start_time）。`ProcessIndex`
+  的 key 集合即 TGID 集合：无每线程 pidfd watcher/冗余状态，freeze/记账/cwd/退出
+  清理不再依赖「同 TGID 多 key + leader fallback」的隐式约定（F11 冻结侧归一化
+  保留为防御）。**用户可见**：内存/进程配额、exec、cwd、freeze、checkpoint 语义
+  不变；`stats().live_watchers` 现按进程组计数（此前 6.9+ 内核下被中介过的线程
+  会各自占一个 watcher 计数）；6.9+ 内核上虚拟化 `/proc` 列表不再单独列出被中介
+  线程的 tid 目录（与旧内核既有行为一致，列表按 leader 归组）。旧内核形态
+  （线程永不建 key）从「部分内核的角落」变成唯一形态，`/proc/<tid>` 可读性判定
+  同步改为 leader-aware。
 - **argv-safety exec 冻结兼容实例内多线程进程**（F11，本地提交）：E2B 探针实测
   线程化网关/uvicorn 一旦存活，后续每条命令 exec 都被拒
   （`argv-safety freeze failed ... PTRACE_SEIZE ... Operation not permitted`

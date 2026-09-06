@@ -21,6 +21,14 @@
 # unchanged from the per-task registrations below; this header is the dated
 # confirmation for the fork-plan closure.
 #
+# F12 (2026-09-06): ProcessIndex one-entry-per-TGID modeling closure —
+# 823 -> 827, +4 unit tests in resource.rs + seccomp/state.rs
+# (thread_notification_registers_single_leader_entry,
+# thread_notification_never_adds_second_key_for_tracked_leader,
+# thread_notified_group_cleans_up_single_entry_on_exit,
+# thread_of_tracked_leader_resolves_to_leaders_entry); one existing cwd test
+# updated to the leader-aware tracking shape. core_integ unchanged at 533.
+#
 # F10 (2026-09-06): supervisor-tier × chroot create/launch regression fixed
 # (confine_child runs the real chdir + Landlock rule build before the userns
 # remap drops the child to the sandbox host uid, so a root-only 0700 image
@@ -28,7 +36,18 @@
 # test_instance_chroot.rs non-root same-uid exec-only acceptance) and +3
 # mediation_2uid (root RunAs(10000)/uid0 restrictive-cache acceptance) —
 # logs tmp/sdd/f10-*.
-core_lib = 823 # F11 (2026-09-06): 822 -> 823, +1 unit test in
+core_lib = 827 # F12 (2026-09-06): 823 -> 827, +4 unit tests pinning the
+               # one-entry-per-TGID ProcessIndex model — resource.rs
+               # (thread notification with an untracked leader registers the
+               # leader once under its pid; a thread of a tracked leader adds
+               # no tid key; a thread-registered group cleans up its single
+               # leader entry on group exit) and seccomp/state.rs (an
+               # unregistered thread resolves through /proc to the leader's
+               # key/state/address-space entry). One existing cwd test
+               # updated (a thread without its own key counts as tracked via
+               # its leader). core_integ unchanged at 533; F11 freeze and
+               # argv-safety regressions stay green.
+               # F11 (2026-09-06): 822 -> 823, +1 unit test in
                # freeze.rs (freeze_deduplicates_thread_group_keys) pinning
                # the TGID-key normalization of the argv-safety exec freeze
                # (a lazily-registered non-leader thread key next to its

@@ -7,7 +7,7 @@
 
 ## A. 代码 / 接线类（需要小代码 + 测试）
 
-- **F12（2026-09-06，已列入主要计划）** — ProcessIndex 一 TGID 一 entry
+- **F12（2026-09-06，已完成）** — ProcessIndex 一 TGID 一 entry
   （线程 tid 懒登记建模收口）。来源：F11 report concern #1 / e2b task-backlog
   row #2 残余。描述：`register_pid_if_new` 对发出被中介 syscall 的非 leader
   线程以 tid 懒登记独立 entry，一个 TGID 可多 key；F11 只在 freeze 侧归一化。
@@ -15,7 +15,13 @@
   逐消费点复核（freeze/记账/cwd/exit/枚举）。详细步骤、RED 用例与审计清单：
   `docs/fork-plan-2026-09-f12.md`。为什么留到 F12：建模改造需逐消费点复核，
   不能与 F11 修复同波冒险；现无已知活 bug（freeze 已归一化，记账/exec/cwd 走
-  leader fallback）。
+  leader fallback）。**F12 已落地（fork 本地提交，见 `docs/CHANGELOG.md` /
+  `docs/test-baseline.md`；报告 `tmp/sdd/f12-report.md`）**：登记归一化放在
+  `register_pid_if_new`（线程通知 → leader；删除 `PIDFD_THREAD` 独立 key 路径），
+  查询面（key_for/entry_for/contains/addr_space_state/cwd）对未登记 tid 做
+  leader 解析；freeze TGID 归一化保留为防御。core_lib 823→827（+4 unit），
+  core_integ 533 不变（F11 回归保持绿）；pidfd leader watcher 的「组退出才可读」
+  语义已探针实证（`tmp/sdd/f12-pidfd-probe.log`）。
 
 - **FUP-01 CLI `--pid-ns` 漏接线** — 来源：fork-plan §1 S1.1 行 / F6.1 review seam
   （`dd5a7e8` 时代仍无 main.rs 转发 `pb.pid_ns`；FFI/Python/profile 均已生效）。
@@ -152,6 +158,17 @@
 
 ## 已处置（F9–F11 内完成，追溯用）
 
+- **F12（2026-09-06，本地提交 `68e7e84`）**：ProcessIndex 一 TGID 一 entry 建模
+  收口——`register_pid_if_new` 对线程通知一律路由/注册到 TGID leader（删除
+  `PIDFD_THREAD` 独立 tid key 路径），`ProcessIndex` key 集合 = TGID 集合；
+  `key_for`/`entry_for`/`contains`/`addr_space_state`/cwd 对未登记 tid 做
+  leader 解析（一次 `/proc` 读仅 miss 时），`entry_for_cleanup`/GC 保持按精确
+  key；freeze TGID 归一化保留为防御（F11 回归不变）。RED→GREEN：4 个新单测
+  （唯一性/leader 已跟踪不加 key/生命周期清理/leader entry 解析）+ 1 个既有
+  cwd 用例语义更新；core_lib 823→827、core_integ 533 不变；pidfd leader
+  watcher 的组退出语义由 C 探针实证（`tmp/sdd/f12-pidfd-probe.{c,log}`）。
+  报告 `tmp/sdd/f12-report.md`；E2B 侧待 wheel 重建后复跑 thread/gateway 探针。
+  F11 报告 concern #1 / task-backlog row #2 残余随之关闭（F12 计划与报告）。
 - **F11（2026-09-06，本地提交）**：argv-safety exec freeze × 多线程进程树
   （E2B M4 FUP-E3 网关+命令变体的 fork 侧阻塞）。根因：`ProcessIndex` 为发过
   被中介 syscall 的线程以 tid 为 key 懒登记（与 leader 同 TGID），exec 冻结把
