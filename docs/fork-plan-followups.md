@@ -7,6 +7,16 @@
 
 ## A. 代码 / 接线类（需要小代码 + 测试）
 
+- **F12（2026-09-06，已列入主要计划）** — ProcessIndex 一 TGID 一 entry
+  （线程 tid 懒登记建模收口）。来源：F11 report concern #1 / e2b task-backlog
+  row #2 残余。描述：`register_pid_if_new` 对发出被中介 syscall 的非 leader
+  线程以 tid 懒登记独立 entry，一个 TGID 可多 key；F11 只在 freeze 侧归一化。
+  完整修法 = 线程通知一律路由到 TGID leader entry、删除 per-tid 登记、
+  逐消费点复核（freeze/记账/cwd/exit/枚举）。详细步骤、RED 用例与审计清单：
+  `docs/fork-plan-2026-09-f12.md`。为什么留到 F12：建模改造需逐消费点复核，
+  不能与 F11 修复同波冒险；现无已知活 bug（freeze 已归一化，记账/exec/cwd 走
+  leader fallback）。
+
 - **FUP-01 CLI `--pid-ns` 漏接线** — 来源：fork-plan §1 S1.1 行 / F6.1 review seam
   （`dd5a7e8` 时代仍无 main.rs 转发 `pb.pid_ns`；FFI/Python/profile 均已生效）。
   描述：`sandlock-cli` 从不暴露 `--pid-ns` 开关，用户会误以为 CLI 不支持该策略。
