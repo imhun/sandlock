@@ -40,16 +40,23 @@
   为什么留：需要专用 exit-order harness（worker 必须先观察 Exited 才能收场的约束
   限制），超出 F9 文档范围。
 - **FUP-04 fs_mount link-EBUSY 直击 + 断言精度** — 来源：F6.2 review（`6fcb8e2`）。
-  **状态：已排入 F13（`docs/fork-plan-2026-09-f13.md`，⬜ 计划中）。**
+  **状态：已完成（F13，2026-09-06，fork 本地提交）。**
   描述：unlink/rename-at-mount-point 已 pin，`link()` 于 rw 挂载点无直击测试；
   `fs_mount` 测试遗留一处 contains 式断言未转精确。
   为什么留：I1 保护族已覆盖写家族主体；补 link pin 与转断言属测试代码级收尾。
+  处置：`tests/fs_mount.rs` 新增 `test_rw_mount_point_resists_link`（EBUSY 直击，
+  宿主源完好、无新宿主文件）+ 既有 `contains` 断言转整串精确（ffi 98→100）。
 - **FUP-05 目录挂载点的 rmdir 未保护（披露项）** — 来源：F6.2 review（`de2f749`/
-  `6fcb8e2`；已在 e2b-integration §3.1 披露）。**状态：已排入 F13
-  （`docs/fork-plan-2026-09-f13.md`，⬜ 计划中）。**
+  `6fcb8e2`；已在 e2b-integration §3.1 披露）。**状态：已完成（F13，2026-09-06，
+  fork 本地提交）。**
   描述：对**目录** bind-mount 点的 rmdir 无 fork 侧保护；宿主侧真实挂载点由内核返回
    EBUSY，沙箱虚拟化形态下该语义需设计。
   为什么留：范围外披露项；需要先定虚拟化 fs 的 rmdir/卸载语义再实现。
+  处置：chroot `handle_chroot_write` 对 `unlinkat(AT_REMOVEDIR)` 命中目录挂载点
+  leaf 时返回 `EBUSY`（与真实 bind-mount 一致；单文件/chardev leaf 回落宿主
+  ENOTDIR）；新测试 `test_directory_mount_point_rmdir_is_refused`（RED 先证
+  空宿主目录可被沙箱 rmdir 删除 → GREEN EBUSY + 宿主目录保留，挂载点内普通
+  目录 mkdir/rmdir 不受影响）。e2b §3.1 注记随 F13 闭环。
 - **FUP-06 fd root 用例 pre_exec 只清 server_fd** — 来源：F2b.3 review
   （`3afc9dd`/`4ea63fa`）。
   描述：root 阶段 fd-handoff 用例把 worker fd 也带进 supervise，EOF 异常路径未覆盖。
@@ -156,8 +163,15 @@
 - **FUP-E3 E2B 复验 §3.8 超卖消除** — M4 落地后按 e2b-integration §3.8 探针重测
   （gateway + 并发命令同实例）。
 
-## 已处置（F9–F11 内完成，追溯用）
+## 已处置（F9–F13 内完成，追溯用）
 
+- **F13（2026-09-06，本地提交）**：fs 写家族挂载保护收尾——FUP-04（`link()` 于
+  rw 单节点挂载点 EBUSY 直击 pin + fs_mount 遗留 contains 断言转整串，ffi 98→100）
+  与 FUP-05（目录挂载点 rmdir：chroot dispatch 对 `unlinkat(AT_REMOVEDIR)` 命中
+  目录 mount leaf 返回 EBUSY，宿主目录不再可被沙箱视图 rmdir 删除；单文件/chardev
+  leaf 回落宿主 ENOTDIR；挂载点内普通目录不受影响）。RED 证据
+  `tmp/sdd/f13-red-rmdir.log`；门禁与文档同步见 CHANGELOG / e2b-integration
+  §3.1/§5 / test-baseline；报告 `tmp/sdd/f13-report.md`。
 - **F12（2026-09-06，本地提交 `68e7e84`）**：ProcessIndex 一 TGID 一 entry 建模
   收口——`register_pid_if_new` 对线程通知一律路由/注册到 TGID leader（删除
   `PIDFD_THREAD` 独立 tid key 路径），`ProcessIndex` key 集合 = TGID 集合；

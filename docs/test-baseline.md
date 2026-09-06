@@ -223,12 +223,20 @@ core_integ = 533 # F11 (2026-09-06): 532 -> 533, +1 argv-safety root-cause
                  # (test_exec_mode_main_exit_is_terminal_and_verbs_close);
                  # one-shot outlives regression stays green in
                  # test_instance_lifecycle.rs.
-ffi = 98 # F6.2 review I1/I2: 96 -> 98, +2 in tests/fs_mount.rs
-         # (test_rw_mount_point_resists_unlink_and_rename — EBUSY guard on
-         # unlink/rename/link at mount points plus ro-over-writable-prefix
-         # EACCES; test_single_file_leaf_opens_without_rootfs_parents — the
-         # missing-parent direct-open pin). The I1 RED (rm of an rw mount
-         # point deleted the host file) is in tmp/sdd/f6.2-fix-red-i1.log.
+ffi = 100 # F13 (2026-09-06): 98 -> 100, +2 in tests/fs_mount.rs
+          # (test_rw_mount_point_resists_link — the I1/P5 hard-link EBUSY
+          # guard's direct pin; test_directory_mount_point_rmdir_is_refused —
+          # rmdir of a directory bind-mount point is refused with EBUSY and
+          # the host directory behind the mount survives). One legacy
+          # contains-style assertion converted to exact equality. Core change:
+          # chroot dispatch refuses rmdir (unlinkat AT_REMOVEDIR) at directory
+          # mount leaves; file/chardev leaves still fall through to ENOTDIR.
+          # F6.2 review I1/I2: 96 -> 98, +2 in tests/fs_mount.rs
+          # (test_rw_mount_point_resists_unlink_and_rename — EBUSY guard on
+          # unlink/rename/link at mount points plus ro-over-writable-prefix
+          # EACCES; test_single_file_leaf_opens_without_rootfs_parents — the
+          # missing-parent direct-open pin). The I1 RED (rm of an rw mount
+          # point deleted the host file) is in tmp/sdd/f6.2-fix-red-i1.log.
          # F6.2 (P5): 94 -> 96, +2 in tests/fs_mount.rs
          # (test_mount_single_file_node, test_mount_chardev_node) — single
          # file/chardev bind-mount points open instead of failing ENOTDIR.

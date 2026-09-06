@@ -10,7 +10,8 @@
 > F11 于 2026-09-06 修复 argv-safety exec freeze × 多线程进程树
 > （FUP-E3 网关+命令变体的 fork 侧阻塞，本文 §3.8/§5/§8 已更新）；F12 于
 > 2026-09-06 收口 ProcessIndex 每 TGID 一 entry 建模（本文 §0/§5/§8 已更新；
-> wheel 随 F12–F14 最终 tip 统一重建）。
+> wheel 随 F12–F14 最终 tip 统一重建）；F13 于 2026-09-06 闭环 fs 写家族挂载
+> 保护（link 直击 pin + 目录挂载点 rmdir EBUSY，本文 §1 P5/§3.1/§5 已更新）。
 
 ## 0. 基线与硬约束
 
@@ -30,7 +31,9 @@ supervise 36 / supervise_cost 3 / cli_build 0 / python 454，root 档 oci 144 /
 supervise_root 2 / mediation_2uid 5，见 §5）。F10（2026-09-06）：core_integ 532、
 mediation_2uid 8（见 §3.1 与 §5 的 F10 行）。F11（2026-09-06）：core_lib 823、
 core_integ 533（root 档三套不变；见 §3.8/§5/§8 的 F11 行）。F12（2026-09-06）：
-core_lib 827 / core_integ 533（root 档三套不变；见 §5/§8 的 F12 行）。
+core_lib 827 / core_integ 533（root 档三套不变；见 §5/§8 的 F12 行）。F13
+（2026-09-06）：ffi 100（core/core_integ/python/root 档不变；见 §1 P5/§5 的
+F13 行）。
 
 ## 1. 已落地的修改方案（fork 侧）
 
@@ -53,7 +56,7 @@ core_lib 827 / core_integ 533（root 档三套不变；见 §5/§8 的 F12 行�
 | M2 per-exec 参数 + 子集校验（fork-plan F4） | per-exec `cwd/env/extra_writable/bind_ports`（execve 前 chdir/envp）；S9 单 choke point（越出实例上限 ⇒ EPERM/`PolicyTooWide`）；`update_network` 只绑新 exec + staleness 回报；per-child 网络按 pid 血缘、未归因 fail-closed | `exec_params.rs` + network 按 pgid 绑定 | ✅ commit `b58b634`、`9f959f1`、`c5d1108` + fixes `902e522`/`e5c7214` | per-child 正向收窄非内核可强制等 seam 见 follow-ups |
 | M3 语义/默认/兜底（fork-plan F5） | 整箱 `max_processes` 默认 **256**（Q10）；多 child `checkpoint()` 显式拒绝；`pid_ns`+实例并存（PidKey 收窄 on-behalf /proc、init reaper）；统一 `InstanceDead`（FFI code 6 / python 消息）；idle `T_idle`/`T_max` | core + FFI/Python 错误面 | ✅ commit `b56fcbe`..`1321ba0`（F5.1–F5.5 + review fix） | **用户可见行为变化**已入 CHANGELOG（默认值/拒绝/Dead/寿命） |
 | SL-1/P1/P2 路径中介身份（fork-plan F6.1，F10 收口） | A 档（同 uid 属主正确）+ B 档（两 supervise 不同 uid 真内核隔离硬证据）+ C 档 fail-closed（root 进程内 remap + 路径中介 ⇒ 建箱前拒绝）；`mediation_run_as=caller|supervisor` 贯穿 builder/Policy/FFI+cbindgen/CLI/Python/supervise 全字段；F10 修复显式 supervisor 逃生门下 chroot × 特权 RunAs 的 create/launch 回归（remap 前做 chdir + Landlock） | notif/builder + 全栈 | ✅ commit `b62e201`、`dd5a7e8`、`7f81314` + fix `75bbe0b`；F10 本地提交 | `--pid-ns` CLI 旧漏线等见 follow-ups |
-| P5 `fs_mount` 单节点 + `minimal_dev`（fork-plan F6.2） | 单文件/chardev bind-mount（不再 ENOTDIR、ro 保持、写家族 EBUSY 防宿主源被删/移）；`minimal_dev()`（`ptmx/pts/null/urandom/zero/tty`）免整树挂 /dev 与 `/dev/shm` carve-out | core + FFI + CLI `--fs-mount` + Python | ✅ commit `de2f749`、`dc0edf3` + fix `6fcb8e2`（ffi 98、python 454） | link-at-mount-point 直击测试、目录挂载点 rmdir 等见 follow-ups |
+| P5 `fs_mount` 单节点 + `minimal_dev`（fork-plan F6.2；F13 收尾） | 单文件/chardev bind-mount（不再 ENOTDIR、ro 保持、写家族 EBUSY 防宿主源被删/移）；`minimal_dev()`（`ptmx/pts/null/urandom/zero/tty`）免整树挂 /dev 与 `/dev/shm` carve-out | core + FFI + CLI `--fs-mount` + Python | ✅ commit `de2f749`、`dc0edf3` + fix `6fcb8e2`（ffi 98、python 454）；**F13（2026-09-06）补 link 直击 pin + 目录挂载点 rmdir EBUSY（ffi 100，见 §3.1/§5 F13 行）** | 挂载点卸载能力不在本期语义（= 与真实 bind-mount 一致，禁止删除） |
 
 ## 2. 待实施的修改方案（E2B 提出，需要改 fork）
 
@@ -108,8 +111,11 @@ A档用例的 `/dev` 提供者换成 `minimal_dev()`（`fs_mount` 单节点集�
 `fs_denied` 也通过**——不再需要整树挂宿主 `/dev` 或为 `/dev/shm` 下发
 carve-out，SL-1 的最大触发面由构造消除。另注：对挂载点本身的
 unlink/rename/link 按真实 bind-mount 语义返回 `EBUSY`（防 nofollow 写家族
-直取宿主源删/移宿主文件）；目录挂载点的 `rmdir` 暴露为既有问题，不在 F6.2
-范围内。
+直取宿主源删/移宿主文件）。**F13（2026-09-06，fork 本地提交）**：目录挂载点的
+`rmdir` 已闭环——chroot dispatch 对 `unlinkat(AT_REMOVEDIR)` 命中目录 mount
+leaf 时返回 `EBUSY`（与真实 bind-mount 一致，空宿主目录不再可被沙箱视图删除；
+单文件/chardev leaf 回落宿主 ENOTDIR；挂载点内普通目录不受影响）；`link()` 于
+rw 单节点挂载点的直击 pin 与遗留 contains 断言精度收尾同步完成。
 
 **F10 收口（2026-09-06，supervisor × chroot × 特权 RunAs 的逃生门真实可用）**：
 E2B M4 实测发现，显式 `supervisor` 档在 **chroot + root holder + `RunAs(非 0)`**
@@ -417,6 +423,9 @@ core_integ 529→531。
 | fork 全量门禁 root 档（F11 终局，2026-09-06，同容器 root 阶段） | oci-root `144` / supervise_root `2` / mediation_2uid `8`（log `tmp/sdd/f11-oci-root.log`、`f11-supervise-root.log`、`f11-mediation-2uid.log`） |
 | fork 全量门禁非 root 档（F12 终局，2026-09-06，sandlock-dev:latest 特权容器） | core_lib `827` / core_integ `533` / ffi `98` / cli `98` / supervise `36` / supervise_cost `3` / cli_build `0` / python `454`（log `tmp/sdd/f12-gate-nonroot.log`） |
 | fork 全量门禁 root 档（F12 终局，2026-09-06，同容器 root 阶段） | oci-root `144` / supervise_root `2` / mediation_2uid `8`（log `tmp/sdd/f12-oci-root.log`、`f12-supervise-root.log`、`f12-mediation-2uid.log`） |
+| fork 全量门禁非 root 档（F13 终局，2026-09-06，sandlock-dev:latest 特权容器） | core_lib `827` / core_integ `533` / ffi `100` / cli `98` / supervise `36` / supervise_cost `3` / cli_build `0` / python `454`（log `tmp/sdd/f13-gate-nonroot.log`） |
+| fork 全量门禁 root 档（F13 终局，2026-09-06，同容器 root 阶段） | oci-root `144` / supervise_root `2` / mediation_2uid `8`（log `tmp/sdd/f13-oci-root.log`、`f13-supervise-root.log`、`f13-mediation-2uid.log`） |
+| fs 写家族挂载保护收尾（F13，2026-09-06，fork 本地提交） | FUP-04：`link()` 于 rw 单节点挂载点 EBUSY 直击 pin + fs_mount contains 断言转整串（ffi 98→100）；FUP-05：目录挂载点 rmdir EBUSY（chroot dispatch，`unlinkat(AT_REMOVEDIR)` 命中目录 mount leaf；单文件/chardev leaf 回落宿主 ENOTDIR；挂载点内普通目录不受影响）。RED 先证「沙箱 rmdir 删除空宿主目录」→ GREEN EBUSY + 宿主保留（`tmp/sdd/f13-red-rmdir.log`）。报告 `tmp/sdd/f13-report.md`；wheel 随 F12–F14 最终 tip 统一重建 |
 | ProcessIndex 一 TGID 一 entry（F12，2026-09-06，fork 本地提交 `68e7e84`） | 建模收口：线程通知一律路由/注册到 TGID leader（删除 `PIDFD_THREAD` 独立 tid key 路径），查询面 leader 解析，freeze 归一化保留为防御；4 个新单测 + 1 个既有 cwd 用例语义更新（core_lib 823→827）；F11 argv-safety 回归（core_integ 533）保持绿；pidfd leader watcher 的组退出语义 C 探针实证（`tmp/sdd/f12-pidfd-probe.log`）。用户可见行为不变（内存/配额/exec/cwd/freeze/checkpoint），`stats().live_watchers` 改按进程组计数、6.9+ 虚拟化 /proc 列表不再单列被中介线程 tid（与旧内核形态一致）。E2B 真栈复跑在 F12–F14 最终 tip wheel 重建后执行（沿用 F11 的 thread/gateway 探针接线模式）。报告 `tmp/sdd/f12-report.md` |
 | E2B 真栈探针 + F11 复跑（argv-safety × 多线程，F11） | fork 侧在 `e2b-sandlock-test:latest` 真栈复跑 `tmp/fup3_thread_probe.py`（E2B 仓库探针，只读挂载）：RED（wheel 基线）`argv-safety freeze failed for pid 26: PTRACE_SEIZE tid 22: Operation not permitted` → B exit 127（`tmp/sdd/f11-e2b-red.log`）；GREEN（F11 debug .so 热替换）B exit 0 / stdout `b-ok\n`（`f11-e2b-green.log`）。**E2B 侧正式复跑（控制器，2026-09-06，wheel = 927d015）**：wheel 已按 F11 tip 重建并同步 `wheels/fork/`、重建 `e2b-sandlock-test:latest`；FUP-E3 gateway+命令变体 pure 形态 4/4 GREEN（`list_tools == ['echo']`、网关后命令 exit 0 / stdout `post-gateway-ok\n`、450M 超卖命令拒绝 exit 137 / stdout `''` / stderr ∈ {"", "Killed\n"}、450M holder 下 50M 控制命令 exit 0、record `memoryMB == 1024`；E2B 日志 `tmp/perf/f11-gateway-probe-450-450-50*.log`）；契约 `tests/contract/test_memory_quota_gateway_command.py` 落库（pure 2 轮 + gate A 内通过；`tmp/f11-e2b-contract-gw*.log` / `tmp/f11-e2b-gate-a.log`），FUP-E3 gateway+命令变体关闭 |
 | E2B 探针（mediation/instance，F10 修复后需 tip wheel 重建验证） | fork 源码侧按探针根因修复并落 Rust 回归用例；wheel 重建后复跑 `tmp/mediation_probe.py` / `tmp/instance_probe.py`（预期：one-shot chroot+RunAs(1000)+supervisor 与 instance uid0/1000/65534+supervisor 全过；caller+RunAs(≠holder) 仍 C 档拒绝） |

@@ -2,8 +2,10 @@
 
 Branch: `upstream-pr/netns-free-clean`（本地，不推送）。进度账本：
 `.superpowers/sdd/progress.md`。Base：fork docs tip（`9d60058` 之上，即 F12 计划
-登记后）。状态：⬜ 计划中（2026-09-06，用户指示排入计划；来源 =
-fork-c-class-design-assessment 第 1 项 + fork-plan-followups FUP-04/FUP-05）。
+登记后）。状态：✅ 已完成（2026-09-06，fork 本地提交；报告
+`tmp/sdd/f13-report.md`；RED/GREEN/门禁与文档同步见报告与 followups 已处置段）。
+计划登记时（⬜ 计划中）来源 = fork-c-class-design-assessment 第 1 项 +
+fork-plan-followups FUP-04/FUP-05。
 
 ## 1. 目标
 

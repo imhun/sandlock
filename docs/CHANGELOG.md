@@ -8,6 +8,13 @@
 
 ## 行为变化（升级 / 接线前必读）
 
+- **目录挂载点的 rmdir 与真实 bind-mount 一致拒绝（F13，本地提交）**：chroot /
+  `fs_mount` 形态下对**目录**挂载点本身执行 `rmdir`（含 `unlinkat(AT_REMOVEDIR)`）
+  返回 `EBUSY`，不再直通宿主目录——此前空宿主目录会被沙箱视图内的 rmdir 直接删除
+  （FUP-05 披露项闭环）。普通目录在挂载点内部仍可正常 mkdir/rmdir（只保护挂载点
+  本身）；单文件/chardev 挂载点的 rmdir 仍回落到宿主 ENOTDIR（与内核一致）。
+  顺带补 `link()` 于 rw 单节点挂载点的直击 pin（既有 EBUSY 守卫的测试缺口，
+  FUP-04a）并把遗留的 `contains` 式断言收敛为整串精确断言。
 - **ProcessIndex 改为每 TGID 一个 entry（建模收口，F12，本地提交）**：发出过被
   中介 syscall 的非 leader 线程不再以线程 tid 懒登记独立 entry（Linux 6.9+
   `PIDFD_THREAD` 路径删除）——线程通知一律解析并路由到其 TGID leader 的 entry；

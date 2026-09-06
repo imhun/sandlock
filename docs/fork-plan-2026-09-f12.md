@@ -4,7 +4,9 @@ Branch: `upstream-pr/netns-free-clean`（本地，不推送）。进度账本：
 `.superpowers/sdd/progress.md`。Base：fork docs tip（`bc6c892` 之上，即 core F11
 tip `927d015`）。E2B 对接：main 仓库（指针 bump + 探针/全量复跑由 E2B 侧任务接续）。
 
-> **状态（2026-09-06）**：⬜ 计划中——用户指示列入主要计划。前身：F11 修复只在
+> **状态（2026-09-06）**：✅ 已完成——实现 `68e7e84` + docs `194ffed`，报告
+> `tmp/sdd/f12-report.md`（RED/GREEN/门禁/内核实证见报告与 followups 已处置段）。
+> 计划登记时（⬜ 计划中）用户指示列入主要计划。前身：F11 修复只在
 > exec 冻结侧把 keys 归一化为唯一 TGID（`freeze.rs`），**线程 tid 懒登记本身保留**；
 > 本计划彻底消除「一个 TGID 在 `ProcessIndex` 有多个 key」的建模残余，属 fork 核心
 > 建模改造，需逐消费点复核（见 §5 审计清单）。
