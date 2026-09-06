@@ -67,6 +67,15 @@ never exercises ②/③/④ — in the fork's own CI and local verification the
 supervisor always runs unprivileged (uid 65534 in the non-root phase, uid
 65533 in the root-phase foreign-uid acceptance, both without any capability).
 
+> **F14（2026-09-06）— ③ 形态与本 gate 的关系**：route-B ③ launcher 的正确使用
+> 方式不变——launcher 持有 `cap_setuid,cap_setgid+eip` **只在 drop 到 uid X 并
+> exec `sandlock-supervise` 之前**，supervise 自身无 caps/无 remap 代码。若
+> 部署形态误把持有 effective `CAP_SETUID/CAP_SETGID` 的进程直接调 fork 的进程内
+> API（不经 supervise），fork 侧的 C 档 gate 现已 capability-aware：euid 非 0 但
+> effective caps 含上述两能力也按特权跨 uid remap 分类，在**建箱前**以点名能力的
+> 消息 fail-closed 拒绝（不再落到暗示无 caps 的晚拒）。launcher 必须在任何
+> sandlock API 调用前完成降权/清 caps（supervise 交接路径不经本 gate）。
+
 ## 3. The three privileged create-time actions (and how to avoid them)
 
 For the on-demand/launcher shape (③), "creating" a sandbox needs privilege

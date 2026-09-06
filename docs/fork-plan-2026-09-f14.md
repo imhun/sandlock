@@ -2,10 +2,12 @@
 
 Branch: `upstream-pr/netns-free-clean`（本地，不推送）。进度账本：
 `.superpowers/sdd/progress.md`。Base：fork docs tip（F13 计划登记后）。状态：
-⬜ 计划中（2026-09-06，用户指示排入计划；来源 = fork-c-class-design-assessment
-第 2 项 + fork-plan-followups FUP-22）。交付时序：**route-B ③ file-cap
-launcher 部署前必须完成**；实现期不引入真实 file-cap 部署，用 capability
-夹具模拟。
+✅ 已完成（2026-09-07，fork 本地提交；报告 `tmp/sdd/f14-report.md`；RED/GREEN/
+门禁与文档同步见报告与 followups 已处置段）。计划登记时（⬜ 计划中，2026-09-06）
+来源 = fork-c-class-design-assessment 第 2 项 + fork-plan-followups FUP-22。
+交付时序：**route-B ③ file-cap launcher 部署前必须完成**；实现期不引入真实
+file-cap 部署，用 capability 夹具模拟（RED/GREEN 已用 `setcap` + `setpriv`
+真执行夹具验证）。
 
 ## 1. 目标
 

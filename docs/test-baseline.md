@@ -36,7 +36,15 @@
 # test_instance_chroot.rs non-root same-uid exec-only acceptance) and +3
 # mediation_2uid (root RunAs(10000)/uid0 restrictive-cache acceptance) —
 # logs tmp/sdd/f10-*.
-core_lib = 827 # F12 (2026-09-06): 823 -> 827, +4 unit tests pinning the
+core_lib = 828 # F14 (2026-09-06): 827 -> 828, +1 unit test
+               # (sandbox::tests::mediation_identity_gate_refuses_nonroot_
+               # effective_caps_remap) pinning the capability-aware C档
+               # predicate — non-root effective CAP_SETUID/CAP_SETGID
+               # (route-B ③ file-cap launcher shape) is refused for a
+               # cross-uid remap with mediation, same-uid/no-caps/no-mediation
+               # stay untouched. Existing truth-table test extended to the
+               # 4-argument predicate (same count).
+               # F12 (2026-09-06): 823 -> 827, +4 unit tests pinning the
                # one-entry-per-TGID ProcessIndex model — resource.rs
                # (thread notification with an untracked leader registers the
                # leader once under its pid; a thread of a tracked leader adds
@@ -320,10 +328,17 @@ supervise_root = 2 # ROOT-MODE: run via scripts/test-all.sh
                    # shutdown/no-residue) and
                    # test_supervisor_as_foreign_uid_fd_handoff_serves_worker
                    # (fd transport, same genuine identities).
-mediation_2uid = 8 # ROOT-MODE: run via scripts/test-all.sh
+mediation_2uid = 9 # ROOT-MODE: run via scripts/test-all.sh
                    # --mediation-2uid as root (same privileged container as
                    # oci). F6.1 (SL-1) acceptance in
                    # crates/sandlock-supervise/tests/mediation_2uid.rs:
+                   # F14 (2026-09-06): 8 -> 9, +1 file-cap launcher acceptance
+                   # (test_nonroot_file_cap_launcher_is_refused_like_c_tier) —
+                   # a scratch copy of the sandlock CLI stamped with
+                   # cap_setuid,cap_setgid+eip and run at euid 65533 via
+                   # setpriv is refused under the default caller tier with the
+                   # capability-aware C档 message (RED: pre-F14 it fell to the
+                   # late "unprivileged supervisor cannot map" refusal).
                    # F10 (2026-09-06): 5 -> 8, +3 restrictive-cache chroot
                    # acceptance tests in the same file
                    # (test_root_chroot_supervisor_runas1000_one_shot_

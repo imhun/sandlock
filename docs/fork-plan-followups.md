@@ -142,12 +142,18 @@
   （拒绝而非静默放宽）。E2B 若需端口级收窄要加 port-aware payload。
   为什么留：需要扩展 wire/verdict 结构 + 测试；E2B 尚未要求。
 - **FUP-22 non-root-but-CAP_SETUID launcher 形态** — 来源：F6.1 concern
-  （`b62e201`）。**状态：已排入 F14（`docs/fork-plan-2026-09-f14.md`，⬜ 计划中，
-  route-B ③ 部署前必须完成）。**
+  （`b62e201`）。**状态：已完成（F14，2026-09-06，fork 本地提交；route-B ③
+  部署前必须完成的 gate 已就位）。**
   描述：C 档 gate 只按 `euid==0` 触发；file-cap launcher（cap_setuid/cap_setgid ③）
    若出现，同类错位可绕过该 gate。
   为什么留：fork 不装特权组件；launcher 由部署侧提供，需在部署面评估（route-B 契约
   文档已列 ③ 为可选形态）。
+  处置：`privileged_userns` 与 C 档 gate 改为 capability-aware——euid 非 0 但
+  effective caps 含 `CAP_SETUID/CAP_SETGID`（`/proc/self/status` CapEff 探测）也
+  按特权跨 uid remap 分类，默认 `caller` 档在建箱前以点名能力的新错误 fail-closed
+  （不再落到暗示无 caps 的晚拒）；无 caps 非 root / 同 uid 自映射 / route-B
+  supervise 不受影响。RED 夹具 = `setcap cap_setuid,cap_setgid+eip` + `setpriv`
+  euid 65533 真执行（mediation_2uid 9/9）。
 
 ## E. E2B 侧 / 仓库外（fork 无权执行，登记以不丢）
 
@@ -163,8 +169,19 @@
 - **FUP-E3 E2B 复验 §3.8 超卖消除** — M4 落地后按 e2b-integration §3.8 探针重测
   （gateway + 并发命令同实例）。
 
-## 已处置（F9–F13 内完成，追溯用）
+## 已处置（F9–F14 内完成，追溯用）
 
+- **F14（2026-09-06，本地提交）**：capability-aware 特权 remap gate（FUP-22 /
+  route-B ③ 前置）——`privileged_userns` 分类与 C 档 gate 从 `euid==0` 升级为
+  effective caps 探测（`CapEff` 含 `CAP_SETUID|CAP_SETGID` 即特权跨 uid remap）；
+  默认 `caller` 档对 euid 非 0 + caps 的调用方（file-cap launcher 形态）以点名
+  能力的新消息建箱前拒绝，不再落到暗示无 caps 的「unprivileged supervisor cannot
+  map」晚拒；root euid 行为/消息不变，无 caps 非 root、同 uid 自映射、route-B
+  supervise 不受影响。RED→GREEN：mediation_2uid 新夹具
+  `test_nonroot_file_cap_launcher_is_refused_like_c_tier`（setcap eip +
+  setpriv 65533 真执行，8→9）；core_lib +1 纯决策单测（827→828）。报告
+  `tmp/sdd/f14-report.md`；门禁与文档同步见 CHANGELOG / e2b-integration §5 /
+  supervise-identity-handoff / sandbox-exec-security / test-baseline。
 - **F13（2026-09-06，本地提交）**：fs 写家族挂载保护收尾——FUP-04（`link()` 于
   rw 单节点挂载点 EBUSY 直击 pin + fs_mount 遗留 contains 断言转整串，ffi 98→100）
   与 FUP-05（目录挂载点 rmdir：chroot dispatch 对 `unlinkat(AT_REMOVEDIR)` 命中

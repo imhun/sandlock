@@ -488,7 +488,11 @@ freeze 拆成 per-child（冻结一条命令的树）与 per-sandbox（全部）
 
 **✅ 收窄 + 审计完成**：F1.5 `793aaf3` 使 init 为 subreaper 并回收收养孤儿；F1.7
 `4b7f7d0` 每 child 独立进程组 + 定向信号；F6.1 `b62e201` 中介身份绑定（mediation 身份 =
-持有进程 euid，root in-process remap fail-closed）。fork 不安装 setuid/凭据驻留组件
+持有进程 euid；**C 档判定自 F14 起 capability-aware**——euid 0 或 euid 非 0 但
+effective caps 含 `CAP_SETUID/CAP_SETGID`（route-B ③ file-cap launcher 形态，
+`/proc/self/status` CapEff 探测）即按特权跨 uid remap 在建箱前 fail-closed，拒绝
+消息区分两种特权形态；无 caps 非 root / 同 uid 自映射 / route-B supervise 不受
+影响）。fork 不安装 setuid/凭据驻留组件
 （F2b.3 契约 `docs/supervise-identity-handoff.md`）。
 
 - `init::spawn()` 在 `fork()` 之后调用 `set_var`/`Vec`/`CString`/`execvp`（glibc 会 malloc），

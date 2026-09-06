@@ -8,6 +8,14 @@
 
 ## 行为变化（升级 / 接线前必读）
 
+- **C 档特权 remap gate 升级为 capability-aware（F14，本地提交）**：路径中介
+  建箱前拒绝的判定从 `euid == 0` 扩展为「实际持有跨 uid remap 特权」——euid 为 0，
+  或 euid 非 0 但 effective caps 含 `CAP_SETUID/CAP_SETGID`（route-B ③ file-cap
+  launcher 形态，`setcap cap_setuid,cap_setgid+eip`）。此前这类进程（euid 非 0 +
+  caps）会绕过 C 档 gate，落在晚到的「unprivileged supervisor cannot map」拒绝
+  （错误信息暗示无 caps，部署排障误导）；现按 C 档 fail-closed 以点名能力的新
+  错误在建箱前拒绝。无 caps 的非 root（生产形态）、同 uid 自映射、host uid 0、
+  route-B supervise 交接均不受影响；root euid 原行为与消息不变。
 - **目录挂载点的 rmdir 与真实 bind-mount 一致拒绝（F13，本地提交）**：chroot /
   `fs_mount` 形态下对**目录**挂载点本身执行 `rmdir`（含 `unlinkat(AT_REMOVEDIR)`）
   返回 `EBUSY`，不再直通宿主目录——此前空宿主目录会被沙箱视图内的 rmdir 直接删除
