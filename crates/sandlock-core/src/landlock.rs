@@ -372,7 +372,20 @@ pub fn confine_filesystem(policy: &Sandbox) -> Result<(), SandlockError> {
     confine_inner(policy, false)
 }
 
-fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError> {
+/// Build (create the ruleset and add every rule) without yet enforcing it.
+///
+/// The confined child uses this in two steps when a privileged `RunAs` remap
+/// will drop it to the sandbox host uid: rule paths (chroot-translated host
+/// paths, e.g. an image rootfs under a mode-0700 root-owned cache) must be
+/// opened while the child still holds the holder's credentials, and
+/// `landlock_restrict_self` is then called after the remap — restricting a
+/// task in a descendant user namespace with an ancestor ruleset is supported,
+/// so enforcement still starts exactly where it did historically, after the
+/// remap, with no later namespace transition to depend on.
+pub(crate) fn build_ruleset(
+    policy: &Sandbox,
+    handle_net: bool,
+) -> Result<OwnedFd, SandlockError> {
     // Step 1 — detect host ABI version.
     let abi = abi_version().map_err(|e| {
         SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
@@ -582,14 +595,26 @@ fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError
         }
     }
 
-    // Step 6 — enforce (irreversible).
-    syscall::landlock_restrict_self(&ruleset_fd, 0).map_err(|e| {
+    Ok(ruleset_fd)
+}
+
+/// Enforce a ruleset built with [`build_ruleset`] (irreversible).
+///
+/// `landlock_restrict_self` needs `no_new_privs` or CAP_SYS_ADMIN over the
+/// ruleset's user namespace; the privileged-remap arm sets no_new_privs
+/// before building, so restricting from the sandbox's (descendant) user
+/// namespace works without any capability over the ancestor ruleset.
+pub(crate) fn restrict_ruleset(ruleset_fd: &OwnedFd) -> Result<(), SandlockError> {
+    syscall::landlock_restrict_self(ruleset_fd, 0).map_err(|e| {
         SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(
             ConfinementError::Landlock(format!("restrict_self: {}", e)),
         ))
-    })?;
+    })
+}
 
-    Ok(())
+fn confine_inner(policy: &Sandbox, handle_net: bool) -> Result<(), SandlockError> {
+    let ruleset_fd = build_ruleset(policy, handle_net)?;
+    restrict_ruleset(&ruleset_fd)
 }
 
 // ============================================================

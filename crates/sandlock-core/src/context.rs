@@ -593,6 +593,79 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         }
     }
 
+    // 5d. Detect the privileged `RunAs` remap *before* the steps below:
+    // when the child will be remapped to a different host uid, the parent
+    // writes the maps and the child re-points its identity via `setresuid`,
+    // after which rootfs host paths (image caches under mode-0700
+    // root-owned directories) are no longer traversable.  The real chdir and
+    // the Landlock *rule build* therefore happen pre-remap for this shape
+    // only; enforcement (`landlock_restrict_self`) still happens post-remap,
+    // where it always has — restricting from a descendant userns with an
+    // ancestor ruleset is supported and no namespace transition follows.
+    let privileged_remap = if pid_ns {
+        false
+    } else {
+        let real_uid = unsafe { libc::getuid() };
+        let real_gid = unsafe { libc::getgid() };
+        matches!(sandbox.user, Some(run_as) if run_as.uid != real_uid || run_as.gid != real_gid)
+    };
+
+    // 6. Optional: change working directory
+    // cwd controls where the child starts; workdir is only for COW.
+    //
+    // This MUST run before the user-namespace remap below drops this child
+    // to the sandbox's host uid: the chdir target is the *host* path of the
+    // configured cwd (under a chroot, inside the rootfs), and a rootfs tree
+    // is frequently only traversable by the privileged holder (image caches
+    // under mode-0700 root-owned directories).  Chroot path mediation does
+    // not exist yet at this point — seccomp is installed later — so the real
+    // chdir must succeed with the holder's credentials, before
+    // `setresuid(0)` activates the mapped identity (fork-plan F10).
+    let effective_cwd = if let Some(ref cwd) = sandbox.cwd {
+        if let Some(ref chroot_root) = sandbox.chroot {
+            Some(chroot_root.join(cwd.strip_prefix("/").unwrap_or(cwd)))
+        } else {
+            Some(cwd.clone())
+        }
+    } else if let Some(ref chroot_root) = sandbox.chroot {
+        // Default to chroot root
+        Some(chroot_root.to_path_buf())
+    } else if let Some(ref workdir) = sandbox.workdir {
+        // Default to workdir when set (COW working directory)
+        Some(workdir.clone())
+    } else {
+        None
+    };
+
+    if let Some(ref cwd) = effective_cwd {
+        let c_path = match CString::new(cwd.as_os_str().as_encoded_bytes()) {
+            Ok(c) => c,
+            Err(_) => fail!("invalid cwd path"),
+        };
+        if unsafe { libc::chdir(c_path.as_ptr()) } != 0 {
+            fail!("chdir");
+        }
+    }
+
+    // 7. Set NO_NEW_PRIVS + build the Landlock ruleset (privileged-remap
+    // arm).  `landlock_restrict_self` needs no_new_privs once the child is
+    // no longer privileged over the ruleset's user namespace, and the rule
+    // build opens the chroot-translated host paths (`exists()` probes and
+    // the path_beneath parent fds) — which must happen while the holder's
+    // credentials still make an image cache under mode-0700 root-owned
+    // directories traversable.  Enforcement is deferred to step 8b below,
+    // after the remap (fork-plan F10).
+    let mut prebuilt_ruleset: Option<std::os::fd::OwnedFd> = None;
+    if privileged_remap {
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            fail!("prctl(PR_SET_NO_NEW_PRIVS)");
+        }
+        match crate::landlock::build_ruleset(sandbox, true) {
+            Ok(ruleset) => prebuilt_ruleset = Some(ruleset),
+            Err(e) => fail!(format!("landlock: {}", e)),
+        }
+    }
+
     // 5. User namespace for --user (run-as uid/gid) mapping.
     //
     // Skipped entirely when the sandbox runs in its own PID namespace:
@@ -753,42 +826,27 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         }
     }
 
-    // 6. Optional: change working directory
-    // cwd controls where the child starts; workdir is only for COW
-    let effective_cwd = if let Some(ref cwd) = sandbox.cwd {
-        if let Some(ref chroot_root) = sandbox.chroot {
-            Some(chroot_root.join(cwd.strip_prefix("/").unwrap_or(cwd)))
-        } else {
-            Some(cwd.clone())
+    // 8b. Enforce Landlock (IRREVERSIBLE).
+    //
+    // Privileged-remap arm: the ruleset was built pre-remap (step 7); apply
+    // it now that the child is inside its own user namespace — the historical
+    // enforcement point, with no namespace transition afterwards.  Every
+    // other arm (no remap, net_isolation self-map, pid-ns) keeps the
+    // historical single-step `confine()` here: the unprivileged self-map
+    // must still write its own `/proc/self/uid_map` before Landlock closes
+    // the filesystem view.
+    if let Some(ruleset) = prebuilt_ruleset.take() {
+        if let Err(e) = crate::landlock::restrict_ruleset(&ruleset) {
+            fail!(format!("landlock: {}", e));
         }
-    } else if let Some(ref chroot_root) = sandbox.chroot {
-        // Default to chroot root
-        Some(chroot_root.to_path_buf())
-    } else if let Some(ref workdir) = sandbox.workdir {
-        // Default to workdir when set (COW working directory)
-        Some(workdir.clone())
     } else {
-        None
-    };
-
-    if let Some(ref cwd) = effective_cwd {
-        let c_path = match CString::new(cwd.as_os_str().as_encoded_bytes()) {
-            Ok(c) => c,
-            Err(_) => fail!("invalid cwd path"),
-        };
-        if unsafe { libc::chdir(c_path.as_ptr()) } != 0 {
-            fail!("chdir");
+        // 7b. NO_NEW_PRIVS (required for Landlock/seccomp without CAP_SYS_ADMIN)
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            fail!("prctl(PR_SET_NO_NEW_PRIVS)");
         }
-    }
-
-    // 7. Set NO_NEW_PRIVS (required for both Landlock and seccomp without CAP_SYS_ADMIN)
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        fail!("prctl(PR_SET_NO_NEW_PRIVS)");
-    }
-
-    // 8. Apply Landlock confinement (IRREVERSIBLE)
-    if let Err(e) = crate::landlock::confine(sandbox) {
-        fail!(format!("landlock: {}", e));
+        if let Err(e) = crate::landlock::confine(sandbox) {
+            fail!(format!("landlock: {}", e));
+        }
     }
 
     // 9. Assemble and install seccomp filter (IRREVERSIBLE)

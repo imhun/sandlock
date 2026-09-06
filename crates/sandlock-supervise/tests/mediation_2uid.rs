@@ -29,6 +29,11 @@
 //! * `test_cli_mediation_run_as_is_wired` — the CLI flag reaches the
 //!   runtime builder: as root, the default tier refuses the C档 shape and
 //!   `--mediation-run-as supervisor` accepts it with the warning.
+//! * F10 acceptance — the explicit `supervisor` tier × chroot × privileged
+//!   `RunAs` must actually create/launch when the rootfs cache is only
+//!   traversable by the privileged holder (root-owned 0700), covering
+//!   one-shot `RunAs(10000)`, exec-only instance `RunAs(10000)` and the
+//!   uid-0 instance regression pins.
 
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -37,6 +42,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use sandlock_core::instance::{ExecStdio, SandboxInstance};
+use sandlock_core::result::ExitStatus;
 use sandlock_core::sandbox::MediationRunAs;
 use sandlock_core::policy_fn::Verdict;
 use sandlock_core::{Sandbox, SandlockError};
@@ -586,7 +593,16 @@ async fn test_root_inprocess_mediation_refused_with_policy_fn_deny_shape() {
 /// Minimal chroot rootfs with the static rootfs-helper and a sticky /tmp.
 fn build_rootfs(base: &Path) -> PathBuf {
     let rootfs = base.join("rootfs");
-    for dir in ["usr/bin", "usr/sbin", "etc", "proc", "dev", "tmp"] {
+    for dir in [
+        "usr/bin",
+        "usr/sbin",
+        "etc",
+        "proc",
+        "dev",
+        "tmp",
+        "workspace",
+        "home/user",
+    ] {
         std::fs::create_dir_all(rootfs.join(dir)).expect("create rootfs dir");
     }
     chmod_dir(&rootfs.join("tmp"), 0o1777);
@@ -668,6 +684,161 @@ async fn test_root_inprocess_mediation_with_caps_kept_would_leak() {
         !host_file.exists(),
         "the root-mediated unlink must have removed the file"
     );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ----------------------------------------------------------------
+// F10: supervisor tier × chroot × privileged RunAs must create/launch
+// ----------------------------------------------------------------
+
+/// Container-local scratch whose parent chain is NOT traversable by the
+/// remapped sandbox uid — the E2B image-cache shape (root-owned 0700).  This
+/// is what exposed the F10 regression: the confined child's initial real
+/// chdir to the chroot cwd ran *after* the userns remap dropped it to the
+/// sandbox host uid, so traversing to `rootfs/cwd` failed EACCES.
+fn restrictive_tmp_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("sandlock-f10-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create container-local scratch");
+    chmod_dir(&dir, 0o700);
+    dir
+}
+
+/// Supervisor-tier chroot policy with a chroot-visible workspace, mirroring
+/// the E2B M4 executor shape (rootfs + `/workspace`/`/home/user` mounts).
+fn f10_chroot_policy(rootfs: &Path, ws: &Path, host_uid: u32) -> Sandbox {
+    Sandbox::builder()
+        .chroot(rootfs)
+        .fs_read("/")
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_mount("/workspace", ws)
+        .fs_mount("/home/user", ws)
+        .fs_write("/workspace")
+        .fs_write("/home/user")
+        .cwd("/workspace")
+        .user(host_uid, host_uid)
+        .mediation_run_as(MediationRunAs::Supervisor)
+        .build()
+        .expect("F10 chroot supervisor policy builds")
+}
+
+/// Acceptance 1: root holder + `RunAs(1000)` + chroot + explicit supervisor
+/// tier must create and run (one-shot) even when the rootfs cache is only
+/// traversable by the privileged holder.  Regression evidence (RED, pre-fix):
+/// `sandlock child: chdir: Permission denied (os error 13)` — the chdir ran
+/// after the remap had dropped the child to the sandbox host uid (E2B: 1000;
+/// this suite: HOST_UID_A = 10000).
+#[tokio::test]
+async fn test_root_chroot_supervisor_runas1000_one_shot_restrictive_cache() {
+    root_phase_env_check();
+    let base = restrictive_tmp_dir("one-shot-r1000");
+    let rootfs = build_rootfs(&base);
+    let ws = base.join("ws");
+    std::fs::create_dir_all(&ws).expect("create workspace host dir");
+    std::os::unix::fs::chown(&ws, Some(HOST_UID_A), Some(HOST_UID_A)).expect("chown ws");
+    chmod_dir(&ws, 0o700);
+
+    let mut sb = f10_chroot_policy(&rootfs, &ws, HOST_UID_A);
+    let r = sb
+        .run(&["rootfs-helper", "sh", "-c", "echo F10X > /workspace/out.txt"])
+        .await
+        .expect("the supervisor-tier chroot box must create and run");
+    assert!(
+        r.success(),
+        "one-shot create/run failed, stderr: {:?}",
+        r.stderr_str()
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join("out.txt")).expect("read mediated output"),
+        "F10X\n",
+        "the mediated write through the /workspace mount must round-trip"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Acceptance 2 (root half, RunAs == 1000): the mainless exec-only instance
+/// over the same restrictive chroot must launch and serve an `exec()` under
+/// the explicit supervisor tier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_root_chroot_supervisor_runas1000_instance_exec_only_restrictive_cache() {
+    root_phase_env_check();
+    let base = restrictive_tmp_dir("inst-r1000");
+    let rootfs = build_rootfs(&base);
+    let ws = base.join("ws");
+    std::fs::create_dir_all(&ws).expect("create workspace host dir");
+    std::os::unix::fs::chown(&ws, Some(HOST_UID_A), Some(HOST_UID_A)).expect("chown ws");
+    chmod_dir(&ws, 0o700);
+
+    let mut inst = SandboxInstance::launch_exec_only(f10_chroot_policy(&rootfs, &ws, HOST_UID_A))
+        .await
+        .expect("exec-only chroot instance must launch under supervisor + RunAs");
+    let h = inst
+        .exec(
+            &["rootfs-helper", "echo", "instance-chroot-r1000-ok"],
+            ExecStdio::Piped,
+        )
+        .await
+        .expect("exec in the RunAs(1000) chroot instance must succeed");
+    let status = inst.wait_child(h.child_id).await.expect("wait child");
+    assert_eq!(status, ExitStatus::Code(0), "exec child must exit 0");
+    let stdout = h.stdout.expect("piped exec stdout");
+    use std::io::Read;
+    let mut out = Vec::new();
+    std::fs::File::from(stdout)
+        .read_to_end(&mut out)
+        .expect("read exec stdout");
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "instance-chroot-r1000-ok\n",
+        "exec stdout must round-trip exactly"
+    );
+    inst.shutdown().await.expect("instance shutdown");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Acceptance 2 (root half, RunAs == holder == 0): uid 0 + explicit
+/// supervisor tier over the same restrictive chroot must also launch and
+/// serve `exec()` — no remap, but the tier must never change the create
+/// outcome (regression pin for the instance exec-only path).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_root_chroot_supervisor_uid0_instance_exec_only_restrictive_cache() {
+    root_phase_env_check();
+    let base = restrictive_tmp_dir("inst-u0");
+    let rootfs = build_rootfs(&base);
+    let ws = base.join("ws");
+    std::fs::create_dir_all(&ws).expect("create workspace host dir");
+    chmod_dir(&ws, 0o777);
+
+    let mut inst = SandboxInstance::launch_exec_only(f10_chroot_policy(&rootfs, &ws, 0))
+        .await
+        .expect("exec-only chroot instance must launch under supervisor tier (uid 0)");
+    let h = inst
+        .exec(
+            &["rootfs-helper", "echo", "instance-chroot-u0-ok"],
+            ExecStdio::Piped,
+        )
+        .await
+        .expect("exec in the uid-0 chroot instance must succeed");
+    let status = inst.wait_child(h.child_id).await.expect("wait child");
+    assert_eq!(status, ExitStatus::Code(0), "exec child must exit 0");
+    let stdout = h.stdout.expect("piped exec stdout");
+    use std::io::Read;
+    let mut out = Vec::new();
+    std::fs::File::from(stdout)
+        .read_to_end(&mut out)
+        .expect("read exec stdout");
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "instance-chroot-u0-ok\n",
+        "exec stdout must round-trip exactly"
+    );
+    inst.shutdown().await.expect("instance shutdown");
 
     let _ = std::fs::remove_dir_all(&base);
 }

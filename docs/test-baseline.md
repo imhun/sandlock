@@ -20,6 +20,14 @@
 # the same tip (tmp/sdd/f9-wheel-build.log / f9-wheel-verify.log). Counts are
 # unchanged from the per-task registrations below; this header is the dated
 # confirmation for the fork-plan closure.
+#
+# F10 (2026-09-06): supervisor-tier × chroot create/launch regression fixed
+# (confine_child runs the real chdir + Landlock rule build before the userns
+# remap drops the child to the sandbox host uid, so a root-only 0700 image
+# cache no longer EACCESes create/exec). +1 core_integ (new
+# test_instance_chroot.rs non-root same-uid exec-only acceptance) and +3
+# mediation_2uid (root RunAs(10000)/uid0 restrictive-cache acceptance) —
+# logs tmp/sdd/f10-*.
 core_lib = 822 # F6.2 review I1/I2: 821 -> 822, +1 unit test
                # (sandbox::tests::minimal_dev_registers_exactly_the_six_dev_
                # nodes) pinning the minimal_dev() six-node rw set.
@@ -67,7 +75,13 @@ core_lib = 822 # F6.2 review I1/I2: 821 -> 822, +1 unit test
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 531 # F8 (P6 design tradeoffs): 529 -> 531, +2 tradeoff-pin
+core_integ = 532 # F10: 531 -> 532, +1 in the new integration/
+                 # test_instance_chroot.rs
+                 # (test_instance_exec_only_chroot_supervisor_same_uid_
+                 # launch_and_exec) — mainless exec-only instance over a
+                 # chroot + fs_mount workspace with the explicit supervisor
+                 # tier (non-root A档 half of the F10 acceptance).
+                 # F8 (P6 design tradeoffs): 529 -> 531, +2 tradeoff-pin
                  # tests in integration/test_network.rs
                  # (test_injected_connect_reports_synthetic_addresses,
                  # test_nonblocking_connect_reports_einprogress) pinning the
@@ -265,10 +279,18 @@ supervise_root = 2 # ROOT-MODE: run via scripts/test-all.sh
                    # shutdown/no-residue) and
                    # test_supervisor_as_foreign_uid_fd_handoff_serves_worker
                    # (fd transport, same genuine identities).
-mediation_2uid = 5 # ROOT-MODE: run via scripts/test-all.sh
+mediation_2uid = 8 # ROOT-MODE: run via scripts/test-all.sh
                    # --mediation-2uid as root (same privileged container as
                    # oci). F6.1 (SL-1) acceptance in
                    # crates/sandlock-supervise/tests/mediation_2uid.rs:
+                   # F10 (2026-09-06): 5 -> 8, +3 restrictive-cache chroot
+                   # acceptance tests in the same file
+                   # (test_root_chroot_supervisor_runas1000_one_shot_
+                   # restrictive_cache, ..._runas1000_instance_exec_only_
+                   # restrictive_cache, ..._uid0_instance_exec_only_
+                   # restrictive_cache) — root-owned 0700 cache + chroot +
+                   # fs_mount workspace + explicit supervisor tier, covering
+                   # the E2B create/launch regression. Plus the F6.1 cases:
                    # test_two_supervisors_distinct_uids_isolate_files (B档
                    # two supervise mediators at uid 65531/65532 via setpriv,
                    # shared 1777+sticky dir, exact EPERM/ownership asserts),
