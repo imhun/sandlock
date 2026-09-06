@@ -34,13 +34,15 @@
   为什么留：需要专用 exit-order harness（worker 必须先观察 Exited 才能收场的约束
   限制），超出 F9 文档范围。
 - **FUP-04 fs_mount link-EBUSY 直击 + 断言精度** — 来源：F6.2 review（`6fcb8e2`）。
+  **状态：已排入 F13（`docs/fork-plan-2026-09-f13.md`，⬜ 计划中）。**
   描述：unlink/rename-at-mount-point 已 pin，`link()` 于 rw 挂载点无直击测试；
   `fs_mount` 测试遗留一处 contains 式断言未转精确。
   为什么留：I1 保护族已覆盖写家族主体；补 link pin 与转断言属测试代码级收尾。
 - **FUP-05 目录挂载点的 rmdir 未保护（披露项）** — 来源：F6.2 review（`de2f749`/
-  `6fcb8e2`；已在 e2b-integration §3.1 披露）。
+  `6fcb8e2`；已在 e2b-integration §3.1 披露）。**状态：已排入 F13
+  （`docs/fork-plan-2026-09-f13.md`，⬜ 计划中）。**
   描述：对**目录** bind-mount 点的 rmdir 无 fork 侧保护；宿主侧真实挂载点由内核返回
-  EBUSY，沙箱虚拟化形态下该语义需设计。
+   EBUSY，沙箱虚拟化形态下该语义需设计。
   为什么留：范围外披露项；需要先定虚拟化 fs 的 rmdir/卸载语义再实现。
 - **FUP-06 fd root 用例 pre_exec 只清 server_fd** — 来源：F2b.3 review
   （`3afc9dd`/`4ea63fa`）。
@@ -127,9 +129,10 @@
   （拒绝而非静默放宽）。E2B 若需端口级收窄要加 port-aware payload。
   为什么留：需要扩展 wire/verdict 结构 + 测试；E2B 尚未要求。
 - **FUP-22 non-root-but-CAP_SETUID launcher 形态** — 来源：F6.1 concern
-  （`b62e201`）。
+  （`b62e201`）。**状态：已排入 F14（`docs/fork-plan-2026-09-f14.md`，⬜ 计划中，
+  route-B ③ 部署前必须完成）。**
   描述：C 档 gate 只按 `euid==0` 触发；file-cap launcher（cap_setuid/cap_setgid ③）
-  若出现，同类错位可绕过该 gate。
+   若出现，同类错位可绕过该 gate。
   为什么留：fork 不装特权组件；launcher 由部署侧提供，需在部署面评估（route-B 契约
   文档已列 ③ 为可选形态）。
 
