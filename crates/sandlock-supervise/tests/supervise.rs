@@ -15,6 +15,17 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_sandlock-supervise")
 }
 
+/// The exact abnormal generation end a supervise process reports when the
+/// peer vanishes or is refused (`serve::Generation::finish`, FUP-11a): one
+/// stderr line, naming the transport outcome.
+const ABNORMAL_END_LINE: &str = "sandlock-supervise: control channel ended abnormally \
+                                 (outcome PeerGone); only a shutdown verb completes a generation";
+
+/// The exact dual-transport channel-token refusal (`core::control`'s shared
+/// `serve_connection`, FUP-11a), presented to the worker in the `err` field.
+const CHANNEL_TOKEN_REFUSAL: &str = "permission denied: verb 'config' requires a valid \
+                                     channel token (missing or mismatched)";
+
 fn repo_tmp_dir() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let dir = manifest.join("../../tmp");
@@ -74,6 +85,54 @@ fn spawn_with_control_fd(
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// FUP-11a: supervise reports a startup/protocol failure as exactly ONE
+/// stderr line (`sandlock-supervise: <reason>`, see `main::main`).  Pinning
+/// the whole line — instead of a keyword — makes a message rewrite that loses
+/// diagnostic detail, or a stray extra line, fail loudly.
+fn single_stderr_line(output: &Output) -> String {
+    let err = stderr(output);
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "supervise must report exactly one stderr line, got: {err:?}"
+    );
+    lines[0].to_string()
+}
+
+/// Assert the whole single stderr line (no dynamic part).
+fn assert_stderr_line(output: &Output, want: &str) {
+    assert_eq!(single_stderr_line(output).as_str(), want);
+}
+
+/// Pin the `--policy <fd>` deadline failure:
+/// `policy fd <N>: timed out after <E> ms of a <D> ms deadline waiting for
+/// bytes`.  `<N>` (the descriptor the test handed over) and `<D>` (the
+/// deadline the test set) are known, so everything but the elapsed counter is
+/// exact — and the counter must be a plain integer that honoured the
+/// deadline instead of silently extending it.
+fn assert_policy_fd_timeout(output: &Output, policy_fd: i32, deadline_ms: u64) {
+    let line = single_stderr_line(output);
+    let prefix =
+        format!("sandlock-supervise: policy read failed: policy fd {policy_fd}: timed out after ");
+    let suffix = format!(" ms of a {deadline_ms} ms deadline waiting for bytes");
+    let elapsed = line
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix(&suffix))
+        .unwrap_or_else(|| {
+            panic!(
+                "timeout failure must be exactly {prefix:?}<elapsed ms>{suffix:?}, got: {line:?}"
+            )
+        });
+    let elapsed: u64 = elapsed
+        .parse()
+        .expect("the elapsed part must be a plain millisecond count");
+    assert!(
+        elapsed <= deadline_ms + 2_000,
+        "deadline of {deadline_ms} ms must be honoured, failed after {elapsed} ms"
+    );
 }
 
 /// Current euid of the test process (the gate runs this suite as uid 65534).
@@ -236,14 +295,15 @@ fn test_supervise_refuses_wrong_uid() {
         !out.status.success(),
         "supervise must refuse to start when euid != --uid"
     );
-    let err = stderr(&out);
-    assert!(
-        err.contains("refusing to start") && err.contains("--uid"),
-        "stderr must explain the refusal, got: {err}"
-    );
-    assert!(
-        err.contains(&euid().to_string()) && err.contains(&wrong_uid.to_string()),
-        "stderr must name both uids, got: {err}"
+    assert_stderr_line(
+        &out,
+        &format!(
+            "sandlock-supervise: refusing to start: euid {} does not match --uid {}; \
+             the launcher must drop privileges before exec (otherwise the sandbox would \
+             silently run in the wrong identity class)",
+            euid(),
+            wrong_uid
+        ),
     );
 }
 
@@ -306,10 +366,9 @@ fn test_supervise_rejects_unknown_policy_field_by_name() {
     drop(server);
     let out = child.wait_with_output().expect("wait supervise unknown field");
     assert!(!out.status.success());
-    let err = stderr(&out);
-    assert!(
-        err.contains("`not_a_real_field`"),
-        "unknown field must be named, got: {err}"
+    assert_stderr_line(
+        &out,
+        "sandlock-supervise: policy rejected: policy contains unknown field(s): `not_a_real_field`",
     );
     let _ = std::fs::remove_file(&policy);
 }
@@ -327,10 +386,10 @@ fn test_supervise_rejects_closed_control_fd() {
         "999",
     ]);
     assert!(!out.status.success());
-    let err = stderr(&out);
-    assert!(
-        err.contains("control fd 999") && err.contains("not open"),
-        "closed control fd must be refused by name, got: {err}"
+    let ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
+    assert_stderr_line(
+        &out,
+        &format!("sandlock-supervise: control fd 999 is not open: {ebadf}"),
     );
     let _ = std::fs::remove_file(&policy);
 }
@@ -346,7 +405,11 @@ fn test_supervise_rejects_closed_control_fd() {
 fn spawn_with_policy_pipe(
     extra_env: &[(&str, &str)],
     extra_args: &[&str],
-) -> (std::process::Child, std::os::unix::io::RawFd) {
+) -> (
+    std::process::Child,
+    std::os::unix::io::RawFd,
+    std::os::unix::io::RawFd,
+) {
     let mut fds = [0i32; 2];
     assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
     let (read_fd, write_fd) = (fds[0], fds[1]);
@@ -399,7 +462,9 @@ fn spawn_with_policy_pipe(
         libc::close(read_fd);
     }
     drop(ctrl_server);
-    (child, write_fd)
+    // The child inherits the descriptor table, so `read_fd` is also the fd
+    // number supervise sees (FUP-11a: needed to pin the failure line fully).
+    (child, write_fd, read_fd)
 }
 
 /// Write bytes to `fd` WITHOUT taking ownership of the descriptor (callers
@@ -527,7 +592,7 @@ fn make_exec_stdio() -> (
 #[test]
 fn test_supervise_reads_policy_from_real_fd() {
     let policy = r#"{"fs_readable": ["/usr"], "net_allow": ["tcp://1.1.1.1:443"]}"#;
-    let (child, write_fd) = spawn_with_policy_pipe(&[], &[]);
+    let (child, write_fd, _policy_fd) = spawn_with_policy_pipe(&[], &[]);
     write_all_fd(write_fd, policy.as_bytes());
     unsafe {
         libc::close(write_fd);
@@ -551,7 +616,7 @@ fn test_supervise_reads_policy_from_real_fd() {
 /// of hanging the slot forever.
 #[test]
 fn test_supervise_policy_fd_times_out() {
-    let (child, write_fd) = spawn_with_policy_pipe(
+    let (child, write_fd, policy_fd) = spawn_with_policy_pipe(
         &[("SANDBOX_SUPERVISE_POLICY_TIMEOUT_MS", "300")],
         &[],
     );
@@ -563,11 +628,7 @@ fn test_supervise_policy_fd_times_out() {
         !out.status.success(),
         "a policy fd that never delivers bytes must fail startup"
     );
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("timed out"),
-        "timeout failure must be named, got: {err}"
-    );
+    assert_policy_fd_timeout(&out, policy_fd, 300);
 }
 
 /// I4: a writer that stalls MID-stream (after delivering the first bytes)
@@ -575,7 +636,7 @@ fn test_supervise_policy_fd_times_out() {
 /// read, not just the first byte.
 #[test]
 fn test_supervise_policy_fd_partial_write_stall_times_out() {
-    let (child, write_fd) = spawn_with_policy_pipe(
+    let (child, write_fd, policy_fd) = spawn_with_policy_pipe(
         &[("SANDBOX_SUPERVISE_POLICY_TIMEOUT_MS", "400")],
         &[],
     );
@@ -589,11 +650,7 @@ fn test_supervise_policy_fd_partial_write_stall_times_out() {
         !out.status.success(),
         "a mid-stream stall must fail startup within the deadline"
     );
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("timed out"),
-        "mid-stream timeout must be named, got: {err}"
-    );
+    assert_policy_fd_timeout(&out, policy_fd, 400);
 }
 
 /// Limit semantics on the fd transport: a document larger than the cap is a
@@ -601,7 +658,7 @@ fn test_supervise_policy_fd_partial_write_stall_times_out() {
 #[test]
 fn test_supervise_policy_fd_rejects_oversize() {
     let huge = "x".repeat(sandlock_supervise::serve::MAX_POLICY_BYTES + 1);
-    let (child, write_fd) = spawn_with_policy_pipe(&[], &[]);
+    let (child, write_fd, policy_fd) = spawn_with_policy_pipe(&[], &[]);
     write_all_fd(write_fd, huge.as_bytes());
     unsafe {
         libc::close(write_fd);
@@ -609,10 +666,12 @@ fn test_supervise_policy_fd_rejects_oversize() {
 
     let out = child.wait_with_output().expect("wait supervise oversize");
     assert!(!out.status.success(), "oversize policy must fail startup");
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("exceeds") && err.contains("bytes"),
-        "oversize failure must name the cap, got: {err}"
+    assert_stderr_line(
+        &out,
+        &format!(
+            "sandlock-supervise: policy read failed: policy fd {policy_fd}: document exceeds {} bytes",
+            sandlock_supervise::serve::MAX_POLICY_BYTES
+        ),
     );
 }
 
@@ -657,11 +716,7 @@ fn test_supervise_serve_eof_without_shutdown_exits_nonzero() {
         "EOF without a shutdown verb must exit non-zero; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.contains("abnormally"),
-        "the abnormal end must be named, got: {err}"
-    );
+    assert_stderr_line(&out, ABNORMAL_END_LINE);
     let _ = std::fs::remove_file(&policy);
 }
 
@@ -679,9 +734,10 @@ fn test_supervise_serve_wrong_token_exits_nonzero() {
         "args": {},
     }));
     assert_eq!(resp["ok"], serde_json::Value::Bool(false));
-    assert!(
-        resp["err"].as_str().unwrap_or_default().contains("token"),
-        "missing-token refusal must name the token: {resp:?}"
+    assert_eq!(
+        resp["err"].as_str(),
+        Some(CHANNEL_TOKEN_REFUSAL),
+        "missing-token refusal must be the exact shared refusal"
     );
     let out = child.wait_with_output().expect("wait supervise wrong token");
     assert!(
@@ -689,6 +745,7 @@ fn test_supervise_serve_wrong_token_exits_nonzero() {
         "a refused peer must exit non-zero; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert_stderr_line(&out, ABNORMAL_END_LINE);
     let _ = std::fs::remove_file(&policy);
 }
 
@@ -708,10 +765,10 @@ fn test_supervise_rejects_non_socket_control_fd() {
         "--serve",
     ]);
     assert!(!out.status.success(), "a non-socket control fd must be refused");
-    let err = stderr(&out);
-    assert!(
-        err.contains("control fd 2") && err.contains("not a socket"),
-        "the refusal must name the fd and the socket requirement, got: {err}"
+    let enotsock = std::io::Error::from_raw_os_error(libc::ENOTSOCK);
+    assert_stderr_line(
+        &out,
+        &format!("sandlock-supervise: control fd 2 is not a socket: {enotsock}"),
     );
     let _ = std::fs::remove_file(&policy);
 }
@@ -755,10 +812,12 @@ fn test_supervise_rejects_non_unix_socket_control_fd() {
     }
     let out = cmd.output().expect("run supervise with tcp control fd");
     assert!(!out.status.success(), "an AF_INET control fd must be refused");
-    let err = stderr(&out);
-    assert!(
-        err.contains("not AF_UNIX") && err.contains("AF_INET"),
-        "the refusal must name the domain mismatch, got: {err}"
+    assert_stderr_line(
+        &out,
+        &format!(
+            "sandlock-supervise: control fd {tcp_fd} is an AF_INET stream socket, \
+             not AF_UNIX: the fd transport serves the unix control socketpair end"
+        ),
     );
     drop(server);
     let _ = std::fs::remove_file(&policy);
@@ -970,10 +1029,12 @@ fn test_supervise_fd_serve_launches_instance_and_serves_instance_verbs() {
         }
     }
     assert_eq!(resp["ok"], serde_json::Value::Bool(false), "wide exec must fail: {resp:?}");
-    let err = resp["err"].as_str().expect("error text");
-    assert!(
-        err.contains("ceiling") && err.contains("bind_ports"),
-        "cross-process S9 error must name the field: {err}"
+    assert_eq!(
+        resp["err"].as_str(),
+        Some(
+            "instance exec failed: process error: exec params exceed the instance policy ceiling: bind_ports 65000 is outside the allowed set (EPERM)"
+        ),
+        "cross-process S9 refusal must be pinned in full: {resp:?}"
     );
 
     // update_network verb (F4.3): the main workload (child id 0) is still
@@ -1086,21 +1147,33 @@ fn test_supervise_path_serve_launches_instance_and_serves_verbs_until_shutdown()
     );
 
     // A refused connection (wrong token) must NOT kill the slot: the next
-    // valid worker is still served.
+    // valid worker is still served.  FUP-11a pins the refusal itself, and
+    // FUP-11b pins that transport 2 carries the same remap-free verb surface
+    // as the fd transport (an unknown `map-uid`-class verb is refused by
+    // name, and the generation survives it).
     {
-        let mut stream = std::os::unix::net::UnixStream::connect(&sock_path)
-            .expect("connect refused socket");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("read timeout");
-        use std::io::Write;
-        let body = serde_json::json!({
-            "v": 1, "verb": "config", "token": "wrong-token", "args": {},
-        });
-        let bytes = serde_json::to_vec(&body).expect("serialize refused frame");
-        let _ = stream
-            .write_all(&(bytes.len() as u32).to_be_bytes())
-            .and_then(|_| stream.write_all(&bytes));
+        let refused = registered_verb(&sock_path, "wrong-token", "config");
+        assert_eq!(
+            refused["ok"],
+            serde_json::Value::Bool(false),
+            "wrong-token connection must be refused: {refused:?}"
+        );
+        assert_eq!(
+            refused["err"].as_str(),
+            Some(CHANNEL_TOKEN_REFUSAL),
+            "registered-path token refusal must be the exact shared refusal: {refused:?}"
+        );
+        let refused = registered_verb(&sock_path, token, "map-uid");
+        assert_eq!(
+            refused["ok"],
+            serde_json::Value::Bool(false),
+            "map-uid must be refused on the registered path too: {refused:?}"
+        );
+        assert_eq!(
+            refused["err"].as_str(),
+            Some("unknown verb: map-uid"),
+            "no remap surface on transport 2: {refused:?}"
+        );
     }
 
     // config / run / stats / ports through the registered path.
@@ -1121,6 +1194,10 @@ fn test_supervise_path_serve_launches_instance_and_serves_verbs_until_shutdown()
         assert_eq!(resp["ok"], serde_json::Value::Bool(true), "stats: {resp:?}");
         if resp["data"]["instance_state"] == "Live"
             && resp["data"]["children_live"] == 1
+            // FUP-11e: same settle strength as the fd-transport sister case —
+            // a reconciled snapshot must show zero accounting drift, not just
+            // the live child count.
+            && resp["data"]["proc_count_vs_live"] == 0
             && resp["data"]["pid"].as_i64() == Some(pid)
         {
             settled = true;
@@ -1130,8 +1207,8 @@ fn test_supervise_path_serve_launches_instance_and_serves_verbs_until_shutdown()
     }
     assert!(
         settled,
-        "path stats must settle to the live snapshot (Live, one live child, \
-         pid {pid})"
+        "path stats must settle to the live reconciled snapshot (Live, one live \
+         child, zero accounting drift, pid {pid})"
     );
     let resp = registered_verb(&sock_path, token, "ports");
     assert_eq!(resp["ok"], serde_json::Value::Bool(true), "ports: {resp:?}");
@@ -1220,6 +1297,16 @@ fn test_supervise_path_serve_launches_instance_and_serves_verbs_until_shutdown()
         "path generation must exit 0 after shutdown; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // FUP-11c: the refused wrong-token connection above is reported as the
+    // slot's FIRST abnormal-end line (pinned verbatim by serve.rs's unit
+    // test) with a running total of exactly 1 — the `unknown verb` refusal is
+    // a Continue, so it is not counted, and no other connection ended
+    // abnormally.  Before this change every such connection printed its own
+    // line, so a worker retry loop could flood the slot's stderr.
+    assert_stderr_line(
+        &out,
+        &sandlock_supervise::serve::registered_abnormal_end_line(1),
+    );
     assert!(
         !sock_path.exists(),
         "the registered socket must be cleaned up on exit"
@@ -1305,11 +1392,9 @@ fn test_supervise_refuses_runtime_uid_map_verbs() {
             serde_json::Value::Bool(false),
             "{verb} must be refused: {resp:?}"
         );
-        assert!(
-            resp["err"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("unknown verb"),
+        assert_eq!(
+            resp["err"].as_str(),
+            Some(format!("unknown verb: {verb}").as_str()),
             "{verb} must be refused as an unknown verb (no remap surface): {resp:?}"
         );
     }
@@ -1324,6 +1409,162 @@ fn test_supervise_refuses_runtime_uid_map_verbs() {
         out.status.success(),
         "generation must still end cleanly after refused verbs; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    // Unknown-verb refusals are ordinary responses on a live generation
+    // (Continue), not abnormal ends: unlike a token refusal, they must leave
+    // the slot's stderr empty (FUP-11c's counter stays at zero).
+    assert!(
+        out.stderr.is_empty(),
+        "refused verbs must not be logged as abnormal ends, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_file(&policy);
+}
+
+/// FUP-11b: `FORBIDDEN_RUNTIME_MEDIATOR_REMAP` must be a *tested* invariant,
+/// not a greppable comment that can rot.  Pinned here: the exact wording of
+/// the claim, and the CLI surface that proves it (no runtime uid re-map flag
+/// of any kind — the only uid the binary takes is the exec-time `--uid`
+/// self-check the constant names).  The wire half of the same claim lives in
+/// `test_supervise_refuses_runtime_uid_map_verbs` (fd transport) and the
+/// registered-path refusal in the path-verbs test.
+#[test]
+fn test_runtime_mediator_remap_invariant_is_pinned() {
+    assert_eq!(
+        sandlock_supervise::FORBIDDEN_RUNTIME_MEDIATOR_REMAP,
+        "supervise never maps a live generation's mediator to a new host uid; \
+         the mediator host uid is fixed at exec (--uid self-check) and the \
+         sandbox's userns maps only the supervisor's own uid",
+        "the constant IS the contract — reword it here and in \
+         docs/supervise-identity-handoff.md together"
+    );
+
+    let out = spawn(&["--help"]);
+    assert!(out.status.success(), "supervise --help must run");
+    let help = String::from_utf8_lossy(&out.stdout);
+    for forbidden in [
+        "--map-uid",
+        "--remap",
+        "--setuid",
+        "--host-uid",
+        "--mediator-uid",
+        "--run-as",
+    ] {
+        assert!(
+            !help.contains(forbidden),
+            "the CLI must expose no runtime re-map flag {forbidden}, got:\n{help}"
+        );
+    }
+    assert!(
+        help.contains("--uid <X>"),
+        "the exec-time self-check must stay the only uid binding, got:\n{help}"
+    );
+}
+
+/// FUP-11f: the F2b.1 validate-and-exit mode (no `--serve`, no
+/// `--serve-path`) is still the launcher's pre-flight, and `--program`
+/// participates in it — the document is parsed, the control descriptor is
+/// validated, and NOTHING is launched.
+#[test]
+fn test_validate_exit_mode_parses_program_without_launching() {
+    let workdir = repo_tmp_dir().join(format!("supervise-validate-exit-{}", std::process::id()));
+    std::fs::create_dir_all(&workdir).expect("create validate-exit workdir");
+    let evidence = workdir.join("evidence.txt");
+    let script = format!("printf 'launched\\n' > {} && exit 0", evidence.display());
+    let program = write_policy(
+        "validate-exit-program",
+        &serde_json::json!({ "argv": ["/bin/sh", "-c", script] }).to_string(),
+    );
+    let policy = write_policy("validate-exit", "{}");
+
+    let (_worker, server) = std::os::unix::net::UnixStream::pair().expect("control socketpair");
+    let control_fd = server.as_raw_fd();
+    let child = spawn_with_control_fd(
+        &[
+            "--policy",
+            policy.to_str().unwrap(),
+            "--uid",
+            &euid().to_string(),
+            "--control-fd",
+            &control_fd.to_string(),
+            "--program",
+            program.to_str().unwrap(),
+        ],
+        control_fd,
+    );
+    drop(server);
+    let out = child.wait_with_output().expect("wait validate-exit");
+    assert!(
+        out.status.success(),
+        "a valid policy + program must pass the pre-flight; stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "the pre-flight must stay silent, got: {}",
+        stderr(&out)
+    );
+    assert!(
+        !evidence.exists(),
+        "validate-and-exit must never launch the workload"
+    );
+    let _ = std::fs::remove_file(&policy);
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+/// FUP-11f: a rejected program document fails the pre-flight by name — the
+/// same field-naming posture the serve modes have.
+#[test]
+fn test_validate_exit_mode_refuses_bad_program_by_name() {
+    let program = write_policy("validate-exit-empty-argv", r#"{"argv": []}"#);
+    let policy = write_policy("validate-exit-bad-program", "{}");
+    let out = spawn(&[
+        "--policy",
+        policy.to_str().unwrap(),
+        "--uid",
+        &euid().to_string(),
+        // Never probed: the program is refused before the fd check.
+        "--control-fd",
+        "2",
+        "--program",
+        program.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success(), "an empty-argv program must fail");
+    assert_stderr_line(
+        &out,
+        "sandlock-supervise: program rejected: program spec `argv` must be non-empty \
+         (argv[0] is the executable)",
+    );
+    let _ = std::fs::remove_file(&policy);
+    let _ = std::fs::remove_file(&program);
+}
+
+/// FUP-11f: an unreadable program document is a startup failure naming the
+/// path and the OS error, not a silent "no workload" exit.
+#[test]
+fn test_validate_exit_mode_refuses_unreadable_program() {
+    let missing = repo_tmp_dir().join("supervise-validate-exit-missing-program.json");
+    let _ = std::fs::remove_file(&missing);
+    let policy = write_policy("validate-exit-missing-program", "{}");
+    let out = spawn(&[
+        "--policy",
+        policy.to_str().unwrap(),
+        "--uid",
+        &euid().to_string(),
+        "--control-fd",
+        "2",
+        "--program",
+        missing.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success(), "a missing program file must fail");
+    let enoent = std::io::Error::from_raw_os_error(libc::ENOENT);
+    assert_stderr_line(
+        &out,
+        &format!(
+            "sandlock-supervise: program read failed: read policy file {}: {enoent}",
+            missing.display()
+        ),
     );
     let _ = std::fs::remove_file(&policy);
 }
