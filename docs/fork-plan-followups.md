@@ -107,7 +107,12 @@
   kill（`InstanceDead`）未测；F4 dead-leader pgid entry 在组空后 linger 至 session
   结束（security-neutral、bounded）与 kill-probe 交错未 stress。
   为什么留：24 h / 极端时序不可在常规门禁内观测；linger 有界且安全中性，改需事件化
-  设计（与 REAP_POLL_MS 同源）。
+  设计（与 REAP_POLL_MS 同源）。**已关闭（2026-09-07，A/B cleanup wave）**：
+  `max_lifetime: None` 由 F5.5 idle/T_max 用例矩阵覆盖（test_instance_semantics
+  的 idle 用例即 None）；pid-ns init 被杀 → `InstanceDead` 新增矩阵用例
+  `test_pid_ns_init_killed_lands_dead_with_unified_code`（core_integ 533→534）；
+  dead-leader linger 与 kill-probe 交错的重复投送面由 FUP-10 的 pgid 去重关闭；
+  24 h 寿命与极端时序仍不可常规门禁观测（非行为缺陷，文档化）。
 
 ## B. 性能 / 构建 / 发布面
 

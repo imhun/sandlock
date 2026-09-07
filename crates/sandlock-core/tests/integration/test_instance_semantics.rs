@@ -234,6 +234,63 @@ async fn test_dead_state_surfaces_single_error_code() {
     );
 }
 
+/// FUP-13: the Dead state semantics also hold under `pid_ns` — the confined
+/// init is namespace PID 1 but its host pid is still the fatal-link anchor;
+/// killing it must land the instance in `Dead` with the same unified code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_pid_ns_init_killed_lands_dead_with_unified_code() {
+    let mut inst = SandboxInstance::launch_exec_only(
+        base_policy()
+            .pid_ns(true)
+            .build()
+            .unwrap()
+            .with_name("f5-dead-pidns"),
+    )
+    .await
+    .expect("launch pid-ns exec session");
+    let child = inst
+        .exec(&["sleep", "60"], ExecStdio::Null)
+        .await
+        .expect("exec child");
+    let init_pid = inst.control_pid().expect("confined init host pid");
+
+    unsafe { libc::kill(init_pid, libc::SIGKILL) };
+    assert!(
+        poll_until(
+            || inst.phase() == InstancePhase::Dead,
+            Duration::from_secs(10)
+        )
+        .await,
+        "a killed pid-ns init must land the instance in Dead"
+    );
+
+    let e_exec = inst
+        .exec(&["sh", "-c", "exit 0"], ExecStdio::Null)
+        .await
+        .expect_err("exec after Dead must fail");
+    let e_wait = inst
+        .wait_child(child.child_id)
+        .await
+        .expect_err("wait_child after Dead must fail");
+    assert!(
+        matches!(
+            &e_exec,
+            sandlock_core::SandlockError::Runtime(SandboxRuntimeError::InstanceDead)
+        ),
+        "exec after pid-ns Dead must return InstanceDead, got: {e_exec:?}"
+    );
+    assert_eq!(format!("{e_exec}"), format!("{e_wait}"));
+
+    let stats = inst.stats().await;
+    assert_eq!(stats.instance_state, InstancePhase::Dead);
+    inst.shutdown().await.expect("shutdown from Dead must clean up");
+    assert_eq!(inst.phase(), InstancePhase::ShutDown);
+    assert!(
+        !inst.control_dir().expect("control dir").exists(),
+        "shutdown from pid-ns Dead must still remove the control dir"
+    );
+}
+
 /// F5.5 (M3 S7): after the child table empties (and no wait_child subscriber
 /// remains), a persistent `T_idle` drains the instance — the phase reads
 /// `Draining`, the next verb performs the shutdown tail (children_live 0,
