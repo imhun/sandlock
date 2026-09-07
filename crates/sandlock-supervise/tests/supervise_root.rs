@@ -216,6 +216,33 @@ fn connect_errno(port: u16) -> Option<i32> {
     }
 }
 
+/// FUP-11d: how long the harness worker keeps retrying `connect()` while it
+/// waits for a registered slot's socket to appear.  This is a *start-up*
+/// budget, not a per-request one: the slot binds before launching the
+/// instance, so the retry only has to ride out slot start-up (120 s is far
+/// above the slowest bind observed on this gate and still fails a genuinely
+/// dead slot inside one suite step).
+const REGISTERED_CONNECT_RETRY: Duration = Duration::from_secs(120);
+
+/// FUP-11d: per-socket send/receive deadline once the worker is connected —
+/// deliberately far shorter than [`REGISTERED_CONNECT_RETRY`].  A slot that
+/// accepted a connection and then does not answer a verb within 30 s is
+/// wedged, and that has to surface as a named timeout on the verb that hung
+/// instead of quietly eating the remaining connect budget.  The asymmetry is
+/// the point (audit item FUP-11: "first-verb recv timeout vs connect retry").
+const VERB_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// FUP-11c: how many refused (wrong-token) connections the registered-path
+/// acceptance drives through the slot's accept loop.  Must exceed
+/// `AbnormalEndLog::REPORT_EVERY` so the throttle window itself is exercised,
+/// and the slot's stderr is pinned to exactly two lines (the naming first
+/// abnormal end + the one at the window boundary).
+const REFUSED_FLOOD_CONNECTIONS: usize = 300;
+
+/// FUP-11c: the token the flood connections present (never the slot's real
+/// channel token, so every one of them is a genuine token refusal).
+const REFUSED_TOKEN: &str = "flood-wrong-token";
+
 /// The workload probe: runs INSIDE the uid-X sandbox and writes tagged
 /// evidence lines for every acceptance item (Landlock deny, seccomp deny,
 /// DNS gateway, inbound mapping), then parks until shutdown kills it.
@@ -321,15 +348,18 @@ def expect_ok(resp, what):
 
 def open_fd_transport(cfg):
     s = socket.socket(fileno=cfg["fd"])
-    s.settimeout(30)
+    s.settimeout(cfg["verb_timeout_s"])
     return s
 
 def open_registered_transport(cfg):
-    deadline = time.time() + 120
+    # FUP-11d: the connect budget (waiting for the slot's socket to appear)
+    # and the per-verb I/O budget are deliberately asymmetric — see the Rust
+    # constants that feed these two numbers.
+    deadline = time.time() + cfg["connect_retry_s"]
     while True:
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(30)
+            s.settimeout(cfg["verb_timeout_s"])
             s.connect(cfg["sock"])
             return s
         except OSError:
@@ -437,6 +467,25 @@ def drive(cfg):
         if not complete:
             raise AssertionError("workload evidence never completed")
 
+        # FUP-11c: a refused-connection flood must not become a log flood.
+        # Every one of these connections is an abnormal end for the slot; the
+        # Rust side pins that the slot's stderr holds only the naming first
+        # line plus one line per throttle window (not 300 lines).
+        refused = 0
+        for _ in range(cfg["refused_flood"]):
+            s = open_registered_transport(cfg)
+            try:
+                resp = frame(s, "config", cfg["refused_token"], {})
+            finally:
+                s.close()
+            if not resp.get("ok"):
+                refused += 1
+        if refused != cfg["refused_flood"]:
+            raise AssertionError(
+                "expected all %d flood connections refused, got %d"
+                % (cfg["refused_flood"], refused))
+        report["refused_flood"] = refused
+
         resp = one_verb(transport, cfg, "shutdown")
         report["shutdown_ok"] = True
 
@@ -487,6 +536,12 @@ fn write_evidence_and_worker_config(
         "token": token,
         "host_port": host_port,
         "evidence": evidence.to_string_lossy(),
+        // FUP-11d: the budgets live in Rust and reach the python worker
+        // through the config, so harness and comments cannot drift apart.
+        "connect_retry_s": REGISTERED_CONNECT_RETRY.as_secs(),
+        "verb_timeout_s": VERB_IO_TIMEOUT.as_secs(),
+        "refused_flood": REFUSED_FLOOD_CONNECTIONS,
+        "refused_token": REFUSED_TOKEN,
     });
     let cfg_path = base.join("worker-config.json");
     write_shared(&cfg_path, &config.to_string());
@@ -693,6 +748,12 @@ fn test_supervisor_as_foreign_uid_is_fully_functional() {
         serde_json::Value::Bool(true),
         "reconciler must settle to a stable snapshot (对账一致): {worker_report}"
     );
+    // FUP-11e (root sibling of the non-root path case): the settle point is
+    // the reconciled snapshot, so the drift counter itself must be zero.
+    assert_eq!(
+        worker_report["stats"]["proc_count_vs_live"], 0,
+        "a settled snapshot must show zero accounting drift: {worker_report}"
+    );
     assert_eq!(
         worker_report["ports"]["host_port"], host_port,
         "ports must report the live mapped host listener: {worker_report}"
@@ -706,6 +767,13 @@ fn test_supervisor_as_foreign_uid_is_fully_functional() {
         worker_report["shutdown_ok"],
         serde_json::Value::Bool(true),
         "shutdown verb: {worker_report}"
+    );
+    // FUP-11c: every flood connection really was refused (so the slot really
+    // saw that many abnormal ends before the log assertion below).
+    assert_eq!(
+        worker_report["refused_flood"],
+        REFUSED_FLOOD_CONNECTIONS as u64,
+        "the worker must have driven the whole refused flood: {worker_report}"
     );
 
     let supervise_status = wait_child_exit(
@@ -723,6 +791,30 @@ fn test_supervisor_as_foreign_uid_is_fully_functional() {
     assert!(
         supervise_status.success(),
         "foreign-uid generation must exit 0 after shutdown; stderr: {supervise_err}"
+    );
+    // FUP-11c: the worker drove `REFUSED_FLOOD_CONNECTIONS` refused
+    // connections through this slot's accept loop.  Every one of them is an
+    // abnormal end, yet the slot must print only the naming first line plus
+    // one line at the throttle-window boundary — an unthrottled
+    // `eprintln!`-per-connection would have printed 300 here.
+    assert!(
+        REFUSED_FLOOD_CONNECTIONS
+            > sandlock_supervise::serve::AbnormalEndLog::REPORT_EVERY as usize,
+        "the flood must cross a throttle window to prove the second line"
+    );
+    let logged: Vec<String> = supervise_err.lines().map(|line| line.to_string()).collect();
+    let expected_log: Vec<String> = vec![
+        sandlock_supervise::serve::registered_abnormal_end_line(1),
+        sandlock_supervise::serve::registered_abnormal_end_line(
+            sandlock_supervise::serve::AbnormalEndLog::REPORT_EVERY,
+        ),
+    ];
+    assert_eq!(
+        logged,
+        expected_log,
+        "the slot must throttle its abnormal-end log (FUP-11c), got \
+         {} line(s)",
+        logged.len()
     );
 
     // Exact evidence lines from the workload inside the uid-X sandbox.
@@ -788,6 +880,34 @@ fn test_supervisor_as_foreign_uid_is_fully_functional() {
         processes_with_uid(UID_X)
     );
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// FUP-11d: the harness budgets must keep their documented shape.  A wedged
+/// slot that already accepted a connection must fail a verb long before the
+/// connect-retry budget for a slot that never appeared runs out, and the
+/// refused flood must be long enough to cross a log throttle window (otherwise
+/// the FUP-11c pin above would pass even without throttling).
+#[test]
+fn test_harness_timeouts_and_flood_keep_their_contract() {
+    assert_eq!(
+        REGISTERED_CONNECT_RETRY,
+        Duration::from_secs(120),
+        "the slot-bind retry budget is documented as 120 s"
+    );
+    assert_eq!(
+        VERB_IO_TIMEOUT,
+        Duration::from_secs(30),
+        "the per-verb send/receive deadline is documented as 30 s"
+    );
+    assert!(
+        VERB_IO_TIMEOUT < REGISTERED_CONNECT_RETRY,
+        "a verb must fail faster than the whole slot wait"
+    );
+    assert!(
+        REFUSED_FLOOD_CONNECTIONS
+            > sandlock_supervise::serve::AbnormalEndLog::REPORT_EVERY as usize,
+        "the flood must cross a throttle window to prove the second log line"
+    );
 }
 
 /// FUP-03 exit-order harness: a worker that closes the fd control channel
