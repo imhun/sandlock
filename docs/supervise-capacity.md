@@ -110,23 +110,31 @@ PSS 4 050/4 075/2 729/4 154；其中 threads=8/arena=1 一轮出现 2 729 的低
 （每 slot 私有+其独占共享份额的上界）；**容量用 §3 的 N 并发边际数**，
 两者口径在文档中显式区分。
 
+采样标注（FUP-18，2026-09-07 复核）：每点"实测" = 状态稳定后 3 次
+（间隔 200 ms）的**中位数**（§1 方法）；"跨轮区间" = 4 配置 × 多轮实测的
+最小–最大，含 §2 记录的 2 729 kB 离群低值；"1000 轮后"上界取 batched
+高水位 5 203 kB（全矩阵最大值），不用单点中位数作上界。
+
 ### 4.2 exec 往返延迟（worker verb → child 启动 → wait 返回）
 
 顺序 1000 轮实测（fd 与 registered 同量级，四配置一致）：
 
-| 统计 | 实测 | 预算 |
-|---|---:|---:|
-| mean | 102.2–102.8 ms | — |
-| p50 | 102.0–102.6 ms | **200 ms** |
-| p95 | 102.9–104.5 ms | **300 ms** |
-| max | 105–203 ms（单次调度尖刺） | **2 000 ms** |
+| 统计 | 实测（2026-09-05，100 ms 轮询地板） | 实测（2026-09-07，FUP-14 事件化后） | 预算 |
+|---|---:|---:|---:|
+| mean | 102.2–102.8 ms | 5.38 ms | — |
+| p50 | 102.0–102.6 ms | 5.35 ms | **200 ms** |
+| p95 | 102.9–104.5 ms | 5.84 ms | **300 ms** |
+| max | 105–203 ms（单次调度尖刺） | 7.22 ms | **2 000 ms** |
 
 上界推导：p50/p95 预算 ≈ 实测 × 2–3 倍（吸收慢 CI 与调度抖动，仍能抓住
-"退出帧不再路由/轮询失效导致往返翻倍"级别的回归）；max 预算留 10×
-给偶发调度停顿。**往返有一个 ~100 ms 的实现地板**：
-`crates/sandlock-core/src/init/mod.rs` 的 `REAP_POLL_MS = 100`
-（子进程退出后由 init 的 100 ms 控制通道轮询收割并回路由 Exited 帧），
-exec 启动腿本身 ~1.5 ms。见 §6 优化点名。
+"退出帧不再路由/事件唤醒失效导致往返翻倍"级别的回归）；max 预算留 10×
+给偶发调度停顿。2026-09-05 行的 ~100 ms 地板来自
+`crates/sandlock-core/src/init/mod.rs` 的 `REAP_POLL_MS = 100`（子进程退出后
+由 init 的 100 ms 控制通道轮询收割并回路由 Exited 帧；exec 启动腿本身
+~1.5 ms）。**FUP-14（2026-09-07）改为 SIGCHLD signalfd 事件唤醒**
+（`REAP_POLL_MS` 保留为无 signalfd/孤儿兜底）：p50 101.75 → 5.35 ms
+（≈19×），latency 测试总时长 32.6 s → 1.75 s。延迟样本存
+`tmp/perf/fup14-latency-{before,after}.txt`。
 
 ## 5. 容量口径与调度账本项（binding）
 
@@ -145,21 +153,20 @@ exec 启动腿本身 ~1.5 ms。见 §6 优化点名。
   正式 supervise **release 单进程**：单进程 PSS ≈ 4.2–4.7 MB（仍 < 25 MB），
   N 并发分摊后 0.42–0.5 MB/slot（100 slot ≈ 50 MB，比 §11.1 口径低 ~50×）。
   **不得再用 §11.1 数字定容量**。
-- profile 备注：仓库 release profile 即 cargo 默认（panic=unwind、未 strip，
-  2026-09-05 实测二进制 9.99 MB、含符号）；plan 协议写的 `panic=abort+strip`
-  未在任意 Cargo.toml 落地。实测针对的是 runner 实际发布的 profile；
-  若后续加 `[profile.release] panic=abort + strip`，PSS/代码体积只会更小，
-  现有预算仍然有效（见 §6）。
+- profile 备注：**FUP-15（2026-09-07）已落地 `[profile.release] panic=abort +
+  strip=symbols`**；2026-09-07 release 实测 sandlock-supervise 5.82 MB、
+  libsandlock_ffi.so 5.57 MB（此前 2026-09-05 为 9.99 MB、含符号、unwind）。
+  PSS/代码体积只会更小，现有预算仍然有效（见 §6）。
 
 ## 6. 测量暴露、点名的后续项（本任务不做范围外实现）
 
-1. **`REAP_POLL_MS = 100` 给每次 exec 往返一个 ~100 ms 地板**（空载轮询
-   收割；wait 腿实测 ~101 ms）。改事件驱动（SIGCHLD self-pipe / pidfd
-   wait 就绪通知）或缩短轮询会把 exec 往返从 ~102 ms 降到个位数 ms ——
-   便宜且安全，但属于 F2b.4 之外的性能改动，留给后续（F5.6 长跑自证同源）。
-2. **release profile 无 `panic=abort`/`strip`**：与 plan 协议描述不符
-   （历史 OCI 期望残留）。若部署 profile 加上，体积/PSS 只会更小；留给
-   release 面任务，不在本任务改。
+1. ~~**`REAP_POLL_MS = 100` 给每次 exec 往返一个 ~100 ms 地板**~~ —
+   **已关闭（FUP-14，2026-09-07）**：init 改为 SIGCHLD signalfd 事件唤醒，
+   `REAP_POLL_MS` 降级为无 signalfd/孤儿兜底；exec 往返 p50 101.75 → 5.35 ms
+   （§4.2 新行）。
+2. ~~**release profile 无 `panic=abort`/`strip`**~~ — **已关闭（FUP-15，
+   2026-09-07）**：`[profile.release] panic=abort + strip=symbols` 落地，
+   supervise 二进制 9.99 → 5.82 MB。
 3. 1000 轮 batched 高水位 +0.5–0.7 MB、sequential 回落：无泄漏证据，
    但 10k 轮单调平台断言归 F5.6。
 

@@ -326,7 +326,9 @@ supervise_cost = 3 # F2b.4 cost target (release-only): new
                    # release label (CARGO_BIN_EXE_sandlock-supervise = the
                    # release binary) with --test-threads=1. Counts/budgets
                    # documented in docs/supervise-capacity.md.
-supervise_root = 2 # ROOT-MODE: run via scripts/test-all.sh
+supervise_root = 3 # ROOT-MODE: run via scripts/test-all.sh; +1 FUP-03
+                   # exit-order harness (worker-close-first leaves no residue,
+                   # 2026-09-07)
                    # --supervise-root as root (same privileged container as
                    # oci). F2b.3 foreign-uid acceptance in
                    # tests/supervise_root.rs: supervise as uid 65533 via

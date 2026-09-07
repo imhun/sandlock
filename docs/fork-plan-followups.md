@@ -45,6 +45,13 @@
   延迟出现的 uid-X 僵尸（state Z、ppid=1、容器无 subreaper 回收），与
   FUP-06 登记同源——异常退出路径存在 reaping/退出顺序缺口；修复需要专用
   exit-order harness，继续 open（专用 harness 任务）。
+  **已关闭（2026-09-07，A/B cleanup wave）**：新增 root 档 exit-order harness
+  `test_supervisor_as_foreign_uid_fd_handoff_worker_close_first_leaves_no_residue`
+  （worker 先关、workload 存活 → supervise 非零退出且无 uid-X 活进程/僵尸）；
+  RED 复现竞态后修 `serve.rs` abnormal end：与正常路径一致先同步
+  `instance.shutdown()`（kill+reap+清理）再退出，不再依赖 Drop 与进程退出竞速。
+  修复后 harness 8/8 绿（supervise_root 2→3）；>5 s deadline 替身单测与
+  overflow cap 覆盖维持既有（F1.8/executor 单测）。
 - **FUP-04 fs_mount link-EBUSY 直击 + 断言精度** — 来源：F6.2 review（`6fcb8e2`）。
   **状态：已完成（F13，2026-09-06，fork 本地提交）。**
   描述：unlink/rename-at-mount-point 已 pin，`link()` 于 rw 挂载点无直击测试；
@@ -134,6 +141,13 @@
   描述：exec 往返 ~102 ms 有 ~100 ms 轮询地板；SIGCHLD self-pipe / pidfd 就绪通知可
   降到个位数 ms。
   为什么留：性能改动需核心行为变更 + 成本/延迟复测，F2b.4 明确留给后续。
+  **已关闭（2026-09-07，A/B cleanup wave）**：init 阻塞 SIGCHLD 并挂 signalfd，
+  poll 集合 = 控制通道 + signalfd；`REAP_POLL_MS` 保留为无 signalfd/孤儿兜底；
+  spawn 子进程在 exec 前解除 SIGCHLD 阻塞（workload 语义不变）。release
+  supervise_cost latency：p50 101.75 → 5.35 ms、p95 102.61 → 5.84 ms、
+  max 103.06 → 7.22 ms（≈19×；latency 测试总时长 32.6 s → 1.75 s；
+  样本 `tmp/perf/fup14-latency-{before,after}.txt`）；core_lib/core_integ/
+  supervise 全量回归绿。
 - **FUP-15 release profile `panic=abort` + `strip`** — 来源：F2b.4（`799fc8f`）/
   F2b.5（`51b64ad`）。
   描述：仓库 release profile 即 cargo 默认（panic=unwind、未 strip），release
@@ -156,6 +170,10 @@
 - **FUP-18 容量表 §4.1 区间/采样标注精度** — 来源：F2b.4 review（`799fc8f`）。
   描述：§4.1 的跨轮区间上界略低估、中位数采样标注不精确；预算余量仍 ≥28–37%。
   为什么留：需回放原始逐轮采样才可精确化；预算有效性不受影响。
+  **已关闭（2026-09-07，A/B cleanup wave）**：capacity doc §4.1 补采样标注
+  （实测=稳定后 3×200 ms 中位数；跨轮区间=4 配置×多轮 min–max，含 2 729 离群；
+  1000 轮后上界=batched 高水位 5 203）；§4.2 延迟表换 FUP-14 前后双列实测；
+  §5/§6 同步 release profile（FUP-15）与事件化（FUP-14）已落地。
 
 ## C. 架构 seam / 设计候补
 
