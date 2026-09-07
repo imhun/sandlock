@@ -40,7 +40,11 @@
   描述：worker 先关控制通道时主退出观察顺序可能异常（未测）；stray overflow cap
   无单测；>5 s deadline 竞态只以替身单测覆盖。
   为什么留：需要专用 exit-order harness（worker 必须先观察 Exited 才能收场的约束
-  限制），超出 F9 文档范围。
+  限制），超出 F9 文档范围。**2026-09-07（A/B cleanup wave）实证**：root 档
+  fd-handoff 异常 EOF（无 shutdown）复测时观察到 supervise 异常退出后留下
+  延迟出现的 uid-X 僵尸（state Z、ppid=1、容器无 subreaper 回收），与
+  FUP-06 登记同源——异常退出路径存在 reaping/退出顺序缺口；修复需要专用
+  exit-order harness，继续 open（专用 harness 任务）。
 - **FUP-04 fs_mount link-EBUSY 直击 + 断言精度** — 来源：F6.2 review（`6fcb8e2`）。
   **状态：已完成（F13，2026-09-06，fork 本地提交）。**
   描述：unlink/rename-at-mount-point 已 pin，`link()` 于 rw 挂载点无直击测试；
@@ -79,6 +83,11 @@
   描述：`early_exit_cap=1024`、`request` 默认 5 s、`T_idle`/`T_max` 目前只走
   constructor/私有 API，未接 CLI/profile。
   为什么留：配置面是产品决策；测试已 pin 默认行为，接线留部署面任务。
+  **已关闭（2026-09-07，A/B cleanup wave，决策）**：无生产消费者需要调这些
+  内部协议/生命周期旋钮（E2B 未请求端口/超时级配置），维持 constructor 默认 +
+  测试 pin 的行为；若未来部署侧需要调优，从 `InstanceLifetime` /
+  `InitLink::with_options` 的既有 seam 接 CLI/profile/env（届时按 F6.1
+  `--mediation-run-as` 的接线纪律做端到端测试）。
 - **FUP-09 egress flake 证据留存流程** — 来源：F2.1 ⚠️ / F5 gate / F8 gate
   （`8e22c5d`..`c8f76d4` 多轮观察；本 F9 终局一次即绿，未触发重试）。
   描述：`cli learn`（curl https://example.com）等外部 egress 用例与本环境偶发的
@@ -102,6 +111,11 @@
   描述：Start/Exec 的 Err 中继已显式化但 call-site Err 未单测；send 失败不标 Dead
   （pre-existing、文档化）。
   为什么留：e2e deadline 用例绿；send 失败无消费者影响，直测收益低。
+  **已关闭（2026-09-07，A/B cleanup wave，证据）**：call-site 错误中继由
+  oci supervisor 单测 `test_request_timeout_returns_error_within_deadline`
+  与 `request on a Dead link must fail`（supervisor.rs:1815/1889）精确 pin
+  （超时精确消息、Dead 后 fail-fast、waiter 不清除）；send 失败不标 Dead 维持
+  pre-existing 文档语义（无消费者路径依赖该标记，直测收益低于文档成本）。
 - **FUP-13 F5 语义观察缺口** — 来源：F5 review（`b56fcbe`..`1321ba0`）。
   描述：supervise `max_lifetime: None` 无运行时测试（24 h 不可观）；pid_ns 下 init 被
   kill（`InstanceDead`）未测；F4 dead-leader pgid entry 在组空后 linger 至 session

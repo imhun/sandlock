@@ -36,7 +36,10 @@
 # test_instance_chroot.rs non-root same-uid exec-only acceptance) and +3
 # mediation_2uid (root RunAs(10000)/uid0 restrictive-cache acceptance) —
 # logs tmp/sdd/f10-*.
-core_lib = 828 # F14 (2026-09-06): 827 -> 828, +1 unit test
+core_lib = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
+               # +3 profile mediation_run_as tests (profile.rs) +2 signal
+               # delivery unit tests (init/mod.rs escaped_group/unique pgids)
+               # F14 (2026-09-06): 827 -> 828, +1 unit test
                # (sandbox::tests::mediation_identity_gate_refuses_nonroot_
                # effective_caps_remap) pinning the capability-aware C档
                # predicate — non-root effective CAP_SETUID/CAP_SETGID
@@ -108,7 +111,9 @@ core_lib = 828 # F14 (2026-09-06): 827 -> 828, +1 unit test
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 533 # F11 (2026-09-06): 532 -> 533, +1 argv-safety root-cause
+core_integ = 534 # FUP-13 (2026-09-07, A/B cleanup wave): 533 -> 534, +1
+                 # pid-ns init-kill Dead matrix test (test_instance_semantics.rs)
+                 # F11 (2026-09-06): 532 -> 533, +1 argv-safety root-cause
                  # regression in integration/test_policy_fn.rs
                  # (test_instance_exec_after_threaded_peer_succeeds): an
                  # exec-only instance whose threaded helper registers its
@@ -261,7 +266,10 @@ ffi = 100 # F13 (2026-09-06): 98 -> 100, +2 in tests/fs_mount.rs
          # compiles the regenerated sandlock.h against the cdylib (still 1);
          # header regeneration also picks up pre-existing drift at HEAD
          # (missing sandlock_sandbox_builder_notify_rate_limit declaration).
-cli = 98      # F6.2 (P5): 97 -> 98, +1 in tests/cli_test.rs
+cli = 100     # FUP-01/FUP-07 (2026-09-07, A/B cleanup wave): 98 -> 100,
+              # +1 --pid-ns runtime-policy unit test (main.rs) +1 profile
+              # mediation_run_as acceptance test (profile_integration.rs)
+              # F6.2 (P5): 97 -> 98, +1 in tests/cli_test.rs
               # (test_fs_mount_flag_wired_end_to_end_single_file) — the
               # --fs-mount flag drives a chroot single-file mount through the
               # real binary (the --pid-ns wiring-miss class is pinned).
