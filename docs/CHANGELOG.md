@@ -195,6 +195,19 @@ sandlock_instance_free                              # F3.3
 
 ## 明确取舍 / 已知限制（不是缺陷修复）
 
+- **⚠ pure 形态 exec stdio 的低位 fd 依赖（FUP-23，2026-09-07 发现，未修）**：
+  承载沙箱的进程如果**除 0/1/2 外不持有任何描述符**（下一个可用 fd = 3），pure
+  形态下 exec 出去的命令会**丢掉整条 stdout**（CPython 退出期 flush 失败 ⇒ exit
+  120；`/bin/echo x` ⇒ exit 1；`> /tmp/f` ⇒ exit 2），只要预先多开 1 个 fd 就正常。
+  根因面在 stdio 搬迁下界（`relocate_high` 只要 ≥3）与桩/控制通道的**固定低位号**
+  （`CONTROL_FD = 3` + READY/GO）可重叠，被覆盖后子进程 fd 1 不可写。A/B 取证：同一
+  镜像只换 debug `.so`，本波之前 tip `4d5f385` 绿、FUP-14 `7671240` 红 ⇒ **本波的
+  signalfd 让潜伏缺陷变得可达**（FUP-14 自身功能与延迟收益不受影响）。全量门禁与
+  入库契约看不到它：pytest/cargo 进程天然持有几十个 fd。生产 envd 服务在启动后即
+  打开监听 socket ⇒ 不在触发条件内，但**任何以「几乎空 fd 表」嵌入沙箱的形态会踩到**。
+  登记与修法见 `docs/fork-plan-followups.md` FUP-23；E2B 侧对应
+  `docs/task-backlog.md` #22。**升级本 wheel 前请先读这条**。
+
 - P6 getsockname/getpeername 合成视图与 fd-inject `EINPROGRESS`：设计取舍 +
   回归 pin（F8 `c8f76d4`，`docs/e2b-integration.md` §3.10）。
 - P4（T4）chroot+net_isolation 入站：fork 侧前提证伪 + 回归 pin（F7 `4e78c98`），

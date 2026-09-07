@@ -166,6 +166,50 @@
 
 ## B. 性能 / 构建 / 发布面
 
+- **FUP-23 pure 形态 exec stdio 低位 fd 串流（2026-09-07，P1，本波发现）** —
+  来源：A/B cleanup wave 的 E2B 复跑（`tmp/f11_fup3_probe.py` 网关+命令探针不可
+  复现，进而二分）。
+  现象：pure（无 base image）形态下，沙箱命令的 **stdout 整条丢失**——CPython 因
+  退出期 flush 失败退 **120**、`/bin/echo x` 以写错误退 **1**、`echo hi > /tmp/f`
+  退 **2**；stderr 通路在同一布局下也受影响，而**入库契约与三档全量门禁全绿**。
+  精确触发条件（唯一变量 = 承载 harness 的客户端进程 fd 表）：客户端除 0/1/2 外
+  **不持有任何 fd**（下一个可用 fd = 3）时必现；只要预先多开 1 个 fd（或 8/24/64）
+  即完全正常。
+  A/B 定位（同一镜像 `39ed2a82b08b`、同一 E2B 代码、只热替换 debug
+  `libsandlock_ffi.so`）：fork `4d5f385`（本波之前）⇒ `FAILURES: []`；
+  `7671240`（FUP-14 事件化 reap）⇒ 复现。即**本波把潜伏缺陷变成可达**。
+  根因面（读码所得，待 RED 钉死）：`sandbox.rs` 的 stdio 装配为了规避
+  「管道端正好占住 0/1/2」用了 `relocate_high()`，但搬迁目标是
+  `F_DUPFD_CLOEXEC(src, 3)`（只要 ≥3），而桩/控制通道用**固定低位号**
+  （`init/proto.rs: pub const CONTROL_FD: i32 = 3`，另有 READY/GO）⇒ 搬迁目标可与
+  被保留的控制 fd 或兄弟流的源 fd 重叠，被 dup2/dup3 覆盖后子进程 fd 1 变成不可写
+  （`/proc/self/fd/1` 存在但 `write` 失败，正是本现象）。FUP-14 在 init 里新增
+  signalfd，使低位 fd 分配整体位移，恰好把 pure 形态推进这个重叠区。
+  为什么门禁看不见：pytest / cargo 测试进程天然持有几十个 fd（socket、缓存、
+  `/proc` 句柄），stdio 管道不会落在 3；只有「fd 表几乎为空」的嵌入形态踩得到。
+  建议修法：①搬迁下界改为「与 0/1/2 **以及全部保留控制 fd** 不相交」的号段
+  （或由 spawn 侧先把保留 fd 搬到固定高位号，再统一 dup2 下发），②`dup2`/`close`
+  返回值在异步信号安全前提下失败即 `_exit` 点名（现在被忽略），③RED 用可控 fd 表
+  （子进程 helper 先 close 掉 3..N 再建管道）钉「三端各归其位且互不串流 + stdout
+  精确到达」，并加一条「保留 fd 号段与 relocate 下界不相交」的纯决策单测。
+  本波未修：需要一轮 fork 修复 + 全门禁 + wheel 重建 + E2B 复跑，且要新增可控
+  fd 表的 RED 夹具；E2B 侧已把该现象与复现记入 `docs/task-backlog.md` #22。
+
+  复现与取证（供修复会话直接接手）：
+  - 判别条件：`tmp/f11_fdcount_probe.py`（E2B 仓库，main `8ae1a40`）在跑
+    `tmp/f11_fup3_probe.py` 前于客户端进程多开 N 个 `/dev/null` ——
+    **N=0 必现、N≥1 全绿**（`highest=3` 即下一个可用 fd 已被占住时安全）。
+  - 引入点 A/B：同一测试镜像 `39ed2a82b08b`、同一 E2B 代码，只把
+    `site-packages/sandlock/libsandlock_ffi.cpython-314-x86_64-linux-gnu.so`
+    换成对应 tip 的 debug 构建 ⇒ `4d5f385` 绿、`7671240`（FUP-14）红。
+  - 子进程侧观察：`/proc/self/fd/1` 存在但 `write(1)` 失败（`/bin/echo x` ⇒ 1、
+    CPython flush ⇒ 120、shell 重定向 ⇒ 2），`write(2)` 同布局下也不可信
+    ⇒ 是 **fork 侧 stdio 装配接错端**，不是 envd/SDK 的传输丢数据。
+  - 待验证的收窄假设：碰撞点是「某个 stdio 端正好落在被保留的低位 fd 上」
+    （`CONTROL_FD = 3`，桩另有 READY/GO 固定号），修复方向 = 先搬 stdio 再装
+    保留 fd，或让保留 fd 号段从 stdio 分配范围里排除；RED 夹具需在子进程里
+    把 fd 表压到「下一个可用 = 3」才能覆盖（现有 cargo/pytest 进程都太“胖”）。
+
 - **FUP-14 REAP_POLL_MS=100 事件化** — 来源：F2b.4（`799fc8f`，capacity doc §6）。
   描述：exec 往返 ~102 ms 有 ~100 ms 轮询地板；SIGCHLD self-pipe / pidfd 就绪通知可
   降到个位数 ms。
