@@ -114,6 +114,35 @@
   verb 30 s recv 超时与 120 s connect 重试不对称；非 root path stats settle 断言弱于
   姊妹用例；`FORBIDDEN` 常量无测试引用。
   为什么留：断言/日志/测试强度收尾，非行为缺陷；逐项改需要各自对应文件的小改动。
+  **已关闭（2026-09-07，A/B cleanup wave，逐项处置）**：
+  **1a** supervise 错误路径断言全部转「整行 / 整串」精确——`tests/supervise.rs`
+  原有的 `contains` 式 error 断言清零（只剩 `--help` 面的正/负存在性检查）：uid
+  自检拒绝、未知 policy 字段、closed / non-socket / AF_INET control fd、
+  `--policy <fd>` 超时（fd 号与 deadline 精确，仅 elapsed 计数留白并校验其量级）、
+  oversize cap、EOF 与 token 的异常结束行、跨进程 S9 `PolicyTooWide`、
+  `unknown verb: <verb>`；`serve.rs` 的三处 ProgramSpec 单测同步转整串。
+  **1b** 新增 `test_runtime_mediator_remap_invariant_is_pinned`：钉
+  `FORBIDDEN_RUNTIME_MEDIATOR_REMAP` 原文 + CLI flag 面（不存在任何运行期 remap
+  flag，`--uid <X>` 仍是唯一 uid 绑定）；registered path 也钉 `map-uid` ⇒
+  `unknown verb: map-uid`（此前只有 fd transport 钉过）。
+  **1c** registered slot 的异常连接日志改走 `AbnormalEndLog`：首条必打（可归因），
+  其后每 `REPORT_EVERY=256` 条打一条且带累计数。lib 单测钉节流序列 + 整行文本，
+  root 档 foreign-uid 验收再钉「300 条被拒连接 ⇒ 恰好 2 行日志」。
+  **1d** `REGISTERED_CONNECT_RETRY=120 s` / `VERB_IO_TIMEOUT=30 s` 提为命名常量并
+  经 worker config 传给 python 夹具（消除双写），注释说明取舍：等 slot 建出 socket
+  是**启动预算**，而连接后 verb 卡死必须更快失败；新增
+  `test_harness_timeouts_and_flood_keep_their_contract` 钉住该关系。
+  **1e** 非 root registered path 的 stats settle 断言补 `proc_count_vs_live == 0`
+  （与 fd 姊妹用例同强度）；root 档 worker report 同样精确断言 drift 归零。
+  **1f** validate-and-exit 模式审计：仍在（`main.rs` 的 `ServeMode::None`）且补 3 例
+  ——合法 program 静默 exit 0 且**绝不 launch**、`{"argv": []}` 与不可读 program
+  文件按整串点名拒绝。
+  计数：supervise 36→42（+2 lib unit / +4 integration）、supervise_root 3→4；
+  行为变化仅 1c 的日志形态（用户可见：slot stderr 不再随被拒连接数线性增长）。
+  证据 `tmp/sdd/f11-supervise-r1.log`（非 root lib+integration 42 绿）、
+  `f11-supervise-root-r3.log`（root 档 4 绿）、`f11-gate-nonroot-final.log`（非 root
+  全量 8 档）与 `f11-gate-root-final.log`（root 三档：supervise_root 4 /
+  mediation_2uid 9 / oci 144）。
 - **FUP-12 F1.8 call-site 错误路径与 send 失败语义** — 来源：F1.8 review（`df5d77a`）。
   描述：Start/Exec 的 Err 中继已显式化但 call-site Err 未单测；send 失败不标 Dead
   （pre-existing、文档化）。

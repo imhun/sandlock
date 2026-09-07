@@ -98,6 +98,25 @@
 - **route-B supervise 单代次**（F2b，`3339c12`..`3afc9dd`）：一个 `sandlock-supervise`
   进程服务一个沙箱，euid == 沙箱 host uid；运行期禁止把中介 remap 成别的 host uid；
   shutdown 清场后 exit(0)。C 档（root 进程内 RunAs + 中介）默认被拒（见上）。
+- **A/B cleanup wave 的行为变化（FUP-01..18，2026-09-07，本地提交）**：
+  * `--pid-ns` 在 CLI 上真正接线（FUP-01，`262c0cf`）：此前 flatten 后的参数没转发给
+    runtime builder，CLI 用户无法开 `pid_ns`（FFI/Python/profile 早已生效）；现按
+    `--mediation-run-as` 的形态有 CLI→运行时回归。
+  * supervise **异常代次结束**改为同步清场后再退出（FUP-03，`dac18ed`）：worker 先关
+    控制通道时不再与进程退出竞速，此前会留下 ppid=1 的 uid-X 僵尸/孤儿 workload。
+  * 信号面两步逃逸（setpgid → setsid 伪装箱内）被检测，`dead_groups` 与活 child pgid
+    重叠时去重，不再可能双 `killpg`（FUP-10，`d5bbdd8`）。
+  * exec/exit 往返去掉 ~100 ms 轮询地板：init 侧 SIGCHLD signalfd 事件化 reap
+    （FUP-14，`7671240`）；release 实测 p50 101.75 → **5.35 ms**、p95 102.61 →
+    5.84 ms、max 103.06 → 7.22 ms（≈19×；样本 `tmp/perf/fup14-latency-*.txt`）。
+    `REAP_POLL_MS` 保留为无 signalfd/孤儿兜底，spawn 子进程在 exec 前解除 SIGCHLD 阻塞。
+  * route-B registered slot 的异常连接日志改**节流**（FUP-11c）：首条照常点名，其后每
+    256 条打一条并带累计数——被拒连接数不再线性放大 slot stderr（300 条被拒 → 2 行）。
+  * release profile 变发布面（FUP-15，`b1e2e32`）：`panic=abort` + `strip="symbols"`；
+    wheel 侧 supervise 注入改 RECORD **replace-in-place**（不再追加第二行）+ verify
+    增校 RECORD/0755/euid+`--uid`（FUP-16，`b87524a`）。
+  * profile 支持 `mediation_run_as` 且 CLI 省略 flag 时不覆盖 profile 值（FUP-07，
+    `48968a5`）；非 root runner 拒绝以 root 跑非 root 档（FUP-17，`e57cebf`）。
 
 ## 新能力
 
@@ -157,16 +176,22 @@ sandlock_instance_free                              # F3.3
 - `--fs-mount VIRTUAL:HOST[:ro]`（F6.2 `de2f749`，chroot 单文件/chardev 端到端）。
 - `sandlock-supervise`：`--policy <fd|path> --uid X --control-fd N`、
   `--serve/--serve-path/--token/--program`（F2b.1–F2b.3）。
-- 已知未接线：CLI `--pid-ns`（历史缺陷，follow-up FUP-01）。
+- `--pid-ns`（FUP-01 `262c0cf`，A/B cleanup wave 接线）：flatten 后的参数此前没有
+  转发给 runtime builder，CLI 形态下 `pid_ns` 静默不生效；现在与
+  `--mediation-run-as` 同形态，并有 CLI→运行时回归钉住。
 
 ## 测试 / 验证基座
 
-- 全量门禁 = 非 root 档（core_lib 822 / core_integ 532 / ffi 98 / cli 98 /
-  supervise 36 / supervise_cost 3 / cli_build 0 / python 454）+ root 档
-  （oci 144 / supervise_root 2 / mediation_2uid 8）+ `--wheels`；
+- 全量门禁 = 非 root 档（core_lib 833 / core_integ 534 / ffi 100 / cli 100 /
+  supervise 42 / supervise_cost 3 / cli_build 0 / python 454）+ root 档
+  （oci 144 / supervise_root 4 / mediation_2uid 9）+ `--wheels`；
   数字逐 commit 登记 `docs/test-baseline.md`，脚本缺一即红、skip 即红。
 - 本计划新增用例全部随阶段 commit 落盘（红→绿证据在 `tmp/sdd/f*-red*.log`，
   终局全绿 `tmp/sdd/f9-gate-*.log`）。
+- A/B cleanup wave（2026-09-07）另加两条纪律：门禁日志必须带 ENV-HEADER
+  （commit / 容器镜像 / 时间），套件 flake 时保留首条红档 `<label>-r1.log` 另跑
+  `-final.log`（FUP-09）；supervise 的 error-path 断言一律整行/整串精确，
+  唯一允许的动态段是 OS 分配的 fd 号与 elapsed 计数（FUP-11a）。
 
 ## 明确取舍 / 已知限制（不是缺陷修复）
 

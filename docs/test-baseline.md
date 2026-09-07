@@ -280,7 +280,16 @@ cli = 100     # FUP-01/FUP-07 (2026-09-07, A/B cleanup wave): 98 -> 100,
               # after F0.4 wiring (cli suite includes net_bind_map tests);
               # F5.1 updates the no-supervisor default validation to
               # DEFAULT_MAX_PROCESSES (256), no count change
-supervise = 36 # F6.1 (SL-1): 35 -> 36, +1 unit test
+supervise = 42 # FUP-11 (2026-09-07, A/B cleanup): 36 -> 42, +2 lib units
+               # (serve::tests::abnormal_end_log_reports_first_then_throttles,
+               # registered_abnormal_end_line_is_pinned — the registered slot's
+               # throttled abnormal-end log) +4 integration
+               # (test_runtime_mediator_remap_invariant_is_pinned pinning the
+               # FORBIDDEN_RUNTIME_MEDIATOR_REMAP constant + the flag surface,
+               # and the three FUP-11f validate-and-exit × --program cases).
+               # FUP-11a also converted every error-path `contains` in this
+               # target to whole-line/exact pins (no count change).
+               # F6.1 (SL-1): 35 -> 36, +1 unit test
                # (policy::tests::mediation_run_as_rejects_unknown_wire_value)
                # alongside the mediation_run_as manifest/apply/verify/readback
                # extension. F5.4 adds the InstancePhase::Dead stats label; count
@@ -326,7 +335,12 @@ supervise_cost = 3 # F2b.4 cost target (release-only): new
                    # release label (CARGO_BIN_EXE_sandlock-supervise = the
                    # release binary) with --test-threads=1. Counts/budgets
                    # documented in docs/supervise-capacity.md.
-supervise_root = 3 # ROOT-MODE: run via scripts/test-all.sh; +1 FUP-03
+supervise_root = 4 # ROOT-MODE: run via scripts/test-all.sh; +1 FUP-11d
+                   # (test_harness_timeouts_and_flood_keep_their_contract:
+                   # connect-retry vs per-verb I/O asymmetry + the refused
+                   # flood crossing a log throttle window). The registered
+                   # acceptance additionally pins the FUP-11c throttled slot
+                   # log (300 refused connections -> 2 lines). +1 FUP-03
                    # exit-order harness (worker-close-first leaves no residue,
                    # 2026-09-07)
                    # --supervise-root as root (same privileged container as
