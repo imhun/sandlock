@@ -17,10 +17,12 @@
 //! operations (main-exit teardown, `Shutdown`, `Signal`) traverse the
 //! registered child-group set: group-first `killpg` plus a per-child
 //! `pidfd_send_signal` complement that fires **only when the child has left
-//! its own group** (best-effort `getpgid` check), so an in-group child gets
-//! exactly one delivery from the group signal and an escapee (e.g. a child
-//! that `setsid()`s away) is still reached by its pidfd while siblings are
-//! never touched. When a child is reaped, its pgid is retained in a
+//! its own group or session** (best-effort `getpgid` + `getsid` compare,
+//! FUP-10 — the session compare closes the two-step setpgid→setsid blind
+//! spot), so an in-group child gets exactly one delivery from the group
+//! signal and an escapee (e.g. a child that `setsid()`s away) is still
+//! reached by its pidfd while siblings are never touched. When a child is
+//! reaped, its pgid is retained in a
 //! `dead_groups` set so live descendants that stayed in the dead child's
 //! group are still covered by later instance-level operations; the entry is
 //! dropped once `killpg` reports ESRCH (the group is empty), so the set does
@@ -304,41 +306,6 @@ fn open_child_pidfd(pid: i32) -> i32 {
     }
 }
 
-/// Deliver `signum` to one registered child. Group-first: `killpg` reaches
-/// every process the child forked that stayed in its group (its subtree) —
-/// including the child itself when it is still in that group — without
-/// touching any sibling's group. The pidfd complement fires **only when the
-/// child has escaped its own group** (best-effort `getpgid` compare): an
-/// in-group child therefore receives exactly one delivery (killpg), while an
-/// escapee (e.g. `setsid()`) is still signaled directly via its pidfd, which
-/// never races on pid reuse. Accepted race: a child that changes groups
-/// between the `getpgid` check and the `killpg` may miss this round's direct
-/// signal (or, conversely, receive it via the group); escapee coverage is
-/// best-effort by design. All calls are best-effort: ESRCH/empty-group
-/// failures are expected once a child has exited.
-fn signal_child(child: &Child, signum: i32) {
-    let escaped = if child.pidfd >= 0 {
-        let pg = unsafe { libc::getpgid(child.pid) };
-        pg != child.pgid
-    } else {
-        false
-    };
-    if escaped {
-        unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_send_signal as libc::c_long,
-                child.pidfd,
-                signum,
-                std::ptr::null::<libc::c_void>(),
-                0u32, // flags
-            );
-        }
-    }
-    unsafe {
-        libc::killpg(child.pgid, signum);
-    }
-}
-
 /// Deliver `signum` to every registered child group and every retained dead
 /// child group: the instance-level kill / teardown / supervisor-signal
 /// primitive. Live children are delivered group-first (with the escape-only
@@ -348,23 +315,83 @@ fn signal_child(child: &Child, signum: i32) {
 /// init-spawned children (and their retained groups) are ever addressed;
 /// adopted orphans and arbitrary pids never are.
 fn signal_all_children(
+    supervisor_session: i32,
     children: &HashMap<i32, Child>,
     dead_groups: &mut HashSet<i32>,
     signum: i32,
 ) {
     for child in children.values() {
-        signal_child(child, signum);
+        if child_escaped(child, supervisor_session) {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal as libc::c_long,
+                    child.pidfd,
+                    signum,
+                    std::ptr::null::<libc::c_void>(),
+                    0u32,
+                );
+            }
+        }
     }
     let mut emptied = Vec::new();
-    for &pgid in dead_groups.iter() {
+    for pgid in unique_signal_pgids(children, dead_groups) {
         let r = unsafe { libc::killpg(pgid, signum) };
-        if r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        if r != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            && dead_groups.contains(&pgid)
+        {
             emptied.push(pgid);
         }
     }
     for pgid in emptied {
         dead_groups.remove(&pgid);
     }
+}
+
+/// FUP-10: a child has escaped group-first delivery when it no longer sits
+/// in its recorded group **or** it created its own session. The session
+/// compare closes the two-step blind spot: `setpgid` into another group
+/// followed by `setsid` returns the child to pgid == its recorded pid, which
+/// the old `getpgid`-only check could not distinguish from never escaping.
+fn escaped_group(
+    recorded_pgid: i32,
+    current_pgid: i32,
+    current_sid: i32,
+    supervisor_sid: i32,
+) -> bool {
+    current_pgid != recorded_pgid || current_sid != supervisor_sid
+}
+
+fn child_escaped(child: &Child, supervisor_session: i32) -> bool {
+    if child.pidfd < 0 {
+        return false;
+    }
+    let pg = unsafe { libc::getpgid(child.pid) };
+    let sid = unsafe { libc::getsid(child.pid) };
+    escaped_group(child.pgid, pg, sid, supervisor_session)
+}
+
+/// FUP-10: every pgid (live children plus retained dead groups) is signaled
+/// exactly once per instance-level delivery. Live children share a pgid only
+/// in the setpgid-failure corner, and a dead group's pgid can be recycled by
+/// a live child; dedupe before `killpg` so neither case double-delivers.
+fn unique_signal_pgids(
+    children: &HashMap<i32, Child>,
+    dead_groups: &HashSet<i32>,
+) -> Vec<i32> {
+    let mut seen = HashSet::new();
+    let mut pgids: Vec<i32> = children
+        .values()
+        .map(|c| c.pgid)
+        .filter(|pgid| seen.insert(*pgid))
+        .collect();
+    for pgid in dead_groups.iter().copied() {
+        if seen.insert(pgid) {
+            pgids.push(pgid);
+        }
+    }
+    pgids.sort_unstable();
+    pgids
 }
 
 /// Poll interval for the control channel: bounds how long a reaped child can
@@ -424,6 +451,10 @@ pub fn run_init() {
     unsafe {
         libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
     }
+    // FUP-10: children inherit init's session; a child that creates its own
+    // session (the two-step setpgid→setsid escape) is detected by comparing
+    // its session against this one.
+    let supervisor_session = unsafe { libc::getsid(0) };
 
     let ctl = CONTROL_FD;
     // Child table: pids init spawned, routed exactly-once on reap. A pid is
@@ -472,7 +503,7 @@ pub fn run_init() {
                                 // dead_groups) and every remaining registered
                                 // child group, so no descendant or exec'd
                                 // sibling survives the container.
-                                signal_all_children(&children, &mut dead_groups, libc::SIGKILL);
+                                signal_all_children(supervisor_session, &children, &mut dead_groups, libc::SIGKILL);
                                 // _exit rather than std::process::exit: this
                                 // is a fork of the supervisor, so atexit
                                 // handlers would run inherited (tokio/glibc)
@@ -654,7 +685,7 @@ pub fn run_init() {
                             // session (no RunMain) must still collapse every
                             // registered child on Shutdown; with an OCI-style
                             // main present the behavior is unchanged.
-                            signal_all_children(&children, &mut dead_groups, libc::SIGKILL);
+                            signal_all_children(supervisor_session, &children, &mut dead_groups, libc::SIGKILL);
                             shutdown = true;
                         }
                         Req::Signal { signum } => {
@@ -664,7 +695,7 @@ pub fn run_init() {
                             // this verb, so even a forged frame cannot address
                             // an arbitrary process (see the module docs,
                             // SECE-6 boundary).
-                            signal_all_children(&children, &mut dead_groups, signum);
+                            signal_all_children(supervisor_session, &children, &mut dead_groups, signum);
                         }
                     }
                 }
@@ -681,4 +712,49 @@ pub fn run_init() {
         }
     }
 
+}
+
+#[cfg(test)]
+mod signal_delivery_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn child(pid: i32, pgid: i32, pidfd: i32) -> Child {
+        Child {
+            kind: ChildKind::ExecDetach,
+            pid,
+            pgid,
+            pidfd,
+        }
+    }
+
+    /// FUP-10: a group move OR a fresh session is an escape; the two-step
+    /// setpgid→setsid corner (pgid back to the recorded value, session new)
+    /// must still be classified as escaped.
+    #[test]
+    fn escaped_group_detects_moves_and_new_sessions() {
+        assert!(!escaped_group(10, 10, 7, 7), "in-group child stays group-first");
+        assert!(escaped_group(10, 11, 7, 7), "a group move must escape");
+        assert!(escaped_group(10, 10, 10, 7), "two-step setpgid→setsid must escape");
+        assert!(escaped_group(10, 11, 10, 7), "move plus new session must escape");
+    }
+
+    /// FUP-10: a live child sharing a pgid and a dead group whose pgid was
+    /// recycled by a live child each produce exactly one killpg target.
+    #[test]
+    fn unique_signal_pgids_deduplicates_live_and_dead_groups() {
+        let mut children = HashMap::new();
+        children.insert(11, child(11, 11, 5));
+        children.insert(12, child(12, 11, 6)); // shares pgid with child 11
+        children.insert(13, child(13, 13, 7));
+        let mut dead_groups = HashSet::new();
+        dead_groups.insert(11); // recycled by the two live children above
+        dead_groups.insert(99);
+
+        assert_eq!(
+            unique_signal_pgids(&children, &dead_groups),
+            vec![11, 13, 99],
+            "each pgid must be delivered exactly once"
+        );
+    }
 }
