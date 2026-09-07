@@ -16,3 +16,11 @@ repository = "https://github.com/multikernel/sandlock"
 homepage = "https://github.com/multikernel/sandlock"
 description = "Lightweight process sandbox using Landlock, seccomp, and seccomp user notification"
 readme = "README.md"
+
+# FUP-15: the plan protocol promised panic=abort + stripped release binaries.
+# Release supervise binaries drop from ~6.3-6.9 MB to well under that; the
+# FFI cdylib ships stripped. supervise_cost thresholds were measured against
+# this profile family (docs/supervise-capacity.md) and stay valid.
+[profile.release]
+panic = "abort"
+strip = "symbols"
