@@ -21,6 +21,13 @@
 #   docker run --privileged --rm -v "$PWD":/src -w /src --entrypoint bash \
 #     sandlock-dev:latest -c 'sh scripts/test-all.sh --mediation-2uid'
 #
+# FUP-09 gate-evidence discipline: when a suite flakes (external-egress
+# `cli learn`, control-dir timing), NEVER rerun over the same log. Keep the
+# first red log as <label>-r1.log and the rerun green log as <label>-final.log
+# (both under tmp/), and say in the report what the red run showed and why the
+# final run is the evidence. The default (no-arg) mode is a non-root suite and
+# refuses to run as root; root-only phases are selected by their own flags.
+#
 # The oci suite is root-mode by design: sandlock-oci e2e supervises OCI-default
 # root containers, and S1.2 fail-closes RunAs(0,0) for non-root supervisors
 # (a tested feature, not a regression). The supervise_root suite is
@@ -109,6 +116,21 @@ case "$mode" in
     ""|--wheels|--oci-root|--supervise-root|--mediation-2uid) ;;
     *) printf 'usage: %s [--wheels|--oci-root|--supervise-root|--mediation-2uid]\n' "$0" >&2; exit 2 ;;
 esac
+
+if [ "${SANDBOX_TEST_ALL_ALLOW_ROOT:-0}" != "1" ]; then
+    if [ "$mode" = "" ] || [ "$mode" = "--wheels" ]; then
+        if [ "$(id -u)" -eq 0 ]; then
+            printf '%s\n' \
+                'default and --wheels modes are NON-ROOT suites: they must run as' \
+                'uid 65534 (the canonical sandlock-dev entrypoint drops to nobody' \
+                'after its root prep, or setpriv --reuid 65534 --regid 65534' \
+                '--clear-groups sh scripts/test-all.sh). Root phases are selected' \
+                'explicitly: --oci-root / --supervise-root / --mediation-2uid.' \
+                'Set SANDBOX_TEST_ALL_ALLOW_ROOT=1 to force non-root suites as root.' >&2
+            exit 1
+        fi
+    fi
+fi
 
 if [ "$mode" = "--oci-root" ]; then
     if [ "$(id -u)" -ne 0 ]; then
