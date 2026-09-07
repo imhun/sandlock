@@ -54,6 +54,12 @@ pub struct ConfigSection {
     pub fs_storage: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workdir: Option<PathBuf>,
+    /// Mediation identity tier: `caller` (default, fail-closed) or the
+    /// explicit `supervisor` downgrade. Absent key = `caller`. Maps to
+    /// `Sandbox::mediation_run_as`; a CLI `--mediation-run-as` that is
+    /// omitted never clobbers this profile value (FUP-07 no-clobber).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mediation_run_as: Option<crate::sandbox::MediationRunAs>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
@@ -265,6 +271,9 @@ pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), Sandlo
     if let Some(p) = input.config.http_ca_out { b = b.http_ca_out(ex.path("[config].http_ca_out", &p)?); }
     if let Some(p) = input.config.fs_storage  { b = b.fs_storage(ex.path("[config].fs_storage", &p)?); }
     if let Some(p) = input.config.workdir     { b = b.workdir(ex.path("[config].workdir", &p)?); }
+    if let Some(tier) = input.config.mediation_run_as {
+        b = b.mediation_run_as(tier);
+    }
 
     // [determinism]
     if let Some(s) = input.determinism.random_seed { b = b.random_seed(s); }
@@ -548,6 +557,8 @@ pub fn sandbox_to_profile(s: &Sandbox, extra_denied: &[String]) -> ProfileInput 
             http_ca_out: s.http_ca_out.clone(),
             fs_storage: s.fs_storage.clone(),
             workdir: s.workdir.clone(),
+            mediation_run_as: (s.mediation_run_as != crate::sandbox::MediationRunAs::Caller)
+                .then_some(s.mediation_run_as),
         },
         determinism: DeterminismSection {
             random_seed: s.random_seed,
@@ -805,6 +816,66 @@ mod tests {
         assert!(parsed.program.args.is_empty());
         assert_eq!(parsed.config, ConfigSection::default());
         assert_eq!(parsed.filesystem, FilesystemSection::default());
+    }
+
+    /// FUP-07: a profile may carry the explicit `supervisor` mediation tier;
+    /// an absent key must stay `caller` (fail-closed default).
+    #[test]
+    fn parse_profile_mediation_run_as_supervisor_sets_policy() {
+        let toml = r#"
+            [config]
+            mediation_run_as = "supervisor"
+
+            [program]
+            exec = "/bin/true"
+
+            [filesystem]
+            read = ["/usr", "/lib", "/bin"]
+        "#;
+        let (sb, _) = parse_profile(toml).unwrap();
+        assert_eq!(
+            sb.mediation_run_as,
+            crate::sandbox::MediationRunAs::Supervisor
+        );
+    }
+
+    #[test]
+    fn parse_profile_mediation_run_as_absent_defaults_caller() {
+        let toml = r#"
+            [program]
+            exec = "/bin/true"
+
+            [filesystem]
+            read = ["/usr", "/lib", "/bin"]
+        "#;
+        let (sb, _) = parse_profile(toml).unwrap();
+        assert_eq!(
+            sb.mediation_run_as,
+            crate::sandbox::MediationRunAs::Caller
+        );
+    }
+
+    #[test]
+    fn profile_mediation_run_as_supervisor_roundtrips_toml() {
+        let toml = r#"
+            [config]
+            mediation_run_as = "supervisor"
+
+            [program]
+            exec = "/bin/true"
+
+            [filesystem]
+            read = ["/usr", "/lib", "/bin"]
+        "#;
+        let (sb, _) = parse_profile(toml).unwrap();
+        let profile = sandbox_to_profile(&sb, &[]);
+        let rendered = profile.to_toml().unwrap();
+        let (back, _) = parse_profile(&rendered).unwrap();
+        assert_eq!(
+            back.mediation_run_as,
+            crate::sandbox::MediationRunAs::Supervisor,
+            "supervisor tier must survive a profile round-trip"
+        );
     }
 
     #[test]

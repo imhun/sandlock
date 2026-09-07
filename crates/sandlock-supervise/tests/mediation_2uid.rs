@@ -1027,5 +1027,87 @@ fn test_cli_mediation_run_as_is_wired() {
         "the explicit tier must warn on stderr (the downgrade is never silent)"
     );
 
+    // FUP-07 no-clobber: a profile that carries `mediation_run_as =
+    // "supervisor"` with the CLI flag omitted behaves exactly like the
+    // explicit flag (the tier is retained, never reset to caller).
+    let profile_path = dir.join("sup-profile.toml");
+    let mut read_list = vec!["/usr", "/lib", "/bin", "/etc", "/proc", "/dev"];
+    if Path::new("/lib64").exists() {
+        read_list.push("/lib64");
+    }
+    let read_toml = read_list
+        .iter()
+        .map(|p| format!("\"{p}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        &profile_path,
+        format!(
+            r#"
+                [config]
+                mediation_run_as = "supervisor"
+
+                [program]
+                exec = "/bin/true"
+                uid = {HOST_UID_A}
+                gid = {HOST_UID_A}
+
+                [filesystem]
+                read = [{read_toml}]
+                write = ["{}"]
+                deny = ["{}"]
+            "#
+            ,
+            dir.display(),
+            deny.display()
+        ),
+    )
+    .expect("write supervisor profile");
+    let profile_only = Command::new(&bin)
+        .args(["run", "--profile-file", profile_path.to_str().unwrap()])
+        .output()
+        .expect("run sandlock with supervisor profile");
+    assert!(
+        profile_only.status.success(),
+        "a supervisor profile with the CLI flag omitted must keep the tier; stderr: {}",
+        String::from_utf8_lossy(&profile_only.stderr)
+    );
+    let profile_err = String::from_utf8_lossy(&profile_only.stderr);
+    assert_eq!(
+        profile_err.lines().next().unwrap_or_default(),
+        format!(
+            "sandlock: warning: mediation_run_as=supervisor: in-process path mediation runs \
+             as euid 0 while the sandbox's host uid is {HOST_UID_A}; on-behalf files are \
+             owned by the mediator, not the sandbox (SL-1 downgrade accepted explicitly)"
+        ),
+        "the profile tier must warn exactly like the explicit flag (no-clobber)"
+    );
+
+    // Explicit CLI flag overrides the profile tier: caller on the same root
+    // remap shape must refuse with the exact C档 message.
+    let overridden = Command::new(&bin)
+        .args([
+            "run",
+            "--profile-file",
+            profile_path.to_str().unwrap(),
+            "--mediation-run-as",
+            "caller",
+            "--",
+            "true",
+        ])
+        .output()
+        .expect("run sandlock with CLI caller override");
+    assert!(
+        !overridden.status.success(),
+        "--mediation-run-as caller must override the profile supervisor tier"
+    );
+    let overridden_err = String::from_utf8_lossy(&overridden.stderr);
+    let overridden_line = overridden_err.lines().next().unwrap_or_default();
+    assert_eq!(
+        overridden_line.strip_prefix("Error: process error: child process error: "),
+        Some(refusal_msg(HOST_UID_A).as_str()),
+        "the CLI override must surface the exact mediation_run_as refusal"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }

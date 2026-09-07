@@ -37,6 +37,38 @@ fn profile_program_section_supplies_command() {
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
 }
 
+/// FUP-07: a profile may carry `mediation_run_as = "supervisor"` and the run
+/// must succeed with the CLI flag omitted (no-clobber: an omitted
+/// `--mediation-run-as` never resets the profile tier to caller).
+#[test]
+fn profile_mediation_run_as_supervisor_without_cli_flag_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let profile_path = tmp.path().join("p.toml");
+    std::fs::write(&profile_path, format!(r#"
+        [config]
+        mediation_run_as = "supervisor"
+
+        [program]
+        exec = "/bin/true"
+
+        [filesystem]
+        {read}
+    "#, read = read_list())).unwrap();
+
+    let out = sandlock_bin()
+        .args(["run", "--profile-file", profile_path.to_str().unwrap()])
+        .output()
+        .expect("spawn sandlock");
+
+    assert!(
+        out.status.success(),
+        "profile supervisor tier without a CLI flag must run: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+}
+
 #[test]
 fn trailing_command_overrides_profile_program_section() {
     let tmp = tempfile::tempdir().unwrap();
