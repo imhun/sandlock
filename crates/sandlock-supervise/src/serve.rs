@@ -666,6 +666,55 @@ pub fn serve_control_fd(
     generation.finish(outcome)
 }
 
+/// Rate limiter for a registered slot's abnormal-connection log (FUP-11c).
+///
+/// Every refused or broken peer on the registered path is a real event, but
+/// it is *one event per connection*: a slot serves many workers over its
+/// lifetime, so an unthrottled `eprintln!` turns a connection flood (or a
+/// misconfigured worker retry loop) into an unbounded log flood.  The fd
+/// transport cannot hit this — one stream, one verdict.
+///
+/// Posture: the **first** abnormal end is always reported (so a genuine
+/// regression is attributable without any counting), and afterwards only
+/// every [`AbnormalEndLog::REPORT_EVERY`]-th one — each line carrying the
+/// running total, so the swallowed volume stays visible.
+#[derive(Debug, Default)]
+pub struct AbnormalEndLog {
+    /// Abnormal ends seen so far (including the ones that stayed quiet).
+    seen: u64,
+}
+
+impl AbnormalEndLog {
+    /// Abnormal ends that may pass between two log lines after the first.
+    pub const REPORT_EVERY: u64 = 256;
+
+    /// Record one abnormal end.  `Some(total)` means "print the line now"
+    /// (the first end, then every [`Self::REPORT_EVERY`]-th); `None` means
+    /// stay quiet and keep counting.
+    pub fn note(&mut self) -> Option<u64> {
+        self.seen += 1;
+        if self.seen == 1 || self.seen % Self::REPORT_EVERY == 0 {
+            Some(self.seen)
+        } else {
+            None
+        }
+    }
+
+    /// Total abnormal ends recorded (teardown summaries, tests).
+    pub fn total(&self) -> u64 {
+        self.seen
+    }
+}
+
+/// The exact line a slot prints for abnormal registered-connection end
+/// number `total` (1 for the naming first line).
+pub fn registered_abnormal_end_line(total: u64) -> String {
+    format!(
+        "sandlock-supervise: registered connection ended abnormally \
+         (refused or broken peer) [{total} total]; the slot keeps serving"
+    )
+}
+
 /// Serve a registered-path slot until a shutdown verb completes the
 /// generation.  The slot binds its channel before this is called (see
 /// `main.rs`); every worker verb arrives on its own connection and is served
@@ -677,6 +726,9 @@ pub fn serve_control_fd(
 /// ends the generation, so a garbage/attacking connection can neither kill
 /// the slot nor masquerade as a clean end.  Returns `Ok(())` only after a
 /// shutdown verb AND a successful instance teardown.
+///
+/// FUP-11c: the per-connection log goes through [`AbnormalEndLog`], so a
+/// flood of refused connections cannot flood the slot's stderr.
 pub fn serve_registered_path(
     listener: &Arc<UnixListener>,
     token: &str,
@@ -685,15 +737,15 @@ pub fn serve_registered_path(
     program: Option<ProgramSpec>,
 ) -> Result<(), String> {
     let mut generation = Generation::new(policy, program)?;
+    let mut abnormal_ends = AbnormalEndLog::default();
     loop {
         match serve_registered_once(listener, token, allowed_peer_uids, &mut generation) {
             Some(ServeOutcome::Continue) => {}
             Some(ServeOutcome::Shutdown) => return generation.finish(ServeOutcome::Shutdown),
             Some(ServeOutcome::PeerGone) => {
-                eprintln!(
-                    "sandlock-supervise: registered connection ended abnormally \
-                     (refused or broken peer); the slot keeps serving"
-                );
+                if let Some(total) = abnormal_ends.note() {
+                    eprintln!("{}", registered_abnormal_end_line(total));
+                }
             }
             None => {
                 drop(generation);
@@ -788,9 +840,9 @@ mod tests {
     #[test]
     fn program_spec_rejects_empty_argv() {
         let err = ProgramSpec::from_json(br#"{"argv": []}"#).unwrap_err();
-        assert!(
-            err.contains("non-empty"),
-            "empty argv must be rejected by name, got: {err}"
+        assert_eq!(
+            err,
+            "program spec `argv` must be non-empty (argv[0] is the executable)"
         );
     }
 
@@ -798,8 +850,9 @@ mod tests {
     fn program_spec_rejects_unknown_fields_by_name() {
         let err =
             ProgramSpec::from_json(br#"{"argv": ["/bin/true"], "env": {"A": "1"}}"#).unwrap_err();
-        assert!(
-            err.contains("`env`"),
+        assert_eq!(
+            err,
+            "program spec contains unknown field(s): `env`",
             "unknown program field must be named, got: {err}"
         );
     }
@@ -807,9 +860,49 @@ mod tests {
     #[test]
     fn program_spec_rejects_non_string_argv_entry() {
         let err = ProgramSpec::from_json(br#"{"argv": ["/bin/true", 42]}"#).unwrap_err();
-        assert!(
-            err.contains("argv[1]"),
-            "non-string argv entry must be named by index, got: {err}"
+        assert_eq!(err, "program spec `argv[1]` must be a string");
+    }
+
+    /// FUP-11c: the registered slot reports the FIRST abnormal connection end
+    /// verbatim and afterwards only one line per `REPORT_EVERY` ends — each
+    /// line carries the running total, so a connection flood cannot become an
+    /// unbounded stderr flood while a real regression stays attributable.
+    #[test]
+    fn abnormal_end_log_reports_first_then_throttles() {
+        let mut log = AbnormalEndLog::default();
+        assert_eq!(
+            log.note(),
+            Some(1),
+            "the first abnormal end must always be reported"
+        );
+        for n in 2..AbnormalEndLog::REPORT_EVERY {
+            assert_eq!(log.note(), None, "abnormal end {n} must stay quiet");
+        }
+        assert_eq!(
+            log.note(),
+            Some(AbnormalEndLog::REPORT_EVERY),
+            "every REPORT_EVERY-th abnormal end must print the running total"
+        );
+        assert_eq!(
+            log.total(),
+            AbnormalEndLog::REPORT_EVERY,
+            "swallowed ends must still be counted"
+        );
+    }
+
+    /// FUP-11c: the slot's log line is a fixed string (the integration suite
+    /// pins the whole stderr of a slot that refused one connection).
+    #[test]
+    fn registered_abnormal_end_line_is_pinned() {
+        assert_eq!(
+            registered_abnormal_end_line(1),
+            "sandlock-supervise: registered connection ended abnormally \
+             (refused or broken peer) [1 total]; the slot keeps serving"
+        );
+        assert_eq!(
+            registered_abnormal_end_line(256),
+            "sandlock-supervise: registered connection ended abnormally \
+             (refused or broken peer) [256 total]; the slot keeps serving"
         );
     }
 }
