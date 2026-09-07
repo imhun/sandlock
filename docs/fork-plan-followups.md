@@ -63,6 +63,11 @@
   （`3afc9dd`/`4ea63fa`）。
   描述：root 阶段 fd-handoff 用例把 worker fd 也带进 supervise，EOF 异常路径未覆盖。
   为什么留：测试侧 exec 前 fd 清场 + 逐 fd 清单断言改动，非收口必需。
+  **已关闭（2026-09-07，A/B cleanup wave）**：supervise child pre_exec 只清
+  server_fd（worker 端 CLOEXEC 随 exec 关闭，不再持有自己的对端掩蔽 EOF）；
+  非 root EOF 用例已覆盖异常路径。root 档补异常 EOF 用例时观察到 supervise
+  异常退出会留下延迟出现的 uid-X 僵尸（ppid=1、门禁环境无 subreaper 回收），
+  该竞态并入 FUP-03（supervise 退出顺序/reaping）。
 - **FUP-07 mediation no-clobber 专属回归测试** — 来源：F6.1 review M1
   （`b62e201`/`dd5a7e8`/`75bbe0b`）。
   描述：profile 携带 `mediation_run_as=supervisor` 而 CLI flag 省略（no-clobber）路径

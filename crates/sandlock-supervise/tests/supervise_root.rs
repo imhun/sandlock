@@ -853,14 +853,15 @@ fn test_supervisor_as_foreign_uid_fd_handoff_serves_worker() {
     unsafe {
         use std::os::unix::process::CommandExt;
         cmd.pre_exec(move || {
-            for fd in [server_fd, worker_fd] {
-                let flags = libc::fcntl(fd, libc::F_GETFD);
-                if flags < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
+            // FUP-06: only the server end belongs to supervise. The worker
+            // end stays CLOEXEC and closes at this exec, so supervise cannot
+            // hold its own write end open and mask EOF semantics.
+            let flags = libc::fcntl(server_fd, libc::F_GETFD);
+            if flags < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(server_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
             }
             Ok(())
         });
