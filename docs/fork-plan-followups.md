@@ -32,7 +32,9 @@
   描述：init/proto/fdpass 从 oci 搬入 `core::init` 后，6 个随搬单测在 core 与 oci
   re-export seam 各跑一份（oci-root 144 精确不变是搬家证明的锚）。
   为什么留：F9 决策 = **维持**（双份防漂移，且单归属需要上游接受 core::init 独立演进
-  后一次性删 oci 复挂副本并重测）；作为长期收尾项登记。
+  后一次性删 oci 复挂副本并重测）；作为长期收尾项登记。**已关闭（2026-09-07，
+  A/B cleanup wave）：决策维持双份复挂并登记为长期项，无代码动作；若上游接受
+  core::init 独立演进再做单归属（届时 oci-root 144 是删副本后的重测锚点）。**
 - **FUP-03 supervise 主退出顺序竞态** — 来源：F3.2/F3.3 review residual
   （`4411c7b`/`3d42bc7`/`3fa0b95`）。
   描述：worker 先关控制通道时主退出观察顺序可能异常（未测）；stray overflow cap
