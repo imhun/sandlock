@@ -5,7 +5,7 @@
 > `sandlock-e2b/docs/HANDOFF.md`, which now only points here.
 >
 > 维护方：E2B（`sandlock-e2b`）。本文是该 fork 的**已做改动 / 待做方案 / 未解决问题**的唯一事实源。
-> 最后更新：2026-09-06（fork-plan F0–F9 于 2026-09-05 收口；F10 于 2026-09-06
+> 最后更新：2026-09-07（fork-plan F0–F9 于 2026-09-05 收口；F10 于 2026-09-06
 > 修复 supervisor × chroot × 特权 RunAs 的 create/launch 回归，本文 §0/§2/§3.1/§5 已更新；
 > F11 于 2026-09-06 修复 argv-safety exec freeze × 多线程进程树
 > （FUP-E3 网关+命令变体的 fork 侧阻塞，本文 §3.8/§5/§8 已更新）；F12 于
@@ -13,7 +13,8 @@
 > wheel 随 F12–F14 最终 tip 统一重建）；F13 于 2026-09-06 闭环 fs 写家族挂载
 > 保护（link 直击 pin + 目录挂载点 rmdir EBUSY，本文 §1 P5/§3.1/§5 已更新）；
 > F14 于 2026-09-06 升级 C 档 gate 为 capability-aware（route-B ③ 前置，
-> 本文 §3.1/§5 已更新）。
+> 本文 §3.1/§5 已更新）；F12–F14 的 E2B 真栈复跑于 2026-09-07 完成
+> （wheel = 4d5f385：thread/gateway 探针 + full gate A/B/macOS 全绿，本文 §5/§8 已更新）。
 
 ## 0. 基线与硬约束
 
@@ -432,8 +433,9 @@ core_integ 529→531。
 | fork 全量门禁 root 档（F14 终局，2026-09-06，同容器 root 阶段） | oci-root `144` / supervise_root `2` / mediation_2uid `9`（log `tmp/sdd/f14-oci-root.log`、`f14-supervise-root.log`、`f14-mediation-2uid.log`） |
 | capability-aware 特权 remap gate（F14，2026-09-06，fork 本地提交） | `privileged_userns` 分类与 C 档 gate 从 `euid==0` 升级为 effective-caps 探测（`CapEff` 含 `CAP_SETUID\|CAP_SETGID`，route-B ③ file-cap launcher 形态）：euid 非 0 + caps 的调用方按特权跨 uid remap 在建箱前 fail-closed，消息点名能力（不再落到暗示无 caps 的晚拒）；root euid 行为/消息不变，无 caps 非 root / 同 uid 自映射 / route-B supervise 不受影响。RED 夹具 = `setcap cap_setuid,cap_setgid+eip` + `setpriv` euid 65533 真执行（mediation_2uid 8→9）；core_lib +1 纯决策单测（827→828）。报告 `tmp/sdd/f14-report.md`；wheel 随 F12–F14 最终 tip 统一重建 |
 | fs 写家族挂载保护收尾（F13，2026-09-06，fork 本地提交） | FUP-04：`link()` 于 rw 单节点挂载点 EBUSY 直击 pin + fs_mount contains 断言转整串（ffi 98→100）；FUP-05：目录挂载点 rmdir EBUSY（chroot dispatch，`unlinkat(AT_REMOVEDIR)` 命中目录 mount leaf；单文件/chardev leaf 回落宿主 ENOTDIR；挂载点内普通目录不受影响）。RED 先证「沙箱 rmdir 删除空宿主目录」→ GREEN EBUSY + 宿主保留（`tmp/sdd/f13-red-rmdir.log`）。报告 `tmp/sdd/f13-report.md`；wheel 随 F12–F14 最终 tip 统一重建 |
-| ProcessIndex 一 TGID 一 entry（F12，2026-09-06，fork 本地提交 `68e7e84`） | 建模收口：线程通知一律路由/注册到 TGID leader（删除 `PIDFD_THREAD` 独立 tid key 路径），查询面 leader 解析，freeze 归一化保留为防御；4 个新单测 + 1 个既有 cwd 用例语义更新（core_lib 823→827）；F11 argv-safety 回归（core_integ 533）保持绿；pidfd leader watcher 的组退出语义 C 探针实证（`tmp/sdd/f12-pidfd-probe.log`）。用户可见行为不变（内存/配额/exec/cwd/freeze/checkpoint），`stats().live_watchers` 改按进程组计数、6.9+ 虚拟化 /proc 列表不再单列被中介线程 tid（与旧内核形态一致）。E2B 真栈复跑在 F12–F14 最终 tip wheel 重建后执行（沿用 F11 的 thread/gateway 探针接线模式）。报告 `tmp/sdd/f12-report.md` |
+| ProcessIndex 一 TGID 一 entry（F12，2026-09-06，fork 本地提交 `68e7e84`） | 建模收口：线程通知一律路由/注册到 TGID leader（删除 `PIDFD_THREAD` 独立 tid key 路径），查询面 leader 解析，freeze 归一化保留为防御；4 个新单测 + 1 个既有 cwd 用例语义更新（core_lib 823→827）；F11 argv-safety 回归（core_integ 533）保持绿；pidfd leader watcher 的组退出语义 C 探针实证（`tmp/sdd/f12-pidfd-probe.log`）。用户可见行为不变（内存/配额/exec/cwd/freeze/checkpoint），`stats().live_watchers` 改按进程组计数、6.9+ 虚拟化 /proc 列表不再单列被中介线程 tid（与旧内核形态一致）。E2B 真栈复跑完成（2026-09-07，wheel = 4d5f385，见本表 F12–F14 E2B 复跑行）。报告 `tmp/sdd/f12-report.md` |
 | E2B 真栈探针 + F11 复跑（argv-safety × 多线程，F11） | fork 侧在 `e2b-sandlock-test:latest` 真栈复跑 `tmp/fup3_thread_probe.py`（E2B 仓库探针，只读挂载）：RED（wheel 基线）`argv-safety freeze failed for pid 26: PTRACE_SEIZE tid 22: Operation not permitted` → B exit 127（`tmp/sdd/f11-e2b-red.log`）；GREEN（F11 debug .so 热替换）B exit 0 / stdout `b-ok\n`（`f11-e2b-green.log`）。**E2B 侧正式复跑（控制器，2026-09-06，wheel = 927d015）**：wheel 已按 F11 tip 重建并同步 `wheels/fork/`、重建 `e2b-sandlock-test:latest`；FUP-E3 gateway+命令变体 pure 形态 4/4 GREEN（`list_tools == ['echo']`、网关后命令 exit 0 / stdout `post-gateway-ok\n`、450M 超卖命令拒绝 exit 137 / stdout `''` / stderr ∈ {"", "Killed\n"}、450M holder 下 50M 控制命令 exit 0、record `memoryMB == 1024`；E2B 日志 `tmp/perf/f11-gateway-probe-450-450-50*.log`）；契约 `tests/contract/test_memory_quota_gateway_command.py` 落库（pure 2 轮 + gate A 内通过；`tmp/f11-e2b-contract-gw*.log` / `tmp/f11-e2b-gate-a.log`），FUP-E3 gateway+命令变体关闭 |
+| E2B 真栈复跑（F12–F14 收口，2026-09-07，wheel = 4d5f385） | E2B 侧在重建的 `e2b-sandlock-test:latest`（fork 指针 bump = 4d5f385）复跑全部接线：thread 探针 GREEN（`tmp/perf/f14-thread-probe.log`：线程化 python A 存活时后续 exec B exit 0 / stdout `b-ok\n`）；FUP-E3 gateway+命令变体 pure 形态 4/4 GREEN（`list_tools == ['echo']`、网关后命令 exit 0 / stdout `post-gateway-ok\n`、450M 超卖命令拒绝 exit 137 / stdout `''` / stderr ∈ {"", "Killed\n"}、50M 控制命令 exit 0、record `memoryMB == 1024`；`tmp/perf/f14-gateway-probe-450-450-50{,-run2,-run3,-run4}.log` + `tmp/perf/f14-gateway-evidence.txt`）；契约 `tests/contract/test_memory_quota_gateway_command.py` / `test_memory_quota_boxed.py` pure 各 2 轮全绿（`tmp/f14-e2b-contract-gw{1,2}.log` / `-boxed{1,2}.log`）；full gate A（image-rootfs python-mcp:3.14 + netns + XFS + npm + strict）`982 passed / 2 skipped / 1 xfailed(T5) / 0 failed`（`tmp/f14-e2b-gate-a.log`）、full gate B（pure sandlock + netns + strict）`982 passed / 3 skipped / 0 failed`（`tmp/f14-e2b-gate-b.log`）、macOS 全量 `916 passed / 65 skipped / 0 failed`（`tmp/f14-e2b-macos.log`） |
 | E2B 探针（mediation/instance，F10 修复后需 tip wheel 重建验证） | fork 源码侧按探针根因修复并落 Rust 回归用例；wheel 重建后复跑 `tmp/mediation_probe.py` / `tmp/instance_probe.py`（预期：one-shot chroot+RunAs(1000)+supervisor 与 instance uid0/1000/65534+supervisor 全过；caller+RunAs(≠holder) 仍 C 档拒绝） |
 
 逐套件权威数字与历史注释见 `docs/test-baseline.md`（F9 终局已复核；本计划新增用例数
@@ -486,7 +488,8 @@ fork 侧复跑命令（非 root 全程，入口脚本做一次性 root 准备）
 > **F12（2026-09-06，fork 本地提交 `68e7e84`）**：fork 建模收口（ProcessIndex
 > 每 TGID 一 entry，线程通知路由到 leader、删除 per-tid 登记）已全门绿
 > （core_lib 827 / core_integ 533，见 §5 F12 行）；E2B 真栈 thread/gateway
-> 复跑将在 F12–F14 最终 tip wheel 重建后执行（fork 侧 wheel 统一于最终 tip 重建）。
+> 复跑已完成（2026-09-07，wheel = 4d5f385：thread 探针 GREEN + FUP-E3
+> gateway+命令 pure 4/4 + full gate A/B/macOS 全绿，见 §5 F12–F14 E2B 复跑行）。
 > gate A（image-rootfs）+ macOS 全量 0 failed；
 > gate B pure 形态 3 条 migration 为既有缺陷（E2B FUP，非 fork/M4 回归）。详见 E2B
 > `docs/HANDOFF.md`「M4 收口」。
@@ -575,7 +578,9 @@ socket，宿主只拿 fd）；Python 增量：`SandboxInstance.exec(...)` 返回
   **F12（2026-09-06，fork 本地提交 `68e7e84`）**：ProcessIndex 收口为每 TGID
   一 entry（线程通知一律路由到 TGID leader、删除 per-tid 登记），F11 冻结
   归一化保留为防御；fork 门禁全绿（core_lib 827 / core_integ 533，见 §5 F12
-  行），对 E2B 无用户可见行为变化；E2B 真栈复跑待最终 tip wheel 重建。
+  行），对 E2B 无用户可见行为变化；E2B 真栈复跑完成（2026-09-07，
+  wheel = 4d5f385：thread/gateway 探针 + full gate A/B/macOS 全绿，
+  见 §5 F12–F14 E2B 复跑行）。
 
 ### 7.6 需要 E2B 同步做的
 

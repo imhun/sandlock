@@ -6,6 +6,12 @@ tip `927d015`）。E2B 对接：main 仓库（指针 bump + 探针/全量复跑�
 
 > **状态（2026-09-06）**：✅ 已完成——实现 `68e7e84` + docs `194ffed`，报告
 > `tmp/sdd/f12-report.md`（RED/GREEN/门禁/内核实证见报告与 followups 已处置段）。
+>
+> **E2B 复跑（2026-09-07，wheel = 4d5f385）**：thread/gateway 探针与 full gate
+> A/B/macOS 全部复跑绿——thread 探针 `tmp/perf/f14-thread-probe.log`、FUP-E3
+> gateway 4/4 `tmp/perf/f14-gateway-probe-450-450-50*.log`、gate A
+> `982/2 skip/1 xfail(T5)/0`、gate B `982/3 skip/0`、macOS `916/65 skip/0`
+> （见 e2b-integration §5 F12–F14 E2B 复跑行）。
 > 计划登记时（⬜ 计划中）用户指示列入主要计划。前身：F11 修复只在
 > exec 冻结侧把 keys 归一化为唯一 TGID（`freeze.rs`），**线程 tid 懒登记本身保留**；
 > 本计划彻底消除「一个 TGID 在 `ProcessIndex` 有多个 key」的建模残余，属 fork 核心
@@ -56,8 +62,9 @@ cwd、freeze、checkpoint 语义。
 - [ ] 门禁：非 root 全套（core_lib/core_integ/ffi/cli/supervise/python）与 root
   档（oci-root/supervise_root/mediation_2uid）数字与基线一致或按登记增量；
   无新增 skip/xfail 掩盖。
-- [ ] wheel 重建 + verify；E2B 指针 bump 后 gateway/thread 探针与 full gate
-  A/B 复跑绿。
+- [x] wheel 重建 + verify；E2B 指针 bump 后 gateway/thread 探针与 full gate
+  A/B 复跑绿（2026-09-07 完成：thread 探针 GREEN + FUP-E3 gateway 4/4 +
+  gate A/B/macOS 全绿）。
 - [ ] 文档收口：`docs/CHANGELOG.md`、`docs/fork-plan-followups.md`、
   `docs/e2b-integration.md` §5/§8 状态行、test-baseline 同步。
 

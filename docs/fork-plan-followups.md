@@ -198,8 +198,10 @@
   （唯一性/leader 已跟踪不加 key/生命周期清理/leader entry 解析）+ 1 个既有
   cwd 用例语义更新；core_lib 823→827、core_integ 533 不变；pidfd leader
   watcher 的组退出语义由 C 探针实证（`tmp/sdd/f12-pidfd-probe.{c,log}`）。
-  报告 `tmp/sdd/f12-report.md`；E2B 侧待 wheel 重建后复跑 thread/gateway 探针。
-  F11 报告 concern #1 / task-backlog row #2 残余随之关闭（F12 计划与报告）。
+  报告 `tmp/sdd/f12-report.md`；E2B 侧复跑完成（2026-09-07，wheel = 4d5f385：
+  thread/gateway 探针 + full gate A/B/macOS 全绿，见 e2b-integration §5
+  F12–F14 E2B 复跑行）。F11 报告 concern #1 / task-backlog row #2 残余随之
+  关闭（F12 计划与报告）。
 - **F11（2026-09-06，本地提交）**：argv-safety exec freeze × 多线程进程树
   （E2B M4 FUP-E3 网关+命令变体的 fork 侧阻塞）。根因：`ProcessIndex` 为发过
   被中介 syscall 的线程以 tid 为 key 懒登记（与 leader 同 TGID），exec 冻结把

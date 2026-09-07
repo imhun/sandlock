@@ -34,7 +34,10 @@
   会各自占一个 watcher 计数）；6.9+ 内核上虚拟化 `/proc` 列表不再单独列出被中介
   线程的 tid 目录（与旧内核既有行为一致，列表按 leader 归组）。旧内核形态
   （线程永不建 key）从「部分内核的角落」变成唯一形态，`/proc/<tid>` 可读性判定
-  同步改为 leader-aware。
+  同步改为 leader-aware。E2B 真栈 thread/gateway 复跑（wheel = 4d5f385，
+  2026-09-07）全绿：线程化 holder 存活时后续 exec 恢复成功、FUP-E3
+  gateway+命令变体 pure 4/4、full gate A/B/macOS 0 failed（见
+  `docs/e2b-integration.md` §5 F12–F14 E2B 复跑行）。
 - **argv-safety exec 冻结兼容实例内多线程进程**（F11，本地提交）：E2B 探针实测
   线程化网关/uvicorn 一旦存活，后续每条命令 exec 都被拒
   （`argv-safety freeze failed ... PTRACE_SEIZE ... Operation not permitted`
