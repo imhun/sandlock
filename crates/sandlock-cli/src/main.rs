@@ -468,6 +468,34 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Apply the flattened `SandboxBuilder` runtime flags that are pure booleans.
+/// FUP-01: `--pid-ns` must reach the runtime builder — a parse-only pin would
+/// not catch a flattened-but-dead flag (the F6.2 `--fs-mount` miss class).
+fn apply_flattened_bool_flags(
+    mut builder: SandboxBuilder,
+    pb: &SandboxBuilder,
+) -> SandboxBuilder {
+    if pb.pid_ns {
+        builder = builder.pid_ns(true);
+    }
+    if pb.port_remap {
+        builder = builder.port_remap(true);
+    }
+    if pb.no_randomize_memory {
+        builder = builder.no_randomize_memory(true);
+    }
+    if pb.no_huge_pages {
+        builder = builder.no_huge_pages(true);
+    }
+    if pb.deterministic_dirs {
+        builder = builder.deterministic_dirs(true);
+    }
+    if pb.no_coredump {
+        builder = builder.no_coredump(true);
+    }
+    builder
+}
+
 /// Implementation of `sandlock run`.
 /// Returns the desired process exit code; the caller does
 /// `process::exit`. Calling `process::exit` here would bypass
@@ -639,11 +667,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
             .ok_or_else(|| anyhow!("--egress-proxy-auth must be USER:PASS, got {auth:?}"))?;
         builder = builder.egress_proxy_credentials(user, pass);
     }
-    if pb.port_remap { builder = builder.port_remap(true); }
-    if pb.no_randomize_memory { builder = builder.no_randomize_memory(true); }
-    if pb.no_huge_pages { builder = builder.no_huge_pages(true); }
-    if pb.deterministic_dirs { builder = builder.deterministic_dirs(true); }
-    if pb.no_coredump { builder = builder.no_coredump(true); }
+    builder = apply_flattened_bool_flags(builder, pb);
 
     // CLI overrides — non-clap-friendly fields (still parsed here)
     if let Some(ref m) = args.max_memory { builder = builder.max_memory(ByteSize::parse(m)?); }
@@ -1181,6 +1205,35 @@ mod net_bind_map_tests {
             err.kind(),
             ErrorKind::ValueValidation,
             "the reserved-range refusal must surface as a value-validation error"
+        );
+    }
+
+    /// FUP-01: `--pid-ns` must be forwarded from the flattened CLI args into
+    /// the runtime policy, not just accepted at parse time.
+    #[test]
+    fn test_pid_ns_flag_reaches_runtime_policy() {
+        let cli = Cli::try_parse_from(["sandlock", "run", "--pid-ns", "--", "true"])
+            .expect("--pid-ns must parse");
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        let policy = apply_flattened_bool_flags(Sandbox::builder(), &args.sandbox_builder)
+            .build()
+            .expect("policy must build");
+        assert!(policy.pid_ns, "--pid-ns must reach the runtime policy");
+
+        let default = Cli::try_parse_from(["sandlock", "run", "--", "true"])
+            .expect("run without --pid-ns must parse");
+        let Command::Run(default_args) = default.command else {
+            panic!("expected the run subcommand");
+        };
+        let default_policy =
+            apply_flattened_bool_flags(Sandbox::builder(), &default_args.sandbox_builder)
+                .build()
+                .expect("default policy must build");
+        assert!(
+            !default_policy.pid_ns,
+            "the default shared-PID-namespace shape must stay the default"
         );
     }
 }
