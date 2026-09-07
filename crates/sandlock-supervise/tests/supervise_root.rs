@@ -790,6 +790,137 @@ fn test_supervisor_as_foreign_uid_is_fully_functional() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// FUP-03 exit-order harness: a worker that closes the fd control channel
+/// FIRST while a workload is live (no `shutdown` verb) is an abnormal
+/// generation end. Supervise (foreign uid X) must exit non-zero AND leave no
+/// uid-X process behind — live or zombie — after its synchronous teardown.
+#[test]
+fn test_supervisor_as_foreign_uid_fd_handoff_worker_close_first_leaves_no_residue() {
+    root_phase_env_check();
+    let base = repo_tmp_dir().join(format!("supervise-root-fd-exitorder-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("create root exit-order base");
+    chmod_dir(&base);
+    let ctl_root = base.join("ctl");
+    std::fs::create_dir_all(&ctl_root).expect("create ctl root");
+    chmod_dir(&ctl_root);
+    let policy_path = base.join("policy.json");
+    let mut readable = base_read_paths();
+    readable.push(base.to_string_lossy().into_owned());
+    write_shared(
+        &policy_path,
+        &serde_json::json!({
+            "fs_readable": readable,
+            "fs_writable": [base.to_string_lossy()],
+        })
+        .to_string(),
+    );
+    let program_path = base.join("program.json");
+    write_shared(
+        &program_path,
+        &serde_json::json!({ "argv": ["/bin/sleep", "300"] }).to_string(),
+    );
+
+    let (mut worker, server_stream) =
+        std::os::unix::net::UnixStream::pair().expect("control socketpair");
+    let server_fd = server_stream.as_raw_fd();
+    let mut cmd = Command::new("setpriv");
+    cmd.args([
+        "--reuid",
+        &UID_X.to_string(),
+        "--regid",
+        &UID_X.to_string(),
+        "--clear-groups",
+        "--",
+        bin(),
+        "--policy",
+        policy_path.to_str().unwrap(),
+        "--program",
+        program_path.to_str().unwrap(),
+        "--uid",
+        &UID_X.to_string(),
+        "--control-fd",
+        &server_fd.to_string(),
+        "--serve",
+    ])
+    .env("SANDBOX_CTL_ROOT", &ctl_root)
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped());
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(move || {
+            // FUP-06: only the server end belongs to supervise.
+            let flags = libc::fcntl(server_fd, libc::F_GETFD);
+            if flags < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(server_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut supervise = cmd.spawn().expect("spawn fd-mode supervise");
+    drop(server_stream);
+
+    use std::io::{Read, Write};
+    let body = serde_json::json!({ "v": 1, "verb": "run", "args": {} });
+    let bytes = serde_json::to_vec(&body).expect("serialize run frame");
+    let mut frame = Vec::with_capacity(4 + bytes.len());
+    frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&bytes);
+    worker.write_all(&frame).expect("write run frame");
+
+    let mut len_buf = [0u8; 4];
+    worker
+        .read_exact(&mut len_buf)
+        .expect("read run response length");
+    let resp_len = u32::from_be_bytes(len_buf) as usize;
+    let mut resp = vec![0u8; resp_len];
+    worker.read_exact(&mut resp).expect("read run response");
+    let resp: serde_json::Value = serde_json::from_slice(&resp).expect("run response JSON");
+    assert_eq!(
+        resp["ok"],
+        serde_json::Value::Bool(true),
+        "run must start the workload: {resp:?}"
+    );
+
+    // Worker closes first, without a shutdown verb: abnormal generation end.
+    drop(worker);
+    let status = wait_child_exit(
+        &mut supervise,
+        Duration::from_secs(90),
+        "exit-order supervise",
+    );
+    let err = {
+        let mut text = String::new();
+        if let Some(ref mut pipe) = supervise.stderr {
+            let _ = pipe.read_to_string(&mut text);
+        }
+        text
+    };
+    assert!(
+        !status.success(),
+        "worker-close-first must exit non-zero; stderr: {err}"
+    );
+    let first = err.lines().next().unwrap_or_default();
+    assert!(
+        first.starts_with("sandlock-supervise: control channel ended abnormally ("),
+        "the abnormal end must be named first, got: {first}"
+    );
+    wait_until(
+        Instant::now() + Duration::from_secs(10),
+        "exit-order uid-X processes to exit",
+        || processes_with_uid(UID_X).is_empty(),
+    );
+    assert!(
+        processes_with_uid(UID_X).is_empty(),
+        "worker-close-first must leave no live or zombie uid-X process: {:?}",
+        processes_with_uid(UID_X)
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// Mechanism-level fd-handoff coverage under the same genuine identities:
 /// supervise (uid X) serves the handed-over socketpair end; the worker end
 /// is held by a real uid-65534 process.  The fd is the credential, so this

@@ -252,7 +252,20 @@ impl Generation {
                     }
                     return Ok(());
                 }
-                drop(self.instance.take());
+                // FUP-03: like the clean paths, an abnormal end must run the
+                // synchronous instance shutdown (kill + reap + control-dir
+                // cleanup) BEFORE this process exits. Relying on Drop alone
+                // raced the runtime teardown against process exit and could
+                // leave a live/zombie workload reparented under pid 1.
+                if let Some(mut instance) = self.instance.take() {
+                    if let Err(e) = self.rt.block_on(instance.shutdown()) {
+                        return Err(format!(
+                            "control channel ended abnormally (outcome {other:?}); \
+                             only a shutdown verb completes a generation \
+                             (instance cleanup failed: {e})"
+                        ));
+                    }
+                }
                 Err(format!(
                     "control channel ended abnormally (outcome {other:?}); \
                      only a shutdown verb completes a generation"
