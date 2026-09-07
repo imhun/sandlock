@@ -255,10 +255,31 @@ for wheel in "$@"; do
         echo "  FAIL -- supervise binary MISSING from wheel: sandlock/bin/sandlock-supervise" >&2
         rc=1
     else
-        extracted_mode="$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$sup")"
-        if [ "$extracted_mode" != "755" ]; then
-            echo "  FAIL -- supervise extracted mode is $extracted_mode, expected 755 (pip installs the wheel binary as 0755)" >&2
+        # FUP-16: the 0755 that pip installs comes from the mode recorded in
+        # the wheel's central directory, so THAT is the authoritative check.
+        # An extracted-file check is only meaningful when the unpacker
+        # restores unix modes: `sandlock-dev` has no `unzip` and falls back to
+        # `python3 -m zipfile -e`, which lands every file at 0644 regardless
+        # of what the wheel says — checking that would fail a correct wheel.
+        wheel_mode="$(python3 -c '
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z:
+    info = z.getinfo("sandlock/bin/sandlock-supervise")
+print(oct((info.external_attr >> 16) & 0o7777)[2:])
+' "$wheel")"
+        if [ "$wheel_mode" != "755" ]; then
+            echo "  FAIL -- wheel records sandlock/bin/sandlock-supervise as mode $wheel_mode, expected 755 (pip installs from the wheel's stored mode)" >&2
             rc=1
+        fi
+        if command -v unzip >/dev/null 2>&1; then
+            extracted_mode="$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$sup")"
+            if [ "$extracted_mode" != "$wheel_mode" ]; then
+                echo "  FAIL -- supervise extracted mode $extracted_mode does not match the wheel's stored mode $wheel_mode (unzip restored it wrong)" >&2
+                rc=1
+            fi
+            echo "  supervise mode: wheel-recorded $wheel_mode, unzip-extracted $extracted_mode"
+        else
+            echo "  supervise mode: wheel-recorded $wheel_mode (no unzip here; python zipfile does not restore modes)"
         fi
         chmod +x "$sup"
         got_arch="$(elf_arch "$sup")"
