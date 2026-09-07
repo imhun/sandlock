@@ -142,26 +142,34 @@ for arch in ("x86_64", "aarch64"):
             f"build-wheels: expected one RECORD in {wheel}, found {records}"
         )
     record_name = records[0]
-    if entries.get(target) != data:
-        entries[target] = data
-        b64 = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
-        entries[record_name] = (
-            entries[record_name].decode() + f"{target},sha256={b64},{len(data)}\n"
-        ).encode()
-        tmp = wheel + ".inject-tmp"
-        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
-            for name in entries:
-                info = infos.get(name)
-                if info is None:
-                    # Newly injected supervise: mark it executable so pip
-                    # installs it as 0755 and E2B can exec it directly.
-                    info = zipfile.ZipInfo(target)
-                    info.external_attr = 0o100755 << 16
-                zout.writestr(info, entries[name])
-        os.replace(tmp, wheel)
-        print(f"  supervise injected into {wheel} ({arch})")
-    else:
-        print(f"  supervise already present in {wheel} ({arch})")
+    changed = entries.get(target) != data
+    entries[target] = data
+    b64 = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+    # FUP-16: replace-in-place RECORD rows for the injected supervise (an
+    # older injector that appended a second row on re-injection must not
+    # leave duplicates for pip).
+    record_lines = [
+        line
+        for line in entries[record_name].decode().splitlines()
+        if not line.startswith(target + ",")
+    ]
+    record_lines.append(f"{target},sha256={b64},{len(data)}")
+    entries[record_name] = ("\n".join(record_lines) + "\n").encode()
+    tmp = wheel + ".inject-tmp"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name in entries:
+            info = infos.get(name)
+            if info is None or name == target:
+                # Injected supervise: executable so pip installs it as 0755
+                # and E2B can exec it directly (also repair an old entry that
+                # lost the exec bit).
+                info = zipfile.ZipInfo(target)
+                info.external_attr = 0o100755 << 16
+            zout.writestr(info, entries[name])
+    os.replace(tmp, wheel)
+    print(
+        f"  supervise {'updated' if changed else 'verified'} in {wheel} ({arch})"
+    )
 
 with open(os.path.join(out, "SHA256SUMS.supervise"), "w") as f:
     f.write("\n".join(manifest_lines) + "\n")

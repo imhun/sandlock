@@ -148,12 +148,38 @@ uid_smoke() {
         echo "  FAIL -- supervise --uid refusal smoke: exited 0 with --uid $wrong (euid $euid)" >&2
         return 1
     fi
-    if ! grep -q "does not match --uid $wrong" "$work/uid-smoke.err"; then
-        echo "  FAIL -- supervise --uid refusal smoke: exit $smoke_rc but stderr does not name the mismatch:" >&2
+    # FUP-16: the smoke grep must name BOTH uids (the real euid and the
+    # requested --uid), not just the requested one.
+    if ! grep -q "refusing to start: euid $euid does not match --uid $wrong" "$work/uid-smoke.err"; then
+        echo "  FAIL -- supervise --uid refusal smoke: exit $smoke_rc but stderr does not name euid $euid vs --uid $wrong:" >&2
         sed 's/^/    /' "$work/uid-smoke.err" >&2
         return 1
     fi
     echo "  --uid refusal smoke: euid $euid with --uid $wrong refused (exit $smoke_rc), stderr names both uids"
+}
+
+# FUP-16: the wheel RECORD must carry exactly one row for the injected
+# supervise binary and that row must match the extracted bytes (a duplicate
+# or stale row would break pip's install-time verification).
+record_ok() {  # record_ok <RECORD-path> <supervise-path>
+    python3 - "$1" "$2" <<'PY'
+import base64
+import csv
+import hashlib
+import sys
+
+rows = []
+with open(sys.argv[1], newline="", encoding="utf-8") as fh:
+    for row in csv.reader(fh):
+        if row and row[0] == "sandlock/bin/sandlock-supervise":
+            rows.append(row)
+if len(rows) != 1:
+    sys.exit(f"expected exactly one RECORD row for sandlock/bin/sandlock-supervise, found {len(rows)}")
+data = open(sys.argv[2], "rb").read()
+want = "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+if rows[0][1] != want or rows[0][2] != str(len(data)):
+    sys.exit(f"RECORD row mismatch for sandlock/bin/sandlock-supervise: {rows[0]!r}")
+PY
 }
 
 # Release symbol set (same for every wheel under test).
@@ -164,6 +190,13 @@ rc=0
 for wheel in "$@"; do
     if [ ! -f "$wheel" ]; then
         echo "verify-wheel: no such wheel: $wheel" >&2
+        exit 1
+    fi
+    if [ "$(dirname "$wheel")" != "$wheel_dir" ]; then
+        echo "verify-wheel: all wheels under verification must share one directory" >&2
+        echo "  (the supervise manifest and standalone copies are resolved next to the wheels):" >&2
+        echo "  first wheel dir: $wheel_dir" >&2
+        echo "  offending wheel: $wheel" >&2
         exit 1
     fi
     echo
@@ -222,9 +255,24 @@ for wheel in "$@"; do
         echo "  FAIL -- supervise binary MISSING from wheel: sandlock/bin/sandlock-supervise" >&2
         rc=1
     else
+        extracted_mode="$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$sup")"
+        if [ "$extracted_mode" != "755" ]; then
+            echo "  FAIL -- supervise extracted mode is $extracted_mode, expected 755 (pip installs the wheel binary as 0755)" >&2
+            rc=1
+        fi
         chmod +x "$sup"
         got_arch="$(elf_arch "$sup")"
         echo "  supervise: sandlock/bin/sandlock-supervise (present, ELF $got_arch)"
+        record="$(find "$dir" -path '*.dist-info/RECORD' -type f | head -1)"
+        if [ -z "$record" ]; then
+            echo "  FAIL -- no RECORD inside $(basename "$wheel")" >&2
+            rc=1
+        elif ! record_ok "$record" "$sup"; then
+            echo "  FAIL -- RECORD validation for sandlock/bin/sandlock-supervise" >&2
+            rc=1
+        else
+            echo "  RECORD row for sandlock/bin/sandlock-supervise: exact match"
+        fi
         if [ "$got_arch" != "$want_arch" ]; then
             echo "  FAIL -- supervise ELF machine is $got_arch but wheel is $want_arch" >&2
             rc=1

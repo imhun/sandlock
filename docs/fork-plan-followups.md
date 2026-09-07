@@ -145,6 +145,10 @@
   错配；uid 冒烟 grep 未显式含 euid；旧版 supervise 已注入时再注入会追加第二条
   RECORD 行（建议 replace-in-place）；pip 真机落 0755 未直接执行验证。
   为什么留：本次 F9 rebuild 用默认 `wheels/` 流程全绿；上述为发布管线的防御性收尾。
+  **已实现（2026-09-07，A/B cleanup wave）**：build-wheels 注入改 replace-in-place
+  （过滤既有 `sandlock/bin/sandlock-supervise` RECORD 行后写唯一一行，并修复
+  执行位）；verify 新增 RECORD 行精确校验、同目录守卫、euid+--uid 双值 grep、
+  提取 0755 权限检查。脚本 `sh -n` 通过；重建/verify 证据随最终 tip wheel 波。
 - **FUP-17 runner 硬化（可选）** — 来源：F0.1 review。
   描述：`scripts/test-all.sh` 无参模式不拒 root（对称守卫可选）；root 与 uid 65534
   共享增量缓存有脏缓存隐患（建议 root 档 `CARGO_INCREMENTAL=0` 或独立 target）。
