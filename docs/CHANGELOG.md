@@ -8,6 +8,21 @@
 
 ## 行为变化（升级 / 接线前必读）
 
+- **控制帧每帧声明自己的描述符数（F15，2026-09-08，`FRAME_VERSION` 1 → 2）**：init
+  控制通道是 `SOCK_STREAM`，一次 `recvmsg` 可并入多帧，而内核交回的 SCM_RIGHTS 描述符是
+  **一条拼接列表**；旧实现把「本读单元的全部 fd」当成「本帧的 fd」（`fdrecv::recv(ctl, 3)` +
+  `received.fds[0..3]`），前一帧带 fd 时后一帧的 stdio 会整体位移——两个 `RunExec` 合并在
+  一次读里时，exec #2 的 stdout 会写进 exec #1 的管道并整条丢失。**修法**：帧头新增 1 字节
+  `n_fds`（`FRAME_HEADER_LEN` 10 → 11），发送侧在 `encode_frame` 声明每帧 fd 数（只有
+  `RunExec` 是 3），接收侧用纯函数 `take_frame_fds` 按声明从读单元队列切分，声明与队列不符
+  ⇒ 整读单元拒绝（不投毒任何一帧）；`MSG_CTRUNC` / `MSG_TRUNC` 不再被忽略——描述符或载荷
+  被内核截断即整个控制通道 fail-closed。`RunExec` 需**恰好** 3 个描述符，多了/少了都回
+  `exec needs 3 fds`。**用户可见**：wire 不兼容（v1 帧在 v2 init 下建箱期即点名拒绝），
+  半升级不会静默错输出；合并帧场景下每个 exec 只拿到自己声明的 stdio。夹具：
+  core_lib 837→841（`take_frame_fds` 4 条纯函数单测）、root 档 oci 145→150
+  （两帧一次写出六端各归其主 + 帧头 `TooManyFds` / v1 头版本点名单测）。本变更与 FUP-23
+  的 stdio 预搬迁/身份校验正交（F15 只改「哪三个 fd 进 `stdio`」）。
+
 - **exec stdio 在宿主形态下会被外部换端 ⇒ init 侧 fork 前预搬迁 + 子进程装配前身份校验
   （FUP-23，2026-09-08）**：pure 形态（沙箱与宿主 agent 同进程）下，命令的 stdout 可能
   **整条静默丢失**（CPython `exit 120`、`/bin/echo x` ⇒ 1、shell 重定向 ⇒ 2），判别变量是

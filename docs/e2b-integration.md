@@ -472,6 +472,12 @@ fork 侧复跑命令（非 root 全程，入口脚本做一次性 root 准备）
 2. fork 修复后，请在本文把条目状态改为"已修（commit/PR）"，E2B 侧的 `xfail(strict=True)` 会
    因 XPASS 立刻失败，提示摘除标记与恢复断言。
 3. 编号沿用：`SL-*` = fork 缺陷，`T*` = E2B 待办，`R*/S*/E*/M*` = 已落地方案编号。
+4. **帧头 `n_fds`（`FRAME_VERSION = 2`，F15，2026-09-08）与 v1 不兼容**：
+   `sandlock-supervise` 二进制与 `_sandlock*.so` 必须来自同一 fork tip（同一份
+   `SHA256SUMS.supervise` manifest）。混装不会静默错输出——旧 init（v1 头）对 11 字节
+   新帧或新 init（v2 头）对 10 字节旧帧都会在建箱/首次 exec 时 fail-closed（错误消息点名
+   "unsupported frame version 1: expected 2"）。E2B 侧升级必须**同批**替换 wheel 与
+   supervise，不做半升级。
 
 ## 8. 采纳方案：每沙箱一个实例（2026-09-03 复核后按最小改动界定）
 
