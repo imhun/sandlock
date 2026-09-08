@@ -318,3 +318,39 @@ a refusal (exit ≠ 0, stderr naming both uids) — the same startup contract as
 §1, proven against the shipped artifact rather than only the source tree.
 Deleting or tampering with the supervise binary, the standalone copy, or the
 manifest goes red with the offending path/hash named.
+
+## 10. Language client access surface（F16，2026-09-08）
+
+route-B 的 worker（E2B envd，Python）今天**当不了** registered-path 客户端：`exec`
+verb 的三端 stdio 必须随请求帧以 SCM_RIGHTS 交到 slot（`serve.rs` `handle_exec`），
+而现有语言面只有 Rust（`control.rs` 的 `channel_request_with_fds` 与
+`RegisteredPathChannel::connect_and_request`，后者不带 fds）。F16 把同一协议面
+暴露给 C 与 Python：
+
+- **C ABI（命名沿用 `sandlock_*` 纪律，错误沿用既有 `err: *mut c_int` +
+  `err_msg: *mut *mut c_char` 约定，消息用 `sandlock_string_free` 释放）**：
+  - `sandlock_supervise_connect(path, token, err, err_msg) -> void*`：只保存
+    path/token 身份（registered transport 每 verb 一条新连接，连接建立延迟到
+    request）；参数非法返回 null + err。
+  - `sandlock_supervise_request(h, verb, args_json, fds, n_fds, err, err_msg)
+    -> char*`：返回序列化的 `ControlResponse` JSON（`v/ok/data/err` 原样，
+    调用方自己解析——客户端不做实例语义）。
+  - `sandlock_supervise_free(h)`。
+- **Python**：`sandlock.supervise.SuperviseChannel(path=..., token=...)`，
+  `.request(verb, *, args=None, fds=()) -> dict`（ctypes 薄包装）；`exec` 的
+  `fds` 必须是恰好 3 个 `[stdin, stdout, stderr]` 的 child 端；传输/协议错误翻成
+  `exceptions.py` 的既有异常（connect/transport → `SandlockError`，非 ok 响应 →
+  `SandboxError` 带服务端 err 文本）。`shutdown()` 便捷方法。
+- **明确不做（本小节边界）**：不在 F16 里加实例语义——`exec`/`wait_child`/
+  `kill_child` 的 verb 语义由服务端（Generation/handle_*）定义，客户端只做
+  「发一请求、收一响应、附上要交的 fd」；不做 fd-handoff（transport 1）的
+  语言面（worker 需要一条已建好的 UnixStream，部署面用 Rust/既有脚本）；不
+  给 registry 协议加版本门（wire 版本与 init 帧协议 `FRAME_VERSION` 无关）。
+- **两条部署约束（会咬人，接线前必读）**：
+  1. `sun_path` 108 字节上限：registered registry 根路径过长会让 slot 假失败
+     （fork 门禁自己踩过，`scripts/test-all.sh:12-20`）——E2B 侧 registry 根
+     路径长度要进部署检查表；
+  2. **一 uid = 一个 supervise = 一代沙箱**：槽位复用只能靠**重启进程**
+     （§6）；uid 复用窗口 = 同时在世槽数 N。E2B 的 per-sandbox uid 池
+     （`envd_service/uid_pool.py`）必须先选 W1/W2 之一再接线（见主仓库
+     task-backlog #5 / 本计划 Task 9 Step 5）。

@@ -8,6 +8,23 @@
 
 ## 行为变化（升级 / 接线前必读）
 
+- **route-B worker 侧客户端暴露给 C 与 Python（F16，2026-09-08）**：registered-path
+  槽位（`sandlock-supervise --serve-path NAME --token T [--peer-uid UID]...`）的
+  worker 面此前只有 Rust（`channel_request_with_fds`；`connect_and_request` 不带 fd）。
+  F16 新增 C ABI：`sandlock_supervise_connect(path, token, err, err_msg)` /
+  `sandlock_supervise_request(h, verb, args_json, fds, n_fds, err, err_msg)`（返回
+  `ControlResponse` JSON 原文，`exec` 的 stdio 三端随帧 SCM_RIGHTS 交付）/
+  `sandlock_supervise_free(h)`（错误沿用既有 `err`/`err_msg` 约定）；Python 薄包装
+  `sandlock.supervise.SuperviseChannel(path, token).request(verb, args=None,
+  fds=()) -> data`（非 ok 响应抛 `SandboxError`，transport 错误抛
+  `SandlockError`）。**用户可见**：FFI 动态符号 156 → 159（verify 双向相等随之更新）；
+  envd（E2B）从此能当 route-B worker（exec + wait_child + kill_child +
+  update_network + shutdown）；T5 的 per-uid 卷保护从此有 Python 可达证据
+  （`mediation_2uid` 新增跨 uid Python-client 用例）。wire 不变（registered 协议
+  与 init 帧协议互不相干）；两条部署约束（`sun_path` 108 字节上限；一 uid = 一个
+  supervise = 一代沙箱，槽位复用只能靠重启）见
+  `docs/supervise-identity-handoff.md` §10。
+
 - **控制帧每帧声明自己的描述符数（F15，2026-09-08，`FRAME_VERSION` 1 → 2）**：init
   控制通道是 `SOCK_STREAM`，一次 `recvmsg` 可并入多帧，而内核交回的 SCM_RIGHTS 描述符是
   **一条拼接列表**；旧实现把「本读单元的全部 fd」当成「本帧的 fd」（`fdrecv::recv(ctl, 3)` +
