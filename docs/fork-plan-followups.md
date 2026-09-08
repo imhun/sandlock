@@ -28,6 +28,9 @@
   描述：`sandlock-cli` 从不暴露 `--pid-ns` 开关，用户会误以为 CLI 不支持该策略。
   为什么留：**既有历史缺陷**，真修 = 新增 clap arg + builder 接线 + CLI→运行时测试
   （`--mediation-run-as`/`--fs-mount` 已示范正确形态），属 F9 文档范围之外的小代码改动。
+  **已关闭（2026-09-08，F15 台账收口）**：`--pid-ns` 在 flatten 后转发给运行时 builder
+  （`262c0cf`；`main.rs:478-479` + 单测 `main.rs:1214 test_pid_ns_flag_reaches_runtime_policy`
+  + `cli_test.rs` 端到端）。台账行漏写关闭结论，本次补记（无代码改动）。
 - **FUP-02 init seam 单归属决策（维持双份复挂）** — 来源：F3.1 review（`d063437`）。
   描述：init/proto/fdpass 从 oci 搬入 `core::init` 后，6 个随搬单测在 core 与 oci
   re-export seam 各跑一份（oci-root 144 精确不变是搬家证明的锚）。
@@ -85,6 +88,10 @@
   未 pin；I1 谓词保守（任何 policy_fn 存在即拒 root-remap caller）已文档化但同样未
   pin 独立回归。
   为什么留：CLI/config 组合测试面缺失，需新用例。
+  **已关闭（2026-09-08，F15 台账收口）**：两半都有独立回归——no-clobber 在
+  `profile.rs:60`/`profile.rs:821` 与 `profile_integration.rs:40`，I1 半在
+  `sandbox/tests.rs:648 mediation_active_covers_policy_fn_deny_capability`（注释点名
+  「the I1 shape」），落地于 `48968a5`。台账行漏写关闭结论，本次补记（无代码改动）。
 - **FUP-08 knobs 未接生产配置** — 来源：F1.2（`c5a0fe7` early_exit_cap）、F1.8
   （`df5d77a` request deadline）、F5 review（`1321ba0` idle/T_max constructor-only）。
   描述：`early_exit_cap=1024`、`request` 默认 5 s、`T_idle`/`T_max` 目前只走
@@ -102,11 +109,18 @@
   证据留存/重试策略（首轮红日志 vs 最终绿日志如何归档）。
   为什么留：属 runner/发布流程纪律（可选加固），非行为缺陷；F9 终局全绿无重试，
   相关观察继续记录在后续 gate 报告。
+  **已关闭（2026-09-08，F15 台账收口）**：`run()` 现自动把同名旧日志轮换成
+  `tmp/<label>-rN.log`（先写纪律 `-r1`/`-final` 从注释变成机制），落地于
+  `8e0adce`（Task 6，本计划）；front 半（纪律注释 `scripts/test-all.sh:33-39`）来自
+  `e57cebf`。
 - **FUP-10 F1.7 逃逸盲区 / dead_groups 重叠建议** — 来源：F1.7 review residual
   （`4b7f7d0`/`d2bd459`）。
   描述：两步逃逸（setpgid 移组 → setsid 后 pgid==pid 伪装组内）建议 getsid 会话比较
   或注释；dead_groups 与活 child pgid 复用重叠可能双 killpg（建议遍历前先去重）。
   为什么留：加固建议需 core 改动 + 新测试；现行形态 fail-safe 且无实际触发证据。
+  **已关闭（2026-09-08，F15 台账收口）**：`d5bbdd8` 落地 getsid 会话比较 +
+  `unique_signal_pgids` 去重（`init/mod.rs:540-566`，单测 `:970`/`:981`）；FUP-13
+  亦记「重复投送面由 FUP-10 关闭」。台账行漏写关闭结论，本次补记（无代码改动）。
 - **FUP-11 F2b/F3 测试与日志硬化小项** — 来源：F2b.1（`3339c12`）与 F2b.3
   （`3afc9dd`）review。
   描述：error-path contains 断言收敛（建议整串/结构化）；registered slot 拒绝
@@ -268,7 +282,13 @@
     内核丢弃的描述符无人发现。候选补丁（帧头声明 fd 数 + 按声明分配 + CTRUNC
     fail-closed + 4 条纯函数单测，全绿）存档在
     `tmp/sdd/fup23-wip-frame-fd-count.patch`；它要 bump `FRAME_VERSION`（wire 不兼容），
-    故单独排期验证，本波不夹带上车。
+    故本波（FUP-23 修复波）不夹带上车。
+  **F15 已落地（2026-09-08）**：帧头新增 1 字节 `n_fds`（`FRAME_VERSION` 1 → 2、
+  `FRAME_HEADER_LEN` 10 → 11），`fdrecv` 对 `MSG_CTRUNC`/`MSG_TRUNC` fail-closed，
+  读循环用纯函数 `take_frame_fds` 按声明从读单元队列切分（不符 ⇒ 整读单元拒绝）；
+  fork 提交 `c50f407`（RED）/ `8640223`（fix）/ `3020ea0`（docs）；门禁与 wheel 见
+  `docs/CHANGELOG.md` F15 条目与 `docs/e2b-integration.md` §5 终态行。候选补丁存档
+  `tmp/sdd/fup23-wip-frame-fd-count.patch` 保留作历史（取证残留清理等用户确认）。
 
   复现与取证（供修复会话直接接手）：
   - 判别条件：`tmp/f11_fdcount_probe.py`（E2B 仓库，main `8ae1a40`）在跑
@@ -306,7 +326,8 @@ N=1（旧「绿」布局）一轮实测，同一次 exec（父端行带 `child_i
 1. **SCM_RIGHTS 收发链路清白**：`fdpass::send_with_fds` 的 `CMSG_SPACE`/`CMSG_LEN` 计算、
    描述符写入顺序，与 `fdrecv::recv` 的 cmsg 遍历、`msg_flags` 处理，逐项核对并实测正确。
    此前「发送端顺序错」「多帧合并串 fd」「`MSG_CTRUNC` 静默丢端」三条假设全部作废
-   （帧头声明 fd 数的候选补丁仍是**独立**缺陷修复，与本因无因果，继续单独排期）。
+   （帧头声明 fd 数的候选补丁是**独立**缺陷修复，与本因无因果；已作为 F15 落地，
+   2026-09-08，见 CHANGELOG F15 条目）。
 2. **换端发生在 `init` 的 `fork()` 与子进程第一条指令之间，且不是 init 自己干的**：
    init 自身表在 fork 前后都完好；marker 管道实验（子进程 `pipe2` 落在 9/10，且该 inode
    从不出现在后续 init 侧快照里）证明父子 **不共享** fd 表。⇒ 由**外部方**在新生儿身上
@@ -365,6 +386,9 @@ stdout `post-gateway-ok\n`、450 M 超卖 137 + `Killed\n`、50 M 控制 exit 0 
   supervise 二进制 ≈6.3–6.9 MB/arch、FFI cdylib 亦未 strip；plan 协议写的历史
   `panic=abort+strip` 未落地。
   为什么留：profile 决策影响发布面；加上只会更小，现有预算已按实测保留余量。
+  **已关闭（2026-09-08，F15 台账收口）**：`b1e2e32`（`Cargo.toml:24-26`
+  `[profile.release] panic=abort + strip=symbols`，wheel 体积 10.4/9.5 →
+  8.3/7.4 MB）。台账行漏写关闭结论，本次补记（无代码改动）。
 - **FUP-16 wheel 管线加固** — 来源：F2b.5 review（`51b64ad`）。
   描述：verify 不校验 RECORD 行；manifest 目录取 `dirname $1` 在跨目录 verify 时会
   错配；uid 冒烟 grep 未显式含 euid；旧版 supervise 已注入时再注入会追加第二条
@@ -378,6 +402,11 @@ stdout `post-gateway-ok\n`、450 M 超卖 137 + `Killed\n`、50 M 控制 exit 0 
   描述：`scripts/test-all.sh` 无参模式不拒 root（对称守卫可选）；root 与 uid 65534
   共享增量缓存有脏缓存隐患（建议 root 档 `CARGO_INCREMENTAL=0` 或独立 target）。
   为什么留：规范入口已由容器 entrypoint 控 uid；守卫属可选加固，不改测试数。
+  **已关闭（2026-09-08，F15 台账收口）**：两半齐——front（无参/`--wheels` 拒 root +
+  三个 root 档正向守卫）`e57cebf`（`scripts/test-all.sh:130+`）；back（root 三档
+  `CARGO_INCREMENTAL=0`，root 与 uid-65534 不再共享增量缓存）`8e0adce`（Task 6）。
+  复验：runner 改动后默认 8 档 + root 档计数零漂移，归档机制生效
+  （`tmp/sdd/f15-runner-default-final.log` / `f15-runner-root-run{1,2}.log`）。
 - **FUP-18 容量表 §4.1 区间/采样标注精度** — 来源：F2b.4 review（`799fc8f`）。
   描述：§4.1 的跨轮区间上界略低估、中位数采样标注不精确；预算余量仍 ≥28–37%。
   为什么留：需回放原始逐轮采样才可精确化；预算有效性不受影响。
@@ -421,12 +450,23 @@ stdout `post-gateway-ok\n`、450 M 超卖 137 + `Killed\n`、50 M 控制 exit 0 
   描述：以 `E2B_BASE_IMAGE` + `xfail(run=True)` 复测
   `test_mcp_full_path_under_net_isolation`；仍失败则在 worker 栈抓 gateway stderr /
   宿主映射端口快照。
+  **已关闭（E2B 侧，2026-09-06，T4/Task 10）**：根因 = envd 侧 base-image 组成
+  （slim rootfs 无 mcp-gateway，ENOENT exit 2），非 fork；改用 MCP-capable 基镜像
+  `python-mcp:3.14` 后 chroot+netns MCP 契约两形态 3/3 绿，xfail 已摘（主仓
+  `883d38d`/`f67a6b9`）。fork 无权执行，条目保留作追溯。
 - **FUP-E2 E2B §8 M4 接线** — 来源：fork-plan §F9 / e2b-integration §8。
   描述：SandlockExecutor 持实例、`_CommandGate` 保留、控制目录名用 sandbox_id+token、
   超卖探针改断言、SCALING 账本项照改、`max_processes` 显式配、minimal_dev 替换整树
   /dev 与 carve-out。
+  **已关闭（E2B 侧，2026-09-06，Task 11）**：fork 侧 M0–M4/F0–F10 在子模块 b955ae9；
+  E2B 接线 5d38537（Task 0.5 supervisor 档）→ 4f34e55…f67a6b9（Task 11 收口，
+  全量门禁见 HANDOFF）。fork 无权执行，条目保留作追溯。
 - **FUP-E3 E2B 复验 §3.8 超卖消除** — M4 落地后按 e2b-integration §3.8 探针重测
   （gateway + 并发命令同实例）。
+  **已关闭（E2B 侧，2026-09-06，FUP #3）**：per-sandbox 默认内存 512→1024 MiB
+  （`E2B_DEFAULT_MEMORY_MB`）给网关 ledger 与 450M MCP server 留出空间；gateway+命令
+  变体 pure 探针与契约两形态全绿（gate A/B 计数见主仓 task-backlog FUP #3 行）。
+  fork 无权执行，条目保留作追溯。
 
 ## 已处置（F9–F14 内完成，追溯用）
 
