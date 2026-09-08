@@ -106,10 +106,10 @@
     控制通道时不再与进程退出竞速，此前会留下 ppid=1 的 uid-X 僵尸/孤儿 workload。
   * 信号面两步逃逸（setpgid → setsid 伪装箱内）被检测，`dead_groups` 与活 child pgid
     重叠时去重，不再可能双 `killpg`（FUP-10，`d5bbdd8`）。
-  * exec/exit 往返去掉 ~100 ms 轮询地板：init 侧 SIGCHLD signalfd 事件化 reap
-    （FUP-14，`7671240`）；release 实测 p50 101.75 → **5.35 ms**、p95 102.61 →
-    5.84 ms、max 103.06 → 7.22 ms（≈19×；样本 `tmp/perf/fup14-latency-*.txt`）。
-    `REAP_POLL_MS` 保留为无 signalfd/孤儿兜底，spawn 子进程在 exec 前解除 SIGCHLD 阻塞。
+  * ~~exec/exit 往返去掉 ~100 ms 轮询地板（FUP-14，`7671240`）~~ **已回退**
+    （`bb1cb42`）：事件化 reap 实测能把 p50 从 101.75 ms 降到 5.35 ms，但它让 init 多占
+    一个低位 fd，从而把 FUP-23（exec stdio 对 fd 号敏感）从潜伏变成可达——pure 形态下
+    命令 stdout 整条丢失。收益随回退一并撤回，重做需与 FUP-23 一起验证。
   * route-B registered slot 的异常连接日志改**节流**（FUP-11c）：首条照常点名，其后每
     256 条打一条并带累计数——被拒连接数不再线性放大 slot stderr（300 条被拒 → 2 行）。
   * release profile 变发布面（FUP-15，`b1e2e32`）：`panic=abort` + `strip="symbols"`；
@@ -206,7 +206,9 @@ sandlock_instance_free                              # F3.3
   入库契约看不到它：pytest/cargo 进程天然持有几十个 fd。生产 envd 服务在启动后即
   打开监听 socket ⇒ 不在触发条件内，但**任何以「几乎空 fd 表」嵌入沙箱的形态会踩到**。
   登记与修法见 `docs/fork-plan-followups.md` FUP-23；E2B 侧对应
-  `docs/task-backlog.md` #22。**升级本 wheel 前请先读这条**。
+  `docs/task-backlog.md` #22。**本波已用「回退 FUP-14」把它压回潜伏状态**（当前
+  wheel 不带这个用户可见故障），但根因未修：任何改动 init 低位 fd 分配的改动都可能
+  再次触发，升级前仍请读这条。
 
 - P6 getsockname/getpeername 合成视图与 fd-inject `EINPROGRESS`：设计取舍 +
   回归 pin（F8 `c8f76d4`，`docs/e2b-integration.md` §3.10）。

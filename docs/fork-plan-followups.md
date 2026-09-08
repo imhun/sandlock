@@ -192,8 +192,21 @@
   返回值在异步信号安全前提下失败即 `_exit` 点名（现在被忽略），③RED 用可控 fd 表
   （子进程 helper 先 close 掉 3..N 再建管道）钉「三端各归其位且互不串流 + stdout
   精确到达」，并加一条「保留 fd 号段与 relocate 下界不相交」的纯决策单测。
-  本波未修：需要一轮 fork 修复 + 全门禁 + wheel 重建 + E2B 复跑，且要新增可控
-  fd 表的 RED 夹具；E2B 侧已把该现象与复现记入 `docs/task-backlog.md` #22。
+  **2026-09-08 状态：已用「回退 FUP-14」缓解（当前 wheel 不带这个用户可见故障），
+  根因仍 open。** E2B 侧现象/复现记入 `docs/task-backlog.md` #22。下一步要点：
+  - 触发方已钉死（上两条取证），但「为什么 init 多占一个低位 fd 就能让子进程 fd 1
+    不可写」还没有 fork 侧可控 RED——cargo/pytest 进程都太"胖"，落不进危险号段。
+    RED 正确姿势 = 在子 shell helper 里先把 fd 表压到「下一个可用 = 3」再建管道
+    exec，断言 stdout 精确到达且三端互不串流。
+  - 排查中发现**另一个独立缺陷**（与 FUP-23 无因果，已实测排除为其成因）：init 控制
+    通道是 SOCK_STREAM，一次 `recvmsg` 可并入多帧，而 SCM_RIGHTS 描述符是一个拼接
+    列表；现有 `fdrecv::recv(ctl, 3)` + `received.fds[0..3]` 把「本读单元已收的全部
+    fd」当成「本帧的 fd」⇒ 前一帧带 fd 时后一帧的 stdio 会整体位移（实测正是
+    `(rd, rd, wr)` 这种"stdout 变成读端"的形状），且 `fdrecv` 不看 `MSG_CTRUNC`，
+    内核丢弃的描述符无人发现。候选补丁（帧头声明 fd 数 + 按声明分配 + CTRUNC
+    fail-closed + 4 条纯函数单测，全绿）存档在
+    `tmp/sdd/fup23-wip-frame-fd-count.patch`；它要 bump `FRAME_VERSION`（wire 不兼容），
+    故单独排期验证，本波不夹带上车。
 
   复现与取证（供修复会话直接接手）：
   - 判别条件：`tmp/f11_fdcount_probe.py`（E2B 仓库，main `8ae1a40`）在跑
@@ -214,13 +227,19 @@
   描述：exec 往返 ~102 ms 有 ~100 ms 轮询地板；SIGCHLD self-pipe / pidfd 就绪通知可
   降到个位数 ms。
   为什么留：性能改动需核心行为变更 + 成本/延迟复测，F2b.4 明确留给后续。
-  **已关闭（2026-09-07，A/B cleanup wave）**：init 阻塞 SIGCHLD 并挂 signalfd，
+  **⚠ 已回退（2026-09-08 `bb1cb42`，重新 open）**：本波曾落地「init 阻塞 SIGCHLD 并挂 signalfd，
   poll 集合 = 控制通道 + signalfd；`REAP_POLL_MS` 保留为无 signalfd/孤儿兜底；
   spawn 子进程在 exec 前解除 SIGCHLD 阻塞（workload 语义不变）。release
   supervise_cost latency：p50 101.75 → 5.35 ms、p95 102.61 → 5.84 ms、
   max 103.06 → 7.22 ms（≈19×；latency 测试总时长 32.6 s → 1.75 s；
   样本 `tmp/perf/fup14-latency-{before,after}.txt`）；core_lib/core_integ/
-  supervise 全量回归绿。
+  supervise 全量回归绿。** 但 E2B 真栈复跑把它打回：signalfd 让 init 的低位 fd 分配整体
+  位移，把 **FUP-23**（exec stdio 对 fd 号敏感）从潜伏变成可达——pure 形态下「承载沙箱的
+  进程 fd 表只剩 0/1/2」时命令 stdout 整条丢失。取证两条都可复现：①同一测试镜像只换
+  debug `.so` ⇒ `4d5f385` 绿 / `7671240` 红；②只回退 `7671240` 的构建 ⇒ 同一 N=0 场景
+  立刻 `FAILURES: []`（五项签名全对）。故本波以回退为**缓解**，latency 收益一并撤回
+  （`supervise_cost` 预算回到 200/300/2000 ms）。事件化 reap 需重做，且**必须**与
+  FUP-23 的 stdio fd 号无关性一起验证后才能再上线。
 - **FUP-15 release profile `panic=abort` + `strip`** — 来源：F2b.4（`799fc8f`）/
   F2b.5（`51b64ad`）。
   描述：仓库 release profile 即 cargo 默认（panic=unwind、未 strip），release

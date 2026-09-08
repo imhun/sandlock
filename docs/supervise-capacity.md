@@ -119,7 +119,7 @@ PSS 4 050/4 075/2 729/4 154；其中 threads=8/arena=1 一轮出现 2 729 的低
 
 顺序 1000 轮实测（fd 与 registered 同量级，四配置一致）：
 
-| 统计 | 实测（2026-09-05，100 ms 轮询地板） | 实测（2026-09-07，FUP-14 事件化后） | 预算 |
+| 统计 | 实测（2026-09-05，100 ms 轮询地板） | 实测（2026-09-07，FUP-14 事件化后；**该实现已回退 `bb1cb42`，本列仅作历史**） | 预算 |
 |---|---:|---:|---:|
 | mean | 102.2–102.8 ms | 5.38 ms | — |
 | p50 | 102.0–102.6 ms | 5.35 ms | **200 ms** |
@@ -131,7 +131,8 @@ PSS 4 050/4 075/2 729/4 154；其中 threads=8/arena=1 一轮出现 2 729 的低
 给偶发调度停顿。2026-09-05 行的 ~100 ms 地板来自
 `crates/sandlock-core/src/init/mod.rs` 的 `REAP_POLL_MS = 100`（子进程退出后
 由 init 的 100 ms 控制通道轮询收割并回路由 Exited 帧；exec 启动腿本身
-~1.5 ms）。**FUP-14（2026-09-07）改为 SIGCHLD signalfd 事件唤醒**
+~1.5 ms）。**FUP-14（2026-09-07）曾改为 SIGCHLD signalfd 事件唤醒**（因触发
+   FUP-23 已回退，见 `docs/fork-plan-followups.md`；下表"事件化后"列为回退前的历史测量）
 （`REAP_POLL_MS` 保留为无 signalfd/孤儿兜底）：p50 101.75 → 5.35 ms
 （≈19×），latency 测试总时长 32.6 s → 1.75 s。延迟样本存
 `tmp/perf/fup14-latency-{before,after}.txt`。
@@ -161,7 +162,8 @@ PSS 4 050/4 075/2 729/4 154；其中 threads=8/arena=1 一轮出现 2 729 的低
 ## 6. 测量暴露、点名的后续项（本任务不做范围外实现）
 
 1. ~~**`REAP_POLL_MS = 100` 给每次 exec 往返一个 ~100 ms 地板**~~ —
-   **已关闭（FUP-14，2026-09-07）**：init 改为 SIGCHLD signalfd 事件唤醒，
+   **曾关闭 → 已回退重新 open（FUP-14，2026-09-07 落地、2026-09-08 回退 `bb1cb42`）**：
+   init 曾改为 SIGCHLD signalfd 事件唤醒（重做前须与 FUP-23 一并验证），
    `REAP_POLL_MS` 降级为无 signalfd/孤儿兜底；exec 往返 p50 101.75 → 5.35 ms
    （§4.2 新行）。
 2. ~~**release profile 无 `panic=abort`/`strip`**~~ — **已关闭（FUP-15，
