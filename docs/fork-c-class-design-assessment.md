@@ -109,3 +109,23 @@ launcher）、FUP-05（目录挂载点 rmdir 语义）。评估维度：问题�
 route-B 部署前置清单（设计先行、随 ③ launcher 形态交付）；FUP-19/20/21
 保持候补，在 F12（ProcessIndex 一 TGID 一 entry）完成后再评估是否与 pid
 穿透设计合并。
+
+## F12 后重估（2026-09-08，Task 8）
+
+- **FUP-19 + FUP-20 ⇒ 合并为一个 pid-passthrough 设计**：两者同源于「通知只带
+  destination，不带 child 归因」——FUP-19 要在 per-child 正向 fs/bind 上强制收窄，
+  FUP-20 要把 credential/HTTP-ACL 按 child 归因，二者都需要把 child 身份（pid/TGID）
+  随通知带到消费点。F12 只修了**进程建模**（TGID leader 归一），没有改变通知面的
+  destination-only 结构，也没有引入 child 归因——因此三条的触发面与 F12 之前相同。
+  合并后设计 = 通知附带发出者的 TGID（消费点据此查 per-child 策略）；同时仍要扩
+  wire/verdict 结构 + 逐消费点复核，成本不对称不变。
+- **FUP-21（port-aware `update_network` payload）单列**：与 child 归因无关，触发面
+  是「按端口收窄」的产品需求；D4=A 已收窄到 destination 级，无端口级消费者。
+- **触发条件（任一被 E2B/产品提出才做，不触发不动）**：
+  1. 跨 uid 文件可见性需要 per-child 正向白名单（不是整实例 ceiling）；
+  2. per-child 凭据（同一 destination 不同 child 不同凭据/ACL）；
+  3. 端口级网络收窄（`update_network` 带端口粒度）。
+  否则保持候补：任一实现都要扩 wire/verdict 结构 + 逐消费点复核，而当前无需求，
+  下波不得无据重开。
+- **结论**：F12/F13/F14/F15 均未改变上述判定；FUP-19/20 合并设计登记为触发式候补，
+  不进入实施队列。
