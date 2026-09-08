@@ -228,6 +228,32 @@
     E2B 侧 `tmp/f11_harness_queue_probe.py`（父进程打印送出 modes）与
     `tmp/f11_fdcount_probe.py`（N=0/N≥1 对照）。现成工作树：
     `tmp/wt-fix`（FUP-14 已恢复 + 候选补丁 + 上述三处诊断，未提交）。
+  - **2026-09-08 成对测量（把范围从"stdio 装配"移到 sendmsg/recvmsg 边界）**：
+    用同一 argv 过滤器同时在两端取值（父端 = `exec_with_fds_inner` 里即将交给
+    `fdpass::send_with_fds` 的三个描述符；子端 = init 装配前 `spawn` 收到的三元组），
+    打包成退出码（`64 + 9*acc0 + 3*acc1 + acc2`；68=(rd,wr,wr) 正常）：
+
+    | 客户端多开 fd | 父端送出 | init 收到 |
+    | --- | --- | --- |
+    | 0（坏） | **68 = (rd, wr, wr)** | **65 = (rd, rd, wr)** |
+    | 1（好） | **68 = (rd, wr, wr)** | **67 = (rd, wr, rd)** |
+
+    并且该读单元**确实只收到 3 个**（把 `fdrecv` 放宽到 16 后，"非 0/3"告警从未触发）。
+    ⇒ 三条推论：①**父端数组是对的**，之前"发送端把顺序搞反"的怀疑排除；
+    ②错位只发生在**送出之后、收到之前**这一段（含 `CMSG_SPACE`/`cmsg_len` 计算、
+    SOCK_STREAM 上"一条消息的 fd 与另一条消息的字节"配对、以及 tokio/`UnixStream`
+    克隆共享 fd 表这些方向），**不是** stdio 装配；③我此前"init 装配循环先搬 stdio
+    就能修"的假设因此作废（那个 relocation 实验也确认不改变结果），不要再往那个方向修。
+    成对探针（含两端 argv 过滤与打包）存档在 `tmp/sdd/f24-paired-send-recv-probes.patch`，
+    下一轮直接在带 FUP-14 的工作树上 `git apply` 复现；它是在
+    `fup23-wip-frame-fd-count.patch`（帧头声明 fd 数 + CTRUNC fail-closed）之上叠加的，
+    两个补丁都不改变本现象，故均非本因。
+    **下一步具体动作**：在 `fdpass::send_with_fds` 送出点打印 `fds.len()`、
+    `fds_bytes`、`CMSG_SPACE`/`cmsg_len`，在 `fdrecv::recv` 收取点打印
+    `msg_flags`（含 `MSG_CTRUNC`/`MSG_TRUNC`）、实收 fd 数与逐个 `O_ACCMODE`，
+    同一次 exec 两端对齐比较 —— 若父端 3 个 (rd,wr,wr) 而子端 3 个含两个读端，
+    就剩"谁把写端换成了读端"这一问，重点查 `send_with_fds` 的 cmsg 空间计算与
+    链接上并发 sendmsg 的配对。
   - 排查中发现**另一个独立缺陷**（与 FUP-23 无因果，已实测排除为其成因）：init 控制
     通道是 SOCK_STREAM，一次 `recvmsg` 可并入多帧，而 SCM_RIGHTS 描述符是一个拼接
     列表；现有 `fdrecv::recv(ctl, 3)` + `received.fds[0..3]` 把「本读单元已收的全部
