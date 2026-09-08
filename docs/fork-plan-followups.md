@@ -198,13 +198,22 @@
     不可写」还没有 fork 侧可控 RED——cargo/pytest 进程都太"胖"，落不进危险号段。
     RED 正确姿势 = 在子 shell helper 里先把 fd 表压到「下一个可用 = 3」再建管道
     exec，断言 stdout 精确到达且三端互不串流。
-  - **2026-09-08 再收窄（实测数据，下一轮直接从这里起）**：
-    ① 装配后子进程 `fcntl(0/1/2, F_GETFD)` 三个都是「开着且非 CLOEXEC」，而
-    `write(1)` = EBADF ⇒ fd 1 是**开着的读端**（不是被关闭、也不是 CLOEXEC 在
-    execve 时掉）；② init 侧该读单元**实收 3 个**描述符（不是 4、不是 0），其
-    `O_ACCMODE` = `(rd, rd, wr)`；父进程同一 exec 送出的 `raw` 实测是
-    `(rd, wr, wr)` ⇒ 错位发生在**送出与收到之间**；③ 把「帧头声明 fd 数」候选补丁
-    叠加到恢复 FUP-14 的构建上，探针仍红 ⇒ 多帧合并**不是**本因（那条仍是独立缺陷）。
+  - **2026-09-08 再收窄（实测数据，下一轮直接从这里起；已订正一次误读）**：
+    诊断按「只匹配目标命令 argv」过滤后重测（先前那版把网关 holder 的 exec 也采样进来了，
+    结论有误，以下为订正数据）：
+    ① 装配后子进程 `fcntl(0/1/2, F_GETFD)` 三个都「开着且非 CLOEXEC」，但
+    `write(1)` = EBADF ⇒ fd 1 是**开着的读端**；
+    ② init 收到的三元组 `O_ACCMODE`：**N=0（坏）= `(rd, rd, wr)`，N=1（好）=
+    `(rd, wr, rd)`** ⇒ **两种布局下顺序都是错位的**，只是坏布局把读端挤进了 stdout 槽、
+    好布局把它留在 stderr 槽（stderr 是读端不影响本探针断言）。所以本因不是「FUP-14
+    让某个号撞车」这种偶发，而是**交给 init 的 stdio 三元组顺序本身就不稳定**，
+    FUP-14 只是把错位从 stderr 槽推进了 stdout 槽；
+    ③ 因此下一步应该查 `exec` 侧 `child_ends` 三端的**产生与移交顺序**
+    （`build_exec_stdio` → `exec_with_fds` 的 `raw` → `fdpass::send_with_fds` →
+    init `recv_with_fds` 的解析顺序，含 `cmsg_len` 与 3 fd 的 `CMSG_SPACE` 对齐），
+    以及网关 holder 与命令 exec 在同一条 link 上交替发送时 host 端/child 端是否
+    发生混用；④「帧头声明 fd 数」候选补丁叠加 FUP-14 复测仍红 ⇒ 多帧合并不是本因
+    （它仍是独立缺陷，补丁继续存档）。
     判别变量确认为父进程 fd 表（多开 1 个 fd 即恢复）+ 只回退 `7671240` 即绿。
     ⇒ 下一轮的方向应从「继续查 stdio 装配」转向**同一条 control link 上是否有交叠的
     sendmsg**（网关 holder 的 exec 与命令的 exec 同时在飞、回复与 fd 归属交叉），
