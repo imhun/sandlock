@@ -1152,3 +1152,226 @@ fn test_eof_closes_received_fd() {
          (baseline {baseline} -> after return {after_eof})"
     );
 }
+
+// ── FUP-23: exec stdio relocation must not leak or miswire ────────────────
+
+/// A framed reader that keeps the bytes after the frame it returns: init's
+/// `Started` and the following `Exited` can coalesce into one socket read, and
+/// the single-shot [`read_init_reply`] helper would drop the second frame.
+struct FrameReader {
+    ctl: UnixStream,
+    buf: Vec<u8>,
+}
+
+impl FrameReader {
+    fn new(ctl: &UnixStream) -> Self {
+        Self {
+            ctl: ctl.try_clone().expect("clone control end"),
+            buf: Vec::new(),
+        }
+    }
+
+    /// Next reply payload, or `None` once the deadline passes / the channel
+    /// closes.
+    fn next_payload(&mut self, deadline: Instant) -> Option<Vec<u8>> {
+        loop {
+            if self.buf.len() >= SLK_HEADER_LEN && self.buf[..4] == SLK_MAGIC {
+                let len = u32::from_le_bytes(self.buf[6..10].try_into().unwrap()) as usize;
+                if self.buf.len() >= SLK_HEADER_LEN + len {
+                    let payload =
+                        self.buf[SLK_HEADER_LEN..SLK_HEADER_LEN + len].to_vec();
+                    self.buf.drain(..SLK_HEADER_LEN + len);
+                    return Some(payload);
+                }
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            let mut pfd = libc::pollfd {
+                fd: self.ctl.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut pfd, 1, 200) } <= 0 {
+                continue;
+            }
+            let mut chunk = [0u8; 4096];
+            let n = unsafe {
+                libc::read(
+                    self.ctl.as_raw_fd(),
+                    chunk.as_mut_ptr() as *mut _,
+                    chunk.len(),
+                )
+            };
+            if n <= 0 {
+                return None;
+            }
+            self.buf.extend_from_slice(&chunk[..n as usize]);
+        }
+    }
+}
+
+fn reply_tag(payload: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|v| v.get("resp").and_then(|t| t.as_str()).map(str::to_string))
+}
+
+fn reply_pid(payload: &[u8]) -> Option<i64> {
+    serde_json::from_slice::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|v| v.get("pid").and_then(|p| p.as_i64()))
+}
+
+/// Read exactly `want` bytes (then expect EOF once the writer is gone).
+fn read_bytes_from(fd: i32, want: usize, deadline: Instant) -> Vec<u8> {
+    let mut buf = Vec::new();
+    while buf.len() < want && Instant::now() < deadline {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pfd, 1, 200) } <= 0 {
+            continue;
+        }
+        let mut chunk = [0u8; 64];
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut _, chunk.len()) };
+        if n <= 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n as usize]);
+    }
+    buf
+}
+
+/// FUP-23: every `RunExec` frame carries three stdio ends, which init now
+/// relocates into a reserved range before the fork. This drives real execs
+/// through the real `run_init` and pins both halves of the contract:
+///
+/// * each round's command delivers **exactly its own** stdout and stderr bytes
+///   (a slot wired to the wrong description — the FUP-23 failure — shows up as
+///   missing output, an `EBADF` writer or another round's bytes);
+/// * init's fd table returns to its baseline after every round: the received
+///   numbers are closed by the receive guard and the reserved copies by the
+///   spawner. A missed close leaks three descriptors per exec and the session
+///   dies of `EMFILE` once the budget runs out.
+#[test]
+fn exec_frames_deliver_their_own_output_and_leave_no_descriptor_behind() {
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipping: /proc fd counting is Linux-only");
+        return;
+    }
+    const ROUNDS: usize = 40;
+    let (pid, ctl, ready_r) = spawn_run_init_probe();
+    let guard = RunInitProbeGuard { pid, ready_r };
+    assert_eq!(
+        wait_ready_byte(ready_r, Instant::now() + Duration::from_secs(5)),
+        Some(b'r'),
+        "probe child never entered run_init"
+    );
+    let baseline = open_fd_count(pid).expect("read child fd table before the execs");
+    let mut reader = FrameReader::new(&ctl);
+
+    for round in 0..ROUNDS {
+        let mut p = [[0i32; 2]; 3];
+        for pair in p.iter_mut() {
+            assert_eq!(unsafe { libc::pipe2(pair.as_mut_ptr(), 0) }, 0, "pipe2");
+        }
+        let tag = format!("{round:02}");
+        let payload = format!(
+            r#"{{"req":"runexec","argv":["/bin/sh","-c","printf '{}O'; printf 'E' 1>&2"],
+                "env":[],"cwd":null,"detach":false}}"#,
+            tag
+        );
+        let frame = frame_bytes(SLK_TYPE_REQ, payload.as_bytes());
+        // [stdin read, stdout write, stderr write] — the exec's child ends.
+        sandlock_oci::fdpass::send_with_fds(&ctl, &frame, &[p[0][0], p[1][1], p[2][1]])
+            .expect("send RunExec frame with stdio");
+        // Our copies of the child ends must go: while we hold them, our own
+        // reader can never see EOF.
+        unsafe {
+            libc::close(p[0][0]);
+            libc::close(p[1][1]);
+            libc::close(p[2][1]);
+        }
+
+        let started = reader
+            .next_payload(Instant::now() + Duration::from_secs(10))
+            .expect("init must answer RunExec");
+        assert_eq!(
+            reply_tag(&started).as_deref(),
+            Some("started"),
+            "round {round}: expected Started, got {}",
+            String::from_utf8_lossy(&started)
+        );
+        let child_pid = reply_pid(&started).expect("Started carries the child pid");
+
+        let out = read_bytes_from(p[1][0], tag.len() + 1, Instant::now() + Duration::from_secs(10));
+        let err = read_bytes_from(p[2][0], 1, Instant::now() + Duration::from_secs(10));
+        unsafe {
+            libc::close(p[0][1]);
+            libc::close(p[1][0]);
+            libc::close(p[2][0]);
+        }
+        assert_eq!(
+            out,
+            format!("{tag}O").into_bytes(),
+            "round {round}: stdout must carry exactly this round's bytes"
+        );
+        assert_eq!(err, b"E", "round {round}: stderr must carry only stderr");
+
+        // Wait for the child's exit to be routed: that is the point by which
+        // init has dropped every descriptor this round was using.
+        let mut exited = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !exited && Instant::now() < deadline {
+            match reader.next_payload(deadline) {
+                None => break,
+                Some(payload) => {
+                    if reply_tag(&payload).as_deref() == Some("exited") {
+                        assert_eq!(
+                            reply_pid(&payload),
+                            Some(child_pid),
+                            "round {round}: Exited must name this round's child"
+                        );
+                        exited = true;
+                    }
+                }
+            }
+        }
+        assert!(exited, "round {round}: init never reported the child's exit");
+
+        let settled = {
+            let until = Instant::now() + Duration::from_secs(5);
+            let mut count = open_fd_count(pid).unwrap_or(usize::MAX);
+            while count != baseline && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(50));
+                count = open_fd_count(pid).unwrap_or(usize::MAX);
+            }
+            count
+        };
+        assert_eq!(
+            settled, baseline,
+            "round {round}: init must return to its baseline fd count \
+             (received ends and reserved copies both closed; \
+             baseline {baseline} -> now {settled})"
+        );
+    }
+    // Both handles must go: `reader` holds a `try_clone` of the control end,
+    // and init only sees EOF once every daemon-side copy is closed.
+    drop(reader);
+    drop(ctl);
+    assert_eq!(
+        wait_ready_byte(ready_r, Instant::now() + Duration::from_secs(5)),
+        Some(b'e'),
+        "channel close must still end run_init normally after {ROUNDS} execs"
+    );
+    let final_count = open_fd_count(pid).expect("read child fd table after EOF");
+    assert_eq!(
+        final_count, baseline,
+        "no descriptor may survive {ROUNDS} execs (baseline {baseline} -> \
+         final {final_count})"
+    );
+    drop(guard);
+}

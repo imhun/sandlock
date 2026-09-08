@@ -115,6 +115,180 @@ fn send(fd: RawFd, resp: &Resp) {
     }
 }
 
+/// FUP-23: reserved child-side stdio slots.
+///
+/// An `exec`'s three stdio ends arrive over SCM_RIGHTS, so init holds them at
+/// whatever numbers `recvmsg` picked (the lowest free ones — classically 5/6/7).
+/// `spawn` used to `dup2` straight from those numbers *in the forked child*.
+/// Measured on the E2B host shape (see `docs/fork-plan-followups.md` FUP-23):
+/// between the fork and the child's very first instruction, one of those low
+/// numbers could already refer to a different file description (an unrelated
+/// pipe pair), so the workload ran with e.g. a read end in its stdout slot —
+/// every write failed `EBADF`, CPython exited 120 and command output vanished
+/// with no error anywhere. init's own table is provably intact before and after
+/// the fork, so the replacement comes from outside this code path (anything
+/// that installs a descriptor into a fresh child at a low fd number hits it).
+///
+/// Two independent defences, because the clobberer is outside core:
+///
+/// 1. relocate the three ends to a fixed reserved range *in init, before the
+///    fork*, so the numbers the child dups from are not in the range a
+///    low-number allocation would pick;
+/// 2. verify in the child, before wiring anything, that every reserved slot
+///    still refers to the same description (access mode + `st_dev`/`st_ino`)
+///    that init relocated — and fail the exec loudly instead of running a
+///    workload whose stdio was swapped under it.
+const EXEC_STDIO_BASE: RawFd = 64;
+
+/// Exit code for an exec whose stdio was swapped between the fork and the
+/// child's wiring. Distinct from 125 (chdir/stdio setup failure), 126
+/// (`setpgid` failure) and 127 (`execvp` failure).
+const EXEC_STDIO_SWAPPED_EXIT: i32 = 124;
+
+/// Identity of the open file description behind `fd`: the access mode plus the
+/// `(st_dev, st_ino)` pair. Cheap, and enough to notice that a slot now points
+/// somewhere else.
+fn fd_identity(fd: RawFd) -> (u64, u64, i32) {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return (u64::MAX, u64::MAX, 7);
+    }
+    (
+        st.st_dev as u64,
+        st.st_ino as u64,
+        if flags < 0 { 7 } else { flags & libc::O_ACCMODE },
+    )
+}
+
+/// What `spawn` needs in order to wire an exec's stdio: the numbers to dup2
+/// from, the identity each of those numbers had when the plan was built, and
+/// whether the plan relocated them (which decides what the parent and the child
+/// have to close).
+struct ExecStdioPlan {
+    slots: [RawFd; 3],
+    expect: [(u64, u64, i32); 3],
+    relocated: bool,
+}
+
+/// True when `fd` is not currently open (a number the relocation may take over
+/// without destroying somebody else's descriptor).
+fn fd_is_free(fd: RawFd) -> bool {
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
+    } else {
+        false
+    }
+}
+
+/// Move the received stdio ends out of the low allocation range.
+///
+/// Relocation is declined — silently, keeping the received numbers — when the
+/// reserved triple is not entirely free or a `dup3` fails (e.g. a sandbox whose
+/// `RLIMIT_NOFILE` sits below the range). Declining must never be worse than
+/// the pre-FUP-23 behaviour, and destroying a descriptor init or a long-lived
+/// sibling still holds would be far worse than the race this guards: `dup3`
+/// replaces its target without complaining. The identity check in the child
+/// stays active either way, so a swapped slot is still a loud failure.
+fn plan_exec_stdio(fds: [RawFd; 3]) -> ExecStdioPlan {
+    let expect = fds.map(fd_identity);
+    let mut slots = fds;
+    let mut made = 0usize;
+    let reserved_free = (0..3).all(|i| {
+        let target = EXEC_STDIO_BASE + i as RawFd;
+        fds.iter().all(|&fd| fd != target) && fd_is_free(target)
+    });
+    if !reserved_free {
+        return ExecStdioPlan {
+            slots: fds,
+            expect,
+            relocated: false,
+        };
+    }
+    for i in 0..3 {
+        let target = EXEC_STDIO_BASE + i as RawFd;
+        if fds[i] == target {
+            continue;
+        }
+        let rc = unsafe { libc::dup3(fds[i], target, libc::O_CLOEXEC) };
+        if rc < 0 {
+            for j in 0..made {
+                unsafe {
+                    libc::close(slots[j]);
+                }
+            }
+            return ExecStdioPlan {
+                slots: fds,
+                expect,
+                relocated: false,
+            };
+        }
+        slots[i] = rc;
+        made = i + 1;
+    }
+    ExecStdioPlan {
+        slots,
+        expect,
+        relocated: true,
+    }
+}
+
+/// A reserved slot no longer holds the description init put there: report it
+/// through the slots that still verify (the broken one is by definition
+/// unusable) and abort the exec.
+fn exec_stdio_swapped(slot: usize, plan: &ExecStdioPlan) -> ! {
+    let msg = format!(
+        "sandlock-init: exec stdio slot {slot} was replaced between the fork and \
+         the workload start; refusing to run with swapped descriptors\n"
+    );
+    for (i, (&fd, &want)) in plan.slots.iter().zip(plan.expect.iter()).enumerate() {
+        if i != slot && fd_identity(fd) == want {
+            unsafe {
+                libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len());
+            }
+        }
+    }
+    unsafe {
+        libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+        libc::_exit(EXEC_STDIO_SWAPPED_EXIT);
+    }
+}
+
+/// Verify that every reserved slot still holds the description init relocated,
+/// then wire them onto 0/1/2 and drop the scratch numbers.
+///
+/// `Err(slot)` means the slot was replaced between the fork and here: nothing is
+/// wired, and the caller must abort the exec rather than run a workload with a
+/// swapped descriptor (FUP-23 — that is exactly how command output used to
+/// vanish with no error anywhere).
+fn wire_exec_stdio(plan: &ExecStdioPlan, received: [RawFd; 3]) -> Result<(), usize> {
+    for (i, (&fd, &want)) in plan.slots.iter().zip(plan.expect.iter()).enumerate() {
+        if fd_identity(fd) != want {
+            return Err(i);
+        }
+    }
+    for (i, &fd) in plan.slots.iter().enumerate() {
+        unsafe {
+            libc::dup2(fd, i as i32);
+        }
+    }
+    // Drop every scratch number: the reserved slots plus, when the plan
+    // relocated, the received ends. A stray dup of the workload's own stdout
+    // write end would keep the host-side reader from ever seeing EOF.
+    let mut seen: [RawFd; 6] = [-1; 6];
+    let mut n = 0usize;
+    for &fd in plan.slots.iter().chain(received.iter()) {
+        if fd > 2 && !seen[..n].contains(&fd) && n < seen.len() {
+            seen[n] = fd;
+            n += 1;
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// fork+exec `argv` with optional cwd/env and optional stdio fds (0,1,2).
 /// Returns the child pid, or -1 on fork failure.
 fn spawn(
@@ -135,8 +309,22 @@ fn spawn(
     unsafe {
         libc::fcntl(CONTROL_FD, libc::F_SETFD, libc::FD_CLOEXEC);
     }
+    // FUP-23: relocate the received ends before the fork, so the child never
+    // dups from a low number that an outside party can hand out in parallel.
+    let plan = stdio.map(plan_exec_stdio);
     let pid = unsafe { libc::fork() };
     if pid != 0 {
+        // The reserved copies were only ever meant for the child; init keeps
+        // none of them, or every exec would leak three descriptors.
+        if let Some(plan) = plan.as_ref() {
+            if plan.relocated {
+                for &fd in &plan.slots {
+                    unsafe {
+                        libc::close(fd);
+                    }
+                }
+            }
+        }
         // Belt alongside the child's own setpgid(0,0): close the fork→setpgid
         // window so the pid is a valid pgid as soon as spawn returns. The
         // child may already have setpgid'd (then this fails EACCES/ESRCH,
@@ -147,6 +335,14 @@ fn spawn(
         return pid;
     }
     // child
+    // FUP-14: init's SIGCHLD block must not leak into the workload (shells
+    // and runtimes legitimately rely on SIGCHLD). Unblock before exec.
+    unsafe {
+        let mut unblock: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut unblock);
+        libc::sigaddset(&mut unblock, libc::SIGCHLD);
+        libc::sigprocmask(libc::SIG_UNBLOCK, &unblock, std::ptr::null_mut());
+    }
     // SECE-6 (F1.7): every child becomes its own process-group leader before
     // exec, so a killpg(getpgid(0), SIGKILL) inside one command can never
     // reach init or a sibling. Fail closed if the kernel refuses: continuing
@@ -157,18 +353,11 @@ fn spawn(
             libc::_exit(126);
         }
     }
-    if let Some(fds) = stdio {
-        for (i, &fd) in fds.iter().enumerate() {
-            unsafe {
-                libc::dup2(fd, i as i32);
-            }
-        }
-        for &fd in &fds {
-            if fd > 2 {
-                unsafe {
-                    libc::close(fd);
-                }
-            }
+    if let (Some(plan), Some(received)) = (plan.as_ref(), stdio) {
+        // FUP-23: a slot that no longer holds the description init relocated is
+        // a slot somebody else took over — never run the workload on it.
+        if let Err(slot) = wire_exec_stdio(plan, received) {
+            exec_stdio_swapped(slot, plan);
         }
     }
     // Per-exec parameter application (F4.1): chdir first, then build the
@@ -394,8 +583,11 @@ fn unique_signal_pgids(
     pgids
 }
 
-/// Poll interval for the control channel: bounds how long a reaped child can
-/// sit as a zombie when no control message is arriving (100 ms class).
+/// Fallback poll interval for the control channel (FUP-14): child exits now
+/// wake the loop immediately via a SIGCHLD signalfd, so this timeout only
+/// bounds how long an adopted orphan (no pidfd/signalfd wake) can sit as a
+/// zombie when no control message is arriving. Kernels without signalfd fall
+/// back to this poll-only behavior (100 ms class).
 const REAP_POLL_MS: i32 = 100;
 
 /// RAII guard for the SCM_RIGHTS fds received in one control read (SL-5).
@@ -455,6 +647,18 @@ pub fn run_init() {
     // session (the two-step setpgid→setsid escape) is detected by comparing
     // its session against this one.
     let supervisor_session = unsafe { libc::getsid(0) };
+    // FUP-14: block SIGCHLD and arm a signalfd so a child exit wakes the
+    // control loop immediately instead of waiting out REAP_POLL_MS (the old
+    // ~100 ms exec-round-trip floor). The block is process-local to init;
+    // `spawn` unblocks SIGCHLD in every child before exec, so workloads keep
+    // stock SIGCHLD semantics.
+    let mut sigchld_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let sigfd = unsafe {
+        libc::sigemptyset(&mut sigchld_mask);
+        libc::sigaddset(&mut sigchld_mask, libc::SIGCHLD);
+        libc::sigprocmask(libc::SIG_BLOCK, &sigchld_mask, std::ptr::null_mut());
+        libc::signalfd(-1, &sigchld_mask, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC)
+    };
 
     let ctl = CONTROL_FD;
     // Child table: pids init spawned, routed exactly-once on reap. A pid is
@@ -531,15 +735,30 @@ pub fn run_init() {
             }
         }
 
-        // Wait up to REAP_POLL_MS for a control message so the loop is not a
-        // busy poll, then loop back (the sweep at the top reaps children that
-        // exited during the wait).
-        let mut pfd = libc::pollfd {
-            fd: ctl,
-            events: libc::POLLIN,
-            revents: 0,
+        // Wait for a control message or a child exit (SIGCHLD via the
+        // signalfd). The REAP_POLL_MS timeout remains only as a fallback
+        // sweep for kernels without signalfd and for adopted orphans whose
+        // exit did not wake us; with the signalfd armed, an exec+exit round
+        // wakes immediately instead of paying the old ~100 ms floor.
+        let mut pfds = [
+            libc::pollfd {
+                fd: ctl,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: sigfd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let pr = unsafe {
+            libc::poll(
+                pfds.as_mut_ptr(),
+                pfds.len() as libc::nfds_t,
+                REAP_POLL_MS,
+            )
         };
-        let pr = unsafe { libc::poll(&mut pfd, 1, REAP_POLL_MS) };
         if pr < 0 {
             let e = std::io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EINTR) {
@@ -547,8 +766,28 @@ pub fn run_init() {
             }
             break; // control fd unusable; treat like EOF below
         }
-        if pr == 0 || (pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) == 0 {
+        if pr == 0 {
             continue; // timeout (or spurious wakeup): sweep again on top
+        }
+        if sigfd >= 0 && (pfds[1].revents & (libc::POLLIN | libc::POLLERR)) != 0 {
+            // Drain the signalfd queue (level-triggered: an unread pending
+            // SIGCHLD would otherwise keep the loop busy).
+            let mut drain = [0u8; 256];
+            loop {
+                let n = unsafe {
+                    libc::read(
+                        sigfd,
+                        drain.as_mut_ptr() as *mut libc::c_void,
+                        drain.len(),
+                    )
+                };
+                if n <= 0 {
+                    break;
+                }
+            }
+        }
+        if (pfds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) == 0 {
+            continue; // only the signalfd woke us; sweep reaps on the top
         }
 
         let (bytes, fds) = match fdrecv::recv(ctl, 3) {
@@ -755,6 +994,232 @@ mod signal_delivery_tests {
             unique_signal_pgids(&children, &dead_groups),
             vec![11, 13, 99],
             "each pgid must be delivered exactly once"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An exec-shaped stdio triple: `(child ends, host ends)`, where the child
+    /// ends are `[stdin read, stdout write, stderr write]` — exactly what
+    /// `build_exec_stdio` hands to init over SCM_RIGHTS.
+    fn exec_ends() -> ([RawFd; 3], [RawFd; 3]) {
+        let mut p = [[0i32; 2]; 3];
+        for pair in p.iter_mut() {
+            assert_eq!(unsafe { libc::pipe2(pair.as_mut_ptr(), 0) }, 0, "pipe2");
+        }
+        ([p[0][0], p[1][1], p[2][1]], [p[0][1], p[1][0], p[2][0]])
+    }
+
+    fn read_up_to(fd: RawFd, want: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        while buf.len() < want {
+            let mut chunk = [0u8; 64];
+            let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut _, chunk.len()) };
+            if n <= 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n as usize]);
+        }
+        buf
+    }
+
+    fn reaped_code(status: libc::c_int) -> i32 {
+        if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            -1 - status
+        }
+    }
+
+    /// Free our copies of the reserved range so the plan can use it. Only ever
+    /// called in a forked child: closing an inherited copy says nothing about
+    /// the parent's table.
+    unsafe fn release_reserved_range() {
+        for fd in EXEC_STDIO_BASE..EXEC_STDIO_BASE + 3 {
+            libc::close(fd);
+        }
+    }
+
+    /// FUP-23: an exec's stdio is wired from the reserved slots and the three
+    /// streams stay separate end to end. The child runs the real
+    /// `plan_exec_stdio` + `wire_exec_stdio` pair; the parent reads the host ends
+    /// and asserts exact bytes, so a slot pointing at the wrong description
+    /// (the FUP-23 failure) cannot pass.
+    #[test]
+    fn exec_child_wires_stdio_from_the_reserved_slots_without_cross_talk() {
+        let (child, host) = exec_ends();
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                release_reserved_range();
+                let plan = plan_exec_stdio(child);
+                let code = match wire_exec_stdio(&plan, child) {
+                    Ok(()) => {
+                        libc::write(1, b"O".as_ptr() as *const _, 1);
+                        libc::write(2, b"E".as_ptr() as *const _, 1);
+                        let mut b = [0u8; 1];
+                        if libc::read(0, b.as_mut_ptr() as *mut _, 1) == 1 && b[0] == b'I' {
+                            0
+                        } else {
+                            7
+                        }
+                    }
+                    Err(_) => 9,
+                };
+                libc::_exit(code);
+            }
+        }
+        unsafe {
+            libc::write(host[0], b"I".as_ptr() as *const _, 1);
+            libc::close(host[0]);
+        }
+        let out = read_up_to(host[1], 1);
+        let err = read_up_to(host[2], 1);
+        unsafe {
+            libc::close(host[1]);
+            libc::close(host[2]);
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(
+            reaped_code(status),
+            0,
+            "the child must wire stdio and read its stdin (exit code in the \
+             assertion above: 7 = stdin, 9 = wiring refused)"
+        );
+        assert_eq!(out, b"O", "stdout must carry exactly the child's stdout byte");
+        assert_eq!(err, b"E", "stderr must carry exactly the child's stderr byte");
+    }
+
+    /// FUP-23 defence 1: the received ends are moved out of the low allocation
+    /// range *before* the fork, which is the only window an outside party can
+    /// hand a fresh child a descriptor at the number the child still dups from.
+    #[test]
+    fn exec_stdio_plan_relocates_the_received_ends_into_the_reserved_range() {
+        let (child, host) = exec_ends();
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe {
+                release_reserved_range();
+                let plan = plan_exec_stdio(child);
+                let ok = plan.relocated
+                    && plan.slots
+                        == [
+                            EXEC_STDIO_BASE,
+                            EXEC_STDIO_BASE + 1,
+                            EXEC_STDIO_BASE + 2,
+                        ]
+                    && (0..3).all(|i| fd_identity(plan.slots[i]) == plan.expect[i])
+                    && (0..3).all(|i| fd_identity(child[i]) == plan.expect[i]);
+                libc::_exit(if ok { 0 } else { 1 });
+            }
+        }
+        unsafe {
+            for fd in host {
+                libc::close(fd);
+            }
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(
+            reaped_code(status),
+            0,
+            "the plan must relocate all three ends into the reserved range and \
+             keep their identity (slots/expect/received all agree)"
+        );
+    }
+
+    /// Relocation must never destroy a descriptor somebody else still holds:
+    /// `dup3` replaces its target without complaining, so an occupied reserved
+    /// number makes the plan decline instead.
+    #[test]
+    fn exec_stdio_plan_declines_when_a_reserved_number_is_already_taken() {
+        let (child, host) = exec_ends();
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe {
+                release_reserved_range();
+                let mut foreign = [0i32; 2];
+                if libc::pipe2(foreign.as_mut_ptr(), 0) != 0 {
+                    libc::_exit(2);
+                }
+                let taken = EXEC_STDIO_BASE + 1;
+                if libc::dup3(foreign[0], taken, 0) < 0 {
+                    libc::_exit(3);
+                }
+                let before = fd_identity(taken);
+                let plan = plan_exec_stdio(child);
+                let ok = !plan.relocated
+                    && plan.slots == child
+                    && fd_identity(taken) == before
+                    && (0..3).all(|i| fd_identity(plan.slots[i]) == plan.expect[i]);
+                libc::_exit(if ok { 0 } else { 1 });
+            }
+        }
+        unsafe {
+            for fd in host {
+                libc::close(fd);
+            }
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(
+            reaped_code(status),
+            0,
+            "an occupied reserved number must make the plan fall back to the \
+             received ends and leave the occupant untouched"
+        );
+    }
+
+    /// FUP-23 defence 2: if a slot is swapped anyway, the wiring refuses to run
+    /// the workload and nothing has been attached to 0/1/2 yet — the caller
+    /// aborts the exec (exit 124) instead of losing its output silently.
+    #[test]
+    fn wire_exec_stdio_refuses_a_swapped_slot_before_touching_stdio() {
+        let (child, host) = exec_ends();
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe {
+                release_reserved_range();
+                let plan = plan_exec_stdio(child);
+                let mut foreign = [0i32; 2];
+                if libc::pipe2(foreign.as_mut_ptr(), 0) != 0 {
+                    libc::_exit(2);
+                }
+                // The FUP-23 clobber: a foreign read end lands on slot 1.
+                if libc::dup3(foreign[0], plan.slots[1], 0) < 0 {
+                    libc::_exit(3);
+                }
+                let stdio_before = (fd_identity(0), fd_identity(1), fd_identity(2));
+                match wire_exec_stdio(&plan, child) {
+                    Err(1) => {
+                        let stdio_after = (fd_identity(0), fd_identity(1), fd_identity(2));
+                        libc::_exit(if stdio_before == stdio_after { 0 } else { 4 });
+                    }
+                    Err(other) => libc::_exit(50 + other as i32),
+                    Ok(()) => libc::_exit(5),
+                }
+            }
+        }
+        unsafe {
+            for fd in host {
+                libc::close(fd);
+            }
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(
+            reaped_code(status),
+            0,
+            "a swapped slot must be refused (Err(1)) with 0/1/2 still untouched \
+             (4 = stdio already rewired, 5 = swap went unnoticed)"
         );
     }
 }

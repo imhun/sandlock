@@ -10,6 +10,15 @@
 #        scripts/test-all.sh --mediation-2uid (root-mode F6.1 B档 two-uid +
 #              C档 suite only; must run as root)
 #
+# Path discipline (2026-09-08, measured): run the gate from a checkout mounted at
+# a SHORT path (/src). `supervise.rs`'s path-mode fixtures build their registry
+# socket under `<repo>/tmp/supervise-ctl-<pid>-registry/<hash>.d/control.sock`; the
+# repo tmp path comes from CARGO_MANIFEST_DIR, so running the suites from a nested
+# git worktree (/src/tmp/wt-fixN/...) pushes that socket path past the 108-byte
+# sun_path limit and `test_supervise_path_serve_...` times out — a false red that
+# looks exactly like a real supervise regression. Always confirm against the repo
+# root before believing that failure.
+#
 # Canonical full-gate procedure (sandlock-dev:latest, repo mounted at /src):
 #   chmod -R a+rwX tmp
 #   docker run --privileged --rm -v "$PWD":/src -w /src \
