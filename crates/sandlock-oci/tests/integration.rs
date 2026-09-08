@@ -848,7 +848,7 @@ async fn oci_stop_collapses_process_group() {
 // here deliberately: the harness must compile and run against the pre-F1.6
 // init too (the RED phase), so it cannot depend on the crate's new framing
 // API; these constants are the black-box oracle for the actual bytes.
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
@@ -1373,5 +1373,79 @@ fn exec_frames_deliver_their_own_output_and_leave_no_descriptor_behind() {
         "no descriptor may survive {ROUNDS} execs (baseline {baseline} -> \
          final {final_count})"
     );
+    drop(guard);
+}
+
+/// F15: the control channel is a `SOCK_STREAM`, so one `recvmsg` can return
+/// several frames while the kernel hands back **one concatenated fd list**.
+/// Two `RunExec` frames written once with six descriptors must give each exec
+/// its own three — the positional guess ("three arrived, so they are mine") is
+/// what made exec #2 write into exec #1's pipe and throw its own output away.
+#[test]
+fn two_exec_frames_in_one_read_unit_get_their_own_stdio() {
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipping: /proc-based fd checks and exec probes are Linux-only");
+        return;
+    }
+    let (pid, ctl, ready_r) = spawn_run_init_probe();
+    let guard = RunInitProbeGuard { pid, ready_r };
+    assert_eq!(
+        wait_ready_byte(ready_r, Instant::now() + Duration::from_secs(5)),
+        Some(b'r'),
+        "probe child never entered run_init"
+    );
+
+    let mut bytes = Vec::new();
+    let mut child_ends: Vec<RawFd> = Vec::new();
+    let mut stdout_read: Vec<RawFd> = Vec::new();
+    let mut stderr_read: Vec<RawFd> = Vec::new();
+    for tag in ["A", "B"] {
+        let mut p = [[0i32; 2]; 3];
+        for pair in p.iter_mut() {
+            assert_eq!(unsafe { libc::pipe2(pair.as_mut_ptr(), 0) }, 0, "pipe2");
+        }
+        let payload = format!(
+            r#"{{"req":"runexec","argv":["/bin/sh","-c","printf '{tag}'"],
+                "env":[],"cwd":null,"detach":false}}"#
+        );
+        bytes.extend_from_slice(&frame_bytes(SLK_TYPE_REQ, payload.as_bytes()));
+        // The three ends init must install as 0/1/2: stdin read, stdout write,
+        // stderr write. Everything else stays ours.
+        child_ends.extend_from_slice(&[p[0][0], p[1][1], p[2][1]]);
+        stdout_read.push(p[1][0]);
+        stderr_read.push(p[2][0]);
+        // Nobody writes this exec's stdin; our copy of the write end goes now.
+        unsafe { libc::close(p[0][1]) };
+    }
+    // ONE write: both frames plus all six descriptors in a single `sendmsg`,
+    // which is what forces them into one read unit on the init side.
+    sandlock_oci::fdpass::send_with_fds(&ctl, &bytes, &child_ends)
+        .expect("send two RunExec frames with six fds");
+    // Our copies of the handed-over ends must go: while we hold a write end,
+    // our own reader can never see EOF for that exec.
+    for fd in &child_ends {
+        unsafe { libc::close(*fd) };
+    }
+
+    let mut reader = FrameReader::new(&ctl);
+    let first = reader
+        .next_payload(Instant::now() + Duration::from_secs(10))
+        .expect("init must answer the first RunExec");
+    let second = reader
+        .next_payload(Instant::now() + Duration::from_secs(10))
+        .expect("init must answer the second RunExec");
+    assert_eq!(reply_tag(&first).as_deref(), Some("started"));
+    assert_eq!(reply_tag(&second).as_deref(), Some("started"));
+    let pa = reply_pid(&first).expect("Started carries the child pid");
+    let pb = reply_pid(&second).expect("Started carries the child pid");
+    assert_ne!(pa, pb, "two exec frames are two distinct children");
+
+    let out_a = read_bytes_from(stdout_read[0], 1, Instant::now() + Duration::from_secs(10));
+    let out_b = read_bytes_from(stdout_read[1], 1, Instant::now() + Duration::from_secs(10));
+    assert_eq!(out_a, b"A", "exec #1 stdout must be exactly its own byte");
+    assert_eq!(out_b, b"B", "exec #2 stdout must be exactly its own byte");
+    for fd in stderr_read.iter().chain(stdout_read.iter()) {
+        unsafe { libc::close(*fd) };
+    }
     drop(guard);
 }
