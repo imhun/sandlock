@@ -230,6 +230,10 @@
     E2B 侧 `tmp/f11_harness_queue_probe.py`（父进程打印送出 modes）与
     `tmp/f11_fdcount_probe.py`（N=0/N≥1 对照）。现成工作树：
     `tmp/wt-fix`（FUP-14 已恢复 + 候选补丁 + 上述三处诊断，未提交）。
+    **2026-09-08 归档**：诊断不再依赖工作树存活 —— 成对探针（argv token + `child_id` +
+    `(O_ACCMODE, st_dev, st_ino)` 身份 + 子进程经自己 stdout 端回送快照）已导出为
+    `tmp/sdd/f24b-paired-identity-probes.patch`（基线 `f623184`，`git apply` 即可复现）；
+    取证用的临时工作树已回收。
   - **2026-09-08 成对测量（把范围从"stdio 装配"移到 sendmsg/recvmsg 边界）**：
     用同一 argv 过滤器同时在两端取值（父端 = `exec_with_fds_inner` 里即将交给
     `fdpass::send_with_fds` 的三个描述符；子端 = init 装配前 `spawn` 收到的三元组），
