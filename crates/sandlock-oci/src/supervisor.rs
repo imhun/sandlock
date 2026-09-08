@@ -180,7 +180,7 @@ impl InitLink {
             return Err(dead_link_error());
         }
         let payload = serde_json::to_vec(req)?;
-        let bytes = proto::encode_frame(FrameKind::Req, &payload)?;
+        let bytes = proto::encode_frame(FrameKind::Req, &payload, fds.len() as u8)?;
         let writer = self.writer.lock().await;
         // Re-check under the writer lock: the only way the link turns Dead is
         // a timed-out request, which marks it while still holding this lock,
@@ -270,7 +270,7 @@ impl InitLink {
     /// the writer lock keeps these serialized against request/reply traffic.
     async fn send(&self, req: &Req) {
         if let Ok(payload) = serde_json::to_vec(req) {
-            if let Ok(bytes) = proto::encode_frame(FrameKind::Req, &payload) {
+            if let Ok(bytes) = proto::encode_frame(FrameKind::Req, &payload, 0) {
                 let writer = self.writer.lock().await;
                 let _ = crate::fdpass::send_with_fds(&writer, &bytes, &[]);
             }
@@ -334,19 +334,19 @@ async fn read_resp_frame(
         }
         got += n;
     }
-    let kind = proto::decode_header(&header).map_err(|e| {
+    let header = proto::decode_header(&header).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("bad control frame from sandlock-init: {e}"),
         )
     })?;
-    if kind != FrameKind::Resp {
+    if header.kind != FrameKind::Resp {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "sandlock-init sent a req-type control frame to the daemon",
         ));
     }
-    let len = u32::from_le_bytes(header[6..10].try_into().expect("10-byte header")) as usize;
+    let len = header.payload_len;
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload).await.map_err(|_| {
         std::io::Error::new(
@@ -1532,7 +1532,7 @@ mod tests {
     async fn write_resp(peer: &mut tokio::net::UnixStream, resp: &Resp) {
         use tokio::io::AsyncWriteExt;
         let payload = serde_json::to_vec(resp).unwrap();
-        let frame = proto::encode_frame(FrameKind::Resp, &payload).unwrap();
+        let frame = proto::encode_frame(FrameKind::Resp, &payload, 0).unwrap();
         peer.write_all(&frame).await.unwrap();
     }
 
@@ -1543,9 +1543,9 @@ mod tests {
         peer.read_exact(&mut header)
             .await
             .expect("read request frame header");
-        let kind = proto::decode_header(&header).expect("valid request frame header");
-        assert_eq!(kind, FrameKind::Req, "fake init must read a Req frame");
-        let len = u32::from_le_bytes(header[6..10].try_into().unwrap()) as usize;
+        let header = proto::decode_header(&header).expect("valid request frame header");
+        assert_eq!(header.kind, FrameKind::Req, "fake init must read a Req frame");
+        let len = header.payload_len;
         let mut payload = vec![0u8; len];
         peer.read_exact(&mut payload)
             .await

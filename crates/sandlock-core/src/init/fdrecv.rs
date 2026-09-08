@@ -2,15 +2,23 @@ use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
 
 use super::proto::{FRAME_HEADER_LEN, MAX_FRAME_PAYLOAD};
 
-/// Blocking recvmsg of whatever is queued on the control socket (up to one
-/// full maximum-size frame) plus up to `max_fds` SCM_RIGHTS fds.
+/// Blocking recvmsg of whatever is queued on the control socket (up to the
+/// read buffer) plus up to `max_fds` SCM_RIGHTS fds.
 ///
 /// Every received fd is handed back as an [`OwnedFd`] — ownership transfers
 /// at the recvmsg boundary, so the caller's RAII guard (not a later branch)
 /// decides when it closes. Returns (bytes, fds); empty bytes means
 /// EOF/peer closed. The read buffer is at least one header + the maximum
 /// payload, so a legitimate single-sendmsg frame always arrives whole (the
-/// F1.6 wire contract: one frame per sendmsg, fds bound to that sendmsg).
+/// F1.6 wire contract). The channel is a `SOCK_STREAM`: one read unit can
+/// hold several frames, and the kernel hands back their descriptors as **one
+/// concatenated list** — which frame owns which slice is decided by each
+/// frame's header `n_fds` (F15), never by position.
+///
+/// A `MSG_CTRUNC` (kernel discarded descriptors that did not fit the control
+/// buffer) or `MSG_TRUNC` (payload lost) poisons the whole read unit: nothing
+/// in it can be trusted, so the channel is failed closed instead of handing a
+/// workload somebody else's stdio end.
 pub fn recv(
     fd: RawFd,
     max_fds: usize,
@@ -27,6 +35,21 @@ pub fn recv(
     msg.msg_controllen = space as _;
     let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
     if n < 0 { return Err(std::io::Error::last_os_error()); }
+    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        // The kernel discarded descriptors that did not fit. Nothing in this
+        // read unit can be trusted, so the caller loses the channel instead
+        // of handing a workload somebody else's stdio end.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "control channel: SCM_RIGHTS truncated (descriptors discarded by the kernel)",
+        ));
+    }
+    if msg.msg_flags & libc::MSG_TRUNC != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "control channel: frame payload truncated (lost frame boundary)",
+        ));
+    }
     let mut fds: Vec<OwnedFd> = Vec::new();
     unsafe {
         let mut c = libc::CMSG_FIRSTHDR(&msg);

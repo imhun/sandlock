@@ -156,7 +156,7 @@ impl ExecLink {
         }
         let payload = serde_json::to_vec(req)
             .map_err(|e| SandboxRuntimeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
-        let bytes = proto::encode_frame(FrameKind::Req, &payload)
+        let bytes = proto::encode_frame(FrameKind::Req, &payload, fds.len() as u8)
             .map_err(|e| SandboxRuntimeError::Io(e))?;
         let writer = self.writer.lock().await;
         // Re-check under the writer lock: the only way the link turns closed
@@ -198,7 +198,7 @@ impl ExecLink {
             Ok(p) => p,
             Err(_) => return,
         };
-        let bytes = match proto::encode_frame(FrameKind::Req, &payload) {
+        let bytes = match proto::encode_frame(FrameKind::Req, &payload, 0) {
             Ok(b) => b,
             Err(_) => return,
         };
@@ -304,7 +304,7 @@ impl ExecLink {
             Ok(p) => p,
             Err(_) => return,
         };
-        let bytes = match proto::encode_frame(FrameKind::Req, &payload) {
+        let bytes = match proto::encode_frame(FrameKind::Req, &payload, 0) {
             Ok(b) => b,
             Err(_) => return,
         };
@@ -345,19 +345,19 @@ async fn read_resp_frame(
         }
         got += n;
     }
-    let kind = proto::decode_header(&header).map_err(|e| {
+    let header = proto::decode_header(&header).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("bad control frame from sandlock-init: {e}"),
         )
     })?;
-    if kind != FrameKind::Resp {
+    if header.kind != FrameKind::Resp {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "sandlock-init sent a req-type control frame to the daemon",
         ));
     }
-    let len = u32::from_le_bytes(header[6..10].try_into().expect("10-byte header")) as usize;
+    let len = header.payload_len;
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload).await.map_err(|_| {
         std::io::Error::new(
@@ -477,7 +477,7 @@ mod tests {
 
     fn started_frame(pid: i32) -> Vec<u8> {
         let payload = serde_json::to_vec(&Resp::Started { pid }).unwrap();
-        proto::encode_frame(FrameKind::Resp, &payload).unwrap()
+        proto::encode_frame(FrameKind::Resp, &payload, 0).unwrap()
     }
 
     async fn wait_until(mut cond: impl FnMut() -> bool) -> bool {

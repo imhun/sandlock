@@ -26,17 +26,44 @@ pub use sandlock_core::init::*;
 mod tests {
     use crate::init::fdpass::{recv_with_fds, send_with_fds};
     use crate::init::proto;
-    use proto::{decode_frame, encode_frame, FrameError, FrameKind};
+    use proto::{decode_frame, decode_header, encode_frame, FrameError, FrameKind};
     use proto::{FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_TYPE_REQ, FRAME_TYPE_RESP, FRAME_VERSION};
-    use proto::{MAX_FRAME_PAYLOAD, Req, Resp};
+    use proto::{MAX_FDS_PER_FRAME, MAX_FRAME_PAYLOAD, Req, Resp};
 
-    fn header(kind: u8, len: u32) -> Vec<u8> {
+    fn header(kind: u8, n_fds: u8, len: u32) -> Vec<u8> {
         let mut h = vec![0u8; FRAME_HEADER_LEN];
         h[..4].copy_from_slice(&FRAME_MAGIC);
         h[4] = FRAME_VERSION;
         h[5] = kind;
-        h[6..10].copy_from_slice(&len.to_le_bytes());
+        h[6] = n_fds;
+        h[7..11].copy_from_slice(&len.to_le_bytes());
         h
+    }
+
+    #[test]
+    fn header_rejects_an_absurd_fd_declaration() {
+        let h = header(FRAME_TYPE_REQ, MAX_FDS_PER_FRAME + 1, 1);
+        let err = decode_header(&h).unwrap_err();
+        assert_eq!(err, FrameError::TooManyFds(MAX_FDS_PER_FRAME + 1));
+        assert!(err.to_string().contains("exceeding the per-frame cap"));
+    }
+
+    #[test]
+    fn a_pre_f15_v1_header_reports_the_version_gap() {
+        // The pre-F15 envelope was 10 bytes with no fd-count byte; decode must
+        // name the version mismatch (expected 2) instead of a generic
+        // truncation so a mixed old/new build fails loudly at the wire.
+        let mut h = vec![0u8; 10];
+        h[..4].copy_from_slice(&FRAME_MAGIC);
+        h[4] = 1;
+        h[5] = FRAME_TYPE_REQ;
+        h[6..10].copy_from_slice(&1u32.to_le_bytes());
+        let err = decode_header(&h).unwrap_err();
+        assert_eq!(err, FrameError::Version(1));
+        assert_eq!(
+            err.to_string(),
+            format!("unsupported frame version 1: expected {FRAME_VERSION}")
+        );
     }
 
     #[test]
@@ -44,12 +71,14 @@ mod tests {
         // A complete frame round-trips with exact fields and an exact consume
         // length (no half-consumption of a following frame).
         let payload = serde_json::to_vec(&Req::Signal { signum: 9 }).unwrap();
-        let frame = encode_frame(FrameKind::Req, &payload).unwrap();
+        let frame = encode_frame(FrameKind::Req, &payload, 0).unwrap();
         assert_eq!(&frame[..4], &FRAME_MAGIC);
         assert_eq!(frame[4], FRAME_VERSION);
         assert_eq!(frame[5], FRAME_TYPE_REQ);
+        assert_eq!(frame[6], 0, "a no-fd frame declares zero descriptors");
         let decoded = decode_frame(&frame).unwrap();
         assert_eq!(decoded.kind, FrameKind::Req);
+        assert_eq!(decoded.n_fds, 0);
         assert_eq!(decoded.payload, payload);
         assert_eq!(decoded.consumed, frame.len());
 
@@ -61,30 +90,31 @@ mod tests {
 
         // Oversize: the declared length alone is rejected, with no payload.
         let over = (MAX_FRAME_PAYLOAD + 1) as u32;
-        let mut oversize = header(FRAME_TYPE_REQ, over);
+        let mut oversize = header(FRAME_TYPE_REQ, 0, over);
         oversize.push(b'x');
         assert_eq!(decode_frame(&oversize).unwrap_err(), FrameError::Oversize(over as u64));
-        assert!(encode_frame(FrameKind::Resp, &vec![0u8; MAX_FRAME_PAYLOAD + 1]).is_err());
-        let max_frame = encode_frame(FrameKind::Resp, &vec![b'x'; MAX_FRAME_PAYLOAD]).unwrap();
+        assert!(encode_frame(FrameKind::Resp, &vec![0u8; MAX_FRAME_PAYLOAD + 1], 0).is_err());
+        let max_frame =
+            encode_frame(FrameKind::Resp, &vec![b'x'; MAX_FRAME_PAYLOAD], 0).unwrap();
         assert_eq!(decode_frame(&max_frame).unwrap().payload.len(), MAX_FRAME_PAYLOAD);
 
         // Truncated: a header-declared payload longer than the available bytes
         // is rejected, never returned as a partial frame.
-        let mut truncated = header(FRAME_TYPE_REQ, 100);
+        let mut truncated = header(FRAME_TYPE_REQ, 0, 100);
         truncated.extend_from_slice(b"only twenty bytes");
         assert_eq!(decode_frame(&truncated).unwrap_err(), FrameError::Truncated);
         // A header shorter than FRAME_HEADER_LEN is truncated too.
         assert_eq!(decode_frame(&truncated[..5]).unwrap_err(), FrameError::Truncated);
 
         // Bad magic / version / type are explicit errors, not panics.
-        let mut bad_magic = header(FRAME_TYPE_RESP, 1);
+        let mut bad_magic = header(FRAME_TYPE_RESP, 0, 1);
         bad_magic[0] ^= 0xff;
         assert_eq!(decode_frame(&bad_magic).unwrap_err(), FrameError::BadMagic);
-        let mut bad_version = header(FRAME_TYPE_RESP, 1);
+        let mut bad_version = header(FRAME_TYPE_RESP, 0, 1);
         bad_version[4] = 99;
-        assert_eq!(decode_frame(&bad_version).unwrap_err(), FrameError::BadVersion(99));
+        assert_eq!(decode_frame(&bad_version).unwrap_err(), FrameError::Version(99));
         for bad_type in [0u8, 3, 255] {
-            let bad = header(bad_type, 1);
+            let bad = header(bad_type, 0, 1);
             assert_eq!(decode_frame(&bad).unwrap_err(), FrameError::BadType(bad_type));
         }
     }

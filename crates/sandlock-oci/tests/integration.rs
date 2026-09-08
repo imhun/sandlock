@@ -855,18 +855,21 @@ use std::time::{Duration, Instant};
 /// F1.6 frame magic ("SLKF"), mirrored from `init::proto::FRAME_MAGIC`.
 const SLK_MAGIC: [u8; 4] = *b"SLKF";
 /// `init::proto::FRAME_VERSION`.
-const SLK_VERSION: u8 = 1;
+const SLK_VERSION: u8 = 2;
 /// `init::proto::FRAME_TYPE_REQ`.
 const SLK_TYPE_REQ: u8 = 1;
 /// `init::proto::MAX_FRAME_PAYLOAD` (64 KiB).
 const SLK_MAX_PAYLOAD: usize = 64 * 1024;
-const SLK_HEADER_LEN: usize = 10;
+/// `init::proto::FRAME_HEADER_LEN`: magic (4) + version (1) + type (1) +
+/// fd count (1) + length (4) (F15).
+const SLK_HEADER_LEN: usize = 11;
 
-fn frame_bytes(kind: u8, payload: &[u8]) -> Vec<u8> {
+fn frame_bytes(kind: u8, n_fds: u8, payload: &[u8]) -> Vec<u8> {
     let mut f = Vec::with_capacity(SLK_HEADER_LEN + payload.len());
     f.extend_from_slice(&SLK_MAGIC);
     f.push(SLK_VERSION);
     f.push(kind);
+    f.push(n_fds);
     f.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     f.extend_from_slice(payload);
     f
@@ -977,7 +980,7 @@ fn read_init_reply(ctl: &UnixStream, deadline: Instant) -> Option<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::new();
     loop {
         if buf.len() >= SLK_HEADER_LEN && buf[..4] == SLK_MAGIC {
-            let len = u32::from_le_bytes(buf[6..10].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(buf[7..11].try_into().unwrap()) as usize;
             if buf.len() >= SLK_HEADER_LEN + len {
                 return Some(buf[SLK_HEADER_LEN..SLK_HEADER_LEN + len].to_vec());
             }
@@ -1053,18 +1056,18 @@ fn test_malformed_frames_do_not_leak_fds() {
     let mut served = 0usize;
     for round in 0..ROUNDS {
         let frame = match round % 4 {
-            0 => frame_bytes(SLK_TYPE_REQ, b"this is not json {"),
+            0 => frame_bytes(SLK_TYPE_REQ, 0, b"this is not json {"),
             1 => {
-                let mut f = frame_bytes(SLK_TYPE_REQ, b"x");
-                f[6..10].copy_from_slice(&((SLK_MAX_PAYLOAD + 1) as u32).to_le_bytes());
+                let mut f = frame_bytes(SLK_TYPE_REQ, 0, b"x");
+                f[7..11].copy_from_slice(&((SLK_MAX_PAYLOAD + 1) as u32).to_le_bytes());
                 f
             }
             2 => {
-                let mut f = frame_bytes(SLK_TYPE_REQ, b"short");
-                f[6..10].copy_from_slice(&300u32.to_le_bytes());
+                let mut f = frame_bytes(SLK_TYPE_REQ, 0, b"short");
+                f[7..11].copy_from_slice(&300u32.to_le_bytes());
                 f
             }
-            _ => frame_bytes(9, b"bad type byte"),
+            _ => frame_bytes(9, 0, b"bad type byte"),
         };
         sandlock_oci::fdpass::send_with_fds(&ctl, &frame, &[attach_w])
             .expect("send malformed frame");
@@ -1130,7 +1133,7 @@ fn test_eof_closes_received_fd() {
     let baseline = open_fd_count(pid).expect("read child fd table before the frame");
     let (attach_r, attach_w) = new_attach_fd();
 
-    let frame = frame_bytes(SLK_TYPE_REQ, br#"{"req":"signal","signum":9}"#);
+    let frame = frame_bytes(SLK_TYPE_REQ, 0, br#"{"req":"signal","signum":9}"#);
     sandlock_oci::fdpass::send_with_fds(&ctl, &frame, &[attach_w]).expect("send frame with fd");
     drop(ctl); // EOF: init's run_init must return
     let returned = wait_ready_byte(ready_r, Instant::now() + Duration::from_secs(5))
@@ -1176,7 +1179,7 @@ impl FrameReader {
     fn next_payload(&mut self, deadline: Instant) -> Option<Vec<u8>> {
         loop {
             if self.buf.len() >= SLK_HEADER_LEN && self.buf[..4] == SLK_MAGIC {
-                let len = u32::from_le_bytes(self.buf[6..10].try_into().unwrap()) as usize;
+                let len = u32::from_le_bytes(self.buf[7..11].try_into().unwrap()) as usize;
                 if self.buf.len() >= SLK_HEADER_LEN + len {
                     let payload =
                         self.buf[SLK_HEADER_LEN..SLK_HEADER_LEN + len].to_vec();
@@ -1284,7 +1287,7 @@ fn exec_frames_deliver_their_own_output_and_leave_no_descriptor_behind() {
                 "env":[],"cwd":null,"detach":false}}"#,
             tag
         );
-        let frame = frame_bytes(SLK_TYPE_REQ, payload.as_bytes());
+        let frame = frame_bytes(SLK_TYPE_REQ, 3, payload.as_bytes());
         // [stdin read, stdout write, stderr write] — the exec's child ends.
         sandlock_oci::fdpass::send_with_fds(&ctl, &frame, &[p[0][0], p[1][1], p[2][1]])
             .expect("send RunExec frame with stdio");
@@ -1408,7 +1411,7 @@ fn two_exec_frames_in_one_read_unit_get_their_own_stdio() {
             r#"{{"req":"runexec","argv":["/bin/sh","-c","printf '{tag}'"],
                 "env":[],"cwd":null,"detach":false}}"#
         );
-        bytes.extend_from_slice(&frame_bytes(SLK_TYPE_REQ, payload.as_bytes()));
+        bytes.extend_from_slice(&frame_bytes(SLK_TYPE_REQ, 3, payload.as_bytes()));
         // The three ends init must install as 0/1/2: stdin read, stdout write,
         // stderr write. Everything else stays ours.
         child_ends.extend_from_slice(&[p[0][0], p[1][1], p[2][1]]);

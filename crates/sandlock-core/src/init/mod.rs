@@ -92,7 +92,7 @@ fn send(fd: RawFd, resp: &Resp) {
         Ok(p) => p,
         Err(_) => return,
     };
-    let frame = match proto::encode_frame(proto::FrameKind::Resp, &payload) {
+    let frame = match proto::encode_frame(proto::FrameKind::Resp, &payload, 0) {
         Ok(f) => f,
         Err(_) => return,
     };
@@ -597,7 +597,7 @@ const REAP_POLL_MS: i32 = 100;
 /// frame/parse errors, `RunMain`/`Shutdown`/`Signal` carrying unexpected fds,
 /// `RunExec` with too few fds, a failed fork — closes them when the guard
 /// drops. Nothing is `mem::forget`ten and nothing escapes the guard except
-/// the three fds a successful `RunExec` dup's into its child, which `spawn`
+/// the fds a successful `RunExec` dup's into its child, which `spawn`
 /// consumes inside the child before exec (tracked via `handed` so the parent
 /// still closes its own copies on drop).
 ///
@@ -620,6 +620,24 @@ impl Drop for RecvFdGuard<'_> {
         *self.leaks += self.fds.len().saturating_sub(self.handed) as u64;
         // The OwnedFds in `fds` close here, after the counter update.
     }
+}
+
+/// Assign one frame its own slice of a read unit's descriptor list, by the
+/// count the frame declared (F15). `None` means the read unit cannot satisfy
+/// the declaration, and the caller fails the whole unit closed rather than
+/// hand a frame somebody else's descriptor.
+fn take_frame_fds(
+    cursor: &mut usize,
+    declared: u8,
+    available: usize,
+) -> Option<std::ops::Range<usize>> {
+    let end = cursor.checked_add(declared as usize)?;
+    if end > available {
+        return None;
+    }
+    let range = *cursor..end;
+    *cursor = end;
+    Some(range)
 }
 
 /// Run the confined PID-1 control loop on [`CONTROL_FD`]. Returns when the
@@ -790,7 +808,7 @@ pub fn run_init() {
             continue; // only the signalfd woke us; sweep reaps on the top
         }
 
-        let (bytes, fds) = match fdrecv::recv(ctl, 3) {
+        let (bytes, fds) = match fdrecv::recv(ctl, proto::MAX_FDS_PER_READ) {
             Ok(p) => p,
             Err(_) => break,
         };
@@ -806,13 +824,19 @@ pub fn run_init() {
             // (and counts) any fd a zero-byte read carried, defensively.
             break;
         }
-        // Decode every complete frame in this read unit (one sendmsg = one
-        // frame; several whole frames may coalesce into one recvmsg). Replies
-        // are deferred until the guard has dropped, so a reply can never be
-        // observed before its frame's fds are closed.
+        // Decode every complete frame in this read unit (several whole frames
+        // may coalesce into one recvmsg). Replies are deferred until the guard
+        // has dropped, so a reply can never be observed before its frame's
+        // fds are closed.
         let mut replies: Vec<Resp> = Vec::new();
         let mut shutdown = false;
         let mut off = 0usize;
+        // F15: descriptors arrive as one concatenated list per read unit;
+        // each frame takes the front slice it *declared*. A declaration the
+        // queue cannot satisfy rejects the whole unit — no frame inherits
+        // another frame's descriptors.
+        let mut fd_cursor = 0usize;
+        let mut handed = 0usize;
         while off < bytes.len() {
             let frame = match proto::decode_frame(&bytes[off..]) {
                 Ok(f) => f,
@@ -825,6 +849,20 @@ pub fn run_init() {
                     // rather than half-guessing. A serialized, well-formed
                     // supervisor never produces one; a hostile peer degrades
                     // only this unit — with no fd leak and no buffering.
+                    break;
+                }
+            };
+            let frame_fds = match take_frame_fds(
+                &mut fd_cursor,
+                frame.n_fds,
+                received.fds.len(),
+            ) {
+                Some(range) => range,
+                None => {
+                    replies.push(Resp::Err {
+                        msg: "control frame declares more descriptors than the read unit carries"
+                            .into(),
+                    });
                     break;
                 }
             };
@@ -883,14 +921,15 @@ pub fn run_init() {
                             extra_writable: _,
                             bind_ports: _,
                         } => {
-                            if received.fds.len() < 3 {
+                            let exec_fds = &received.fds[frame_fds];
+                            if exec_fds.len() != 3 {
                                 replies.push(Resp::Err { msg: "exec needs 3 fds".into() });
                                 continue;
                             }
                             let stdio = [
-                                received.fds[0].as_raw_fd(),
-                                received.fds[1].as_raw_fd(),
-                                received.fds[2].as_raw_fd(),
+                                exec_fds[0].as_raw_fd(),
+                                exec_fds[1].as_raw_fd(),
+                                exec_fds[2].as_raw_fd(),
                             ];
                             let pid = spawn(&argv, &env, &cwd, clean_env, Some(stdio));
                             if pid < 0 {
@@ -900,7 +939,7 @@ pub fn run_init() {
                             // The fds were dup2'd into the child before exec;
                             // the guard still closes the parent's copies on
                             // drop but no longer counts them as guard-closed.
-                            received.handed = 3;
+                            handed += 3;
                             children.insert(
                                 pid,
                                 Child {
@@ -940,6 +979,10 @@ pub fn run_init() {
                 }
             }
         }
+        // Count every exec whose stdio was handed to a child (dup'd into the
+        // child before exec) as consumed; the guard's own copies still close
+        // on drop but are not counted as guard-closed leaks.
+        received.handed = handed;
         // Release the receive guard (closing every unhanded fd) before any
         // reply becomes observable, then answer in frame order.
         drop(received);
@@ -951,6 +994,46 @@ pub fn run_init() {
         }
     }
 
+}
+
+#[cfg(test)]
+mod fd_assignment_tests {
+    use super::take_frame_fds;
+
+    /// F15: descriptors belong to the frame that *declared* them. A
+    /// zero-descriptor frame ahead of an exec must not shift that exec's
+    /// stdio onto the wrong pipe ends.
+    #[test]
+    fn a_zero_fd_frame_does_not_steal_the_next_frames_descriptors() {
+        let mut cursor = 0usize;
+        assert_eq!(take_frame_fds(&mut cursor, 0, 3), Some(0..0));
+        assert_eq!(take_frame_fds(&mut cursor, 3, 3), Some(0..3));
+        assert_eq!(cursor, 3, "the exec frame consumed exactly its own three");
+    }
+
+    #[test]
+    fn two_exec_frames_split_one_queue_in_order() {
+        let mut cursor = 0usize;
+        assert_eq!(take_frame_fds(&mut cursor, 3, 6), Some(0..3));
+        assert_eq!(take_frame_fds(&mut cursor, 3, 6), Some(3..6));
+        assert_eq!(cursor, 6);
+    }
+
+    #[test]
+    fn a_short_queue_fails_closed_without_consuming() {
+        let mut cursor = 0usize;
+        assert_eq!(take_frame_fds(&mut cursor, 3, 2), None);
+        assert_eq!(cursor, 0, "a rejected declaration must not advance the queue");
+    }
+
+    #[test]
+    fn zero_descriptor_frames_always_succeed() {
+        let mut cursor = 0usize;
+        for _ in 0..16 {
+            assert_eq!(take_frame_fds(&mut cursor, 0, 0), Some(0..0));
+        }
+        assert_eq!(cursor, 0);
+    }
 }
 
 #[cfg(test)]

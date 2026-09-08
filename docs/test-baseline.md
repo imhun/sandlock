@@ -36,7 +36,12 @@
 # test_instance_chroot.rs non-root same-uid exec-only acceptance) and +3
 # mediation_2uid (root RunAs(10000)/uid0 restrictive-cache acceptance) —
 # logs tmp/sdd/f10-*.
-core_lib = 837 # FUP-23 (2026-09-08): 833 -> 837, +4 unit tests in init/mod.rs
+core_lib = 841 # F15 (2026-09-08): 837 -> 841, +4 fd_assignment_tests in
+               # init/mod.rs pinning per-frame descriptor ownership (a zero-fd
+               # frame cannot shift the next exec's stdio, two execs split one
+               # queue in order, a short queue fails closed without consuming,
+               # zero-fd frames always succeed)
+               # FUP-23 (2026-09-08): 833 -> 837, +4 unit tests in init/mod.rs
                # pinning the exec-stdio plan (relocation into the reserved range,
                # declining when a reserved number is taken without destroying it,
                # exact non-cross-talking delivery through the wired 0/1/2, and
@@ -390,7 +395,12 @@ mediation_2uid = 9 # ROOT-MODE: run via scripts/test-all.sh
                    # unlink prove the downgrade is real), and
                    # test_cli_mediation_run_as_is_wired (root-tier CLI
                    # refusal vs --mediation-run-as supervisor warning).
-oci = 145     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root.
+oci = 150     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root.
+              # F15 (2026-09-08): 145 -> 150, +2 header-validation tests in
+              # oci/src/init.rs (TooManyFds declaration + pre-F15 10-byte v1
+              # header reports the version gap; the seam module recompiles in
+              # both the lib and bin targets) and +1 integration test
+              # (two RunExec frames in one read unit each get their own stdio).
               # FUP-23 (2026-09-08): 144 -> 145, +1 exec-stdio leak/delivery
               # regression driven through the real run_init control loop
               # (40 real execs: each round's stdout/stderr exact, init's fd table
