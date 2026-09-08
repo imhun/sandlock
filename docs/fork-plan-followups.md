@@ -198,6 +198,27 @@
     不可写」还没有 fork 侧可控 RED——cargo/pytest 进程都太"胖"，落不进危险号段。
     RED 正确姿势 = 在子 shell helper 里先把 fd 表压到「下一个可用 = 3」再建管道
     exec，断言 stdout 精确到达且三端互不串流。
+  - **2026-09-08 再收窄（实测数据，下一轮直接从这里起）**：
+    ① 装配后子进程 `fcntl(0/1/2, F_GETFD)` 三个都是「开着且非 CLOEXEC」，而
+    `write(1)` = EBADF ⇒ fd 1 是**开着的读端**（不是被关闭、也不是 CLOEXEC 在
+    execve 时掉）；② init 侧该读单元**实收 3 个**描述符（不是 4、不是 0），其
+    `O_ACCMODE` = `(rd, rd, wr)`；父进程同一 exec 送出的 `raw` 实测是
+    `(rd, wr, wr)` ⇒ 错位发生在**送出与收到之间**；③ 把「帧头声明 fd 数」候选补丁
+    叠加到恢复 FUP-14 的构建上，探针仍红 ⇒ 多帧合并**不是**本因（那条仍是独立缺陷）。
+    判别变量确认为父进程 fd 表（多开 1 个 fd 即恢复）+ 只回退 `7671240` 即绿。
+    ⇒ 下一轮的方向应从「继续查 stdio 装配」转向**同一条 control link 上是否有交叠的
+    sendmsg**（网关 holder 的 exec 与命令的 exec 同时在飞、回复与 fd 归属交叉），
+    以及 `fdpass::send_with_fds` 的 `cmsg_len`/`CMSG_SPACE` 在 3 fd 时是否与被
+    `MSG_CTRUNC` 静默丢弃的路径相互作用。
+    复现三件套（本轮验证有效、未提交，避免把 `_exit` 探针留在仓库）：在带 FUP-14 的
+    工作树里对 `init/mod.rs` 的 stdio 装配加 `MODES1`（装配前三端 `O_ACCMODE`，
+    `64+9*a0+3*a1+a2`，68=正常、65=第二端是读端）、`MODES2`（装配后 0/1/2 的
+    `F_GETFD` 状态，0=closed/1=open/2=cloexec）、`QLEN`（读单元实收 fd 数
+    `100+n`），构建 debug `.so` 后热替换镜像内
+    `site-packages/sandlock/libsandlock_ffi.cpython-314-x86_64-linux-gnu.so`，跑
+    E2B 侧 `tmp/f11_harness_queue_probe.py`（父进程打印送出 modes）与
+    `tmp/f11_fdcount_probe.py`（N=0/N≥1 对照）。现成工作树：
+    `tmp/wt-fix`（FUP-14 已恢复 + 候选补丁 + 上述三处诊断，未提交）。
   - 排查中发现**另一个独立缺陷**（与 FUP-23 无因果，已实测排除为其成因）：init 控制
     通道是 SOCK_STREAM，一次 `recvmsg` 可并入多帧，而 SCM_RIGHTS 描述符是一个拼接
     列表；现有 `fdrecv::recv(ctl, 3)` + `received.fds[0..3]` 把「本读单元已收的全部
