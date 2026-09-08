@@ -192,8 +192,10 @@
   返回值在异步信号安全前提下失败即 `_exit` 点名（现在被忽略），③RED 用可控 fd 表
   （子进程 helper 先 close 掉 3..N 再建管道）钉「三端各归其位且互不串流 + stdout
   精确到达」，并加一条「保留 fd 号段与 relocate 下界不相交」的纯决策单测。
-  **2026-09-08 状态：已用「回退 FUP-14」缓解（当前 wheel 不带这个用户可见故障），
-  根因仍 open。** E2B 侧现象/复现记入 `docs/task-backlog.md` #22。下一步要点：
+  **2026-09-08 状态：已修复** —— init 侧「fork 前把三端搬到保留号段」+ 子进程「装配前逐槽
+  身份校验，被换端就以 124 明确失败」双保险（见本条目末「根因闭环 + 修复」）。FUP-14 的回退
+  缓解已撤销、事件化 reap 重新上线，收益（exec 往返 p50 5.35 ms）一并恢复。
+  E2B 侧现象/复现记入 main 仓库 `docs/task-backlog.md` #22。
   - 触发方已钉死（上两条取证），但「为什么 init 多占一个低位 fd 就能让子进程 fd 1
     不可写」还没有 fork 侧可控 RED——cargo/pytest 进程都太"胖"，落不进危险号段。
     RED 正确姿势 = 在子 shell helper 里先把 fd 表压到「下一个可用 = 3」再建管道
@@ -279,11 +281,67 @@
     保留 fd，或让保留 fd 号段从 stdio 分配范围里排除；RED 夹具需在子进程里
     把 fd 表压到「下一个可用 = 3」才能覆盖（现有 cargo/pytest 进程都太“胖”）。
 
+### FUP-23 根因闭环与修复（2026-09-08）
+
+成对探针升级到「同一 argv token + 子进程退出码 packed + 子进程用自己的 stdout 端回送快照」，
+并在链路上打了六个快照点（`fcntl(F_GETFL)` 取 `O_ACCMODE` + `fstat` 取 `(st_dev, st_ino)`）。
+N=1（旧「绿」布局）一轮实测，同一次 exec（父端行带 `child_id=2` 与 argv token，子端退出码
+即 packed，两端不可能来自不同次尝试）：
+
+| 快照点 | 三元组（`fd:mode:inode`） | 判定 |
+| --- | --- | --- |
+| 父端送出（`exec_with_fds_inner`） | `60:0 65:1 67:1` = (rd, wr, wr) | 正确 |
+| A：`fdrecv::recv` 返回处 | `5:0:…024 6:1:…025 7:1:…026`，1 个 cmsg、`len28 n3`、`msg_flags=0` | 正确、无 CTRUNC |
+| B：帧循环装配前 | 同 A | 正确 |
+| S1/S2：`spawn` 内 `dup3` 前 / `fork` 前 | 同 A | 正确 |
+| S3：`fork` 返回后 init 自身 | 同 A（另见 fd 8 为 init 自己的描述符） | 正确 |
+| C：子进程 `fork` 后第一条指令处 | `5:0:…024 6:1:…025` **`7:0:9485707`** | **第 3 端被换成另一条管道的读端**（其写端在子进程 fd 8；`readlink /proc/self/fd/7` = `pipe:[9485707]` 自证，`write(7)` = EBADF 实证） |
+
+三条结论：
+
+1. **SCM_RIGHTS 收发链路清白**：`fdpass::send_with_fds` 的 `CMSG_SPACE`/`CMSG_LEN` 计算、
+   描述符写入顺序，与 `fdrecv::recv` 的 cmsg 遍历、`msg_flags` 处理，逐项核对并实测正确。
+   此前「发送端顺序错」「多帧合并串 fd」「`MSG_CTRUNC` 静默丢端」三条假设全部作废
+   （帧头声明 fd 数的候选补丁仍是**独立**缺陷修复，与本因无因果，继续单独排期）。
+2. **换端发生在 `init` 的 `fork()` 与子进程第一条指令之间，且不是 init 自己干的**：
+   init 自身表在 fork 前后都完好；marker 管道实验（子进程 `pipe2` 落在 9/10，且该 inode
+   从不出现在后续 init 侧快照里）证明父子 **不共享** fd 表。⇒ 由**外部方**在新生儿身上
+   安装低位描述符。E2B 宿主形态独有：argv 安全路径会对发出 `clone` 通知的进程做一次性
+   ptrace fork 事件跟踪并在新生儿上注册状态（supervisor 侧还有 `NOTIF_ADDFD` 一类注入），
+   pure 形态下 envd 与沙箱同进程，号段由客户端 fd 表决定 —— 所以「客户端多开 1 个 fd」
+   改变的只是**哪个槽**被换，而不是「是否被换」（每次都换）。
+3. **旧「红/绿」是同一损坏的两种落点**：红 = 换到 stdout 槽 ⇒ 所有写 EBADF
+   （`/bin/echo x` 1、CPython flush 120、shell 重定向 2）；绿 = 换到 stderr 槽 ⇒
+   本探针断言不到（stderr 是读端只是写不进去）。
+
+修复（`crates/sandlock-core/src/init/mod.rs`，不依赖揪出注入方）：
+
+- **预搬迁**：init 在 `fork()` **之前**把收到的三端 `dup3` 到保留号段
+  `EXEC_STDIO_BASE = 64`，子进程一律从保留号 dup2 下发；低号段留给外部方随便分配，
+  再也撞不到「即将被 dup2 的待装配描述符」。保留号**必须三个都空**才搬迁
+  （`fcntl(F_GETFD)` == EBADF），否则整体退回原号 —— `dup3` 会静默覆盖占用中的目标号，
+  毁掉 init 或长命兄弟进程仍持有的描述符比本次竞态更糟；搬迁失败（例如沙箱
+  `RLIMIT_NOFILE` 低于该号段）同样退回，行为不劣于修复前。
+- **装配前身份校验**：子进程在 dup2 之前逐槽比对 `(O_ACCMODE, st_dev, st_ino)` 与 init
+  搬迁时记录的身份；不一致 ⇒ **拒绝装配**，把说明写到仍然完好的槽上并以退出码
+  `EXEC_STDIO_SWAPPED_EXIT = 124` 结束该 exec。同类竞态最坏是「命令明确失败」，
+  不再静默丢输出。
+- **收尾**：父进程 fork 后关闭保留副本（否则每轮 exec 漏 3 个描述符），子进程关闭保留号
+  **和**原始接收号（否则 workload 手里留着自家 stdout 写端，宿主侧永远等不到 EOF）。
+
+验证：FUP-14 已恢复的工作树上，E2B 侧 `tmp/f11_fdcount_probe.py`（main 仓库）
+**N = 0 / 1 / 2 / 8 全部 `FAILURES: []`**（网关 `['echo']`、trivial exit 0 +
+stdout `post-gateway-ok\n`、450 M 超卖 137 + `Killed\n`、50 M 控制 exit 0 +
+`got 50\n`、record `memoryMB 1024`）；`tmp/f23_multi_probe.py 0 4` 四个不同 marker
+连发，每条命令各拿到自己那条 stdout。夹具：core_lib +4（搬迁与身份 / 占号退让 /
+三端精确不串流 / 换端拒装配）、oci root 档 +1（真 `run_init` 控制环 40 轮 exec：
+每轮输出精确、init fd 表每轮回基线、EOF 后仍基线）。
+
 - **FUP-14 REAP_POLL_MS=100 事件化** — 来源：F2b.4（`799fc8f`，capacity doc §6）。
   描述：exec 往返 ~102 ms 有 ~100 ms 轮询地板；SIGCHLD self-pipe / pidfd 就绪通知可
   降到个位数 ms。
   为什么留：性能改动需核心行为变更 + 成本/延迟复测，F2b.4 明确留给后续。
-  **⚠ 已回退（2026-09-08 `bb1cb42`，重新 open）**：本波曾落地「init 阻塞 SIGCHLD 并挂 signalfd，
+  **✅ 已重新上线（2026-09-08：`bb1cb42` 的回退已撤销，随 FUP-23 修复一起复验）**：本波曾落地「init 阻塞 SIGCHLD 并挂 signalfd，
   poll 集合 = 控制通道 + signalfd；`REAP_POLL_MS` 保留为无 signalfd/孤儿兜底；
   spawn 子进程在 exec 前解除 SIGCHLD 阻塞（workload 语义不变）。release
   supervise_cost latency：p50 101.75 → 5.35 ms、p95 102.61 → 5.84 ms、
@@ -293,9 +351,10 @@
   位移，把 **FUP-23**（exec stdio 对 fd 号敏感）从潜伏变成可达——pure 形态下「承载沙箱的
   进程 fd 表只剩 0/1/2」时命令 stdout 整条丢失。取证两条都可复现：①同一测试镜像只换
   debug `.so` ⇒ `4d5f385` 绿 / `7671240` 红；②只回退 `7671240` 的构建 ⇒ 同一 N=0 场景
-  立刻 `FAILURES: []`（五项签名全对）。故本波以回退为**缓解**，latency 收益一并撤回
-  （`supervise_cost` 预算回到 200/300/2000 ms）。事件化 reap 需重做，且**必须**与
-  FUP-23 的 stdio fd 号无关性一起验证后才能再上线。
+  立刻 `FAILURES: []`（五项签名全对）。故本波一度以回退为**缓解**，latency 收益一并撤回。
+  **2026-09-08 现状**：FUP-23 根因闭环（见上一条目）后回退撤销、事件化 reap 重新上线，
+  `supervise_cost` 预算恢复 FUP-14 的紧预算，并与 FUP-23 的 stdio 搬迁/校验一起在同一棵树上
+  跑完整门禁 + E2B 三档复验。
 - **FUP-15 release profile `panic=abort` + `strip`** — 来源：F2b.4（`799fc8f`）/
   F2b.5（`51b64ad`）。
   描述：仓库 release profile 即 cargo 默认（panic=unwind、未 strip），release

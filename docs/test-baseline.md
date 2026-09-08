@@ -36,7 +36,12 @@
 # test_instance_chroot.rs non-root same-uid exec-only acceptance) and +3
 # mediation_2uid (root RunAs(10000)/uid0 restrictive-cache acceptance) —
 # logs tmp/sdd/f10-*.
-core_lib = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
+core_lib = 837 # FUP-23 (2026-09-08): 833 -> 837, +4 unit tests in init/mod.rs
+               # pinning the exec-stdio plan (relocation into the reserved range,
+               # declining when a reserved number is taken without destroying it,
+               # exact non-cross-talking delivery through the wired 0/1/2, and
+               # refusing a slot that was swapped after the fork)
+core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # +3 profile mediation_run_as tests (profile.rs) +2 signal
                # delivery unit tests (init/mod.rs escaped_group/unique pgids)
                # F14 (2026-09-06): 827 -> 828, +1 unit test
@@ -385,7 +390,12 @@ mediation_2uid = 9 # ROOT-MODE: run via scripts/test-all.sh
                    # unlink prove the downgrade is real), and
                    # test_cli_mediation_run_as_is_wired (root-tier CLI
                    # refusal vs --mediation-run-as supervisor warning).
-oci = 144     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e2e
+oci = 145     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root.
+              # FUP-23 (2026-09-08): 144 -> 145, +1 exec-stdio leak/delivery
+              # regression driven through the real run_init control loop
+              # (40 real execs: each round's stdout/stderr exact, init's fd table
+              # back at baseline every round and after EOF)
+              # previous: 144     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root. oci e2e
               # supervises OCI-default root containers; S1.2 fail-closes
               # RunAs(0,0) for non-root supervisors (tested feature). 140 = 55+67+18
               # (lib + bin + integration: the bin target recompiles the crate

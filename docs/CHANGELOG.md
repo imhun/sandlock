@@ -8,6 +8,26 @@
 
 ## 行为变化（升级 / 接线前必读）
 
+- **exec stdio 在宿主形态下会被外部换端 ⇒ init 侧 fork 前预搬迁 + 子进程装配前身份校验
+  （FUP-23，2026-09-08）**：pure 形态（沙箱与宿主 agent 同进程）下，命令的 stdout 可能
+  **整条静默丢失**（CPython `exit 120`、`/bin/echo x` ⇒ 1、shell 重定向 ⇒ 2），判别变量是
+  宿主进程的 fd 表。取证：父端送出、init `recvmsg` 返回、装配前、`fork` 前、`fork` 后 init
+  自身这五个快照点的 `(O_ACCMODE, st_dev, st_ino)` 全部正确，只有子进程 `fork` 后第一条指令处
+  第 3 端已变成另一条管道的读端（marker 管道实验证明父子 fd 表不共享）⇒ SCM_RIGHTS 链路清白，
+  换端由**外部方**在新生儿身上装低号描述符造成（E2B 侧 argv 安全的 ptrace fork 事件跟踪 /
+  supervisor `NOTIF_ADDFD` 一类注入）。换到 stdout 槽就丢输出，换到 stderr 槽只是没人发现 ——
+  旧「多开 1 个 fd 即恢复」的绿只是换到了不致命的槽。**修法**：init 在 `fork()` 前把三端
+  `dup3` 到保留号段 64+（保留号不全部空闲就整体退回原号，绝不覆盖别人还持有的描述符），
+  子进程 dup2 之前逐槽校验身份；被换端 ⇒ **拒绝装配**，消息写到仍然完好的流上并以退出码
+  **124** 结束该 exec —— 最坏情况从「静默丢数据」变成「明确失败」。父进程 fork 后关闭保留
+  副本，子进程关闭保留号与原始接收号（既不漏描述符，也不破坏宿主侧 EOF）。
+  **用户可见**：上述丢输出回归消失；新增 124 这一条 exec 级失败语义（与 125 chdir、
+  126 setpgid、127 exec 失败并列）；FUP-14 事件化 reap 的回退撤销，exec 往返 p50 恢复
+  5.35 ms 一档。夹具：core_lib 833→837（搬迁与身份 / 占号退让 / 三端精确不串流 /
+  换端拒装配）、root 档 oci 144→145（真 `run_init` 控制环 40 轮 exec：逐轮输出精确、
+  init fd 表逐轮回到基线）。取证与修法细节见
+  `docs/fork-plan-followups.md`「FUP-23 根因闭环与修复」。
+
 - **C 档特权 remap gate 升级为 capability-aware（F14，本地提交）**：路径中介
   建箱前拒绝的判定从 `euid == 0` 扩展为「实际持有跨 uid remap 特权」——euid 为 0，
   或 euid 非 0 但 effective caps 含 `CAP_SETUID/CAP_SETGID`（route-B ③ file-cap
