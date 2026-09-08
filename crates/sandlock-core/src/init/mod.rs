@@ -147,14 +147,6 @@ fn spawn(
         return pid;
     }
     // child
-    // FUP-14: init's SIGCHLD block must not leak into the workload (shells
-    // and runtimes legitimately rely on SIGCHLD). Unblock before exec.
-    unsafe {
-        let mut unblock: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut unblock);
-        libc::sigaddset(&mut unblock, libc::SIGCHLD);
-        libc::sigprocmask(libc::SIG_UNBLOCK, &unblock, std::ptr::null_mut());
-    }
     // SECE-6 (F1.7): every child becomes its own process-group leader before
     // exec, so a killpg(getpgid(0), SIGKILL) inside one command can never
     // reach init or a sibling. Fail closed if the kernel refuses: continuing
@@ -402,11 +394,8 @@ fn unique_signal_pgids(
     pgids
 }
 
-/// Fallback poll interval for the control channel (FUP-14): child exits now
-/// wake the loop immediately via a SIGCHLD signalfd, so this timeout only
-/// bounds how long an adopted orphan (no pidfd/signalfd wake) can sit as a
-/// zombie when no control message is arriving. Kernels without signalfd fall
-/// back to this poll-only behavior (100 ms class).
+/// Poll interval for the control channel: bounds how long a reaped child can
+/// sit as a zombie when no control message is arriving (100 ms class).
 const REAP_POLL_MS: i32 = 100;
 
 /// RAII guard for the SCM_RIGHTS fds received in one control read (SL-5).
@@ -466,18 +455,6 @@ pub fn run_init() {
     // session (the two-step setpgid→setsid escape) is detected by comparing
     // its session against this one.
     let supervisor_session = unsafe { libc::getsid(0) };
-    // FUP-14: block SIGCHLD and arm a signalfd so a child exit wakes the
-    // control loop immediately instead of waiting out REAP_POLL_MS (the old
-    // ~100 ms exec-round-trip floor). The block is process-local to init;
-    // `spawn` unblocks SIGCHLD in every child before exec, so workloads keep
-    // stock SIGCHLD semantics.
-    let mut sigchld_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
-    let sigfd = unsafe {
-        libc::sigemptyset(&mut sigchld_mask);
-        libc::sigaddset(&mut sigchld_mask, libc::SIGCHLD);
-        libc::sigprocmask(libc::SIG_BLOCK, &sigchld_mask, std::ptr::null_mut());
-        libc::signalfd(-1, &sigchld_mask, libc::SFD_NONBLOCK | libc::SFD_CLOEXEC)
-    };
 
     let ctl = CONTROL_FD;
     // Child table: pids init spawned, routed exactly-once on reap. A pid is
@@ -554,30 +531,15 @@ pub fn run_init() {
             }
         }
 
-        // Wait for a control message or a child exit (SIGCHLD via the
-        // signalfd). The REAP_POLL_MS timeout remains only as a fallback
-        // sweep for kernels without signalfd and for adopted orphans whose
-        // exit did not wake us; with the signalfd armed, an exec+exit round
-        // wakes immediately instead of paying the old ~100 ms floor.
-        let mut pfds = [
-            libc::pollfd {
-                fd: ctl,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: sigfd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        let pr = unsafe {
-            libc::poll(
-                pfds.as_mut_ptr(),
-                pfds.len() as libc::nfds_t,
-                REAP_POLL_MS,
-            )
+        // Wait up to REAP_POLL_MS for a control message so the loop is not a
+        // busy poll, then loop back (the sweep at the top reaps children that
+        // exited during the wait).
+        let mut pfd = libc::pollfd {
+            fd: ctl,
+            events: libc::POLLIN,
+            revents: 0,
         };
+        let pr = unsafe { libc::poll(&mut pfd, 1, REAP_POLL_MS) };
         if pr < 0 {
             let e = std::io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EINTR) {
@@ -585,28 +547,8 @@ pub fn run_init() {
             }
             break; // control fd unusable; treat like EOF below
         }
-        if pr == 0 {
+        if pr == 0 || (pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) == 0 {
             continue; // timeout (or spurious wakeup): sweep again on top
-        }
-        if sigfd >= 0 && (pfds[1].revents & (libc::POLLIN | libc::POLLERR)) != 0 {
-            // Drain the signalfd queue (level-triggered: an unread pending
-            // SIGCHLD would otherwise keep the loop busy).
-            let mut drain = [0u8; 256];
-            loop {
-                let n = unsafe {
-                    libc::read(
-                        sigfd,
-                        drain.as_mut_ptr() as *mut libc::c_void,
-                        drain.len(),
-                    )
-                };
-                if n <= 0 {
-                    break;
-                }
-            }
-        }
-        if (pfds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) == 0 {
-            continue; // only the signalfd woke us; sweep reaps on the top
         }
 
         let (bytes, fds) = match fdrecv::recv(ctl, 3) {

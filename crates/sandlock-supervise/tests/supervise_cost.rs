@@ -49,14 +49,14 @@ const BUDGET_ONE_CMD_KB: u64 = 6_144;
 const BUDGET_64_PROCS_KB: u64 = 6_144;
 const BUDGET_AFTER_1000_KB: u64 = 6_656;
 
-/// Exec round-trip latency budgets (milliseconds).  The historical ~100 ms
-/// implementation floor (sandlock-init reaping exited children on its
-/// 100 ms control-channel poll, `REAP_POLL_MS`) was removed by FUP-14:
-/// a SIGCHLD signalfd now wakes the reap loop immediately, and the
-/// sandlock-dev:latest measurement is p50 ≈ 5.35 ms (2026-09-07).  Budgets
-/// remain the measured p50/p95 plus margin (docs/supervise-capacity.md §4.2)
-/// with a generous max bound for scheduler stalls — an event-wake regression
-/// that pushes p95 toward the old 100 ms floor still fails loudly.
+/// Exec round-trip latency budgets (milliseconds).  The wait leg has a
+/// ~100 ms implementation floor: sandlock-init reaps exited children on its
+/// 100 ms control-channel poll (`REAP_POLL_MS`, crates/sandlock-core/src/
+/// init/mod.rs), so one exec+exit round measures ≈ 103 ms p50 in the
+/// sandlock-dev:latest environment.  Budgets are the measured p50/p95 plus
+/// margin (see docs/supervise-capacity.md), with a generous max bound for
+/// scheduler stalls — a regression that removes the floor or a stall that
+/// pushes p95 beyond the bound both fail here.
 const LATENCY_P50_BUDGET_MS: f64 = 200.0;
 const LATENCY_P95_BUDGET_MS: f64 = 300.0;
 const LATENCY_MAX_BUDGET_MS: f64 = 2_000.0;
