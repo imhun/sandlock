@@ -246,7 +246,11 @@ core_integ = 534 # FUP-13 (2026-09-07, A/B cleanup wave): 533 -> 534, +1
                  # (test_exec_mode_main_exit_is_terminal_and_verbs_close);
                  # one-shot outlives regression stays green in
                  # test_instance_lifecycle.rs.
-ffi = 100 # F13 (2026-09-06): 98 -> 100, +2 in tests/fs_mount.rs
+ffi = 101 # F16 (2026-09-08): 100 -> 101, +1 C smoke
+          # (tests/c_smoke.rs supervise_client_smoke_compiles_and_runs —
+          # the route-B worker client symbols must compile + link + fail a
+          # nonexistent slot's request with the err/err_msg contract)
+          # F13 (2026-09-06): 98 -> 100, +2 in tests/fs_mount.rs
           # (test_rw_mount_point_resists_link — the I1/P5 hard-link EBUSY
           # guard's direct pin; test_directory_mount_point_rmdir_is_refused —
           # rmdir of a directory bind-mount point is refused with EBUSY and
@@ -362,10 +366,15 @@ supervise_root = 4 # ROOT-MODE: run via scripts/test-all.sh; +1 FUP-11d
                    # shutdown/no-residue) and
                    # test_supervisor_as_foreign_uid_fd_handoff_serves_worker
                    # (fd transport, same genuine identities).
-mediation_2uid = 9 # ROOT-MODE: run via scripts/test-all.sh
+mediation_2uid = 10 # ROOT-MODE: run via scripts/test-all.sh
                    # --mediation-2uid as root (same privileged container as
                    # oci). F6.1 (SL-1) acceptance in
                    # crates/sandlock-supervise/tests/mediation_2uid.rs:
+                   # F16 (2026-09-08): 9 -> 10, +1 Python-client B档
+                   # (test_python_client_execs_distinct_uids_on_shared_sticky_dir —
+                   # two distinct-uid registered slots driven by
+                   # sandlock.supervise.SuperviseChannel exec + wait_child +
+                   # shutdown; = T5 所缺的 Python 可达证据)
                    # F14 (2026-09-06): 8 -> 9, +1 file-cap launcher acceptance
                    # (test_nonroot_file_cap_launcher_is_refused_like_c_tier) —
                    # a scratch copy of the sandlock CLI stamped with
@@ -432,7 +441,11 @@ oci = 150     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root.
               # 56 lib + 68 bin + 15 integration.rs + 2 reaper + 3 process
               # groups = 144).
 cli_build = 0 # workspace release build gate (no test binaries; 0 = build passed)
-python = 454  # F6.2 (P5): 453 -> 454, +1 in tests/test_fs_mount.py
+python = 455  # F16 (2026-09-08): 454 -> 455, +1
+              # tests/test_supervise_channel.py (same-uid registered slot:
+              # SuperviseChannel exec-with-SCM_RIGHTS + wait_child + stats +
+              # shutdown; python face of the route-B client)
+              # F6.2 (P5): 453 -> 454, +1 in tests/test_fs_mount.py
               # (TestFsMount::test_minimal_dev_helper) — the minimal_dev()
               # helper content is exact and its /dev/null mount serves the
               # host chardev under chroot without fs_denied.

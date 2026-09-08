@@ -1,12 +1,14 @@
-//! Compile and run the pure-C smoke test against the cdylib.
+//! Compile and run the pure-C smoke tests against the cdylib.
 
-#[test]
-fn c_smoke_compiles_and_runs() {
+/// Build the cdylib (see the calling test's doc), locate it, compile `src`
+/// against `include/sandlock.h`, link, and run it.
+fn compile_and_run_c(src: &str) -> std::process::Output {
     use std::path::PathBuf;
     use std::process::Command;
 
     let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    let bin = out_dir.join("handler_smoke");
+    let stem = src.rsplit('/').next().unwrap_or(src).replace(".c", "");
+    let bin = out_dir.join(&stem);
     let profile = if cfg!(debug_assertions) {
         "debug"
     } else {
@@ -61,7 +63,11 @@ fn c_smoke_compiles_and_runs() {
             "-Werror",
             "-I",
             concat!(env!("CARGO_MANIFEST_DIR"), "/include"),
-            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/c/handler_smoke.c"),
+            &format!(
+                "{}/tests/c/{}",
+                env!("CARGO_MANIFEST_DIR"),
+                src
+            ),
             "-L",
             cdylib_dir.to_str().unwrap(),
             &rpath_arg,
@@ -73,10 +79,29 @@ fn c_smoke_compiles_and_runs() {
         .expect("cc invocation");
     assert!(status.success(), "C compile failed");
 
-    let out = Command::new(&bin).output().expect("run handler_smoke");
+    Command::new(&bin).output().expect("run C smoke")
+}
+
+#[test]
+fn c_smoke_compiles_and_runs() {
+    let out = compile_and_run_c("handler_smoke.c");
     assert!(
         out.status.success(),
         "handler_smoke exited non-zero: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// F16 RED pin: the route-B worker-side client must be declared in
+/// `sandlock.h` and linkable from C.  Before the exports exist this test
+/// fails at compile time (implicit declaration under `-Werror`).
+#[test]
+fn supervise_client_smoke_compiles_and_runs() {
+    let out = compile_and_run_c("supervise_client_smoke.c");
+    assert!(
+        out.status.success(),
+        "supervise_client_smoke exited non-zero: stdout={:?} stderr={:?}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );

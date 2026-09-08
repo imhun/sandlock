@@ -1501,6 +1501,24 @@ pub fn channel_request_with_fds(
     serde_json::from_slice(&resp_body).map_err(|e| format!("parse response: {}", e))
 }
 
+/// Worker-side client for a registered slot (transport 2): connect by path,
+/// attach the channel token, and issue one verb — optionally handing over
+/// descriptors (`exec` needs exactly three stdio ends). Response bytes come
+/// back as-is so the caller keeps the existing JSON contract. One request per
+/// connection, matching the registered transport's accept-per-connection
+/// model; `fds` ride the same `sendmsg` as the request frame (F3.2).
+pub fn registered_request(
+    sock_path: &std::path::Path,
+    token: &str,
+    verb: &str,
+    args: serde_json::Value,
+    fds: &[std::os::fd::RawFd],
+) -> Result<ControlResponse, String> {
+    let mut stream = std::os::unix::net::UnixStream::connect(sock_path)
+        .map_err(|e| format!("connect {:?}: {}", sock_path, e))?;
+    channel_request_with_fds(&mut stream, token, verb, args, fds)
+}
+
 /// Transport 1 — fd handoff.  Created with one `socketpair()` at
 /// generation-create time; the launcher hands [`FdHandoffChannel::server`]
 /// to the supervise process (`--control-fd N`) and keeps

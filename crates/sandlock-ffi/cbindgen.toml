@@ -43,6 +43,7 @@ typedef struct sandlock_t sandlock_t;
 typedef struct sandlock_sandbox_t sandlock_sandbox_t;
 typedef struct sandlock_result_t sandlock_result_t;
 typedef struct sandlock_handler_t sandlock_handler_t;
+typedef struct sandlock_supervise_t sandlock_supervise_t;
 """
 
 [parse]
@@ -63,6 +64,7 @@ exclude = [
     "sandlock_sandbox_t",
     "sandlock_result_t",
     "sandlock_handler_t",
+    "sandlock_supervise_t",
 ]
 
 [export.rename]

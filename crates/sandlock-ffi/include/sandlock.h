@@ -20,6 +20,7 @@ typedef struct sandlock_t sandlock_t;
 typedef struct sandlock_sandbox_t sandlock_sandbox_t;
 typedef struct sandlock_result_t sandlock_result_t;
 typedef struct sandlock_handler_t sandlock_handler_t;
+typedef struct sandlock_supervise_t sandlock_supervise_t;
 
 
 /**
@@ -1752,6 +1753,53 @@ int sandlock_instance_resize_child(sandlock_instance_t *h,
  * must not be used again.
  */
 void sandlock_instance_free(sandlock_instance_t *h);
+
+/**
+ * Validate a registered slot identity and return the opaque client handle.
+ * On success, `*err` is 0 and a non-null handle is returned; on failure
+ * `*err` is -1, null is returned, and `*err_msg` (if non-null) names the
+ * problem (caller frees with [`sandlock_string_free`]).
+ *
+ * # Safety
+ * `path` and `token` must be valid NUL-terminated C strings. `err` and
+ * `err_msg` may both be null.
+ */
+sandlock_supervise_t *sandlock_supervise_connect(const char *path,
+                                                 const char *token,
+                                                 int *err,
+                                                 char **err_msg);
+
+/**
+ * Issue one verb on a registered slot: connect by the handle's socket path,
+ * attach the channel token, hand over `n_fds` descriptors (empty for every
+ * verb but `exec`, which needs exactly three), and return the serialized
+ * `ControlResponse` JSON (`{"v":1,"ok":...,"data":...,"err":...}`) as a C
+ * string the caller frees with [`sandlock_string_free`]. A refused connect,
+ * transport error or unparseable `args_json` sets `*err` to -1 and
+ * `*err_msg`; an `ok:false` server response still returns JSON with `*err`
+ * 0 — the caller inspects `ok`.
+ *
+ * # Safety
+ * `h` must be a valid handle from [`sandlock_supervise_connect`]; `verb` and
+ * `args_json` must be valid NUL-terminated C strings; when `n_fds > 0`,
+ * `fds` must point to `n_fds` valid file descriptors.
+ */
+char *sandlock_supervise_request(sandlock_supervise_t *h,
+                                 const char *verb,
+                                 const char *args_json,
+                                 const int *fds,
+                                 uintptr_t n_fds,
+                                 int *err,
+                                 char **err_msg);
+
+/**
+ * Free a supervise client handle.
+ *
+ * # Safety
+ * `h` must be null or a valid handle from [`sandlock_supervise_connect`];
+ * after this call the handle must not be used again.
+ */
+void sandlock_supervise_free(sandlock_supervise_t *h);
 
 /**
  * Query the Landlock ABI version supported by the running kernel.

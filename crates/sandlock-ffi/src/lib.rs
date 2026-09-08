@@ -3597,6 +3597,225 @@ pub unsafe extern "C" fn sandlock_instance_free(h: *mut sandlock_instance_t) {
 }
 
 // ----------------------------------------------------------------
+// Supervise registered client (route B worker side, F16)
+// ----------------------------------------------------------------
+
+/// Opaque handle wrapping a registered slot's identity (registry socket path
+/// + channel token).
+///
+/// The registered transport serves **one request per connection**
+/// (accept-per-connection), so "connect" only stores the identity; every
+/// `sandlock_supervise_request` opens a fresh unix connection, attaches the
+/// token, and hands over any descriptors (`exec` needs exactly three stdio
+/// ends, which travel on the same `sendmsg` as the request frame).
+#[repr(C)]
+pub struct sandlock_supervise_t {
+    _private: SuperviseClient,
+}
+
+struct SuperviseClient {
+    sock_path: String,
+    token: String,
+}
+
+/// Shared error path for the supervise client exports: set `*err` to -1 and,
+/// when `err_msg` is non-null, publish `msg` as a heap C string the caller
+/// frees with [`sandlock_string_free`].
+///
+/// # Safety
+/// `err` and `err_msg` may be null; when non-null they must point to
+/// writable storage.
+unsafe fn supervise_ffi_fail(err: *mut c_int, err_msg: *mut *mut c_char, msg: &str) {
+    if !err.is_null() {
+        *err = -1;
+    }
+    if !err_msg.is_null() {
+        if let Ok(c) = CString::new(msg) {
+            *err_msg = c.into_raw();
+        }
+    }
+}
+
+/// Validate a registered slot identity and return the opaque client handle.
+/// On success, `*err` is 0 and a non-null handle is returned; on failure
+/// `*err` is -1, null is returned, and `*err_msg` (if non-null) names the
+/// problem (caller frees with [`sandlock_string_free`]).
+///
+/// # Safety
+/// `path` and `token` must be valid NUL-terminated C strings. `err` and
+/// `err_msg` may both be null.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_supervise_connect(
+    path: *const c_char,
+    token: *const c_char,
+    err: *mut c_int,
+    err_msg: *mut *mut c_char,
+) -> *mut sandlock_supervise_t {
+    if !err_msg.is_null() {
+        *err_msg = ptr::null_mut();
+    }
+    if path.is_null() || token.is_null() {
+        supervise_ffi_fail(err, err_msg, "sandlock_supervise_connect: path and token are required");
+        return ptr::null_mut();
+    }
+    let path = match CStr::from_ptr(path).to_str() {
+        Ok(p) => p,
+        Err(_) => {
+            supervise_ffi_fail(err, err_msg, "sandlock_supervise_connect: path is not UTF-8");
+            return ptr::null_mut();
+        }
+    };
+    let token = match CStr::from_ptr(token).to_str() {
+        Ok(t) => t,
+        Err(_) => {
+            supervise_ffi_fail(err, err_msg, "sandlock_supervise_connect: token is not UTF-8");
+            return ptr::null_mut();
+        }
+    };
+    if path.is_empty() || token.is_empty() {
+        supervise_ffi_fail(
+            err,
+            err_msg,
+            "sandlock_supervise_connect: path and token must be non-empty",
+        );
+        return ptr::null_mut();
+    }
+    if !err.is_null() {
+        *err = 0;
+    }
+    Box::into_raw(Box::new(sandlock_supervise_t {
+        _private: SuperviseClient {
+            sock_path: path.to_string(),
+            token: token.to_string(),
+        },
+    }))
+}
+
+/// Issue one verb on a registered slot: connect by the handle's socket path,
+/// attach the channel token, hand over `n_fds` descriptors (empty for every
+/// verb but `exec`, which needs exactly three), and return the serialized
+/// `ControlResponse` JSON (`{"v":1,"ok":...,"data":...,"err":...}`) as a C
+/// string the caller frees with [`sandlock_string_free`]. A refused connect,
+/// transport error or unparseable `args_json` sets `*err` to -1 and
+/// `*err_msg`; an `ok:false` server response still returns JSON with `*err`
+/// 0 — the caller inspects `ok`.
+///
+/// # Safety
+/// `h` must be a valid handle from [`sandlock_supervise_connect`]; `verb` and
+/// `args_json` must be valid NUL-terminated C strings; when `n_fds > 0`,
+/// `fds` must point to `n_fds` valid file descriptors.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_supervise_request(
+    h: *mut sandlock_supervise_t,
+    verb: *const c_char,
+    args_json: *const c_char,
+    fds: *const c_int,
+    n_fds: usize,
+    err: *mut c_int,
+    err_msg: *mut *mut c_char,
+) -> *mut c_char {
+    if !err_msg.is_null() {
+        *err_msg = ptr::null_mut();
+    }
+    if h.is_null() || verb.is_null() || args_json.is_null() {
+        supervise_ffi_fail(
+            err,
+            err_msg,
+            "sandlock_supervise_request: handle, verb and args_json are required",
+        );
+        return ptr::null_mut();
+    }
+    let verb = match CStr::from_ptr(verb).to_str() {
+        Ok(v) => v,
+        Err(_) => {
+            supervise_ffi_fail(err, err_msg, "sandlock_supervise_request: verb is not UTF-8");
+            return ptr::null_mut();
+        }
+    };
+    let args_json = match CStr::from_ptr(args_json).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            supervise_ffi_fail(
+                err,
+                err_msg,
+                "sandlock_supervise_request: args_json is not UTF-8",
+            );
+            return ptr::null_mut();
+        }
+    };
+    let args: serde_json::Value = match serde_json::from_str(args_json) {
+        Ok(v) => v,
+        Err(e) => {
+            supervise_ffi_fail(
+                err,
+                err_msg,
+                &format!("sandlock_supervise_request: bad args_json: {e}"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    let fd_slice: &[c_int] = if n_fds == 0 {
+        &[]
+    } else if fds.is_null() {
+        supervise_ffi_fail(err, err_msg, "sandlock_supervise_request: n_fds > 0 but fds is null");
+        return ptr::null_mut();
+    } else {
+        std::slice::from_raw_parts(fds, n_fds)
+    };
+    let client = &(*h)._private;
+    match sandlock_core::control::registered_request(
+        std::path::Path::new(&client.sock_path),
+        &client.token,
+        verb,
+        args,
+        fd_slice,
+    ) {
+        Ok(resp) => match serde_json::to_vec(&resp) {
+            Ok(bytes) => {
+                if !err.is_null() {
+                    *err = 0;
+                }
+                match CString::new(bytes) {
+                    Ok(c) => c.into_raw(),
+                    Err(_) => {
+                        supervise_ffi_fail(
+                            err,
+                            err_msg,
+                            "sandlock_supervise_request: response contains NUL",
+                        );
+                        ptr::null_mut()
+                    }
+                }
+            }
+            Err(e) => {
+                supervise_ffi_fail(
+                    err,
+                    err_msg,
+                    &format!("sandlock_supervise_request: serialize response: {e}"),
+                );
+                ptr::null_mut()
+            }
+        },
+        Err(e) => {
+            supervise_ffi_fail(err, err_msg, &e);
+            ptr::null_mut()
+        },
+    }
+}
+
+/// Free a supervise client handle.
+///
+/// # Safety
+/// `h` must be null or a valid handle from [`sandlock_supervise_connect`];
+/// after this call the handle must not be used again.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_supervise_free(h: *mut sandlock_supervise_t) {
+    if !h.is_null() {
+        drop(Box::from_raw(h));
+    }
+}
+
+// ----------------------------------------------------------------
 // Platform query
 // ----------------------------------------------------------------
 

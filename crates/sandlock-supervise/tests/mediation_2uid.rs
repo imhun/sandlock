@@ -52,6 +52,8 @@ use sandlock_core::{Sandbox, SandlockError};
 /// (not 0, not the 1–999 system range, not 65534 = nobody/overflowuid).
 const UID_X: u32 = 65531;
 const UID_Y: u32 = 65532;
+/// The route-B worker uid (the python client runs as this; slots allowlist it).
+const UID_WORKER: u32 = 65534;
 
 /// C档 sandbox host uids (root in-process remap targets).
 const HOST_UID_A: u32 = 10000;
@@ -399,6 +401,326 @@ fn test_two_supervisors_distinct_uids_isolate_files() {
     );
     let (sup_y, worker_y) = spawn_supervise_at(UID_Y, &policy_path, &prog_y, &ctl_root);
     run_generation_to_end(sup_y, worker_y, "uid-Y supervisor");
+
+    let report: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(evidence.join("y-report.json")).expect("read Y report"),
+    )
+    .expect("Y report is JSON");
+    assert_eq!(
+        report["read"],
+        serde_json::Value::String("XDATA\n".into()),
+        "Y must be able to read X's 0644 file"
+    );
+    assert_eq!(
+        report["rm_errno"],
+        serde_json::Value::from(1),
+        "Y's unlink of X's file in the sticky dir must be EPERM"
+    );
+    assert_eq!(
+        report["chmod_errno"],
+        serde_json::Value::from(1),
+        "Y's chmod of X's file must be EPERM"
+    );
+    assert_eq!(report["exists"], serde_json::Value::Bool(true));
+
+    let meta_after = std::fs::metadata(&x_file).expect("X's file survives Y");
+    assert_eq!(
+        meta_after.uid(),
+        UID_X,
+        "the file must still be owned by X after Y's refused operations"
+    );
+    assert_eq!(
+        meta_after.mode() & 0o7777,
+        0o644,
+        "Y's refused chmod must not have changed X's file"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ----------------------------------------------------------------
+// F16 (Python client) B档: two distinct-uid registered slots driven by
+// sandlock.supervise.SuperviseChannel over exec + wait_child + shutdown.
+// The exec'd children run inside each slot's instance; the evidence and the
+// host-side ownership assertions are the same B档 facts as above, now
+// reached through the Python worker face envd (E2B) will use.
+// ----------------------------------------------------------------
+
+/// The Python client: exec `code_file` (python -c) in the slot, wait for its
+/// exit, require exit code 0, then shut the generation down.
+const F16_PY_CLIENT: &str = r#"
+import os, sys
+from sandlock.supervise import SuperviseChannel
+
+path, token, code_file, shared, ev = sys.argv[1:6]
+with open(code_file) as f:
+    code = f.read()
+
+with SuperviseChannel(path, token) as ch:
+    dn = os.open("/dev/null", os.O_RDWR)
+    try:
+        fds = [dn, dn, dn]
+        started = ch.request(
+            "exec",
+            {"argv": ["python3", "-B", "-c", code, shared, ev]},
+            fds=fds,
+        )
+    finally:
+        os.close(dn)
+    status = ch.request("wait_child", {"child_id": started["child_id"]})
+    if status.get("code") != 0:
+        raise SystemExit("exec child failed: %r" % (status,))
+    ch.request("shutdown")
+"#;
+
+/// Spawn a registered-path supervise slot at `uid` (via setpriv) with a
+/// launch-first parking program so the instance exists for exec verbs.
+fn spawn_supervise_registered(
+    uid: u32,
+    policy: &Path,
+    program: &Path,
+    ctl_root: &Path,
+    name: &str,
+    token: &str,
+    peer_uids: &[u32],
+) -> Child {
+    let mut args: Vec<String> = vec![
+        "--reuid".to_string(),
+        uid.to_string(),
+        "--regid".to_string(),
+        uid.to_string(),
+        "--clear-groups".to_string(),
+        "--".to_string(),
+        supervise_bin().to_string(),
+        "--policy".to_string(),
+        policy.to_string_lossy().into_owned(),
+        "--uid".to_string(),
+        uid.to_string(),
+        "--serve-path".to_string(),
+        name.to_string(),
+        "--token".to_string(),
+        token.to_string(),
+    ];
+    for u in peer_uids {
+        args.push("--peer-uid".to_string());
+        args.push(u.to_string());
+    }
+    args.push("--program".to_string());
+    args.push(program.to_string_lossy().into_owned());
+    Command::new("setpriv")
+        .args(&args)
+        .env("SANDBOX_CTL_ROOT", ctl_root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn setpriv registered supervise")
+}
+
+/// Run the Python SuperviseChannel client as UID_WORKER (the route-B worker
+/// uid), returning its exit status.  The fork's python package and the debug
+/// cdylib live under the /src mount; the ffi c_smoke suite has already built
+/// the cdylib in the non-root phase.
+fn run_f16_client(
+    script: &Path,
+    args: &[&str],
+) -> std::process::ExitStatus {
+    let mut cmd = Command::new("setpriv");
+    cmd.args([
+        "--reuid",
+        &UID_WORKER.to_string(),
+        "--regid",
+        &UID_WORKER.to_string(),
+        "--clear-groups",
+        "--",
+        "python3",
+        "-B",
+        script.to_str().expect("client script utf8"),
+    ])
+    .args(args)
+    .env(
+        "PYTHONPATH",
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../python/src")
+            .to_string_lossy()
+            .into_owned(),
+    )
+    .env(
+        "LD_LIBRARY_PATH",
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target-linux/debug")
+            .to_string_lossy()
+            .into_owned(),
+    )
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn python client");
+    let status = child.wait().expect("wait python client");
+    if !status.success() {
+        let mut err = String::new();
+        if let Some(ref mut pipe) = child.stderr {
+            let _ = std::io::Read::read_to_string(pipe, &mut err);
+        }
+        panic!("python client failed (status {status}); stderr: {err}");
+    }
+    status
+}
+
+fn wait_for_registered_socket(
+    supervise: &mut Child,
+    sock_path: &Path,
+    what: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if sock_path.exists() {
+            return;
+        }
+        if let Some(status) = supervise.try_wait().expect("try_wait supervise") {
+            let mut err = String::new();
+            if let Some(ref mut pipe) = supervise.stderr {
+                let _ = std::io::Read::read_to_string(pipe, &mut err);
+            }
+            panic!(
+                "{what}: supervise exited ({status}) before binding {sock_path:?}; stderr: {err}"
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: timed out waiting for registered socket {sock_path:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Drive one F16 slot: write the parking program + workload code, spawn the
+/// registered supervise at `uid`, run the Python client, and require both
+/// processes to end cleanly.
+fn run_f16_slot(
+    uid: u32,
+    base: &Path,
+    shared: &Path,
+    evidence: &Path,
+    name: &str,
+    token: &str,
+    workload: &str,
+) {
+    // Each slot gets its own control root: the shared registry root is
+    // per-uid by design (channel_registry_root defaults to
+    // /tmp/sandlock-ctl-<uid>-registry), and two slots at different uids
+    // must never chmod each other's registry root (sticky ownership).
+    let ctl_root = base.join(format!("ctl-{name}"));
+    std::fs::create_dir_all(&ctl_root).expect("create per-slot ctl root");
+    chmod_dir(&ctl_root, 0o777);
+    let policy_body = serde_json::json!({
+        "fs_readable": base_read_paths(),
+        "fs_writable": [shared.to_string_lossy(), evidence.to_string_lossy()],
+        "fs_denied": [shared.join("secret.txt").to_string_lossy()],
+    })
+    .to_string();
+    let policy_path = base.join(format!("policy-{name}.json"));
+    write_shared(&policy_path, &policy_body);
+
+    let program_path = base.join(format!("prog-{name}.json"));
+    write_shared(
+        &program_path,
+        &serde_json::json!({
+            "argv": ["python3", "-B", "-c", "import time; time.sleep(300)"],
+        })
+        .to_string(),
+    );
+    let code_path = base.join(format!("code-{name}.py"));
+    write_shared(&code_path, workload);
+    let client_path = base.join("f16-client.py");
+    write_shared(&client_path, F16_PY_CLIENT);
+
+    let mut supervise = spawn_supervise_registered(
+        uid,
+        &policy_path,
+        &program_path,
+        &ctl_root,
+        name,
+        token,
+        &[UID_WORKER],
+    );
+    let sock_path = PathBuf::from(format!(
+        "{}-registry/{}.d/control.sock",
+        ctl_root.to_string_lossy().trim_end_matches('/'),
+        sandlock_core::control::fnv1a_hex(name),
+    ));
+    wait_for_registered_socket(&mut supervise, &sock_path, name);
+
+    run_f16_client(
+        &client_path,
+        &[
+            sock_path.to_str().unwrap(),
+            token,
+            code_path.to_str().unwrap(),
+            shared.to_str().unwrap(),
+            evidence.to_str().unwrap(),
+        ],
+    );
+
+    let status = supervise.wait().expect("wait supervise");
+    assert!(
+        status.success(),
+        "{name}: supervise must exit 0 after the Python shutdown verb"
+    );
+}
+
+#[test]
+fn test_python_client_execs_distinct_uids_on_shared_sticky_dir() {
+    root_phase_env_check();
+    let base = dac_tmp_dir("b-py");
+
+    let shared = base.join("shared");
+    std::fs::create_dir_all(&shared).expect("create shared dir");
+    chmod_dir(&shared, 0o1777);
+    let evidence = base.join("evidence");
+    std::fs::create_dir_all(&evidence).expect("create evidence dir");
+    chmod_dir(&evidence, 0o1777);
+
+    let tag = format!("f16-{}", std::process::id());
+    let token_x = format!("{tag}-x");
+    run_f16_slot(
+        UID_X,
+        &base,
+        &shared,
+        &evidence,
+        &format!("{tag}-x"),
+        &token_x,
+        X_WORKLOAD,
+    );
+
+    let x_file = shared.join("x.txt");
+    let meta = std::fs::metadata(&x_file).expect("host-side stat of X's mediated file");
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        meta.uid(),
+        UID_X,
+        "F16 python client: the exec'd create must run as supervisor uid X \
+         (the sandbox host uid); got uid {}",
+        meta.uid()
+    );
+    assert_eq!(
+        meta.mode() & 0o7777,
+        0o644,
+        "F16 python client: X's own chmod must take effect on its file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(evidence.join("x-done")).expect("read x-done"),
+        "created\n"
+    );
+
+    let token_y = format!("{tag}-y");
+    run_f16_slot(
+        UID_Y,
+        &base,
+        &shared,
+        &evidence,
+        &format!("{tag}-y"),
+        &token_y,
+        Y_WORKLOAD,
+    );
 
     let report: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(evidence.join("y-report.json")).expect("read Y report"),
