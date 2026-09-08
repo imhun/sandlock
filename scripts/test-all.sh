@@ -83,6 +83,14 @@ run() {  # run <label> <command...>
     log="tmp/test-all-$label.log"
     rcfile="tmp/test-all-$label.rc"
     printf '==> %s\n' "$label"
+    # FUP-09: keep the first red log. Rerunning over the same name would make
+    # the discipline (`-r1.log` then `-final.log`) a memory; rotate instead.
+    n=1
+    while [ -e "tmp/$label-r$n.log" ]; do n=$((n + 1)); done
+    if [ -e "$log" ]; then
+        mv "$log" "tmp/$label-r$n.log"
+        printf '    previous %s log archived as tmp/%s-r%s.log\n' "$label" "$label" "$n"
+    fi
     # sandlock's checkpoint/restore reopens a checkpointed child's stdio by
     # path, so a suite whose stdout is a plain file would hand that file to the
     # sandboxed child; the restored process then cannot reopen it (outside the
@@ -124,6 +132,16 @@ mode="${1:-}"
 case "$mode" in
     ""|--wheels|--oci-root|--supervise-root|--mediation-2uid) ;;
     *) printf 'usage: %s [--wheels|--oci-root|--supervise-root|--mediation-2uid]\n' "$0" >&2; exit 2 ;;
+esac
+
+# FUP-17: the root phases share target-linux with the uid-65534 phase. Cargo's
+# incremental artifacts are owned by the uid that produced them, so a root run
+# either cannot rewrite them or reads an index the other uid wrote -- a stale-cache
+# false red that looks exactly like a code regression. Dropping incremental
+# compilation for the root phases costs only our own crates' re-codegen (deps
+# still come from the shared cache) and removes that whole class.
+case "$mode" in
+    --oci-root|--supervise-root|--mediation-2uid) export CARGO_INCREMENTAL=0 ;;
 esac
 
 if [ "${SANDBOX_TEST_ALL_ALLOW_ROOT:-0}" != "1" ]; then
