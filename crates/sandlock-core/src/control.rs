@@ -1460,13 +1460,19 @@ pub fn channel_request(
     channel_request_with_fds(stream, token, verb, args, &[])
 }
 
+/// Default response deadline for a client-side control request (the
+/// one-shot/registered transports: a wedged server must not hang the caller).
+pub const CHANNEL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Worker/client side of a control channel with SCM_RIGHTS fd delivery (the
 /// F3.2 `exec` verb): send one verb with the channel token attached and up to
 /// three stdio fds, and return the parsed response. Header + body + fds are
 /// written in **one** `sendmsg` so the fds bind to the request frame
 /// (fdpass semantics); plain verbs call this with an empty fd slice.
-/// Sets 2-second read/write timeouts so a wedged server cannot hang the
-/// caller.
+/// Applies [`CHANNEL_REQUEST_TIMEOUT`] so a wedged server cannot hang the
+/// caller; a session that legitimately serves a long verb (transport 1's
+/// `wait_child` on a live child) chooses its own deadline through
+/// [`channel_request_with_fds_timeout`].
 pub fn channel_request_with_fds(
     stream: &mut std::os::unix::net::UnixStream,
     token: &str,
@@ -1474,11 +1480,38 @@ pub fn channel_request_with_fds(
     args: serde_json::Value,
     fds: &[std::os::fd::RawFd],
 ) -> Result<ControlResponse, String> {
+    channel_request_with_fds_timeout(
+        stream,
+        token,
+        verb,
+        args,
+        fds,
+        Some(CHANNEL_REQUEST_TIMEOUT),
+    )
+}
+
+/// [`channel_request_with_fds`] with an explicit response deadline
+/// (`None` = block until the peer answers or the connection dies).
+///
+/// The deadline is per request, not per handle: transport 1 keeps **one**
+/// persistent stream for the whole generation, so the same connection carries
+/// instant verbs (`stats`, `kill_child`) and verbs that legitimately wait as
+/// long as a child runs (`wait_child`). A fixed 2 s cap would turn the latter
+/// into a spurious "server closed without a response" and make the holder
+/// believe its own generation had died.
+pub fn channel_request_with_fds_timeout(
+    stream: &mut std::os::unix::net::UnixStream,
+    token: &str,
+    verb: &str,
+    args: serde_json::Value,
+    fds: &[std::os::fd::RawFd],
+    timeout: Option<std::time::Duration>,
+) -> Result<ControlResponse, String> {
     stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .set_read_timeout(timeout)
         .map_err(|e| format!("set_read_timeout: {}", e))?;
     stream
-        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+        .set_write_timeout(timeout)
         .map_err(|e| format!("set_write_timeout: {}", e))?;
 
     let req = ControlRequest {

@@ -3613,9 +3613,90 @@ pub struct sandlock_supervise_t {
     _private: SuperviseClient,
 }
 
-struct SuperviseClient {
-    sock_path: String,
+/// Worker-side client for one supervise generation. Both route-B transports
+/// share the verb contract; [`sandlock_supervise_request`] dispatches on the
+/// shape:
+///
+/// * `Registered` (transport 2) — the slot's hashed registry socket path plus
+///   the channel token, one fresh connection per verb.
+/// * `HandedOver` (transport 1, F17) — the worker end of the launcher's
+///   `socketpair()`, held for the life of the generation. The descriptor *is*
+///   the credential (the token is the optional belt), so the token may be
+///   absent and no path ever exists.
+enum SuperviseClient {
+    Registered {
+        sock_path: String,
+        token: String,
+    },
+    HandedOver {
+        session: std::sync::Mutex<HandedOverSession>,
+    },
+}
+
+/// One transport-1 session: a persistent stream plus its per-request response
+/// deadline.
+///
+/// The mutex guards the *frame stream*, not just the fd: every verb is
+/// length-prefixed on a single connection, so two client threads must never
+/// interleave a `sendmsg` with a `recvmsg`. And once any request fails mid
+/// flight the stream is dropped rather than reused -- a half-read response
+/// would otherwise make the next request return someone else's answer.
+struct HandedOverSession {
+    stream: Option<std::os::unix::net::UnixStream>,
     token: String,
+    /// `None` = block until the peer answers or the connection dies.
+    timeout: Option<Duration>,
+}
+
+/// Validate a handed-over control descriptor before taking it: open,
+/// `SOCK_STREAM`, `AF_UNIX` (the same fail-safe the supervise binary applies
+/// in `check_control_fd`, so a launcher that wired up the wrong fd learns it
+/// here rather than after a generation has started).
+fn check_supervise_control_fd(fd: std::os::fd::RawFd) -> Result<(), String> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(format!(
+            "control fd {fd} is not open: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let probe = |opt: libc::c_int, name: &str| -> Result<libc::c_int, String> {
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                &mut value as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            // A pipe, a regular file or a socket that is not a stream fails
+            // the query outright (ENOTSOCK/ENOPROTOOPT), which is the common
+            // launcher mistake -- name it as "not a socket" instead of
+            // leaking a bare getsockopt error code.
+            if err.raw_os_error() == Some(libc::ENOTSOCK) {
+                return Err(format!("control fd {fd} is not a socket"));
+            }
+            return Err(format!("control fd {fd}: getsockopt({name}) failed: {err}"));
+        }
+        Ok(value)
+    };
+    if probe(libc::SO_TYPE, "SO_TYPE")? != libc::SOCK_STREAM {
+        return Err(format!(
+            "control fd {fd} is a socket but not SOCK_STREAM"
+        ));
+    }
+    let domain = probe(libc::SO_DOMAIN, "SO_DOMAIN")?;
+    if domain != libc::AF_UNIX {
+        return Err(format!(
+            "control fd {fd} is an AF_{domain} stream socket, not AF_UNIX: the fd              transport serves the worker end of a unix socketpair"
+        ));
+    }
+    Ok(())
 }
 
 /// Shared error path for the supervise client exports: set `*err` to -1 and,
@@ -3684,26 +3765,166 @@ pub unsafe extern "C" fn sandlock_supervise_connect(
         *err = 0;
     }
     Box::into_raw(Box::new(sandlock_supervise_t {
-        _private: SuperviseClient {
+        _private: SuperviseClient::Registered {
             sock_path: path.to_string(),
             token: token.to_string(),
         },
     }))
 }
 
-/// Issue one verb on a registered slot: connect by the handle's socket path,
-/// attach the channel token, hand over `n_fds` descriptors (empty for every
-/// verb but `exec`, which needs exactly three), and return the serialized
-/// `ControlResponse` JSON (`{"v":1,"ok":...,"data":...,"err":...}`) as a C
-/// string the caller frees with [`sandlock_string_free`]. A refused connect,
-/// transport error or unparseable `args_json` sets `*err` to -1 and
-/// `*err_msg`; an `ok:false` server response still returns JSON with `*err`
-/// 0 — the caller inspects `ok`.
+/// Validate a transport-1 (fd handoff) control descriptor: it must be open, a
+/// `SOCK_STREAM` socket and `AF_UNIX`. Returns null when the fd is usable and
+/// a heap message (free with [`sandlock_string_free`)) naming the problem
+/// otherwise, so a launcher can pre-flight the handoff before it starts a
+/// generation.
 ///
 /// # Safety
-/// `h` must be a valid handle from [`sandlock_supervise_connect`]; `verb` and
-/// `args_json` must be valid NUL-terminated C strings; when `n_fds > 0`,
-/// `fds` must point to `n_fds` valid file descriptors.
+/// `fd` may be any integer; only `-1` or a valid descriptor is accepted.
+#[no_mangle]
+pub extern "C" fn sandlock_supervise_check_fd(fd: c_int) -> *mut c_char {
+    match check_supervise_control_fd(fd) {
+        Ok(()) => ptr::null_mut(),
+        Err(msg) => match CString::new(msg) {
+            Ok(c) => c.into_raw(),
+            Err(_) => ptr::null_mut(),
+        },
+    }
+}
+
+/// Worker-side client for a **handed-over** control descriptor (route B
+/// transport 1, F17): the launcher creates a `socketpair()`, keeps one end,
+/// and hands the other to the slot as `--control-fd N --serve`. This call
+/// takes a private dup of `fd` (the caller keeps its own) and remembers it as
+/// a persistent session; `token` may be null or empty because the descriptor
+/// is already the credential.
+///
+/// # Safety
+/// `fd` must be a valid AF_UNIX `SOCK_STREAM` descriptor; `token` may be null,
+/// otherwise must be a valid NUL-terminated C string. `err` and `err_msg` may
+/// both be null.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_supervise_connect_fd(
+    fd: c_int,
+    token: *const c_char,
+    err: *mut c_int,
+    err_msg: *mut *mut c_char,
+) -> *mut sandlock_supervise_t {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    if !err_msg.is_null() {
+        *err_msg = ptr::null_mut();
+    }
+    let token_str: &str = if token.is_null() {
+        ""
+    } else {
+        match CStr::from_ptr(token).to_str() {
+            Ok(t) => t,
+            Err(_) => {
+                supervise_ffi_fail(
+                    err,
+                    err_msg,
+                    "sandlock_supervise_connect_fd: token is not UTF-8",
+                );
+                return ptr::null_mut();
+            }
+        }
+    };
+    if let Err(msg) = check_supervise_control_fd(fd) {
+        supervise_ffi_fail(err, err_msg, &msg);
+        return ptr::null_mut();
+    }
+    let dup = unsafe { libc::dup(fd) };
+    if dup < 0 {
+        supervise_ffi_fail(
+            err,
+            err_msg,
+            &format!("dup control fd {fd}: {}", std::io::Error::last_os_error()),
+        );
+        return ptr::null_mut();
+    }
+    let owned = unsafe { <OwnedFd as FromRawFd>::from_raw_fd(dup) };
+    let stream = std::os::unix::net::UnixStream::from(owned);
+    if !err.is_null() {
+        *err = 0;
+    }
+    Box::into_raw(Box::new(sandlock_supervise_t {
+        _private: SuperviseClient::HandedOver {
+            session: std::sync::Mutex::new(HandedOverSession {
+                stream: Some(stream),
+                token: token_str.to_string(),
+                // Fail-fast by default, like the registered transport; a
+                // holder that means to park (wait_child) opts out through
+                // sandlock_supervise_set_timeout(h, 0).
+                timeout: Some(sandlock_core::control::CHANNEL_REQUEST_TIMEOUT),
+            }),
+        },
+    }))
+}
+
+/// Set the per-request response deadline of a transport-1 session
+/// (`0` = block until the slot answers; a fresh session starts on the
+/// registered transport's default deadline so a wedged slot cannot hang the
+/// caller by accident). One stream carries both the instant verbs and a
+/// `wait_child` that parks for the life of a child, so the holder owns that
+/// choice. Registered-path handles reject this (`*err` = -1): they open a
+/// fresh connection per verb with the default deadline.
+///
+/// # Safety
+/// `h` must be a valid handle from a `sandlock_supervise_connect*` call;
+/// `err` and `err_msg` may be null.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_supervise_set_timeout(
+    h: *mut sandlock_supervise_t,
+    timeout_ms: u64,
+    err: *mut c_int,
+    err_msg: *mut *mut c_char,
+) -> c_int {
+    if !err_msg.is_null() {
+        *err_msg = ptr::null_mut();
+    }
+    if h.is_null() {
+        supervise_ffi_fail(err, err_msg, "sandlock_supervise_set_timeout: null handle");
+        return -1;
+    }
+    match &(*h)._private {
+        SuperviseClient::HandedOver { session } => {
+            let mut guard = session.lock().unwrap_or_else(|e| e.into_inner());
+            guard.timeout = if timeout_ms == 0 {
+                None
+            } else {
+                Some(Duration::from_millis(timeout_ms))
+            };
+            if !err.is_null() {
+                *err = 0;
+            }
+            0
+        }
+        SuperviseClient::Registered { .. } => {
+            supervise_ffi_fail(
+                err,
+                err_msg,
+                "sandlock_supervise_set_timeout: the registered transport opens one \
+                 connection per verb and always uses the default deadline",
+            );
+            -1
+        }
+    }
+}
+
+/// Issue one verb on a supervise generation: on a registered handle, connect
+/// by the handle's socket path; on a handed-over handle, send on the
+/// persistent session stream (F17). Either way the call attaches the channel
+/// token, hands over `n_fds` descriptors (empty for every verb but `exec`,
+/// which needs exactly three), and returns the serialized `ControlResponse`
+/// JSON (`{"v":1,"ok":...,"data":...,"err":...}`) as a C string the caller
+/// frees with [`sandlock_string_free`]. A refused connect, transport error or
+/// unparseable `args_json` sets `*err` to -1 and `*err_msg`; an `ok:false`
+/// server response still returns JSON with `*err` 0 -- the caller inspects
+/// `ok`.
+///
+/// # Safety
+/// `h` must be a valid handle from a `sandlock_supervise_connect*` call;
+/// `verb` and `args_json` must be valid NUL-terminated C strings; when
+/// `n_fds > 0`, `fds` must point to `n_fds` valid file descriptors.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_supervise_request(
     h: *mut sandlock_supervise_t,
@@ -3757,19 +3978,51 @@ pub unsafe extern "C" fn sandlock_supervise_request(
     let fd_slice: &[c_int] = if n_fds == 0 {
         &[]
     } else if fds.is_null() {
-        supervise_ffi_fail(err, err_msg, "sandlock_supervise_request: n_fds > 0 but fds is null");
+        supervise_ffi_fail(
+            err,
+            err_msg,
+            "sandlock_supervise_request: n_fds > 0 but fds is null",
+        );
         return ptr::null_mut();
     } else {
         std::slice::from_raw_parts(fds, n_fds)
     };
-    let client = &(*h)._private;
-    match sandlock_core::control::registered_request(
-        std::path::Path::new(&client.sock_path),
-        &client.token,
-        verb,
-        args,
-        fd_slice,
-    ) {
+    let response = match &(*h)._private {
+        SuperviseClient::Registered { sock_path, token } => {
+            sandlock_core::control::registered_request(
+                std::path::Path::new(sock_path),
+                token,
+                verb,
+                args,
+                fd_slice,
+            )
+        }
+        SuperviseClient::HandedOver { session } => {
+            let mut guard = session.lock().unwrap_or_else(|e| e.into_inner());
+            // Copy the session's scalar state out first: `stream.as_mut()`
+            // borrows the guard mutably for the whole request.
+            let (token, timeout) = (guard.token.clone(), guard.timeout);
+            let Some(stream) = guard.stream.as_mut() else {
+                supervise_ffi_fail(
+                    err,
+                    err_msg,
+                    "control stream was lost by an earlier request that did not \
+                     complete; its frame alignment cannot be trusted, so the session \
+                     is closed rather than reused",
+                );
+                return ptr::null_mut();
+            };
+            let outcome = sandlock_core::control::channel_request_with_fds_timeout(
+                stream, &token, verb, args, fd_slice, timeout,
+            );
+            if outcome.is_err() {
+                // Drop the stream on any transport failure (see the struct doc).
+                guard.stream = None;
+            }
+            outcome
+        }
+    };
+    match response {
         Ok(resp) => match serde_json::to_vec(&resp) {
             Ok(bytes) => {
                 if !err.is_null() {

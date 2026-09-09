@@ -441,7 +441,16 @@ oci = 150     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root.
               # 56 lib + 68 bin + 15 integration.rs + 2 reaper + 3 process
               # groups = 144).
 cli_build = 0 # workspace release build gate (no test binaries; 0 = build passed)
-python = 455  # F16 (2026-09-08): 454 -> 455, +1
+python = 460  # F17 (2026-09-09): 455 -> 460, +5
+              # tests/test_supervise_channel.py -- the route-B transport-1
+              # (fd handoff) face: persistent session with no path and no token
+              # (argv keeps the secret out, SL-10), token belt still refuses a
+              # mismatch, `set_timeout` lets a `wait_child` park past the 2 s
+              # default, a failed verb retires the shared stream instead of
+              # mis-aligning it, and `check_control_fd` names a bad descriptor
+              # (also the SL-9 regression: a transport failure raises
+              # SandlockError with the server's text, never AttributeError).
+              # F16 (2026-09-08): 454 -> 455, +1
               # tests/test_supervise_channel.py (same-uid registered slot:
               # SuperviseChannel exec-with-SCM_RIGHTS + wait_child + stats +
               # shutdown; python face of the route-B client)
