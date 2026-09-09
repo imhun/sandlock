@@ -319,7 +319,7 @@ a refusal (exit ≠ 0, stderr naming both uids) — the same startup contract as
 Deleting or tampering with the supervise binary, the standalone copy, or the
 manifest goes red with the offending path/hash named.
 
-## 10. Language client access surface（F16，2026-09-08）
+## 10. Language client access surface（F16 registered / F17 fd handoff，2026-09-08/09）
 
 route-B 的 worker（E2B envd，Python）今天**当不了** registered-path 客户端：`exec`
 verb 的三端 stdio 必须随请求帧以 SCM_RIGHTS 交到 slot（`serve.rs` `handle_exec`），
@@ -336,21 +336,49 @@ verb 的三端 stdio 必须随请求帧以 SCM_RIGHTS 交到 slot（`serve.rs` `
     -> char*`：返回序列化的 `ControlResponse` JSON（`v/ok/data/err` 原样，
     调用方自己解析——客户端不做实例语义）。
   - `sandlock_supervise_free(h)`。
+- **F17 追加的 transport-1（fd handoff）面**（worker 需要一条已连好的 `UnixStream`，
+  此前只有 Rust）：
+  - `sandlock_supervise_connect_fd(fd, token, err, err_msg) -> void*`：取 `fd` 的私有
+    dup 作为**持久会话**（调用方保留自己那份）；`token` 可为 NULL —— 描述符就是凭证，
+    token 只是可选的第二层。
+  - `sandlock_supervise_check_fd(fd) -> char*|NULL`：交付前预检（必须是打开的
+    `AF_UNIX` `SOCK_STREAM`），失败返回点名消息，调用方 `sandlock_string_free` 释放。
+  - `sandlock_supervise_set_timeout(h, timeout_ms, err, err_msg) -> int`：单 verb 响应
+    deadline，`0` = 一直等；registered handle 拒绝（-1）——它每 verb 一条新连接。
+  - `sandlock_supervise_request` **签名不变**，按 handle 形状分派两条传输。
+  - Python：`SuperviseChannel(fd=..., token="", timeout_ms=...)` 与既有
+    `SuperviseChannel(path, token)` 共用 `.request()` / `.shutdown()` / `.close()`；
+    模块级 `check_control_fd(fd)`。
+  - 持久单流的两条纪律（都在 Rust 侧实现，不在语言层重做）：handle 内一把互斥锁串行
+    所有 verb（绝不在同一连接上交错帧）；任何 verb 失败即**退役会话**，后续调用返回
+    "frame alignment" 点名错误而不是冒用可能错位的响应。因此新会话默认仍是 fail-fast
+    的 2 s deadline，只有明确要 park 的调用方才 `set_timeout(0)`。
+  - 顺带修 **SL-9**：`_take_err_msg` 曾对 `ctypes.byref(...)` 取 `.contents`，于是
+    每个 transport 失败都抛 `AttributeError` 并吞掉服务端文本；现在按地址读取/释放，
+    失败一律是带文本的 `SandlockError`。
 - **Python**：`sandlock.supervise.SuperviseChannel(path=..., token=...)`，
   `.request(verb, *, args=None, fds=()) -> dict`（ctypes 薄包装）；`exec` 的
   `fds` 必须是恰好 3 个 `[stdin, stdout, stderr]` 的 child 端；传输/协议错误翻成
   `exceptions.py` 的既有异常（connect/transport → `SandlockError`，非 ok 响应 →
   `SandboxError` 带服务端 err 文本）。`shutdown()` 便捷方法。
-- **明确不做（本小节边界）**：不在 F16 里加实例语义——`exec`/`wait_child`/
-  `kill_child` 的 verb 语义由服务端（Generation/handle_*）定义，客户端只做
-  「发一请求、收一响应、附上要交的 fd」；不做 fd-handoff（transport 1）的
-  语言面（worker 需要一条已建好的 UnixStream，部署面用 Rust/既有脚本）；不
-  给 registry 协议加版本门（wire 版本与 init 帧协议 `FRAME_VERSION` 无关）。
-- **两条部署约束（会咬人，接线前必读）**：
-  1. `sun_path` 108 字节上限：registered registry 根路径过长会让 slot 假失败
-     （fork 门禁自己踩过，`scripts/test-all.sh:12-20`）——E2B 侧 registry 根
-     路径长度要进部署检查表；
-  2. **一 uid = 一个 supervise = 一代沙箱**：槽位复用只能靠**重启进程**
+- **明确不做（本小节边界）**：不在语言层加实例语义——`exec`/`wait_child`/`kill_child`
+  的 verb 语义由服务端（Generation/handle_*）定义，客户端只做「发一请求、收一响应、附上要交的 fd」；
+  不给 registry 协议加版本门（wire 版本与 init 帧协议 `FRAME_VERSION` 无关）；
+  语言层也不复制一套 deadline/串行逻辑（都压在 Rust handle 里，两条传输共用）。
+  ~~不做 fd-handoff（transport 1）的语言面~~ —— F17 已补（见上），因为 registered
+  形态要求把 channel token 放进槽位 argv，而 `/proc/<pid>/cmdline`(0444) 本机任意 uid
+  可读（见下第 1 条约束的更正）。
+- **三条部署约束（会咬人，接线前必读）**：
+  1. `sun_path` 108 字节上限：**registered 形态独有**——registry 根路径过长会让 slot
+     假失败（fork 门禁自己踩过，`scripts/test-all.sh:12-20`）。transport 1（F17 fd
+     handoff）不创建任何 socket 路径，该约束对它不适用；
+  2. **token 出现在 argv 里就是暴露**（2026-09-09 实测更正本文件早先的相反判断）：
+     `/proc/<pid>/cmdline` 是 0444 且**不走** `ptrace_may_access` 门（`environ` 才是
+     0400），所以 `--serve-path --token T` 的槽位对本机任意 uid 可读，`ps`/coredump/
+     审计日志同理。registered 形态今天没成为攻击面，只因鉴权顺序是
+     ①`SO_PEERCRED` ∈ `--peer-uid` ②token —— 实测非白名单 uid 带**正确** token 也被
+     静默关连接。结论：`--peer-uid` 只能含 worker uid，且能用 transport 1 就用 transport 1。
+  3. **一 uid = 一个 supervise = 一代沙箱**：槽位复用只能靠**重启进程**
      （§6）；uid 复用窗口 = 同时在世槽数 N。E2B 的 per-sandbox uid 池
      （`envd_service/uid_pool.py`）必须先选 W1/W2 之一再接线（见主仓库
      task-backlog #5 / 本计划 Task 9 Step 5）。

@@ -1,4 +1,4 @@
-# CHANGELOG — sandlock fork（fork-plan-2026-09，F0–F12）
+# CHANGELOG — sandlock fork（fork-plan-2026-09，F0–F17）
 
 > 范围：`upstream-pr/netns-free-clean`（本地提交，未推送）。本文件以 release-note 语义
 > 汇总 fork-plan F0–F12（2026-09-04/06）的特性、修复与**用户可见行为变化**；每条可追溯到
@@ -7,6 +7,32 @@
 > E2B 集成状态见 `docs/e2b-integration.md`。
 
 ## 行为变化（升级 / 接线前必读）
+
+- **route-B transport 1 的语言面 + 客户端错误分支修复（F17，2026-09-09）**：F16 只把
+  registered-path（transport 2）暴露给 C/Python，fd handoff（transport 1）仍只有 Rust
+  （worker 需要一条已连好的 `UnixStream`）。E2B 接线 route B 时实测出这条缺口为何要紧：
+  registered 形态的 channel token 只能经 `--token` **argv** 提供，而
+  `/proc/<pid>/cmdline` 是 0444 且**不受 ptrace 门约束**（`environ` 才 0400）⇒ 本机任意
+  uid 都能读到别人槽位的 token 与 socket 路径（当前仅被 `--peer-uid` 白名单兜住）。
+  **新增 C ABI**：`sandlock_supervise_connect_fd(fd, token, err, err_msg)`（取 fd 的私有
+  dup 作为**持久会话**；`token` 可为 NULL——描述符本身就是凭证）、
+  `sandlock_supervise_check_fd(fd)`（交付前预检：非 socket / 非 SOCK_STREAM / 非 AF_UNIX
+  点名拒绝）、`sandlock_supervise_set_timeout(h, timeout_ms, err, err_msg)`
+  （`0` = 一直等到槽位回答）。`sandlock_supervise_request` 不改签名，按 handle 形状分派。
+  **Python**：`SuperviseChannel(fd=..., token="", timeout_ms=...)`（与
+  `SuperviseChannel(path, token)` 同一 `.request()` 面）、模块级 `check_control_fd(fd)`。
+  **持久单流的两条纪律**：会话由 handle 内的锁串行（绝不让两个线程在同一连接上交错帧）；
+  任何 verb 失败即**退役**该会话（后续调用点名 "frame alignment"，不再冒用可能错位的响应），
+  所以新通道默认仍是 fail-fast 的 2 s deadline，只有明确要 park 的调用方（`wait_child`
+  等一个活着的子进程）才 `set_timeout(0)`。**修 SL-9**：`_take_err_msg` 过去对
+  `ctypes.byref(...)` 取 `.contents` ⇒ 每个 transport 失败都抛
+  `AttributeError: '_ctypes.CArgObject' object has no attribute 'contents'` 并吞掉服务端
+  文本；现在按地址读取并释放，失败一律是带文本的 `SandlockError`。**用户可见**：FFI 动态
+  符号 159 → 162；registered 路径行为不变（每 verb 一条新连接、固定默认 deadline）；
+  `python` 基线 455 → 460（+5，`test_supervise_channel.py` 的 fd-handoff 用例）。
+  envd 侧由此把 route-B 槽位的 token 与 socket 路径从 argv/`/tmp` 彻底拿掉（E2B
+  `E2B_ROUTE_B_TRANSPORT` 默认 `fd`），并顺带获得「worker 崩溃 ⇒ 通道 EOF ⇒ 槽位按
+  `finish()` 异常收口自杀」的生命周期保证。
 
 - **route-B worker 侧客户端暴露给 C 与 Python（F16，2026-09-08）**：registered-path
   槽位（`sandlock-supervise --serve-path NAME --token T [--peer-uid UID]...`）的
