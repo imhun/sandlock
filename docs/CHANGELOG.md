@@ -34,6 +34,16 @@
   `E2B_ROUTE_B_TRANSPORT` 默认 `fd`），并顺带获得「worker 崩溃 ⇒ 通道 EOF ⇒ 槽位按
   `finish()` 异常收口自杀」的生命周期保证。
 
+- **F17 附带硬化：控制描述符的 `FD_CLOEXEC`（同文件 `serve_control_fd`）**：fd handoff
+  要求 launcher 清掉 `FD_CLOEXEC` 描述符才能跨 `exec` 存活；若 supervise 不再置回，
+  主管**自己的**控制端就可能被 `sandlock-init` 及其子进程继承 —— SL-4 同族（沙箱内进程读到
+  发给 worker 的帧、含 SCM_RIGHTS 的 stdio 描述符；并会把连接吊住，使这一代沙箱熬死 worker）。
+  本树实测：core 交给 init 的是显式 fd 集合，**未观察到泄漏**（把 fix 前后都跑过一遍，
+  `/proc/<stats.pid>/fd` 比对结果相同），因此这是**护栏**而非 bug 复现：仍在 launch 前无条件
+  `fcntl(F_SETFD, FD_CLOEXEC)`，并用 fork python 用例把不变量钉住（比对 worker 端 socket
+  inode）。附带收益：worker 崩溃后槽位按 EOF 走 `finish()` 异常收口（E2B 侧契约
+  `test_worker_death_ends_the_generation` 实测槽位退出）。
+
 - **route-B worker 侧客户端暴露给 C 与 Python（F16，2026-09-08）**：registered-path
   槽位（`sandlock-supervise --serve-path NAME --token T [--peer-uid UID]...`）的
   worker 面此前只有 Rust（`channel_request_with_fds`；`connect_and_request` 不带 fd）。

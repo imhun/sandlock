@@ -661,6 +661,22 @@ pub fn serve_control_fd(
     // socketpair.  Taking ownership is correct for the serve duration: this
     // process exits right after serving.
     let stream = unsafe { UnixStream::from_raw_fd(control_fd) };
+    // Put `FD_CLOEXEC` back before anything is launched.  The launcher had to
+    // clear it so the descriptor would survive its own `exec`, and leaving it
+    // cleared leaks the supervisor's control endpoint into `sandlock-init` and
+    // therefore into every workload process it spawns -- the SL-4 class: a
+    // confined process would hold the same socket the worker frames its
+    // `exec`/`wait_child` requests on (reading frames addressed to the worker,
+    // including the SCM_RIGHTS stdio descriptors), and it would also pin the
+    // connection open so the generation outlives a dead worker instead of
+    // tearing itself down on EOF.  The flag is per descriptor, so the worker's
+    // own end is untouched.
+    if unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(format!(
+            "set FD_CLOEXEC on the handed-over control fd: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
     let mut generation = Generation::new(policy, program)?;
     let outcome = serve_fd_connection(stream, expected_token, &mut generation);
     generation.finish(outcome)

@@ -297,6 +297,53 @@ def test_fd_handoff_channel_runs_verbs_with_no_path_no_token(tmp_path: Path) -> 
             proc.wait()
 
 
+def test_control_fd_does_not_leak_into_the_confined_tree(tmp_path: Path) -> None:
+    """Invariant: the confined `sandlock-init` must not hold the supervisor's
+    control endpoint.
+
+    Why it matters: a workload-visible copy of that socket could read the
+    frames addressed to the worker (including the SCM_RIGHTS stdio ends) and
+    would pin the connection open past a dead worker -- the SL-4 class of
+    inherited-control-fd bugs. Supervise now re-sets `FD_CLOEXEC` on the
+    handed-over descriptor before launching (serve.rs), so the property holds
+    regardless of how the launcher cleared it. Measured 2026-09-09: the fd
+    table was already clean before that change (core hands `sandlock-init` an
+    explicit fd set), so this test is a *guard*, not a bug reproduction; it
+    pins the property so neither side can regress into the leak silently.
+
+    Both ends of a `socketpair()` share one socket inode, which is what makes
+    the check exact.
+    """
+    proc, worker = _spawn_fd_slot(tmp_path)
+    inode = os.fstat(worker.fileno()).st_ino
+    try:
+        with SuperviseChannel(fd=worker.fileno()) as channel:
+            stats = channel.request("stats")
+            assert stats["launched"] is True, stats
+            init_pid = stats["pid"]
+            leaked = []
+            fd_dir = Path(f"/proc/{init_pid}/fd")
+            for entry in fd_dir.iterdir():
+                try:
+                    target = os.readlink(fd_dir / entry.name)
+                except OSError:
+                    continue
+                if target == f"socket:[{inode}]":
+                    leaked.append(entry.name)
+            assert leaked == [], (
+                f"the confined init (pid {init_pid}) inherited the control "
+                f"socket on fd(s) {leaked}"
+            )
+            # The instance control dir must still be functional: the leak fix
+            # must not cost the session its own init channel.
+            assert channel.request("stats")["instance_state"] == "Live"
+    finally:
+        worker.close()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
 def test_fd_handoff_token_belt_refuses_a_mismatch(tmp_path: Path) -> None:
     """A token is optional on this transport, but when the slot was given one
     the belt still has to hold: a client that presents a different token is

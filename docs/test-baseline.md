@@ -441,7 +441,7 @@ oci = 150     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root.
               # 56 lib + 68 bin + 15 integration.rs + 2 reaper + 3 process
               # groups = 144).
 cli_build = 0 # workspace release build gate (no test binaries; 0 = build passed)
-python = 460  # F17 (2026-09-09): 455 -> 460, +5
+python = 461  # F17 (2026-09-09): 455 -> 461, +6
               # tests/test_supervise_channel.py -- the route-B transport-1
               # (fd handoff) face: persistent session with no path and no token
               # (argv keeps the secret out, SL-10), token belt still refuses a
@@ -450,6 +450,9 @@ python = 460  # F17 (2026-09-09): 455 -> 460, +5
               # mis-aligning it, and `check_control_fd` names a bad descriptor
               # (also the SL-9 regression: a transport failure raises
               # SandlockError with the server's text, never AttributeError).
+              # +1: the handed-over control fd stays out of the confined init's fd
+              # table (SL-4-class guard; measured clean before the FD_CLOEXEC restore,
+              # pinned so neither side can regress silently).
               # F16 (2026-09-08): 454 -> 455, +1
               # tests/test_supervise_channel.py (same-uid registered slot:
               # SuperviseChannel exec-with-SCM_RIGHTS + wait_child + stats +
