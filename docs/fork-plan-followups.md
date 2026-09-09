@@ -288,7 +288,8 @@
   读循环用纯函数 `take_frame_fds` 按声明从读单元队列切分（不符 ⇒ 整读单元拒绝）；
   fork 提交 `c50f407`（RED）/ `8640223`（fix）/ `3020ea0`（docs）；门禁与 wheel 见
   `docs/CHANGELOG.md` F15 条目与 `docs/e2b-integration.md` §5 终态行。候选补丁存档
-  `tmp/sdd/fup23-wip-frame-fd-count.patch` 保留作历史（取证残留清理等用户确认）。
+  （`tmp/sdd/fup23-wip-frame-fd-count.patch` 及 E2B 侧副本）已按用户确认清理
+  （2026-09-09），不再保留。
 
   复现与取证（供修复会话直接接手）：
   - 判别条件：`tmp/f11_fdcount_probe.py`（E2B 仓库，main `8ae1a40`）在跑
