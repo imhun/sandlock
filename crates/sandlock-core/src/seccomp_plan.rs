@@ -585,6 +585,45 @@ pub(crate) fn arg_filters_resolved(resolved: &ResolvedSandbox) -> Vec<SockFilter
     insns.push(jump(BPF_JMP | BPF_JSET | BPF_K, CLONE_NS_FLAGS as u32, 0, 1));
     insns.push(stmt(BPF_RET | BPF_K, ret_errno));
 
+    // --- mknod / mknodat: block *device* nodes, keep FIFOs ---
+    // Inside its own user namespace the sandbox holds CAP_MKNOD (F18 makes the
+    // in-guest identity match a privileged supervisor's), so it could create a
+    // block/char node in a writable directory and open it -- raw device access
+    // that in practice is stopped only by the runtime's device cgroup, which a
+    // plain process has no reason to have configured. `mkfifo()` is the *same*
+    // syscall with S_IFIFO and workloads genuinely need it, so filter on the
+    // file-type bits instead of the syscall name.
+    // Layout per call (mode arg): LD NR, JEQ ->+0/skip 6, LD mode, AND S_IFMT,
+    //   JEQ S_IFBLK ->+0/skip 1, RET ERRNO, JEQ S_IFCHR ->+0/skip 1, RET ERRNO.
+    // The legacy `mknod` entry exists on x86_64 but not on aarch64, and its
+    // mode is arg1 there; `mknodat` is the one glibc actually calls.
+    let mut mknod_arms: Vec<(u32, u32)> = Vec::new();
+    if let Some(nr) = arch::sys_mknod() {
+        mknod_arms.push((nr as u32, OFFSET_ARGS1_LO));
+    }
+    mknod_arms.push((libc::SYS_mknodat as u32, OFFSET_ARGS2_LO));
+    for (nr_mknod, mode_offset) in mknod_arms {
+        insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR));
+        insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr_mknod, 0, 6));
+        insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, mode_offset));
+        insns.push(stmt(BPF_ALU | BPF_AND | BPF_K, libc::S_IFMT as u32));
+        insns.push(jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            libc::S_IFBLK as u32,
+            0,
+            1,
+        ));
+        insns.push(stmt(BPF_RET | BPF_K, ret_errno));
+        // A still holds the masked file type, so the second test needs no reload.
+        insns.push(jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            libc::S_IFCHR as u32,
+            0,
+            1,
+        ));
+        insns.push(stmt(BPF_RET | BPF_K, ret_errno));
+    }
+
     // --- ioctl: block dangerous commands ---
     // Block terminal injection (TIOCSTI, TIOCLINUX) and network interface
     // enumeration ioctls (SIOCGIF*, SIOCETHTOOL) to complement NETLINK_ROUTE

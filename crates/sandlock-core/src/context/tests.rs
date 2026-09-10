@@ -335,6 +335,46 @@ fn test_arg_filters_has_clone_ioctl_prctl_socket() {
 }
 
 #[test]
+fn test_arg_filters_block_device_nodes_but_not_fifos() {
+    use crate::sys::structs::{BPF_ALU, BPF_AND, BPF_JEQ, BPF_JMP, BPF_K};
+    let policy = Sandbox::builder().build().unwrap();
+    let filters = arg_filters(&policy);
+    let compares = |k: u32| {
+        filters
+            .iter()
+            .any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K) && f.k == k)
+    };
+    // Device nodes are denied by file-type, not by syscall name: inside its own
+    // user namespace the sandbox holds CAP_MKNOD (F18), and a block/char node it
+    // creates could then be opened for raw device access -- which in practice
+    // only the runtime's device cgroup stops.
+    assert!(compares(libc::SYS_mknodat as u32), "mknodat must be filtered");
+    assert!(compares(libc::S_IFBLK as u32), "block devices must be denied");
+    assert!(
+        compares(libc::S_IFCHR as u32),
+        "character devices must be denied"
+    );
+    // `mkfifo()` is the *same* syscall with S_IFIFO, and workloads legitimately
+    // use it, so the filter must not reach for the other file types.
+    assert!(
+        !compares(libc::S_IFIFO as u32),
+        "FIFOs must stay creatable (mkfifo shares mknodat)"
+    );
+    assert!(
+        !compares(libc::S_IFSOCK as u32),
+        "socket file type must not be part of the deny"
+    );
+    let masks = filters
+        .iter()
+        .filter(|f| f.code == (BPF_ALU | BPF_AND | BPF_K) && f.k == libc::S_IFMT as u32)
+        .count();
+    assert!(
+        (1..=2).contains(&masks),
+        "one mask per filtered entry (mknodat, plus legacy mknod where it exists), got {masks}"
+    );
+}
+
+#[test]
 fn test_arg_filters_raw_sockets() {
     use crate::sys::structs::{BPF_ALU, BPF_AND, BPF_JEQ, BPF_JMP, BPF_K};
     // Raw sockets are blocked by default: no `icmp-raw://*` rule.

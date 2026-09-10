@@ -36,7 +36,11 @@
 # test_instance_chroot.rs non-root same-uid exec-only acceptance) and +3
 # mediation_2uid (root RunAs(10000)/uid0 restrictive-cache acceptance) —
 # logs tmp/sdd/f10-*.
-core_lib = 841 # F15 (2026-09-08): 837 -> 841, +4 fd_assignment_tests in
+core_lib = 842 # F18 (2026-09-09): 841 -> 842, +1 device-node-vs-FIFO arg-filter
+              # test (mknod/mknodat filtered on S_IFBLK|S_IFCHR so CAP_MKNOD inside
+              # the sandbox's own userns cannot mint raw-device nodes, while
+              # mkfifo -- the same syscall with S_IFIFO -- keeps working).
+              # F15 (2026-09-08): 837 -> 841, +4 fd_assignment_tests in
                # init/mod.rs pinning per-frame descriptor ownership (a zero-fd
                # frame cannot shift the next exec's stdio, two execs split one
                # queue in order, a short queue fails closed without consuming,

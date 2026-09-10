@@ -195,7 +195,7 @@ fn run(cli: Cli) -> Result<()> {
     //    applies a timeout and a hard size cap so a stuck or oversized
     //    startup document cannot hang or silently truncate.
     let bytes = read_document(&cli.policy).context("policy read failed")?;
-    let sandbox = sandlock_supervise::policy::validate(&bytes)
+    let mut sandbox = sandlock_supervise::policy::validate(&bytes)
         .map_err(|e| anyhow::anyhow!("policy rejected: {e}"))?;
 
     // 3. Optional workload program spec (launch-first; parse failures name
@@ -210,6 +210,20 @@ fn run(cli: Cli) -> Result<()> {
         }
         None => None,
     };
+    // F18: an unprivileged mediator *is* the sandbox uid, so the privileged
+    // `0 -> host_uid` map cannot be written for the child. Self-map instead --
+    // the same in-guest identity a privileged supervisor produces -- and only
+    // when the kernel actually allows an unprivileged userns. Logged, because
+    // it changes what a workload can do inside (`apt-get`, `chown`, low ports);
+    // the worker sees the same answer in `stats.guest_uid`.
+    if euid != 0 && sandbox.user.is_some() {
+        sandbox.userns_self_map = sandlock_supervise::serve::probe_userns_self_map();
+    }
+    // Which shape the guest got is reported through `stats.guest_uid`
+    // (`uid-0-in-userns` / `host-uid`) rather than stderr: a clean startup must
+    // stay silent (`test_policy_roundtrip_covers_every_field` pins that), and
+    // the worker is the party that needs to know -- it logs the value with the
+    // lease.
     let policy = std::sync::Arc::new(sandbox);
 
     match mode {

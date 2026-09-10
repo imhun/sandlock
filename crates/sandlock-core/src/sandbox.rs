@@ -705,6 +705,12 @@ pub struct Sandbox {
     #[serde(default)]
     pub pid_ns: bool,
 
+    /// Self-map the supervisor's own host uid to in-namespace uid 0 (see
+    /// `SandboxBuilder::userns_self_map`): how a route-B slot restores
+    /// "root inside the sandbox, host uid outside".
+    #[serde(skip, default)]
+    pub userns_self_map: bool,
+
     /// Enable the per-sandbox control socket for introspection (`sandlock ps`,
     /// `sandlock inspect`, etc.). Defaults to `true`. Set to `false` to skip
     /// the runtime dir, pid file, and control-socket tokio task entirely.
@@ -847,6 +853,7 @@ impl Clone for Sandbox {
             net_isolation: self.net_isolation,
             no_supervisor: self.no_supervisor,
             pid_ns: self.pid_ns,
+            userns_self_map: self.userns_self_map,
             control_socket: self.control_socket,
             user: self.user,
             mediation_run_as: self.mediation_run_as,

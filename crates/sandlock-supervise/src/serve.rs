@@ -291,6 +291,15 @@ impl Generation {
                     "children_live": stats.children_live,
                     "proc_count_vs_live": stats.proc_count_vs_live,
                     "mediation_downgrades": stats.mediation_downgrades,
+                    // Which identity the guest really gets: `uid-0-in-userns`
+                    // (self-mapped, parity with a privileged supervisor) or
+                    // `host-uid` (no usable unprivileged namespace, or the
+                    // mediator already runs as the target uid by design).
+                    "guest_uid": if self.policy.userns_self_map {
+                        "uid-0-in-userns"
+                    } else {
+                        "host-uid"
+                    },
                     "pid": instance.pid(),
                 })
             }
@@ -637,6 +646,41 @@ impl ControlHandler for Generation {
             }
         }
     }
+}
+
+/// Does an unprivileged process here get a usable user namespace?
+///
+/// Route B restores "root inside the sandbox, host uid outside" by having the
+/// confined child self-map `0 -> its own euid` (see `Sandbox::userns_self_map`),
+/// which needs an unprivileged `unshare(CLONE_NEWUSER)` *and* a map write.
+/// Kernels and LSMs differ (`kernel.apparmor_restrict_unprivileged_userns=1`
+/// on Ubuntu 24.04 makes unshare succeed and the map write fail), so probe once
+/// in a throwaway child and run the generation with whichever shape actually
+/// works -- reported through `stats.guest_uid` so the worker can log it.
+pub fn probe_userns_self_map() -> bool {
+    let euid = unsafe { libc::geteuid() };
+    if euid == 0 {
+        // A privileged mediator needs none of this: it writes the child's maps
+        // itself.
+        return false;
+    }
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return false;
+    }
+    if pid == 0 {
+        // The probe child exits; it never returns into the supervisor.
+        let ok = unsafe { libc::unshare(libc::CLONE_NEWUSER) } == 0
+            && std::fs::write("/proc/self/uid_map", format!("0 {euid} 1\n")).is_ok()
+            && std::fs::write("/proc/self/setgroups", "deny\n").is_ok()
+            && std::fs::write("/proc/self/gid_map", format!("0 {euid} 1\n")).is_ok();
+        unsafe { libc::_exit(i32::from(!ok)) };
+    }
+    let mut status: libc::c_int = 0;
+    if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+        return false;
+    }
+    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
 }
 
 /// Serve the handed-off control fd until a shutdown verb completes the

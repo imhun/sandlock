@@ -269,6 +269,21 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "pid-ns"))]
     pub pid_ns: bool,
 
+    /// Self-map the confining process's own host uid to **in-namespace uid 0**
+    /// (`0 -> euid`), so the workload is root inside its user namespace and
+    /// its host uid outside -- the rootless-container pattern.
+    ///
+    /// This exists for route B (F18): the supervisor there *is* the sandbox's
+    /// host uid, so the privileged path (parent writes `0 -> host_uid` after the
+    /// child unshares) cannot apply, and without a self-map the guest would see
+    /// its host uid instead of root -- a visible behaviour difference from the
+    /// in-process shape (`apt-get`, `chown`, low ports). Set by
+    /// `sandlock-supervise` only after it probes that an unprivileged userns is
+    /// actually available; nothing else opts in, and a caller that asks for it
+    /// without a usable userns falls back to today's shape rather than failing.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub userns_self_map: bool,
+
     /// Enable the per-sandbox control socket for introspection. Defaults to
     /// `true`. When `false`, no runtime dir, pid file, or control-socket task
     /// is created — `sandlock ps` and `sandlock inspect` will not see this
@@ -396,6 +411,7 @@ impl Default for SandboxBuilder {
             net_isolation: false,
             no_supervisor: false,
             pid_ns: false,
+            userns_self_map: false,
             control_socket: true,
             user: None,
             mediation_run_as: None,
@@ -470,6 +486,7 @@ impl Clone for SandboxBuilder {
             net_isolation: self.net_isolation,
             no_supervisor: self.no_supervisor,
             pid_ns: self.pid_ns,
+            userns_self_map: self.userns_self_map,
             control_socket: self.control_socket,
             user: self.user,
             mediation_run_as: self.mediation_run_as,
@@ -1345,6 +1362,7 @@ impl SandboxBuilder {
             net_isolation: self.net_isolation,
             no_supervisor: self.no_supervisor,
             pid_ns: self.pid_ns,
+            userns_self_map: self.userns_self_map,
             control_socket: self.control_socket,
             user: self.user,
             mediation_run_as: self.mediation_run_as.unwrap_or_default(),

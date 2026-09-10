@@ -685,11 +685,27 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         // Capture real uid/gid before any unshare (after unshare they become 65534)
         let real_uid = unsafe { libc::getuid() };
         let real_gid = unsafe { libc::getgid() };
-        let userns_needed = sandbox.net_isolation
-            || matches!(sandbox.user, Some(run_as) if run_as.uid != real_uid || run_as.gid != real_gid);
+        let remap = matches!(sandbox.user, Some(run_as) if run_as.uid != real_uid || run_as.gid != real_gid);
+        // F18 (route B): when the requested identity is *already* ours, the
+        // privileged path (parent writes `0 -> host_uid`) cannot apply, and
+        // without a namespace the guest would see its host uid instead of root
+        // -- a visible difference from a sandbox confined by a privileged
+        // supervisor (`apt-get`, `chown`, low ports). Self-map `0 -> euid`
+        // instead, which needs no privilege (rootless-container pattern).
+        let self_map =
+            sandbox.userns_self_map && !remap && sandbox.user.is_some() && real_uid != 0;
+        let userns_needed = sandbox.net_isolation || remap || self_map;
 
         if userns_needed {
-            if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+            // The self-map is the only *optional* namespace: if the kernel or
+            // AppArmor denies unprivileged user namespaces, continuing without
+            // one leaves the sandbox with strictly less privilege than
+            // requested (host uid inside), so it must not fail the generation
+            // -- `sandlock-supervise` probes this and logs which shape it got.
+            // Every other case needs its namespace or the identity/netns
+            // contract would silently be a lie.
+            let unshared = unsafe { libc::unshare(libc::CLONE_NEWUSER) } == 0;
+            if !unshared && !(self_map && !sandbox.net_isolation && !remap) {
                 fail!("unshare(CLONE_NEWUSER)");
             }
             match sandbox.user {
@@ -734,6 +750,21 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
                                  e.g. kernel.apparmor_restrict_unprivileged_userns=1)"
                             );
                         }
+                    }
+                }
+                Some(_) if self_map => {
+                    // `0 -> our own host uid`: inside the namespace we are uid 0;
+                    // outside, every file and socket we touch is still owned by
+                    // the sandbox's host uid (the kernel compares the *kuid*, so
+                    // DAC against other tenants is unchanged). When there is no
+                    // namespace to map, the sandbox keeps its host uid inside as
+                    // well -- less privilege than requested, never more.
+                    if unshared && write_id_maps(real_uid, real_gid, 0, 0).is_err() {
+                        fail!(
+                            "uid_map/gid_map write for the route-B self-map \
+                             (is unprivileged userns restricted? e.g. \
+                             kernel.apparmor_restrict_unprivileged_userns=1)"
+                        );
                     }
                 }
                 _ => {
