@@ -1086,6 +1086,20 @@ impl SandboxInstance {
             }
         };
         let pid = self.translate_announced_pid(pid)?;
+        // Seed the tracked cwd from the request. The child already chdir'd to
+        // it, but that chdir is serviced by *recording* (see
+        // handle_chroot_chdir), and the seed is what makes the record
+        // independent of the order in which the child's own chdir
+        // notification and this announcement reach the supervisor. Confined on
+        // the way in, exactly like the chdir handler records it: both writers
+        // feed the same cell, and the spelling `getcwd` reports must not depend
+        // on which of them won (a `cwd` of `/workspace/.` would otherwise leak
+        // that spelling into the child's view).
+        if let (Some(procs), Some(cwd)) =
+            (self.supervisor_processes.as_ref(), params.cwd.as_ref())
+        {
+            procs.set_virtual_cwd(pid, crate::chroot::resolve::confine(&cwd.to_string_lossy()));
+        }
         // F4.3/F4.4: attribute the announced child to the session network
         // policy current at exec time (an `update_network` in flight between
         // the request and the announcement applies to this exec — the

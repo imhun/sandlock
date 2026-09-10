@@ -8,6 +8,40 @@
 
 ## 行为变化（升级 / 接线前必读）
 
+- **cwd 由请求决定 + 挂载别名确定性（A2，2026-09-10）**：同一个宿主目录被挂在多个
+  虚拟路径下时（E2B 的 `/workspace` 与 `/home/user` 就是同一个目录），此前有三处
+  行为由「宿主路径反查」决定，结果既歧义又依挂载声明顺序：
+  ① `chdir` 记录的是 `host_to_virtual(readlink(fd))`（平局取**最后**一个声明），
+  于是 `chdir("/workspace")` 会记成 `/home/user`，`getcwd` 与之后所有相对路径都
+  跟着错；② `host_to_virtual` 平局取末位，`/proc/<pid>/fd`、`/proc/<pid>/cwd` 的
+  命名同样不确定；③ 相对路径按别名落到 `/home/user` 后，**看不到**声明在
+  `/workspace/mnt/data` 下的子挂载，`cat mnt/data/x` 得到 `EACCES`。
+  **现在**：`chdir` 记录请求的虚拟路径（存在性/errno 仍由 `openat2_in_root` 证明）；
+  `host_to_virtual` 平局按**声明顺序取第一个**（longest-host-source 优先）；
+  挂载查找先经「宿主实现 + 反查」把别名归一到规范拼写再匹配，于是子挂载对其
+  同源别名同样可见（`/home/user/mnt/data/x` → 卷）。**用户可见**：`pwd`/`getcwd`
+  报告请求的别名；同源别名下声明在兄弟别名上的子挂载现在可达（此前 `EACCES`）。
+  **deny / read-only 取更严（同一宿主对象的别名拼写都生效）**：别名归一让
+  `/home/user/mnt/data/...` 也能落到卷上，于是 `fs_deny` 与 `fs_mount_ro` 的判定
+  同时吃三处拼写 —— **请求拼写**、归一后的**规范拼写**、以及该宿主路径在**每个
+  挂载下**的拼写，任一命中即算命中（deny 优先于只读，只读优先于「已挂载即放行」）。
+  否则「写在 `/workspace/mnt/data` 上的 deny」会被同源别名 `/home/user` 绕过 ——
+  那正是别名归一新引入的暴露面（评审构造路径）；三个别名时「写在中间别名上的
+  deny」同样会被走第三个别名的请求绕过，所以按宿主对象折叠而不是按两个拼写。
+  放行面（`is_mounted`）仍按请求拼写，不因别名归一而收紧；反方向（deny 写在被
+  更深挂载遮蔽的别名上、请求走规范拼写）**未**折叠 —— 那是「deny 按虚拟前缀匹配」
+  的既有语义，本次不动。
+  **cwd 是逻辑路径**：`chdir` 记录请求拼写，因此 `cd <符号链接>` 之后的 `..`
+  按**逻辑父目录**解析、`getcwd` 报告请求拼写，而不是内核解析出的物理路径
+  （与 POSIX `getcwd` 的物理路径语义不同；用户决定 #2）。
+  本提交另加 core_lib +3（`host_to_virtual_tie_breaks_on_declaration_order`、
+  `mount_walk_folds_a_shared_directory_submount_onto_the_canonical_alias`、
+  `mount_walk_falls_back_to_the_input_when_it_cannot_converge`）、
+  core_integ +2（`test_deny_declared_under_one_alias_covers_the_other_alias`、
+  `test_read_only_declared_under_one_alias_covers_the_other_alias`）；
+  `test_instance_chroot` 的两条 RED（别名子挂载、请求别名身份）由 `aadb5ad` 引入，
+  在此转绿。
+
 - **route-B 客体内身份对齐（F18，2026-09-10）+ 设备节点按文件类型拒绝**：
   E2B 把 `E2B_PER_SANDBOX_UID` 翻成默认后实测发现，同一负载在两种后端下客体内身份
   不一致 —— 进程内后端（特权 supervisor 为子进程写 `0 -> host_uid`）里沙箱是

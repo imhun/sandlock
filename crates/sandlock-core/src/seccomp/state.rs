@@ -373,6 +373,18 @@ impl ProcessIndex {
 
     /// Record where this task now believes it is. Silently does nothing
     /// for an untracked pid: the fallback is the kernel's own cwd.
+    ///
+    /// Every caller writes a path the *request* named, never a host path
+    /// mapped back through the mount table: one host directory can be mounted
+    /// at several virtual paths (E2B's `/workspace` and `/home/user` are the
+    /// same directory), so a reverse lookup has no single right answer and
+    /// picking one makes every later relative path resolve against the wrong
+    /// alias. The seeded callers are `handle_chroot_chdir` (the chdir the
+    /// child asked for) and the exec announcement in
+    /// `SandboxInstance::exec_with_fds_inner` (the request's `cwd`), which
+    /// exists because a child that never re-derives its cwd must not depend on
+    /// the kernel's `/proc/<pid>/cwd` — that one still points at the launch
+    /// directory, since the supervisor services chdir by recording it.
     pub fn set_virtual_cwd(&self, pid: i32, cwd: PathBuf) {
         if let Some(cell) = self.cwd_cell(pid) {
             if let Ok(mut slot) = cell.lock() {

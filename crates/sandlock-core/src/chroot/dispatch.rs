@@ -104,12 +104,60 @@ impl ChrootCtx<'_> {
         self.denied.iter().any(|p| virtual_path.starts_with(p))
     }
 
+    /// Whether any spelling of `virtual_path`'s host object satisfies `test`.
+    ///
+    /// One host directory can be mounted at several virtual paths (E2B's
+    /// `/workspace` and `/home/user` are the same directory), so "the" spelling
+    /// of the object a request names is not unique. Deny and read-only verdicts
+    /// are therefore folded over every spelling that names it: the requested
+    /// one, the canonical one the mount walk settles on, and the one each mount
+    /// of the same host path implies.
+    ///
+    /// Without the fold a deny written on one alias stayed bypassable through
+    /// another: the alias-normalised mount walk resolves
+    /// `/home/user/mnt/data/...` onto the very volume that
+    /// `fs_deny("/workspace/mnt/data")` names. The fold only ever *adds*
+    /// refusals (both predicates are restrictions), so it cannot widen access —
+    /// the allow side (`is_mounted`) keeps matching the requested spelling
+    /// alone.
+    ///
+    /// Deliberately *not* folded: a deny written on a path that a deeper mount
+    /// shadows (`/home/user/mnt/data` realises to the workspace copy), asked
+    /// through the canonical spelling (`/workspace/mnt/data`, which is the
+    /// volume). That asymmetry is what "deny matches a virtual prefix" means,
+    /// it predates the alias walk, and it is left as it was.
+    fn any_alias_spelling(&self, virtual_path: &Path, test: impl Fn(&Path) -> bool) -> bool {
+        if test(virtual_path) {
+            return true;
+        }
+        if test(&self.mount_walk_path(virtual_path)) {
+            return true;
+        }
+        let host = crate::chroot::resolve::host_of(self.root, self.mounts, virtual_path);
+        self.mounts.iter().any(|(mount_vp, mount_hp)| match host.strip_prefix(mount_hp) {
+            Ok(rest) if rest.as_os_str().is_empty() => test(mount_vp),
+            Ok(rest) => test(&mount_vp.join(rest)),
+            Err(_) => false,
+        })
+    }
+
+    /// Whether any spelling of `virtual_path`'s host object is denied.
+    fn is_denied_any(&self, virtual_path: &Path) -> bool {
+        self.any_alias_spelling(virtual_path, |p| self.is_denied(p))
+    }
+
+    /// Whether any spelling of `virtual_path`'s host object falls under a
+    /// read-only mount.
+    fn is_mount_ro_any(&self, virtual_path: &Path) -> bool {
+        self.any_alias_spelling(virtual_path, |p| self.is_mount_ro(p))
+    }
+
     /// Check if `virtual_path` is allowed for reading.
     /// Also allows access to ancestor directories of readable paths
     /// (e.g. "/" is allowed if "/usr" is readable, since you need to open "/"
     /// to list or traverse to "/usr").
     fn can_read(&self, virtual_path: &Path) -> bool {
-        if self.is_denied(virtual_path) {
+        if self.is_denied_any(virtual_path) {
             return false;
         }
         if self.is_mounted(virtual_path) {
@@ -127,14 +175,14 @@ impl ChrootCtx<'_> {
 
     /// Check if `virtual_path` is allowed for writing.
     fn can_write(&self, virtual_path: &Path) -> bool {
-        if self.is_denied(virtual_path) {
+        if self.is_denied_any(virtual_path) {
             return false;
         }
         // Read-only mounts deny writes even though they are mounted (and so
         // readable). Checked before the is_mounted allow so a read-only mount
         // (e.g. the host procfs) can't be made writable by a broad writable
         // prefix such as a read-write rootfs granting "/".
-        if self.is_mount_ro(virtual_path) {
+        if self.is_mount_ro_any(virtual_path) {
             return false;
         }
         if self.is_mounted(virtual_path) {
@@ -162,15 +210,20 @@ impl ChrootCtx<'_> {
     ///
     /// `virtual_path` must already be in confined (canonical) form.
     fn mount_leaf_host(&self, virtual_path: &Path) -> Option<&Path> {
+        // Same alias walk as `mount_target`: a single-node mount declared
+        // under one alias is the same object under the other, and the two
+        // helpers must agree on which entry they matched or the leaf case
+        // would fall back to the alias's directory mount.
+        let walk = self.mount_walk_path(virtual_path);
         self.mounts
             .iter()
-            .find(|(vp, _)| vp == virtual_path)
+            .find(|(vp, _)| vp == &walk)
             .map(|(_, hp)| hp.as_path())
     }
 
-    /// Return (mount_target_dir, sub_path_string) for a virtual path under a mount.
-    /// Uses longest-prefix matching when multiple mounts could match.
-    fn mount_target(&self, virtual_path: &Path) -> Option<(&Path, String)> {
+    /// Longest-virtual-prefix lookup: the declared mount whose destination is
+    /// the most specific match for `virtual_path`.
+    fn mount_base(&self, virtual_path: &Path) -> Option<(&Path, &Path)> {
         let mut best: Option<(&Path, &Path)> = None;
         for (vp, hp) in self.mounts {
             if virtual_path.starts_with(vp) {
@@ -179,8 +232,23 @@ impl ChrootCtx<'_> {
                 }
             }
         }
-        let (mount_vp, mount_hp) = best?;
-        let sub = virtual_path.strip_prefix(mount_vp).ok()?;
+        best
+    }
+
+    /// The spelling the mount table must be walked with for `virtual_path`.
+    /// The rule lives in `chroot::resolve` (with its convergence bound and
+    /// fallback); this is the policy-bound call for the handlers' context.
+    fn mount_walk_path(&self, virtual_path: &Path) -> PathBuf {
+        crate::chroot::resolve::mount_walk_path(self.root, self.mounts, virtual_path)
+    }
+
+    /// Return (mount_target_dir, sub_path_string) for a virtual path under a mount.
+    /// Uses longest-prefix matching when multiple mounts could match, on the
+    /// spelling [`ChrootCtx::mount_walk_path`] resolves the aliases to.
+    fn mount_target(&self, virtual_path: &Path) -> Option<(&Path, String)> {
+        let walk = self.mount_walk_path(virtual_path);
+        let (mount_vp, mount_hp) = self.mount_base(&walk)?;
+        let sub = walk.strip_prefix(mount_vp).ok()?;
         let sub_str = if sub.as_os_str().is_empty() {
             "/".to_string()
         } else {
@@ -2067,14 +2135,17 @@ pub(crate) async fn handle_chroot_chdir(
         Ok(fd) => fd,
         Err(errno) => return NotifAction::Errno(errno),
     };
-    // Record where the kernel actually landed, not what the child asked for:
-    // symlinks and .. are already collapsed in the resolved fd.
-    let resolved = std::fs::read_link(format!("/proc/self/fd/{}", src_fd)).ok();
     unsafe { libc::close(src_fd) };
-    let virtual_cwd = resolved
-        .as_deref()
-        .and_then(|host| ctx.host_to_virtual(host))
-        .unwrap_or(confined);
+
+    // Record the path the caller asked for, not a host->virtual reverse
+    // lookup: when one host directory is mounted at several virtual paths
+    // (E2B's /workspace and /home/user are the same directory) the reverse
+    // lookup is ambiguous, and recording the wrong alias makes every later
+    // relative open miss sub-mounts declared under the requested one. The
+    // `openat2_in_root` above is the liveness/existence proof -- it is what
+    // decides whether the directory exists, is reachable inside the root,
+    // and is a directory at all -- and it is also what gives the child the
+    // errno for the cases where it is not.
 
     // The child's own cwd never moves. chdir cannot be run on-behalf (only
     // the kernel can update the calling task's fs_struct) and the argument
@@ -2085,7 +2156,7 @@ pub(crate) async fn handle_chroot_chdir(
     // here instead serves every spelling, and it drops both a TOCTOU window
     // (the kernel re-read the path we wrote) and a force-write through
     // /proc/<pid>/mem that permanently corrupted a .rodata path literal.
-    set_virtual_cwd(notif, ctx, virtual_cwd);
+    set_virtual_cwd(notif, ctx, confined);
     NotifAction::ReturnValue(0)
 }
 
@@ -2549,11 +2620,21 @@ mod mount_ro_tests {
         writable: &'a [PathBuf],
         processes: &'a Arc<ProcessIndex>,
     ) -> ChrootCtx<'a> {
+        ctx_denied(mounts, mount_ro, writable, &[], processes)
+    }
+
+    fn ctx_denied<'a>(
+        mounts: &'a [(PathBuf, PathBuf)],
+        mount_ro: &'a [PathBuf],
+        writable: &'a [PathBuf],
+        denied: &'a [PathBuf],
+        processes: &'a Arc<ProcessIndex>,
+    ) -> ChrootCtx<'a> {
         ChrootCtx {
             root: Path::new("/rootfs"),
             readable: &[],
             writable,
-            denied: &[],
+            denied,
             mounts,
             mount_ro,
             processes,
@@ -2583,5 +2664,56 @@ mod mount_ro_tests {
         let c = ctx(&mounts, &ro, &writable, &processes);
         assert!(c.can_read(Path::new("/data/file")));
         assert!(c.can_write(Path::new("/data/file")));
+    }
+
+    /// One host directory mounted at three virtual paths: a deny (or a
+    /// read-only mount) written on *any* of them covers the object, whichever
+    /// alias the request is spelled through. The walk alone only compares the
+    /// requested and the canonical spelling, so a deny on the middle alias
+    /// would still be missed by a request through the third — the fold has to
+    /// cover every spelling of the host object.
+    #[test]
+    fn deny_and_read_only_fold_across_every_alias_of_a_shared_directory() {
+        let ws = PathBuf::from("/host/ws");
+        let vol = PathBuf::from("/host/vol");
+        let mounts = vec![
+            (PathBuf::from("/workspace"), ws.clone()),
+            (PathBuf::from("/home/user"), ws.clone()),
+            (PathBuf::from("/legacy"), ws.clone()),
+            (PathBuf::from("/workspace/mnt/data"), vol),
+        ];
+        let processes = Arc::new(ProcessIndex::new());
+
+        let denied = vec![PathBuf::from("/home/user/mnt/data")];
+        let writable = vec![PathBuf::from("/legacy")];
+        let c = ctx_denied(&mounts, &[], &writable, &denied, &processes);
+        assert!(
+            !c.can_read(Path::new("/legacy/mnt/data/x")),
+            "a deny on the middle alias must cover a read spelled through the third"
+        );
+        assert!(!c.can_write(Path::new("/legacy/mnt/data/x")));
+        assert!(
+            c.can_read(Path::new("/legacy/plain")),
+            "the deny still covers only the denied subtree"
+        );
+        // The converse spelling — a deny written on a path that a *deeper*
+        // mount shadows, asked through the canonical spelling — is not folded:
+        // `/workspace/mnt/data` realizes to the volume, while the deny on
+        // `/home/user/mnt/data` realizes to the workspace copy it shadows. That
+        // asymmetry is a property of deny-as-virtual-prefix and predates the
+        // alias walk (the canonical spelling reached the volume before this
+        // change too, and still does), so it is deliberately left alone here.
+        assert!(c.can_read(Path::new("/workspace/mnt/data/x")));
+
+        let ro = vec![PathBuf::from("/home/user/mnt/data")];
+        let c = ctx(&mounts, &ro, &writable, &processes);
+        assert!(
+            c.can_read(Path::new("/legacy/mnt/data/x")),
+            "a read-only mount stays readable through every alias"
+        );
+        assert!(
+            !c.can_write(Path::new("/legacy/mnt/data/x")),
+            "…and refuses writes through every alias"
+        );
     }
 }

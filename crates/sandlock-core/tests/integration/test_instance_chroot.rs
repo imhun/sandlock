@@ -231,7 +231,11 @@ async fn test_relative_open_from_second_workspace_alias_resolves_the_submount() 
     );
     assert_eq!(
         std::fs::read_to_string(vol.join("new.txt")).expect("volume must hold the write"),
-        "bye",
+        // `rootfs-helper write` always terminates its argument with a newline
+        // (tests/rootfs-helper.c:174), so the exact bytes on disk are "bye\n".
+        // The assertion itself is unchanged in substance: the relative write
+        // must land in the volume, byte-for-byte.
+        "bye\n",
         "relative write must land in the volume; stderr={:?}",
         String::from_utf8_lossy(&werr)
     );
@@ -333,6 +337,179 @@ async fn test_getcwd_reports_the_requested_alias_not_the_best_match() {
         String::from_utf8_lossy(&out),
         "OK /workspace\n",
         "the requested alias, not the reverse-lookup winner"
+    );
+
+    inst.shutdown().await.expect("shutdown");
+    cleanup(&rootfs);
+    cleanup(&base);
+}
+
+/// Denying a sub-mount declared under one alias must cover the same host object
+/// reached through the other alias. `/workspace` and `/home/user` are the same
+/// host directory and the volume is mounted at `/workspace/mnt/data`, so
+/// `fs_deny("/workspace/mnt/data")` has to catch `/home/user/mnt/data/...` too:
+/// the alias-normalised mount walk reaches that very volume, and a deny that
+/// only matched the spelling it was written with would be a way around itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_deny_declared_under_one_alias_covers_the_other_alias() {
+    let base = temp_dir("alias-deny");
+    let rootfs = build_test_rootfs("rootfs");
+    let ws = base.join("workspace");
+    let vol = base.join("vol");
+    std::fs::create_dir_all(&ws).expect("create workspace host dir");
+    std::fs::create_dir_all(&vol).expect("create volume host dir");
+    std::fs::write(vol.join("data.txt"), "hello\n").expect("seed volume file");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/")
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/proc")
+        .fs_mount("/workspace", &ws)
+        .fs_mount("/workspace/mnt/data", &vol)
+        .fs_mount("/home/user", &ws)
+        .fs_write("/workspace")
+        .fs_write("/workspace/mnt/data")
+        .fs_write("/home/user")
+        .fs_deny("/workspace/mnt/data")
+        .cwd("/home/user")
+        .build()
+        .expect("alias + submount + deny policy builds");
+
+    let mut inst = SandboxInstance::launch_exec_only(policy)
+        .await
+        .expect("alias + deny instance must launch");
+    let h = inst
+        .exec(&["rootfs-helper", "cat", "mnt/data/data.txt"], ExecStdio::Piped)
+        .await
+        .expect("exec must succeed");
+    let status = inst.wait_child(h.child_id).await.expect("wait child");
+    let mut out = Vec::new();
+    std::fs::File::from(h.stdout.expect("piped stdout"))
+        .read_to_end(&mut out)
+        .expect("read stdout");
+    let mut err = Vec::new();
+    std::fs::File::from(h.stderr.expect("piped stderr"))
+        .read_to_end(&mut err)
+        .expect("read stderr");
+    let err = String::from_utf8_lossy(&err);
+
+    assert_ne!(
+        status,
+        ExitStatus::Code(0),
+        "the deny covers this alias: the read must not succeed (stdout={:?}, stderr={:?})",
+        String::from_utf8_lossy(&out),
+        err
+    );
+    assert_eq!(
+        err,
+        "cat: mnt/data/data.txt: Permission denied\n",
+        "the deny fires on the requested path and reports EACCES exactly"
+    );
+
+    // Nothing served the file through the deny: the volume is untouched and the
+    // denied read cannot have leaked its bytes.
+    assert_eq!(
+        std::fs::read_to_string(vol.join("data.txt")).expect("volume intact"),
+        "hello\n"
+    );
+
+    inst.shutdown().await.expect("shutdown");
+    cleanup(&rootfs);
+    cleanup(&base);
+}
+
+/// The read-only twin of the deny case: `fs_mount_ro("/workspace/mnt/data")`
+/// must make the volume read-only through `/home/user/mnt/data` as well — reads
+/// still work (the mount is readable), writes are refused. Without the
+/// alias-aware check the relative write landed in the volume, which is exactly
+/// the exposure the deny/RO folding exists to close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_read_only_declared_under_one_alias_covers_the_other_alias() {
+    let base = temp_dir("alias-ro");
+    let rootfs = build_test_rootfs("rootfs");
+    let ws = base.join("workspace");
+    let vol = base.join("vol");
+    std::fs::create_dir_all(&ws).expect("create workspace host dir");
+    std::fs::create_dir_all(&vol).expect("create volume host dir");
+    std::fs::write(vol.join("data.txt"), "hello\n").expect("seed volume file");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/")
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/proc")
+        .fs_mount("/workspace", &ws)
+        .fs_mount_ro("/workspace/mnt/data", &vol)
+        .fs_mount("/home/user", &ws)
+        .fs_write("/workspace")
+        .fs_write("/home/user")
+        .cwd("/home/user")
+        .build()
+        .expect("alias + read-only submount policy builds");
+
+    let mut inst = SandboxInstance::launch_exec_only(policy)
+        .await
+        .expect("alias + read-only instance must launch");
+
+    // Read through the alias: allowed, byte-for-byte.
+    let r = inst
+        .exec(&["rootfs-helper", "cat", "mnt/data/data.txt"], ExecStdio::Piped)
+        .await
+        .expect("read exec must succeed");
+    let rstatus = inst.wait_child(r.child_id).await.expect("wait read child");
+    let mut rout = Vec::new();
+    std::fs::File::from(r.stdout.expect("piped stdout"))
+        .read_to_end(&mut rout)
+        .expect("read stdout");
+    let mut rerr = Vec::new();
+    std::fs::File::from(r.stderr.expect("piped stderr"))
+        .read_to_end(&mut rerr)
+        .expect("read stderr");
+    assert_eq!(
+        rstatus,
+        ExitStatus::Code(0),
+        "a read-only mount stays readable; stderr={:?}",
+        String::from_utf8_lossy(&rerr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&rout),
+        "hello\n",
+        "exact volume bytes through the alias; stderr={:?}",
+        String::from_utf8_lossy(&rerr)
+    );
+
+    // Write through the alias: refused, and nothing reaches the volume.
+    let w = inst
+        .exec(&["rootfs-helper", "write", "mnt/data/new.txt", "bye"], ExecStdio::Piped)
+        .await
+        .expect("write exec must succeed");
+    let wstatus = inst.wait_child(w.child_id).await.expect("wait write child");
+    let mut werr = Vec::new();
+    std::fs::File::from(w.stderr.expect("piped stderr"))
+        .read_to_end(&mut werr)
+        .expect("read stderr");
+    let werr = String::from_utf8_lossy(&werr);
+    assert_ne!(
+        wstatus,
+        ExitStatus::Code(0),
+        "the read-only mount covers this alias: the write must not succeed (stderr={:?})",
+        werr
+    );
+    assert_eq!(
+        werr,
+        "write: mnt/data/new.txt: Permission denied\n",
+        "the read-only mount fires on the requested path and reports EACCES exactly"
+    );
+    assert!(
+        !vol.join("new.txt").exists(),
+        "the refused write must not land in the volume"
+    );
+    assert!(
+        !ws.join("mnt/data/new.txt").exists(),
+        "the refused write must not land in the workspace copy either"
     );
 
     inst.shutdown().await.expect("shutdown");

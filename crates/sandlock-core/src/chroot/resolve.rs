@@ -43,6 +43,18 @@ pub fn to_virtual_path(chroot_root: &Path, host_path: &Path) -> Option<PathBuf> 
 /// most-specific-prefix lookup over `{ "/" => chroot_root } ∪ mounts` —
 /// the same rule the kernel uses to pick among overlapping mounts. Returns
 /// None when the host path is under neither the root nor any mount.
+///
+/// Ties between sources of equal length go to *declaration order*: the first
+/// mount declared in the policy wins. That matters because one host directory
+/// can be mounted at several virtual paths (E2B's `/workspace` and
+/// `/home/user` are the same directory), so the question "which virtual path
+/// is this host path?" has more than one true answer and the sandbox has to
+/// pick one deterministically. The previous `max_by_key(…len())` kept the
+/// *last* of the tied mounts, so a policy that declared `/workspace` before
+/// `/home/user` still got `/home/user` back for the shared directory — and
+/// every caller that walks from that answer (cwd identity, the mount-alias
+/// walk in `chroot::dispatch`) then missed whatever was declared under the
+/// other alias.
 pub fn host_to_virtual(
     chroot_root: &Path,
     mounts: &[(PathBuf, PathBuf)],
@@ -51,8 +63,16 @@ pub fn host_to_virtual(
     std::iter::once((Path::new("/"), chroot_root))
         .chain(mounts.iter().map(|(v, h)| (v.as_path(), h.as_path())))
         .filter(|(_, source)| host_path.starts_with(source))
-        .max_by_key(|(_, source)| source.as_os_str().len())
-        .map(|(virtual_base, source)| {
+        .enumerate()
+        // Longest host source wins; ties fall back to *declaration order*
+        // (the first mount in the policy wins). The old `max_by_key` kept
+        // the last of equal-length sources, so a caller that declared
+        // /workspace before /home/user still got /home/user back for the
+        // shared workspace directory -- and every relative path resolved
+        // from that cwd then missed the sub-mounts declared under
+        // /workspace.
+        .max_by_key(|(idx, (_, source))| (source.as_os_str().len(), std::cmp::Reverse(*idx)))
+        .map(|(_, (virtual_base, source))| {
             // strip_prefix cannot fail: the filter above already matched it.
             let rest = host_path.strip_prefix(source).expect("prefix matched");
             // join("") appends a separator, so the mount point itself would
@@ -63,6 +83,92 @@ pub fn host_to_virtual(
                 virtual_base.join(rest)
             }
         })
+}
+
+/// Where a virtual path lands on the host, following the mount table one step:
+/// the source of the most specific declared mount plus the part below its
+/// destination, or the chroot root for a path no mount covers.
+///
+/// `host_of` + [`host_to_virtual`] is what turns one alias of a shared host
+/// directory into another; `mount_walk_path` iterates the pair and the policy
+/// verdicts in `chroot::dispatch` use it directly to fold deny / read-only
+/// checks across every alias spelling of the same object.
+pub fn host_of(chroot_root: &Path, mounts: &[(PathBuf, PathBuf)], virtual_path: &Path) -> PathBuf {
+    let mut best: Option<(&Path, &Path)> = None;
+    for (vp, hp) in mounts {
+        if virtual_path.starts_with(vp) {
+            if best.is_none() || vp.as_os_str().len() > best.unwrap().0.as_os_str().len() {
+                best = Some((vp.as_path(), hp.as_path()));
+            }
+        }
+    }
+    match best {
+        Some((mount_vp, mount_hp)) => {
+            let sub = virtual_path.strip_prefix(mount_vp).unwrap_or(Path::new(""));
+            mount_hp.join(sub)
+        }
+        None => {
+            let rel = virtual_path.strip_prefix("/").unwrap_or(virtual_path);
+            chroot_root.join(rel)
+        }
+    }
+}
+
+/// Rounds [`mount_walk_path`] may take before it gives up.
+const MOUNT_WALK_ROUNDS: usize = 4;
+
+/// The spelling the mount table must be walked with for `virtual_path`.
+///
+/// Mounts are keyed by *virtual* destination, but one host directory may be
+/// mounted at several of them: E2B's `/workspace` and `/home/user` are the same
+/// directory. A sub-mount declared under one alias
+/// (`/workspace/mnt/data -> <volume>`) is therefore invisible from the other,
+/// even though both name the same host directory — a relative open from a
+/// `/home/user` cwd asked for `/home/user/mnt/data/...`, matched the
+/// `/home/user` alias, and got EACCES on the workspace copy instead of reaching
+/// the volume.
+///
+/// Realize the path on the host (`host_of`) and map it back
+/// (`host_to_virtual`), repeating while the spelling keeps changing: the second
+/// round then finds the deeper mount. `host_to_virtual` breaks host-source ties
+/// by declaration order, so the walk is deterministic and the first-declared
+/// alias stays canonical.
+///
+/// The result is a *lookup key only*. Policy verdicts (deny, read-only) are
+/// folded over both the requested and the walked spelling by the caller, so
+/// folding an alias here can never widen what the policy allows.
+pub fn mount_walk_path(
+    chroot_root: &Path,
+    mounts: &[(PathBuf, PathBuf)],
+    virtual_path: &Path,
+) -> PathBuf {
+    mount_walk_path_bounded(chroot_root, mounts, virtual_path, MOUNT_WALK_ROUNDS)
+}
+
+/// [`mount_walk_path`] with an explicit round bound, so a unit test can drive
+/// the non-convergence fallback deterministically.
+pub fn mount_walk_path_bounded(
+    chroot_root: &Path,
+    mounts: &[(PathBuf, PathBuf)],
+    virtual_path: &Path,
+    max_rounds: usize,
+) -> PathBuf {
+    let mut current = virtual_path.to_path_buf();
+    for _ in 0..max_rounds {
+        let host = host_of(chroot_root, mounts, &current);
+        match host_to_virtual(chroot_root, mounts, &host) {
+            Some(next) if next != current => current = next,
+            // The spelling is a fixed point (or has no host realization at
+            // all): that is the answer.
+            _ => return current,
+        }
+    }
+    // Still moving after `max_rounds`. A table whose aliases and sub-mounts
+    // nest into each other can in principle keep re-anchoring, and a spelling
+    // that never settles must not be handed out as if it were canonical. Fall
+    // back to the caller's spelling: that is the pre-alias-walk behaviour, it
+    // is deterministic, and it never invents a path the caller did not name.
+    virtual_path.to_path_buf()
 }
 
 /// Resolve a virtual path within the chroot using `openat2(RESOLVE_IN_ROOT)`.
@@ -303,11 +409,93 @@ mod tests {
     }
 
     #[test]
+    fn host_to_virtual_tie_breaks_on_declaration_order() {
+        let host = PathBuf::from("/srv/ws");
+        let mounts = vec![
+            (PathBuf::from("/workspace"), host.clone()),
+            (PathBuf::from("/home/user"), host.clone()),
+        ];
+        assert_eq!(
+            host_to_virtual(Path::new("/rootfs"), &mounts, &host.join("a.txt")),
+            Some(PathBuf::from("/workspace/a.txt")),
+            "first-declared alias must win the tie"
+        );
+        // Same source, opposite declaration order: the *other* alias is now
+        // the canonical one. The rule is "first declared", not "prefer this
+        // particular name".
+        let mounts = vec![
+            (PathBuf::from("/home/user"), host.clone()),
+            (PathBuf::from("/workspace"), host.clone()),
+        ];
+        assert_eq!(
+            host_to_virtual(Path::new("/rootfs"), &mounts, &host.join("a.txt")),
+            Some(PathBuf::from("/home/user/a.txt")),
+            "declaration order decides, not the alias name"
+        );
+    }
+
+    #[test]
     fn test_confine_escape_attempt() {
         // Deeply nested .. should always clamp at /
         assert_eq!(
             confine("/a/b/c/../../../../../../../../etc/shadow"),
             PathBuf::from("/etc/shadow")
+        );
+    }
+
+    #[test]
+    fn mount_walk_folds_a_shared_directory_submount_onto_the_canonical_alias() {
+        // `/workspace` and `/home/user` are one host directory; the volume is
+        // mounted under `/workspace` only. Walking the `/home/user` spelling
+        // must reach the volume (that is what makes a relative open from a
+        // `/home/user` cwd find `/workspace/mnt/data`).
+        let mounts = vec![
+            (PathBuf::from("/workspace"), PathBuf::from("/srv/ws")),
+            (PathBuf::from("/workspace/mnt/data"), PathBuf::from("/srv/vol")),
+            (PathBuf::from("/home/user"), PathBuf::from("/srv/ws")),
+        ];
+        assert_eq!(
+            mount_walk_path(Path::new("/rootfs"), &mounts, Path::new("/home/user/mnt/data/x")),
+            PathBuf::from("/workspace/mnt/data/x")
+        );
+        // A spelling no mount and no alias covers is its own fixed point.
+        assert_eq!(
+            mount_walk_path(Path::new("/rootfs"), &mounts, Path::new("/etc/hosts")),
+            PathBuf::from("/etc/hosts")
+        );
+        // Non-alias mount: the walk returns the same spelling it was given.
+        assert_eq!(
+            mount_walk_path(Path::new("/rootfs"), &mounts, Path::new("/workspace/plain")),
+            PathBuf::from("/workspace/plain")
+        );
+    }
+
+    #[test]
+    fn mount_walk_falls_back_to_the_input_when_it_cannot_converge() {
+        // The same shared-directory table, but with a bound of one round: the
+        // walk is still moving when it runs out (one more round is what finds
+        // the volume), so the fallback must hand back the *input* spelling —
+        // never a half-finished intermediate one.
+        let mounts = vec![
+            (PathBuf::from("/workspace"), PathBuf::from("/srv/ws")),
+            (PathBuf::from("/workspace/mnt/data"), PathBuf::from("/srv/vol")),
+            (PathBuf::from("/home/user"), PathBuf::from("/srv/ws")),
+        ];
+        let requested = PathBuf::from("/home/user/mnt/data/x");
+        assert_eq!(
+            mount_walk_path_bounded(Path::new("/rootfs"), &mounts, &requested, 1),
+            requested,
+            "an unconverged walk must fall back to the caller's spelling"
+        );
+        assert_eq!(
+            mount_walk_path_bounded(Path::new("/rootfs"), &mounts, &requested, 0),
+            requested,
+            "a zero-round walk is the identity"
+        );
+        assert_eq!(
+            mount_walk_path(Path::new("/rootfs"), &mounts, &requested),
+            PathBuf::from("/workspace/mnt/data/x"),
+            "the real bound converges on the same table"
         );
     }
 
