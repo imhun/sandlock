@@ -268,6 +268,23 @@ outside the root phase, the target fails loudly. The non-root phase runs the
 rest of the supervise suite (`--lib --test supervise`), including both
 transports' instance verbs in the same-uid special case.
 
+## 7b. Which identity path needs which privilege (measured 2026-09-10)
+
+Two different ways exist to give the sandbox the host uid the policy asks for,
+and they need different privileges -- which decides what a deployment can run
+without `--privileged`:
+
+| path | who maps | privilege needed | consequence |
+|---|---|---|---|
+| in-process `RunAs(X)` by a **root** worker | supervisor writes the child's `/proc/<pid>/uid_map` after the child unshares | **CAP_SETUID/SETGID + CAP_SYS_PTRACE** (the kernel also requires ptrace access to the map target) | a root worker that dropped `CAP_SYS_PTRACE` fails every create with the generic `sandlock_create failed` -- measured with `--cap-drop ALL --cap-add SYS_ADMIN` and no ptrace, and fixed by adding only `SYS_PTRACE` |
+| route-B slot (mediator **is** uid X) | the confined child self-maps `0 -> own euid` (F18) | **no capability at all**, beyond being able to run as that uid | measured: the route-B contract suite (slot pool, executor, uid permissions) passes in a `--cap-drop ALL` container holding only the Docker-default set + `SYS_ADMIN` -- no `SYS_PTRACE`, no `MKNOD` |
+
+So: a deployment that wants per-sandbox host uids on chroot (image-rootfs)
+sandboxes needs *no* ptrace -- route B is the unprivileged-friendly path, which
+is a second reason to prefer it beyond the ownership fix. A root worker running
+the **pure** (no chroot) shape with per-sandbox uids does need `CAP_SYS_PTRACE`,
+and E2B says so at startup rather than letting it surface as create failures.
+
 ## 8. Operational notes for deployers
 
 - Always pass `--uid X` equal to the uid the process actually runs as; the
