@@ -123,6 +123,14 @@ deployments on another worker uid pass that uid. The genuine cross-uid
 kernel-peer acceptance (`supervise` as 65533 serving a 65534 worker) is the
 root-phase suite in §7.
 
+> **客体内身份（F18）**：槽位自己就是沙箱的 host uid，用不上特权 supervisor 那条
+> 「父进程为子进程写 `0 -> host_uid`」的路径。为与进程内后端一致，supervise 启动时
+> `probe_userns_self_map()` 探一次非特权 userns 是否**真的**可用，可用才让子进程自映射
+> `0 -> euid`（客体内 uid 0，宿主侧仍是该 host uid）；不可用就不建 namespace，客体内
+> 保持 host uid（权限只少不多，不因此失败）。实际形态经 `stats` 的 `guest_uid` 字段
+> 回报（`uid-0-in-userns` / `host-uid`）。自映射换来的 in-ns `CAP_MKNOD` 由 seccomp 的
+> 文件类型过滤兜住：块/字符设备节点 EPERM，`mkfifo` 仍可用。
+
 Instance-level verb surface (all served against the live `SandboxInstance`):
 
 | Verb | Semantics |

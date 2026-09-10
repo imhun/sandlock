@@ -8,6 +8,29 @@
 
 ## 行为变化（升级 / 接线前必读）
 
+- **route-B 客体内身份对齐（F18，2026-09-10）+ 设备节点按文件类型拒绝**：
+  E2B 把 `E2B_PER_SANDBOX_UID` 翻成默认后实测发现，同一负载在两种后端下客体内身份
+  不一致 —— 进程内后端（特权 supervisor 为子进程写 `0 -> host_uid`）里沙箱是
+  **uid 0**，而 route-B 槽位本身就是那个 host uid，`confine_child` 的 `userns_needed`
+  判定「请求身份已等于当前 euid」⇒ 不建 userns ⇒ 客体内直接是 X（`apt-get`、
+  `chown`、bind 低位端口这类用法就此失效）。
+  **修法**：新增 `SandboxBuilder::userns_self_map`（只在 Rust 侧，不上 policy wire、
+  不进 CLI）。槽位在 `euid != 0 && user.is_some()` 时先 `probe_userns_self_map()`
+  —— fork 一个一次性子进程真做 `unshare(CLONE_NEWUSER)` + 写 `0 euid 1`，因为
+  Ubuntu 24.04 的 `apparmor_restrict_unprivileged_userns=1` 会让「unshare 成功、
+  map 失败」—— 可用才置位；`confine_child` 随即自映射 ⇒ 客体内 uid 0、宿主侧仍是 X
+  （内核比较 kuid，跨租户 DAC 不变）。**探测不通就不建 ns**，客体内保持 host uid：
+  比请求的权限更少、绝不更多，因此不失败；实际形态经 `stats.guest_uid`
+  （`uid-0-in-userns` / `host-uid`）回报，槽位 stderr 也写一行，worker 据此记日志。
+  **配套收紧**：自映射带来 in-ns `CAP_MKNOD`，沙箱便可能在可写目录里造**块/字符设备
+  节点**再 open（现实上只有 runtime 的 device cgroup 会挡，裸进程没有）。因此
+  `mknod`/`mknodat` **按文件类型位**过滤（`AND S_IFMT` 后比 `S_IFBLK`/`S_IFCHR`），
+  不是整号屏蔽 —— `mkfifo()` 用的正是同一 syscall 的 `S_IFIFO`，真实负载需要它。
+  新增 `test_arg_filters_block_device_nodes_but_not_fifos`（core_lib 841 → 842）；
+  端到端证据在 E2B 契约
+  `test_slot_restores_in_guest_root_without_device_nodes`（客体内 `id -u`=0、
+  `mkfifo` 成功、`mknod b` 得 EPERM 且节点不存在）。
+
 - **route-B transport 1 的语言面 + 客户端错误分支修复（F17，2026-09-09）**：F16 只把
   registered-path（transport 2）暴露给 C/Python，fd handoff（transport 1）仍只有 Rust
   （worker 需要一条已连好的 `UnixStream`）。E2B 接线 route B 时实测出这条缺口为何要紧：
