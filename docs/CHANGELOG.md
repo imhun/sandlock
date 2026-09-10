@@ -34,13 +34,16 @@
   **cwd 是逻辑路径**：`chdir` 记录请求拼写，因此 `cd <符号链接>` 之后的 `..`
   按**逻辑父目录**解析、`getcwd` 报告请求拼写，而不是内核解析出的物理路径
   （与 POSIX `getcwd` 的物理路径语义不同；用户决定 #2）。
-  本提交另加 core_lib +3（`host_to_virtual_tie_breaks_on_declaration_order`、
+  本提交另加 core_lib +4（`host_to_virtual_tie_breaks_on_declaration_order`、
   `mount_walk_folds_a_shared_directory_submount_onto_the_canonical_alias`、
-  `mount_walk_falls_back_to_the_input_when_it_cannot_converge`）、
+  `mount_walk_falls_back_to_the_input_when_it_cannot_converge`、
+  `deny_and_read_only_fold_across_every_alias_of_a_shared_directory`）、
   core_integ +2（`test_deny_declared_under_one_alias_covers_the_other_alias`、
   `test_read_only_declared_under_one_alias_covers_the_other_alias`）；
   `test_instance_chroot` 的两条 RED（别名子挂载、请求别名身份）由 `aadb5ad` 引入，
-  在此转绿。
+  在此转绿（该提交里 `test_getcwd_reports_the_alias_the_policy_declared` 是守护断言，
+  当时即绿）。本行计数与 `docs/test-baseline.md` 的 A3 登记一致：core_lib 842 → 846、
+  core_integ 534 → 539（后者另有 `aadb5ad` 引入的 3 条，合计 +5）。
 
 - **route-B 客体内身份对齐（F18，2026-09-10）+ 设备节点按文件类型拒绝**：
   E2B 把 `E2B_PER_SANDBOX_UID` 翻成默认后实测发现，同一负载在两种后端下客体内身份

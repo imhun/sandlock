@@ -36,7 +36,27 @@
 # test_instance_chroot.rs non-root same-uid exec-only acceptance) and +3
 # mediation_2uid (root RunAs(10000)/uid0 restrictive-cache acceptance) —
 # logs tmp/sdd/f10-*.
-core_lib = 842 # F18 (2026-09-09): 841 -> 842, +1 device-node-vs-FIFO arg-filter
+#
+# A3 (2026-09-10, A2 alias-normalization wave): every label below re-run at
+# c6cbe03 in sandlock-dev:latest (--privileged, repo mounted at /src) — logs
+# tmp/a3-gate-nonroot.log / a3-gate-oci-r1.log (red) + a3-gate-oci-final.log
+# (the FUP-09 re-run; the only red was the pre-existing oci
+# test_signal_to_sibling_pid_rejected timing flake, reproduced at aadb5ad —
+# see tmp/a3-oci-full-repeat.log / a3-oci-baseline-repeat.log) /
+# a3-gate-supervise-root.log / a3-gate-mediation.log, wheels rebuilt + verified
+# at the same tip
+# (tmp/a3-wheel-build.log / a3-wheel-verify.log). Only core_lib (842 -> 846)
+# and core_integ (534 -> 539) move, by the A1/A2 test cases registered below;
+# ffi / cli / supervise / supervise_cost / cli_build / python / oci /
+# supervise_root / mediation_2uid are unchanged.
+core_lib = 846 # A2+A3 (2026-09-10): 842 -> 846, +4 chroot resolve unit tests
+              # (crates/sandlock-core/src/chroot/resolve.rs) pinning the
+              # request-derived cwd + alias normalization:
+              # host_to_virtual_tie_breaks_on_declaration_order,
+              # mount_walk_folds_a_shared_directory_submount_onto_the_canonical_alias,
+              # mount_walk_falls_back_to_the_input_when_it_cannot_converge,
+              # deny_and_read_only_fold_across_every_alias_of_a_shared_directory.
+              # F18 (2026-09-09): 841 -> 842, +1 device-node-vs-FIFO arg-filter
               # test (mknod/mknodat filtered on S_IFBLK|S_IFCHR so CAP_MKNOD inside
               # the sandbox's own userns cannot mint raw-device nodes, while
               # mkfifo -- the same syscall with S_IFIFO -- keeps working).
@@ -125,7 +145,18 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 534 # FUP-13 (2026-09-07, A/B cleanup wave): 533 -> 534, +1
+core_integ = 539 # A1+A2+A3 (2026-09-10): 534 -> 539, +5 in
+                 # crates/sandlock-core/tests/integration/test_instance_chroot.rs —
+                 # A1 (aadb5ad) pinned three cases in that file and A2 turns the
+                 # two RED ones green
+                 # (test_relative_open_from_second_workspace_alias_resolves_the_
+                 # submount, test_getcwd_reports_the_requested_alias_not_the_best_
+                 # match; test_getcwd_reports_the_alias_the_policy_declared is the
+                 # guard that was already green at aadb5ad),
+                 # A2 (c6cbe03) added two more
+                 # (test_deny_declared_under_one_alias_covers_the_other_alias,
+                 # test_read_only_declared_under_one_alias_covers_the_other_alias).
+                 # FUP-13 (2026-09-07, A/B cleanup wave): 533 -> 534, +1
                  # pid-ns init-kill Dead matrix test (test_instance_semantics.rs)
                  # F11 (2026-09-06): 532 -> 533, +1 argv-safety root-cause
                  # regression in integration/test_policy_fn.rs
