@@ -25,7 +25,7 @@ use sandlock_ffi::{
     sandlock_instance_launch, sandlock_instance_launch_with_err, sandlock_sandbox_build,
     sandlock_sandbox_builder_fs_deny, sandlock_sandbox_builder_fs_read,
     sandlock_sandbox_builder_new, sandlock_sandbox_builder_user, sandlock_sandbox_free,
-    sandlock_sandbox_t, sandlock_string_free,
+    sandlock_sandbox_t, sandlock_string_free, SANDLOCK_INSTANCE_ERR_CHILD,
 };
 
 /// The sandbox host uid/gid every refusal fixture requests: far from any real
@@ -155,7 +155,13 @@ fn instance_launch_with_err_publishes_the_core_refusal() {
         instance.is_null(),
         "a refused launch must not return a handle"
     );
-    assert_eq!(err, -1, "a refused launch must set *err to -1");
+    // The instance family reports the *stable* code rather than a bare -1, so
+    // callers classify by code (closed=1 / dead=6) instead of parsing the
+    // reason text (B1 review, minor-3).
+    assert_eq!(
+        err, SANDLOCK_INSTANCE_ERR_CHILD,
+        "a spawn refusal is classified as a child failure"
+    );
     let text = unsafe { take(err_msg) };
     assert_eq!(text, expected_refusal());
     unsafe { sandlock_sandbox_free(policy) };

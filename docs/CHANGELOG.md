@@ -8,6 +8,31 @@
 
 ## 行为变化（升级 / 接线前必读）
 
+- **B1 fix round 1（2026-09-11，SL-12 评审）**：四条修正，两条是安全相关的。
+  ① **缺符号不再静默**：新的 Python 包配上旧的 `libsandlock_ffi.so`（源码树
+  `target/` 陈旧、部分升级、wheel 与库路径混搭）以前会在 `import sandlock`
+  直接抛 `AttributeError`；调用方（E2B 的 `_sandlock_available()`）用宽 `except`
+  吞掉后**悄悄退化成无约束的 LocalExecutor**。现在 `_sdk` 用 `hasattr` feature-detect
+  这两个导出，缺哪个就抛点名的 `RuntimeError`（写明符号、当前库路径与「装匹配 wheel
+  或 `cargo build -p sandlock-ffi` + `LD_LIBRARY_PATH`」的修法），**不回落**到无原因的
+  旧符号。② **closed/dead 变成类型**：`sandlock.exceptions` 新增
+  `InstanceClosedError` / `InstanceDeadError`（都是 `RuntimeError` 子类，既有
+  `except RuntimeError` 照旧生效），会话关闭/死亡一律按类型抛出；配套地
+  `sandlock_instance_launch_with_err` 的 `*err` 不再一律 -1，而是报**稳定的实例错误码**
+  （`SANDLOCK_INSTANCE_ERR_*`），调用方按码分类而不用猜自由文本（绑定层入参错误仍是
+  -1）。宿主的「rebuild once」判定因此改成 `isinstance`，不再对消息做子串匹配 ——
+  B1 之后失败文本会带 core 的自由文案，子串匹配可能误判。③ 失败文本**只留一层前缀**：
+  FFI 的绑定层消息不再重复符号名（Python 面仍是
+  `sandlock_create failed: <reason>` / `sandlock_instance_launch failed: <reason>`）。
+  ④ E2B 侧同批修正：`envd_service/executors/factory.py` 区分「包不存在」
+  （`ModuleNotFoundError` ⇒ 既有 local 回落）与「包在但坏」（显式
+  `E2B_EXECUTOR=sandlock` ⇒ 直接 raise；`auto` ⇒ **ERROR** 日志，明说回落的是无约束
+  local），`envd_service/executors/sandlock.py` 的导入失败不再吞成 `sandlock = None`，
+  route-B 的 `SlotDeadError` 与 in-process 的两个新类型一起进按类型判定表。
+  测试：fork `python` 461→467（+4：点名错误、旧 `.so` 桩 import、typed closed、
+  启动错误码映射），ffi 计数不变（ABI 未动）；E2B `tests/unit` 774 passed
+  （新增 factory 健康度 4 条、launch 文本误判回归 1 条，closed/dead 假体改抛 typed）。
+
 - **create/launch 失败带原因（B1，2026-09-11，SL-12）**：`sandlock_create` /
   `sandlock_instance_launch` 失败时 FFI 只回 NULL，SDK 面于是只剩
   `RuntimeError("sandlock_create failed")` / `…instance_launch failed` ——
@@ -345,6 +370,9 @@ sandlock_instance_launch_with_err                    # B1 (SL-12)
   （共享同一个 `ffi_fail` 错误路径：`err=-1` + 由 `sandlock_string_free` 释放的消息），
   而不是新发明一条错误通道；`sandlock.h` 增量补这两处声明 —— 既有 supervise 文档
   是手工润色过的，整份 cbindgen 重生成会把这些文档回退成较短的源码注释。
+  fix round 1 没有新增符号（ABI 不变），只细化语义：绑定层出参错误仍是 -1，
+  但 `sandlock_instance_launch_with_err` 的 core 失败改为回报稳定实例错误码
+  （`ffi_fail_with_code`），好让 `closed` / `dead` 可按码/类型判定。
 - `sandlock.h` 重生成顺带修复既有声明漂移（补 `notify_rate_limit` builder 声明）。
 - wheel 符号集双向相等（缺/多即红）是 verify 硬门（F0.2/F2b.5；F9 已在最终 tip
   重建 verify，见 `tmp/sdd/f9-wheel-verify.log`）。

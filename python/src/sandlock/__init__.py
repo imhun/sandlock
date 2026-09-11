@@ -32,6 +32,8 @@ from .exceptions import (
     NotifError,
     BranchError,
     BranchConflictError,
+    InstanceClosedError,
+    InstanceDeadError,
 )
 
 __all__ = [
@@ -86,4 +88,6 @@ __all__ = [
     "NotifError",
     "BranchError",
     "BranchConflictError",
+    "InstanceClosedError",
+    "InstanceDeadError",
 ]

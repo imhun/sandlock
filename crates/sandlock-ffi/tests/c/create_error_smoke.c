@@ -3,7 +3,11 @@
  * contract must surface the reason.  A NULL policy is refused by the binding's
  * own prologue, so the smoke needs no fork and stays deterministic -- its job
  * is to pin the hand-maintained header declarations against the exported
- * symbols (a header typo would otherwise only show up in the wheel check). */
+ * symbols (a header typo would otherwise only show up in the wheel check).
+ *
+ * The expected strings are the prologue's *bare* reasons: the caller's own
+ * face names the operation (`sandlock_create failed: <reason>` in Python), so
+ * the FFI must not prefix the symbol a second time (B1 review, minor-1). */
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -40,7 +44,7 @@ int main(void) {
         return 1;
     }
     if (check("create", err, err_msg,
-              "sandlock_create: policy and argv are required") != 0) {
+              "policy and argv are required") != 0) {
         return 1;
     }
 
@@ -52,7 +56,7 @@ int main(void) {
         return 1;
     }
     if (check("launch", err, err_msg,
-              "sandlock_instance_launch: policy is required") != 0) {
+              "policy is required") != 0) {
         return 1;
     }
     return 0;

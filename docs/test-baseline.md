@@ -495,7 +495,14 @@ oci = 150     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root.
               # 56 lib + 68 bin + 15 integration.rs + 2 reaper + 3 process
               # groups = 144).
 cli_build = 0 # workspace release build gate (no test binaries; 0 = build passed)
-python = 463  # B1 (2026-09-11, SL-12): 461 -> 463, +2 in the new
+python = 467  # B1 fix round 1 (2026-09-11, SL-12 review): 463 -> 467, +4 in
+              # tests/test_failure_reason.py — the missing reason export is a
+              # named RuntimeError (guard helper + a subprocess probe that
+              # loads the package against a stubbed pre-SL-12 .so), a verb on a
+              # shut-down session raises the typed InstanceClosedError, and the
+              # FFI instance error codes map to the typed session-gone errors
+              # (closed=1 / dead=6) while keeping the reason text verbatim.
+              #  B1 (2026-09-11, SL-12): 461 -> 463, +2 in the new
               # tests/test_failure_reason.py — `Sandbox.create` and
               # `SandboxInstance` must raise RuntimeError whose *whole* text is
               # `sandlock_create failed: <core Display>` /

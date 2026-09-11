@@ -1386,7 +1386,10 @@ unsafe fn sandlock_create_with_runtime(
     let (mut sb, rt, args) = match prepare(policy, name, argv, argc, build_rt) {
         Ok(t) => t,
         Err(why) => {
-            ffi_fail(err, err_msg, &format!("sandlock_create: {why}"));
+            // Bare reason: the caller's own face already names the operation
+            // (Python raises `sandlock_create failed: <reason>`), so repeating
+            // the symbol here would only double the prefix (B1 review).
+            ffi_fail(err, err_msg, &why);
             return ptr::null_mut();
         }
     };
@@ -1406,11 +1409,7 @@ unsafe fn sandlock_create_with_runtime(
             return ptr::null_mut();
         }
         None => {
-            ffi_fail(
-                err,
-                err_msg,
-                "sandlock_create: the sandbox runtime is unavailable",
-            );
+            ffi_fail(err, err_msg, "the sandbox runtime is unavailable");
             return ptr::null_mut();
         }
     }
@@ -3297,8 +3296,11 @@ fn exec_stdio_from_raw(mode: u32) -> Option<sandlock_core::instance::ExecStdio> 
 ///
 /// Returns an opaque instance handle, or NULL on any failure (the caller
 /// frees it with `sandlock_instance_free`); when `err_msg` is non-null the
-/// core's own error text is published there (`*err` is -1 on failure, 0 on
-/// success) under the same out-parameter contract the supervise exports use.
+/// core's own error text is published there under the same out-parameter
+/// contract the supervise exports use. `*err` is 0 on success, the stable
+/// instance error code (`SANDLOCK_INSTANCE_ERR_*`) for a core failure — so
+/// `closed` / `dead` stay distinguishable without parsing the text — and -1
+/// for a binding-level prologue failure (null policy, bad name, no runtime).
 /// Pass null for both to discard the reason ([`sandlock_instance_launch`]).
 ///
 /// # Safety
@@ -3316,29 +3318,21 @@ pub unsafe extern "C" fn sandlock_instance_launch_with_err(
         *err_msg = ptr::null_mut();
     }
     if policy.is_null() {
-        ffi_fail(err, err_msg, "sandlock_instance_launch: policy is required");
+        ffi_fail(err, err_msg, "policy is required");
         return ptr::null_mut();
     }
     let policy = &(*policy)._private;
     let name = match optional_name(name) {
         Ok(n) => n,
         Err(_) => {
-            ffi_fail(
-                err,
-                err_msg,
-                "sandlock_instance_launch: name is not valid UTF-8",
-            );
+            ffi_fail(err, err_msg, "name is not valid UTF-8");
             return ptr::null_mut();
         }
     };
     let rt = match build_live_runtime() {
         Some(rt) => rt,
         None => {
-            ffi_fail(
-                err,
-                err_msg,
-                "sandlock_instance_launch: failed to build the sandbox runtime",
-            );
+            ffi_fail(err, err_msg, "failed to build the sandbox runtime");
             return ptr::null_mut();
         }
     };
@@ -3358,9 +3352,11 @@ pub unsafe extern "C" fn sandlock_instance_launch_with_err(
             }))
         }
         Some(Err(e)) => {
-            // As with `sandlock_create_with_err`: the core text (thiserror
-            // Display) carries the refusal's remedy or the confinement errno.
-            ffi_fail(err, err_msg, &format!("{e}"));
+            // As with `sandlock_create_with_err` the reason is the core's
+            // Display text; unlike it, `*err` carries the *stable* instance
+            // error code (closed=1, dead=6, ...) so callers can classify the
+            // failure without parsing that text.
+            ffi_fail_with_code(err, err_msg, instance_error_code(&e), &format!("{e}"));
             ptr::null_mut()
         }
         None => {
@@ -3841,8 +3837,24 @@ fn check_supervise_control_fd(fd: std::os::fd::RawFd) -> Result<(), String> {
 /// `err` and `err_msg` may be null; when non-null they must point to
 /// writable storage.
 unsafe fn ffi_fail(err: *mut c_int, err_msg: *mut *mut c_char, msg: &str) {
+    ffi_fail_with_code(err, err_msg, -1, msg)
+}
+
+/// [`ffi_fail`] with an explicit `*err` value: the instance family reports the
+/// stable `SANDLOCK_INSTANCE_ERR_*` code so a caller can branch on the failure
+/// *class* (`closed` / `dead`) instead of substring-matching the message text,
+/// which now carries the core's own prose (B1 review, minor-3).
+///
+/// # Safety
+/// Same contract as [`ffi_fail`].
+unsafe fn ffi_fail_with_code(
+    err: *mut c_int,
+    err_msg: *mut *mut c_char,
+    code: c_int,
+    msg: &str,
+) {
     if !err.is_null() {
-        *err = -1;
+        *err = code;
     }
     if !err_msg.is_null() {
         if let Ok(c) = CString::new(msg) {

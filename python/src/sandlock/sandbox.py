@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
+from .exceptions import InstanceClosedError, InstanceDeadError
+
 # Module-level counter for auto-generated sandbox names.
 # Using itertools.count avoids both dataclass field pollution (a class-level
 # annotated assignment inside @dataclass becomes a real field) and a
@@ -1092,7 +1094,7 @@ class Sandbox:
         """
         import ctypes
 
-        from ._sdk import _failure_text, _lib, _make_argv
+        from ._sdk import _create_with_err, _failure_text, _make_argv
 
         self._check_not_running()
 
@@ -1102,7 +1104,7 @@ class Sandbox:
 
         err = ctypes.c_int(0)
         err_msg = ctypes.c_void_p()
-        self._handle = _lib.sandlock_create_with_err(
+        self._handle = _create_with_err(
             native.ptr, _encode(resolved_name), argv, argc,
             ctypes.byref(err), ctypes.byref(err_msg),
         )
@@ -1943,7 +1945,7 @@ class SandboxInstance:
     def __init__(self, policy: "Sandbox", name: str | None = None):
         import ctypes
 
-        from ._sdk import _failure_text, _lib
+        from ._sdk import _failure_text, _instance_launch_with_err
 
         if not isinstance(policy, Sandbox):
             raise TypeError(
@@ -1955,17 +1957,22 @@ class SandboxInstance:
         self._policy = policy
         err = ctypes.c_int(0)
         err_msg = ctypes.c_void_p()
-        self._handle = _lib.sandlock_instance_launch_with_err(
+        self._handle = _instance_launch_with_err(
             native.ptr,
             _encode(resolved) if resolved is not None else None,
             ctypes.byref(err),
             ctypes.byref(err_msg),
         )
         if not self._handle:
-            # `err` is -1 on this path too; the null handle is the same signal
-            # and `err_msg` carries the core's reason.
-            raise RuntimeError(
-                _failure_text("sandlock_instance_launch", err_msg)
+            # `err` is the *stable* instance error code for a core failure
+            # (closed=1 / dead=6 / ...), so a session-gone launch failure keeps
+            # its type even though the text is now the core's prose (SL-12 fix
+            # round 1); `err_msg` carries the reason, and a binding-level
+            # prologue failure reports -1 and stays a plain RuntimeError.
+            raise self._error_for_code(
+                err.value,
+                "launch",
+                _failure_text("sandlock_instance_launch", err_msg),
             )
 
     def exec(
@@ -2023,7 +2030,7 @@ class SandboxInstance:
         )
 
         if self._handle is None:
-            raise RuntimeError(self._closed_message())
+            raise InstanceClosedError(self._closed_message())
         if not isinstance(cmd, (list, tuple)) or not cmd:
             raise ValueError("exec requires a non-empty argv sequence")
         mode = int(stdio)
@@ -2070,10 +2077,9 @@ class SandboxInstance:
             ctypes.byref(out),
         )
         if rc != 0:
-            message = self._error_message(rc, "exec")
             if rc == self._ERR_POLICY:
-                raise PermissionError(message)
-            raise RuntimeError(message)
+                raise PermissionError(self._error_message(rc, "exec"))
+            raise self._error_for_code(rc, "exec")
         return ExecProcess(
             self,
             child_id=out.child_id,
@@ -2101,7 +2107,7 @@ class SandboxInstance:
         from ._sdk import _encode, _lib
 
         if self._handle is None:
-            raise RuntimeError(self._closed_message())
+            raise InstanceClosedError(self._closed_message())
         encoded = [_encode(str(ip)) for ip in ips]
         if encoded:
             arr = (ctypes.c_char_p * len(encoded))(*encoded)
@@ -2124,7 +2130,7 @@ class SandboxInstance:
                 "update_network exceeds the instance policy ceiling (EPERM)"
             )
         if rc != 0:
-            raise RuntimeError(self._error_message(rc, "update_network"))
+            raise self._error_for_code(rc, "update_network")
         n = min(out_count.value, cap)
         return list(stale[:n])
 
@@ -2169,16 +2175,42 @@ class SandboxInstance:
             "silently relaunched"
         )
 
-    def _error_message(self, rc: int, verb: str) -> str:
-        if rc == self._ERR_CLOSED:
-            return self._closed_message()
-        if rc == self._ERR_DEAD:
-            return self._dead_message()
-        if rc == self._ERR_UNKNOWN_CHILD:
-            return f"sandlock_instance_{verb}: unknown child id"
-        if rc == self._ERR_POLICY:
-            return f"sandlock_instance_{verb}: exec params exceed the instance policy ceiling (EPERM)"
-        return f"sandlock_instance_{verb} failed (error code {rc})"
+    @classmethod
+    def _error_for_code(
+        cls, rc: int, verb: str, message: str | None = None
+    ) -> BaseException:
+        """The exception an instance failure code maps to.
+
+        Closed and dead are **typed** (SL-12 fix round 1): a host has to tell
+        "the session is gone, build a replacement" apart from any other
+        failure, and since SL-12 the message carries the core's own free text
+        (a refusal's remedy, a confinement errno), so substring-matching it is
+        no longer sound. Both classes subclass ``RuntimeError``, so existing
+        ``except RuntimeError`` handlers keep working unchanged.
+
+        ``message`` overrides the built-in text — the launch path passes the
+        reason the FFI just reported, keeping the ``<what> failed: <reason>``
+        shape while still typing a closed/dead failure.
+        """
+        if rc == cls._ERR_CLOSED:
+            return InstanceClosedError(message or cls._closed_message())
+        if rc == cls._ERR_DEAD:
+            return InstanceDeadError(message or cls._dead_message())
+        if message is not None:
+            return RuntimeError(message)
+        if rc == cls._ERR_UNKNOWN_CHILD:
+            return RuntimeError(f"sandlock_instance_{verb}: unknown child id")
+        if rc == cls._ERR_POLICY:
+            return RuntimeError(
+                f"sandlock_instance_{verb}: exec params exceed the instance "
+                "policy ceiling (EPERM)"
+            )
+        return RuntimeError(f"sandlock_instance_{verb} failed (error code {rc})")
+
+    @classmethod
+    def _error_message(cls, rc: int, verb: str) -> str:
+        """The text of :meth:`_error_for_code` (message-only callers)."""
+        return str(cls._error_for_code(rc, verb))
 
 
 class ExecProcess:
@@ -2306,7 +2338,7 @@ class ExecProcess:
                 self._instance._handle, self._child_id, signal.SIGKILL
             )
         if rc != 0:
-            raise RuntimeError(self._instance._error_message(rc, "kill_child"))
+            raise self._instance._error_for_code(rc, "kill_child")
 
     def wait(self, timeout: float | None = None) -> "Result":
         """Wait for the child to exit and return its :class:`Result`.

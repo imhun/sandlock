@@ -454,15 +454,65 @@ _c_handle_p = ctypes.c_void_p
 _lib.sandlock_create.restype = _c_handle_p
 _lib.sandlock_create.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
 
-_lib.sandlock_create_with_err.restype = _c_handle_p
-_lib.sandlock_create_with_err.argtypes = [
-    _c_policy_p,
-    ctypes.c_char_p,
-    ctypes.POINTER(ctypes.c_char_p),
-    ctypes.c_uint,
-    ctypes.POINTER(ctypes.c_int),      # err
-    ctypes.POINTER(ctypes.c_void_p),   # err_msg (char **)
-]
+# SL-12 fix round 1 (security review): the create/launch exports that carry a
+# failure reason are *required* by this package, but the `.so` it loads is a
+# separate artifact — a stale `target/`, a partially upgraded image or a wheel
+# built against an older library can predate them. Two failure modes must be
+# avoided:
+#
+#   * silently falling back to the reason-less symbols (a sandbox failure
+#     would then be reported without its cause), and
+#   * a bare `AttributeError` at `import sandlock` — launcher-level guards
+#     (E2B's `_sandlock_available()`) catch broadly, so an AttributeError reads
+#     as "sandlock is unavailable" and the worker quietly loses confinement.
+#
+# So: probe with `hasattr` (ctypes answers a missing symbol from dlsym with
+# AttributeError, which must not escape), bind what exists, and fail by name
+# with the remedy when an export is missing.
+_CREATE_WITH_ERR_EXPORT = "sandlock_create_with_err"
+_INSTANCE_LAUNCH_WITH_ERR_EXPORT = "sandlock_instance_launch_with_err"
+
+
+def _bind_export(name: str, restype, argtypes):
+    """Bind `name` when the loaded library exports it; else return None."""
+    if not hasattr(_lib, name):
+        return None
+    fn = getattr(_lib, name)
+    fn.restype = restype
+    fn.argtypes = list(argtypes)
+    return fn
+
+
+def _require_export(name: str, fn):
+    """The bound export, or a `RuntimeError` naming the symbol and the fix."""
+    if fn is None:
+        raise RuntimeError(
+            f"{name} is missing from the loaded sandlock library "
+            f"({_lib._name!s}). This Python package requires the create/launch "
+            "exports that carry a failure reason: without them a sandbox "
+            "failure would be reported without its cause, so this is refused "
+            "rather than silently degraded. Install the matching sandlock "
+            "wheel, or rebuild the native library "
+            "(cargo build -p sandlock-ffi) and point LD_LIBRARY_PATH at it."
+        )
+    return fn
+
+
+_create_with_err = _bind_export(
+    _CREATE_WITH_ERR_EXPORT,
+    _c_handle_p,
+    [
+        _c_policy_p,
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_char_p),
+        ctypes.c_uint,
+        ctypes.POINTER(ctypes.c_int),      # err
+        ctypes.POINTER(ctypes.c_void_p),   # err_msg (char **)
+    ],
+)
+# Import-time refusal, by name: a newer SDK must never run against a library
+# that cannot report why a sandbox failed.
+_require_export(_CREATE_WITH_ERR_EXPORT, _create_with_err)
 
 _lib.sandlock_create_for_run.restype = _c_handle_p
 _lib.sandlock_create_for_run.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
@@ -534,13 +584,17 @@ class _SandlockInstanceExecParams(ctypes.Structure):
 
 _lib.sandlock_instance_launch.restype = _c_instance_p
 _lib.sandlock_instance_launch.argtypes = [_c_policy_p, ctypes.c_char_p]
-_lib.sandlock_instance_launch_with_err.restype = _c_instance_p
-_lib.sandlock_instance_launch_with_err.argtypes = [
-    _c_policy_p,
-    ctypes.c_char_p,
-    ctypes.POINTER(ctypes.c_int),      # err
-    ctypes.POINTER(ctypes.c_void_p),   # err_msg (char **)
-]
+_instance_launch_with_err = _bind_export(
+    _INSTANCE_LAUNCH_WITH_ERR_EXPORT,
+    _c_instance_p,
+    [
+        _c_policy_p,
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_int),      # err
+        ctypes.POINTER(ctypes.c_void_p),   # err_msg (char **)
+    ],
+)
+_require_export(_INSTANCE_LAUNCH_WITH_ERR_EXPORT, _instance_launch_with_err)
 _lib.sandlock_instance_exec.restype = ctypes.c_int
 _lib.sandlock_instance_exec.argtypes = [
     _c_instance_p,

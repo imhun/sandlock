@@ -1660,8 +1660,11 @@ char *sandlock_handle_restore_skipped_path(const sandlock_handle_t *h, uintptr_t
  *
  * Returns an opaque instance handle, or NULL on any failure (the caller
  * frees it with `sandlock_instance_free`); when `err_msg` is non-null the
- * core's own error text is published there (`*err` is -1 on failure, 0 on
- * success) under the same out-parameter contract the supervise exports use.
+ * core's own error text is published there under the same out-parameter
+ * contract the supervise exports use. `*err` is 0 on success, the stable
+ * instance error code (`SANDLOCK_INSTANCE_ERR_*`) for a core failure — so
+ * `closed` / `dead` stay distinguishable without parsing the text — and -1
+ * for a binding-level prologue failure (null policy, bad name, no runtime).
  * Pass null for both to discard the reason ([`sandlock_instance_launch`]).
  *
  * # Safety
