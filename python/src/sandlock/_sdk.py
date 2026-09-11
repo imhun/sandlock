@@ -216,9 +216,6 @@ _b_egress_proxy_credentials = _builder_fn(
     "sandlock_sandbox_builder_egress_proxy_credentials", ctypes.c_char_p, ctypes.c_char_p
 )
 _b_user = _builder_fn("sandlock_sandbox_builder_user", ctypes.c_uint32, ctypes.c_uint32)
-_b_mediation_run_as = _builder_fn(
-    "sandlock_sandbox_builder_mediation_run_as", ctypes.c_uint8
-)
 _b_random_seed = _builder_fn("sandlock_sandbox_builder_random_seed", ctypes.c_uint64)
 _b_clean_env = _builder_fn("sandlock_sandbox_builder_clean_env", ctypes.c_bool)
 _b_env_var = _builder_fn("sandlock_sandbox_builder_env_var", ctypes.c_char_p, ctypes.c_char_p)
@@ -1335,7 +1332,7 @@ class _NativePolicy:
         "pid_ns", "net_isolation", "fd_inject_connect", "port_mappings",
         "http_allow", "http_deny", "http_ports", "http_ca", "http_key",
         "http_inject_ca", "http_ca_out", "http_inject", "host_mask",
-        "egress_proxy", "uid", "gid", "mediation_run_as",
+        "egress_proxy", "uid", "gid",
         "notify_rate_limit",
         "random_seed", "time_start", "clean_env", "env",
         "extra_deny_syscalls", "extra_allow_syscalls", "max_open_files",
@@ -1485,10 +1482,6 @@ class _NativePolicy:
             if policy.uid is None or policy.gid is None:
                 raise ValueError("uid and gid must both be set (or both unset)")
             b = _b_user(b, policy.uid, policy.gid)
-
-        if policy.mediation_run_as != "caller":
-            # 1 = supervisor (explicit downgrade tier); 0 = caller (default).
-            b = _b_mediation_run_as(b, 1)
 
         if policy.random_seed is not None:
             b = _b_random_seed(b, policy.random_seed)

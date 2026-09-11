@@ -49,8 +49,17 @@
 # and core_integ (534 -> 539) move, by the A1/A2 test cases registered below;
 # ffi / cli / supervise / supervise_cost / cli_build / python / oci /
 # supervise_root / mediation_2uid are unchanged.
-core_lib = 846 # A2+A3 (2026-09-10): 842 -> 846, +4 chroot resolve unit tests
-              # (crates/sandlock-core/src/chroot/resolve.rs) pinning the
+core_lib = 840 # B3 (2026-09-11, SL-1 hard delete): 846 -> 840, -6 unit tests
+               # removed with the privileged-mediator downgrade tier:
+               # sandbox/tests.rs (-3: the MediationRunAs parse /
+               # default / serde round-trip cases) and profile.rs (-3: the
+               # profile `[config]` key parse / absent-default / TOML
+               # round-trip cases). The C档 predicate truth table
+               # (mediation_identity_gate_refuses_only_root_remap_with_
+               # mediation, + the F14 caps case) and
+               # mediation_active_covers_policy_fn_deny_capability stay.
+               # A2+A3 (2026-09-10): 842 -> 846, +4 chroot resolve unit tests
+               # (crates/sandlock-core/src/chroot/resolve.rs) pinning the
               # request-derived cwd + alias normalization:
               # host_to_virtual_tie_breaks_on_declaration_order,
               # mount_walk_folds_a_shared_directory_submount_onto_the_canonical_alias,
@@ -145,7 +154,19 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 539 # A1+A2+A3 (2026-09-10): 534 -> 539, +5 in
+core_integ = 540 # B3 (2026-09-11, SL-1 hard delete): 539 -> 540, +1 in
+                 # crates/sandlock-core/tests/integration/test_mediation_identity.rs
+                 # (privileged_in_process_mediation_is_refused_with_route_b_remedy:
+                 # the C档 shape is refused before fork with the route-B
+                 # remedy and no downgrade offered; phase-aware, the root
+                 # branch is the acceptance and the unprivileged branch pins
+                 # the userns-map refusal that fires first there). Count
+                 # unchanged in test_instance_chroot.rs — the F10 non-root
+                 # case lost its tier argument and was renamed
+                 # (test_instance_exec_only_chroot_same_uid_launch_and_exec),
+                 # keeping its role as the "mediation active + mediator ==
+                 # host uid is untouched" reverse regression.
+                 # A1+A2+A3 (2026-09-10): 534 -> 539, +5 in
                  # crates/sandlock-core/tests/integration/test_instance_chroot.rs —
                  # A1 (aadb5ad) pinned three cases in that file and A2 turns the
                  # two RED ones green
@@ -281,7 +302,14 @@ core_integ = 539 # A1+A2+A3 (2026-09-10): 534 -> 539, +5 in
                  # (test_exec_mode_main_exit_is_terminal_and_verbs_close);
                  # one-shot outlives regression stays green in
                  # test_instance_lifecycle.rs.
-ffi = 106 # B1 (2026-09-11, SL-12): 101 -> 106, +4 in the new
+ffi = 104 # B3 (2026-09-11, SL-1 hard delete): 106 -> 104 — the whole
+          # tests/mediation_run_as.rs target is gone with the tier it drove
+          # (-2: builder_mediation_run_as_supervisor_lands_on_policy,
+          # builder_mediation_run_as_defaults_to_caller_and_invalid_stays_
+          # closed), and the FFI export itself is gone (symbol count 164 ->
+          # 163 in the wheel verify). tests/failure_reason.rs keeps its two
+          # count (only the pinned C档 text changed).
+          # B1 (2026-09-11, SL-12): 101 -> 106, +4 in the new
           # tests/failure_reason.rs — the create/launch `*_with_err` symbols
           # publish the core's own failure text through the supervise
           # `err`/`err_msg` contract, and the legacy 4-arg `sandlock_create` /
@@ -327,7 +355,14 @@ ffi = 106 # B1 (2026-09-11, SL-12): 101 -> 106, +4 in the new
          # compiles the regenerated sandlock.h against the cdylib (still 1);
          # header regeneration also picks up pre-existing drift at HEAD
          # (missing sandlock_sandbox_builder_notify_rate_limit declaration).
-cli = 100     # FUP-01/FUP-07 (2026-09-07, A/B cleanup wave): 98 -> 100,
+cli = 97      # B3 (2026-09-11, SL-1 hard delete): 100 -> 97, -3 with the
+              # `--mediation-run-as` flag: tests/cli_test.rs (-2:
+              # test_mediation_run_as_flag_accepted_and_runs,
+              # test_mediation_run_as_rejects_unknown_value_at_parse) and
+              # tests/profile_integration.rs (-1: the FUP-07 no-clobber
+              # profile-tier case; a profile that still carries the key is
+              # now refused by name via ConfigSection's deny_unknown_fields).
+              # FUP-01/FUP-07 (2026-09-07, A/B cleanup wave): 98 -> 100,
               # +1 --pid-ns runtime-policy unit test (main.rs) +1 profile
               # mediation_run_as acceptance test (profile_integration.rs)
               # F6.2 (P5): 97 -> 98, +1 in tests/cli_test.rs
@@ -341,7 +376,11 @@ cli = 100     # FUP-01/FUP-07 (2026-09-07, A/B cleanup wave): 98 -> 100,
               # after F0.4 wiring (cli suite includes net_bind_map tests);
               # F5.1 updates the no-supervisor default validation to
               # DEFAULT_MAX_PROCESSES (256), no count change
-supervise = 43 # SL-11 (2026-09-11, B2): 42 -> 43, +1 integration
+supervise = 42 # B3 (2026-09-11, SL-1 hard delete): 43 -> 42, -1 lib unit
+               # (policy::tests::mediation_run_as_rejects_unknown_wire_value
+               # went with the wire field; the field-list drift guard and the
+               # full-field round-trip doc both lost the entry, same count).
+               # SL-11 (2026-09-11, B2): 42 -> 43, +1 integration
                # (test_supervise_control_fd_stays_out_of_the_confined_tree:
                # the fd transport's own socket inode — the handed-over
                # `--control-fd` end — must appear in the slot's
@@ -420,7 +459,20 @@ supervise_root = 4 # ROOT-MODE: run via scripts/test-all.sh; +1 FUP-11d
                    # shutdown/no-residue) and
                    # test_supervisor_as_foreign_uid_fd_handoff_serves_worker
                    # (fd transport, same genuine identities).
-mediation_2uid = 10 # ROOT-MODE: run via scripts/test-all.sh
+mediation_2uid = 9 # B3 (2026-09-11, SL-1 hard delete): 10 -> 9. Removed with
+                   # the tier: test_root_inprocess_mediation_with_caps_kept_
+                   # would_leak (the caps-kept control proving the downgrade
+                   # was real) and test_cli_mediation_run_as_is_wired (the CLI
+                   # flag); the two F10 `RunAs(10000)` create/launch
+                   # acceptances became one refusal acceptance
+                   # (test_root_chroot_privileged_remap_is_refused_before_fork).
+                   # Added: that refusal, plus the two reverse regressions
+                   # (test_root_pure_per_uid_run_as_is_still_accepted — a
+                   # privileged per-uid remap with NO mediation stays legal;
+                   # test_root_chroot_uid0_instance_exec_only_restrictive_cache
+                   # — host uid 0 needs no remap). B档 (the two-supervisor
+                   # pair + the Python-client slot case) is untouched.
+                   # ROOT-MODE: run via scripts/test-all.sh
                    # --mediation-2uid as root (same privileged container as
                    # oci). F6.1 (SL-1) acceptance in
                    # crates/sandlock-supervise/tests/mediation_2uid.rs:
@@ -495,7 +547,12 @@ oci = 150     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root.
               # 56 lib + 68 bin + 15 integration.rs + 2 reaper + 3 process
               # groups = 144).
 cli_build = 0 # workspace release build gate (no test binaries; 0 = build passed)
-python = 467  # B1 fix round 1 (2026-09-11, SL-12 review): 463 -> 467, +4 in
+python = 464  # B3 (2026-09-11, SL-1 hard delete): 467 -> 464, -3 in
+              # tests/test_sandbox_config.py (the whole TestMediationRunAs
+              # class: default / native round-trip / invalid-value cases).
+              # tests/test_failure_reason.py keeps its count (only the pinned
+              # C档 text changed).
+              # B1 fix round 1 (2026-09-11, SL-12 review): 463 -> 467, +4 in
               # tests/test_failure_reason.py — the missing reason export is a
               # named RuntimeError (guard helper + a subprocess probe that
               # loads the package against a stubbed pre-SL-12 .so), a verb on a

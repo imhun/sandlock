@@ -14,8 +14,7 @@
 //! The tests below pin that same-uid contract (A档) on the default
 //! non-root gate.  They deliberately do NOT use `RunAs`: a `RunAs` remap
 //! to a *different* host uid from a root supervisor is the C档 shape and is
-//! refused / explicitly downgraded elsewhere (see the root-mode
-//! `mediation_2uid` target and `mediation_run_as`).
+//! refused elsewhere (see the root-mode `mediation_2uid` target).
 
 use std::path::PathBuf;
 
@@ -149,4 +148,52 @@ async fn test_denied_path_still_denied() {
     );
 
     cleanup(&dir);
+}
+
+/// The privileged-mediator downgrade tier no longer exists: when path
+/// mediation is active, a mediator that can remap the sandbox to a
+/// *different* non-zero host uid must be refused before fork, and the only
+/// remedy the refusal may offer is route B (run `sandlock-supervise` as the
+/// sandbox's host uid).  There is no `supervisor` escape hatch and no field
+/// to name one.
+///
+/// The refusal is privilege-dependent by construction — it is the
+/// *privileged* mediator that has to be stopped — so the assertion follows
+/// the phase instead of skipping: as root the shape reaches the identity
+/// gate and the exact route-B sentence is pinned; unprivileged the same
+/// shape is stopped one check earlier by the single-entry userns map
+/// refusal.  Neither text may offer a downgrade.  The root phase is
+/// exercised in the B3 evidence run and, as an acceptance, by the root-mode
+/// `mediation_2uid` target.
+#[tokio::test]
+async fn privileged_in_process_mediation_is_refused_with_route_b_remedy() {
+    let mut sb = Sandbox::builder()
+        // Path mediation (chroot) + a host uid this process would have to
+        // remap to: the C档 shape.
+        .chroot("/tmp")
+        .fs_read("/")
+        .user(21700, 21700)
+        .build()
+        .expect("the policy itself builds; the refusal is at spawn");
+
+    let err = sb.run(&["true"]).await.expect_err(
+        "a privileged mediator remapping to host uid 21700 with mediation must be refused",
+    );
+    let msg = err.to_string();
+
+    if euid() == 0 {
+        assert!(
+            msg.contains("Run sandlock-supervise as uid 21700 (route B)"),
+            "the refusal must name the route-B remedy verbatim at root, got: {msg}"
+        );
+    } else {
+        assert!(
+            msg.contains("RunAs(21700, 21700) refused"),
+            "unprivileged, the userns-map refusal fires before the identity gate, got: {msg}"
+        );
+    }
+    assert!(
+        !msg.contains("downgrade"),
+        "the removed downgrade tier must not be offered as a remedy, got: {msg}"
+    );
 }

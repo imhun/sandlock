@@ -678,19 +678,6 @@ sandlock_builder_t *sandlock_sandbox_builder_user(sandlock_builder_t *b,
                                                   uint32_t gid);
 
 /**
- * Set the mediation identity tier for on-behalf path operations:
- * `0` = `caller` (root in-process remaps are refused), `1` =
- * `supervisor` (explicit downgrade tier; warning + `stats()` counter).
- * Unknown discriminants are ignored and **preserve the builder's current
- * state** (on a fresh builder that current state is the fail-closed
- * `caller` default).
- *
- * # Safety
- * `b` must be a valid builder pointer.
- */
-sandlock_builder_t *sandlock_sandbox_builder_mediation_run_as(sandlock_builder_t *b, uint8_t tier);
-
-/**
  * # Safety
  * `b` and `rule` must be valid pointers.
  */
@@ -1793,9 +1780,7 @@ int sandlock_instance_resize_child(sandlock_instance_t *h,
 void sandlock_instance_free(sandlock_instance_t *h);
 
 /**
- * Validate a **registered-path** (transport 2) slot identity and return the
- * opaque client handle: the path is the slot's hashed registry socket and the
- * token must be non-empty (every verb carries it).
+ * Validate a registered slot identity and return the opaque client handle.
  * On success, `*err` is 0 and a non-null handle is returned; on failure
  * `*err` is -1, null is returned, and `*err_msg` (if non-null) names the
  * problem (caller frees with [`sandlock_string_free`]).
@@ -1810,53 +1795,47 @@ sandlock_supervise_t *sandlock_supervise_connect(const char *path,
                                                  char **err_msg);
 
 /**
- * Client for a **handed-over** control descriptor (route B transport 1): the
- * launcher creates a `socketpair()`, hands one end to the slot as
- * `--control-fd N --serve` and keeps the other. The descriptor *is* the
- * credential, so `token` may be NULL (an optional belt when both sides have
- * one) and no registry path or `sun_path` budget is involved — which is also
- * how a deployment keeps the channel secret out of the slot's argv
- * (`/proc/<pid>/cmdline` is world-readable).
- *
- * The call takes a private dup of `fd` (the caller keeps its own) and opens a
- * persistent session: every later verb travels on that one stream, serialised
- * internally, and a verb that fails mid flight retires the session rather than
- * risk answering a later request with a stale frame.
+ * Validate a transport-1 (fd handoff) control descriptor: it must be open, a
+ * `SOCK_STREAM` socket and `AF_UNIX`. Returns null when the fd is usable and
+ * a heap message (free with [`sandlock_string_free`)) naming the problem
+ * otherwise, so a launcher can pre-flight the handoff before it starts a
+ * generation.
  *
  * # Safety
- * `fd` must be a valid AF_UNIX SOCK_STREAM descriptor; `token` may be null,
- * otherwise must be a valid NUL-terminated C string. `err`/`err_msg` may be
- * null.
- */
-sandlock_supervise_t *sandlock_supervise_connect_fd(int fd,
-                                                   const char *token,
-                                                   int *err,
-                                                   char **err_msg);
-
-/**
- * Pre-flight a transport-1 control descriptor: NULL when `fd` is open, a
- * SOCK_STREAM socket and AF_UNIX (i.e. usable with
- * [`sandlock_supervise_connect_fd`]), otherwise a heap message naming the
- * problem, freed with [`sandlock_string_free`]. Lets a launcher validate the
- * handoff before it starts a generation.
- *
- * # Safety
- * `fd` may be any integer; only a valid descriptor is accepted.
+ * `fd` may be any integer; only `-1` or a valid descriptor is accepted.
  */
 char *sandlock_supervise_check_fd(int fd);
 
 /**
- * Set the per-request response deadline of a transport-1 session: `0` blocks
- * until the slot answers, any other value is milliseconds. A fresh session
- * starts on the registered transport's default deadline, so a wedged slot
- * cannot hang the caller by accident; the holder opts into parking when it
- * issues a verb that legitimately waits (`wait_child` on a live child).
- * Returns 0 on success, -1 on a registered-path handle (one connection per
- * verb, fixed default deadline).
+ * Worker-side client for a **handed-over** control descriptor (route B
+ * transport 1, F17): the launcher creates a `socketpair()`, keeps one end,
+ * and hands the other to the slot as `--control-fd N --serve`. This call
+ * takes a private dup of `fd` (the caller keeps its own) and remembers it as
+ * a persistent session; `token` may be null or empty because the descriptor
+ * is already the credential.
+ *
+ * # Safety
+ * `fd` must be a valid AF_UNIX `SOCK_STREAM` descriptor; `token` may be null,
+ * otherwise must be a valid NUL-terminated C string. `err` and `err_msg` may
+ * both be null.
+ */
+sandlock_supervise_t *sandlock_supervise_connect_fd(int fd,
+                                                    const char *token,
+                                                    int *err,
+                                                    char **err_msg);
+
+/**
+ * Set the per-request response deadline of a transport-1 session
+ * (`0` = block until the slot answers; a fresh session starts on the
+ * registered transport's default deadline so a wedged slot cannot hang the
+ * caller by accident). One stream carries both the instant verbs and a
+ * `wait_child` that parks for the life of a child, so the holder owns that
+ * choice. Registered-path handles reject this (`*err` = -1): they open a
+ * fresh connection per verb with the default deadline.
  *
  * # Safety
  * `h` must be a valid handle from a `sandlock_supervise_connect*` call;
- * `err`/`err_msg` may be null.
+ * `err` and `err_msg` may be null.
  */
 int sandlock_supervise_set_timeout(sandlock_supervise_t *h,
                                    uint64_t timeout_ms,
@@ -1864,20 +1843,21 @@ int sandlock_supervise_set_timeout(sandlock_supervise_t *h,
                                    char **err_msg);
 
 /**
- * Issue one verb on a supervise generation: on a registered handle, connect by
- * the handle's socket path; on a handed-over handle, send on the persistent
- * session stream. Either way the call attaches the channel token, hands over
- * `n_fds` descriptors (empty for every verb but `exec`, which needs exactly
- * three), and returns the serialized `ControlResponse` JSON
- * (`{"v":1,"ok":...,"data":...,"err":...}`) as a C string the caller frees with
- * [`sandlock_string_free`]. A refused connect, transport error or unparseable
- * `args_json` sets `*err` to -1 and `*err_msg`; an `ok:false` server response
- * still returns JSON with `*err` 0 — the caller inspects `ok`.
+ * Issue one verb on a supervise generation: on a registered handle, connect
+ * by the handle's socket path; on a handed-over handle, send on the
+ * persistent session stream (F17). Either way the call attaches the channel
+ * token, hands over `n_fds` descriptors (empty for every verb but `exec`,
+ * which needs exactly three), and returns the serialized `ControlResponse`
+ * JSON (`{"v":1,"ok":...,"data":...,"err":...}`) as a C string the caller
+ * frees with [`sandlock_string_free`]. A refused connect, transport error or
+ * unparseable `args_json` sets `*err` to -1 and `*err_msg`; an `ok:false`
+ * server response still returns JSON with `*err` 0 -- the caller inspects
+ * `ok`.
  *
  * # Safety
- * `h` must be a valid handle from a `sandlock_supervise_connect*` call; `verb`
- * and `args_json` must be valid NUL-terminated C strings; when `n_fds > 0`,
- * `fds` must point to `n_fds` valid file descriptors.
+ * `h` must be a valid handle from a `sandlock_supervise_connect*` call;
+ * `verb` and `args_json` must be valid NUL-terminated C strings; when
+ * `n_fds > 0`, `fds` must point to `n_fds` valid file descriptors.
  */
 char *sandlock_supervise_request(sandlock_supervise_t *h,
                                  const char *verb,
@@ -1891,8 +1871,8 @@ char *sandlock_supervise_request(sandlock_supervise_t *h,
  * Free a supervise client handle.
  *
  * # Safety
- * `h` must be null or a valid handle from a `sandlock_supervise_connect*`
- * call; after this call the handle must not be used again.
+ * `h` must be null or a valid handle from [`sandlock_supervise_connect`];
+ * after this call the handle must not be used again.
  */
 void sandlock_supervise_free(sandlock_supervise_t *h);
 

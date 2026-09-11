@@ -514,77 +514,13 @@ async fn a_finished_capture_survives_a_cancellation_at_the_sibling_join() {
 }
 
 // ============================================================
-// F6.1 (SL-1): mediation_run_as identity tier
+// F6.1 (SL-1): mediated-path identity gate
 // ============================================================
-
-#[test]
-fn mediation_run_as_parses_both_tiers_and_rejects_unknown() {
-    assert_eq!(MediationRunAs::from_str("caller").unwrap(), MediationRunAs::Caller);
-    assert_eq!(
-        MediationRunAs::from_str("supervisor").unwrap(),
-        MediationRunAs::Supervisor
-    );
-    assert_eq!(MediationRunAs::Caller.to_string(), "caller");
-    assert_eq!(MediationRunAs::Supervisor.to_string(), "supervisor");
-    for bad in ["root", "CALLER", "", "caller:supervisor"] {
-        assert!(
-            MediationRunAs::from_str(bad).is_err(),
-            "{bad:?} must not parse as a mediation_run_as tier"
-        );
-    }
-}
-
-#[test]
-fn mediation_run_as_defaults_to_caller_everywhere() {
-    // Builder default (undecided layer), built-Sandbox default, and
-    // serde-default (old profiles / configs that predate the field keep
-    // the fail-closed caller tier rather than silently downgrading to
-    // supervisor).
-    let b = SandboxBuilder::default();
-    assert_eq!(
-        b.mediation_run_as,
-        None,
-        "the builder layer must stay undecided (None) so a base layer's \
-         explicit value can never be clobbered by a default"
-    );
-    let sb = Sandbox::builder().build().unwrap();
-    assert_eq!(sb.mediation_run_as, MediationRunAs::Caller);
-
-    let json = serde_json::to_string(&sb).expect("serialize sandbox");
-    let back: Sandbox = serde_json::from_str(&json).expect("deserialize sandbox");
-    assert_eq!(back.mediation_run_as, MediationRunAs::Caller);
-    // A document without the key must deserialize to caller.
-    let mut value: serde_json::Value =
-        serde_json::to_value(&sb).expect("sandbox to value");
-    value
-        .as_object_mut()
-        .expect("sandbox serializes to an object")
-        .remove("mediation_run_as");
-    let sb2: Sandbox = serde_json::from_value(value)
-        .expect("field-less sandbox config must still parse");
-    assert_eq!(sb2.mediation_run_as, MediationRunAs::Caller);
-}
-
-#[test]
-fn mediation_run_as_supervisor_roundtrips_through_builder_and_serde() {
-    let sb = Sandbox::builder()
-        .mediation_run_as(MediationRunAs::Supervisor)
-        .build()
-        .unwrap();
-    assert_eq!(sb.mediation_run_as, MediationRunAs::Supervisor);
-    let json = serde_json::to_string(&sb).expect("serialize sandbox");
-    assert!(
-        json.contains("\"mediation_run_as\":\"supervisor\""),
-        "the tier must serialize by its wire spelling, got: {json}"
-    );
-    let back: Sandbox = serde_json::from_str(&json).expect("deserialize sandbox");
-    assert_eq!(back.mediation_run_as, MediationRunAs::Supervisor);
-}
 
 /// Truth table for the C档 fail-closed gate: only a mediator that can remap
 /// the sandbox to a different non-zero host uid — euid 0, or a non-root euid
 /// holding effective CAP_SETUID/CAP_SETGID (the route-B ③ file-cap launcher
-/// shape, F14) — with path mediation active is refused under `caller`.
+/// shape, F14) — with path mediation active is refused.
 /// Same-uid A/B mediation, caps-free non-root supervisors, host uid 0
 /// sandboxes, and no-mediation configs are all untouched.
 #[test]

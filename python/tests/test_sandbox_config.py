@@ -141,22 +141,6 @@ class TestPolicy:
         assert p.max_cpu is None
 
 
-class TestMediationRunAs:
-    """F6.1 (SL-1): the mediation identity tier round-trips to the native
-    builder (caller default / explicit supervisor) with fail-closed
-    validation at the Python boundary."""
-
-    def test_defaults_to_caller(self):
-        assert Sandbox().mediation_run_as == "caller"
-
-    def test_supervisor_roundtrips_to_native_build(self):
-        p = Sandbox(mediation_run_as="supervisor")
-        assert p._ensure_native().ptr
-
-    def test_invalid_tier_rejected(self):
-        with pytest.raises(ValueError, match="mediation_run_as"):
-            Sandbox(mediation_run_as="root")
-
     def test_mutable_config(self):
         # Sandbox is no longer frozen — it holds runtime state too.
         p = Sandbox(max_memory="512M")

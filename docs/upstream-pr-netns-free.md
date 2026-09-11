@@ -65,9 +65,11 @@ scope note for the PR, see `fork-plan-2026-09.md` and `e2b-integration.md`):**
   euid is the sandbox's host uid (identity by construction), dual control
   transport (registered path + fd handoff), full-field policy entry,
   foreign-uid acceptance; ships in wheels with a HEAD-pinned fingerprint.
-- **`mediation_run_as` (SL-1/P1/P2)** — mediation identity is bound to the
-  owning process; a root in-process remap with path mediation is refused
-  fail-closed (`caller` default); explicit `supervisor` tier warns and counts.
+- **mediated-path identity (SL-1/P1/P2)** — mediation identity is bound to
+  the owning process; a privileged in-process remap with path mediation is
+  refused fail-closed before fork, with route B as the only remedy (B3
+  removed the explicit `supervisor` downgrade tier and every field that
+  named it, so the condition is the only shape left).
 - **`fs_mount` single-node mounts + `minimal_dev()` (P5)** — file/chardev
   bind-mount leaves (no more `ENOTDIR`), read-only preserved, mount-point
   write family protected with `EBUSY`; a six-node `/dev` helper removes the

@@ -17,23 +17,26 @@
 //!   sandbox host uid), X's own chmod takes effect, Y reads it, and Y's
 //!   unlink/chmod are refused with EPERM by the kernel.  This is the only
 //!   hard cross-uid evidence that SL-1's failure class is gone.
-//! * `test_root_inprocess_mediation_is_refused` — C档.  A root in-process
-//!   mediator remapping the sandbox to a non-zero host uid with path
-//!   mediation active is refused under the default `caller` tier; the
-//!   explicit `supervisor` tier builds, warns, and counts in `stats()`.
-//! * `test_root_inprocess_mediation_with_caps_kept_would_leak` — the
-//!   caps-kept control: under the explicit supervisor tier the mediator
-//!   really runs as root (the sandbox's file is root-owned) and the same
-//!   unlinkat B档 refuses succeeds through chroot mediation — proving the
-//!   refusal of the default tier is load-bearing, not decorative.
-//! * `test_cli_mediation_run_as_is_wired` — the CLI flag reaches the
-//!   runtime builder: as root, the default tier refuses the C档 shape and
-//!   `--mediation-run-as supervisor` accepts it with the warning.
-//! * F10 acceptance — the explicit `supervisor` tier × chroot × privileged
-//!   `RunAs` must actually create/launch when the rootfs cache is only
-//!   traversable by the privileged holder (root-owned 0700), covering
-//!   one-shot `RunAs(10000)`, exec-only instance `RunAs(10000)` and the
-//!   uid-0 instance regression pins.
+//! * C档 fail-closed — a privileged in-process mediator (euid 0, or a
+//!   non-root euid holding effective CAP_SETUID/CAP_SETGID) that would remap
+//!   the sandbox to a *different* non-zero host uid with path mediation
+//!   active is **refused before fork**, and the refusal's only remedy is
+//!   route B (`Run sandlock-supervise as uid <host uid>`).  There is no
+//!   downgrade tier left to accept it, so SL-1's owner/chmod/sticky failure
+//!   class has no way back in through the in-process shape
+//!   (`test_root_inprocess_mediation_is_refused`,
+//!   `test_root_inprocess_mediation_refused_with_policy_fn_deny_shape`,
+//!   `test_root_chroot_privileged_remap_is_refused_before_fork`,
+//!   `test_nonroot_file_cap_launcher_is_refused_like_c_tier`,
+//!   `test_cli_refuses_the_root_remap_shape`).
+//! * The reverse regression — the refusal is *conditional* on
+//!   `mediation_active`, never an unconditional same-identity demand, so the
+//!   shapes that are legal today must keep working:
+//!   `test_root_pure_per_uid_run_as_is_still_accepted` (privileged remap
+//!   with **no** mediation: no chroot/COW/deny/policy_fn) and
+//!   `test_root_chroot_uid0_instance_exec_only_restrictive_cache` (no remap
+//!   at all).  The non-root same-uid chroot half of that pair lives in
+//!   `crates/sandlock-core/tests/integration/test_instance_chroot.rs`.
 
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -44,7 +47,6 @@ use std::time::{Duration, Instant};
 
 use sandlock_core::instance::{ExecStdio, SandboxInstance};
 use sandlock_core::result::ExitStatus;
-use sandlock_core::sandbox::MediationRunAs;
 use sandlock_core::policy_fn::Verdict;
 use sandlock_core::{Sandbox, SandlockError};
 
@@ -55,9 +57,8 @@ const UID_Y: u32 = 65532;
 /// The route-B worker uid (the python client runs as this; slots allowlist it).
 const UID_WORKER: u32 = 65534;
 
-/// C档 sandbox host uids (root in-process remap targets).
+/// C档 sandbox host uid (the root in-process remap target).
 const HOST_UID_A: u32 = 10000;
-const HOST_UID_B: u32 = 10001;
 
 /// Non-root euid for the F14 file-cap launcher fixture (route-B ③ shape).
 const CAPS_UID: u32 = 65533;
@@ -759,15 +760,14 @@ fn test_python_client_execs_distinct_uids_on_shared_sticky_dir() {
 }
 
 // ----------------------------------------------------------------
-// C档: root in-process mediation is refused under `caller`
+// C档: privileged in-process mediation is refused (no downgrade tier)
 // ----------------------------------------------------------------
 
 fn refusal_msg(host_uid: u32) -> String {
     format!(
-        "mediation_run_as=caller refused: in-process path mediation would run as euid 0 \
-         while the sandbox's host uid is {host_uid}; on-behalf files would be owned by the \
-         mediator, not the sandbox (SL-1). Run sandlock-supervise as uid {host_uid} (route B), \
-         or pass mediation_run_as=supervisor to explicitly accept the downgrade"
+        "in-process path mediation refused: mediation would run as euid 0 while the sandbox's \
+         host uid is {host_uid}; on-behalf files would be owned by the mediator, not the \
+         sandbox (SL-1). Run sandlock-supervise as uid {host_uid} (route B)"
     )
 }
 
@@ -776,11 +776,10 @@ fn refusal_msg(host_uid: u32) -> String {
 /// "non-root effective CAP_SETUID/CAP_SETGID").
 fn caps_refusal_msg(euid: u32, host_uid: u32) -> String {
     format!(
-        "mediation_run_as=caller refused: in-process path mediation would run as euid {euid} \
-         with effective CAP_SETUID/CAP_SETGID while the sandbox's host uid is {host_uid}; \
-         on-behalf files would be owned by the mediator, not the sandbox (SL-1). Run \
-         sandlock-supervise as uid {host_uid} (route B), or pass \
-         mediation_run_as=supervisor to explicitly accept the downgrade"
+        "in-process path mediation refused: mediation would run as euid {euid} with effective \
+         CAP_SETUID/CAP_SETGID while the sandbox's host uid is {host_uid}; on-behalf files \
+         would be owned by the mediator, not the sandbox (SL-1). Run sandlock-supervise as \
+         uid {host_uid} (route B)"
     )
 }
 
@@ -789,7 +788,7 @@ fn assert_run_refused(err: SandlockError, expected: &str) {
         SandlockError::Runtime(sandlock_core::error::SandboxRuntimeError::Child(msg)) => {
             assert_eq!(msg, expected)
         }
-        other => panic!("expected the mediation_run_as refusal, got: {other:?}"),
+        other => panic!("expected the mediated-path identity refusal, got: {other:?}"),
     }
 }
 
@@ -811,61 +810,15 @@ async fn test_root_inprocess_mediation_is_refused() {
     root_phase_env_check();
     let dir = dac_tmp_dir("c-refused");
 
-    // Witness session (no path mediation) so the stats delta is exact
-    // regardless of test order within this process.
-    let mut witness = Sandbox::builder()
-        .fs_read("/usr")
-        .fs_read("/lib")
-        .fs_read_if_exists("/lib64")
-        .fs_read("/bin")
-        .fs_read("/etc")
-        .fs_read("/proc")
-        .fs_read("/dev")
-        .fs_write(&dir)
-        .user(HOST_UID_A, HOST_UID_A)
-        .build()
-        .expect("witness builds");
-    let wr = witness.run(&["true"]).await.expect("witness runs");
-    assert!(wr.success());
-    let before = witness
-        .stats()
-        .await
-        .expect("witness stats")
-        .mediation_downgrades;
-
-    // Default `caller` tier: the C档 shape (root + RunAs(10000) + mediation)
-    // must be refused with the exact message before any fork.
+    // The C档 shape (root + RunAs(10000) + path mediation) must be refused
+    // with the exact message before any fork.  There is no tier left that
+    // would accept it: the refusal names route B as the only remedy.
     let mut sb = c_tier_base(&dir)
         .fs_deny(dir.join("secret.txt"))
         .build()
-        .expect("caller-tier policy builds");
+        .expect("C档 policy builds");
     let err = sb.run(&["true"]).await.expect_err("C档 must refuse");
     assert_run_refused(err, &refusal_msg(HOST_UID_A));
-
-    // Explicit `supervisor` tier: allowed, warned, and counted in stats().
-    let mut downgraded = c_tier_base(&dir)
-        .fs_deny(dir.join("secret.txt"))
-        .mediation_run_as(MediationRunAs::Supervisor)
-        .build()
-        .expect("supervisor-tier policy builds");
-    let dr = downgraded
-        .run(&["true"])
-        .await
-        .expect("supervisor tier runs");
-    assert!(
-        dr.success(),
-        "the explicit supervisor tier must build the box"
-    );
-    let after = downgraded
-        .stats()
-        .await
-        .expect("downgraded stats")
-        .mediation_downgrades;
-    assert_eq!(
-        after,
-        before + 1,
-        "the supervisor-tier launch must be counted in stats() exactly once"
-    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -873,8 +826,8 @@ async fn test_root_inprocess_mediation_is_refused() {
 /// F14 (route-B ③ 前置): a non-root process whose executable carries
 /// `cap_setuid,cap_setgid+eip` (the file-cap launcher shape) holds effective
 /// CAP_SETUID/CAP_SETGID at a non-zero euid — the same privileged cross-uid
-/// remap capability the C档 gate refuses for euid 0. The default `caller`
-/// tier must fail closed at the gate with the capability-aware message
+/// remap capability the C档 gate refuses for euid 0. The launcher shape must
+/// fail closed at the gate with the capability-aware message
 /// BEFORE any fork, instead of falling through to the late "unprivileged
 /// supervisor cannot map" refusal (which assumes a caps-free caller and
 /// would become an SL-1-class leak the moment the remap path honored caps).
@@ -957,59 +910,43 @@ fn test_nonroot_file_cap_launcher_is_refused_like_c_tier() {
 /// `has_denied_paths()` on the shared DeniedSet, which also receives live
 /// `policy_fn`-issued `deny_path()` calls.  A root in-process mediator with
 /// `RunAs(non-zero)` and a path-denying policy_fn (no static
-/// fs_denied/chroot/COW) must therefore be refused under the default
-/// `caller` tier too — and the explicit `supervisor` tier remains the
-/// escape hatch.
+/// fs_denied/chroot/COW) must therefore be refused too: the refusal is about
+/// the *capability*, not about whether a deny has fired yet.
 #[tokio::test]
 async fn test_root_inprocess_mediation_refused_with_policy_fn_deny_shape() {
     root_phase_env_check();
     let dir = dac_tmp_dir("c-policy-fn");
     let deny_target = dir.join("secret.txt").to_string_lossy().into_owned();
 
-    let build = |tier: Option<MediationRunAs>| {
-        let target = deny_target.clone();
-        let mut b = Sandbox::builder()
-            .fs_read("/usr")
-            .fs_read("/lib")
-            .fs_read_if_exists("/lib64")
-            .fs_read("/bin")
-            .fs_read("/etc")
-            .fs_read("/proc")
-            .fs_read("/dev")
-            .fs_write(&dir)
-            .user(HOST_UID_A, HOST_UID_A)
-            .policy_fn(move |_ev, ctx| {
-                // A live path-denying policy_fn: subsequent opens of the
-                // target are mediated on-behalf by the supervisor.
-                ctx.deny_path(&target);
-                Verdict::Allow
-            });
-        if let Some(tier) = tier {
-            b = b.mediation_run_as(tier);
-        }
-        b.build().expect("policy_fn policy builds")
-    };
-
-    // Default caller tier: refused even with no static fs_denied/chroot/COW
-    // — the deny_path capability is a mediation trigger.
-    let mut sb = build(None);
+    // Refused even with no static fs_denied/chroot/COW — the deny_path
+    // capability is a mediation trigger.
+    let target = deny_target.clone();
+    let mut sb = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(&dir)
+        .user(HOST_UID_A, HOST_UID_A)
+        .policy_fn(move |_ev, ctx| {
+            // A live path-denying policy_fn: subsequent opens of the
+            // target are mediated on-behalf by the supervisor.
+            ctx.deny_path(&target);
+            Verdict::Allow
+        })
+        .build()
+        .expect("policy_fn policy builds");
     let err = sb
         .run(&["true"])
         .await
-        .expect_err("the policy_fn deny shape must refuse under caller");
+        .expect_err("the policy_fn deny shape must refuse");
     assert_run_refused(err, &refusal_msg(HOST_UID_A));
-
-    // Explicit supervisor tier: builds and runs (the escape hatch).
-    let mut sup = build(Some(MediationRunAs::Supervisor));
-    let r = sup.run(&["true"]).await.expect("supervisor tier runs");
-    assert!(r.success(), "the explicit supervisor tier must run with policy_fn");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
-
-// ----------------------------------------------------------------
-// C档 control: caps-kept root mediator proves the downgrade is real
-// ----------------------------------------------------------------
 
 /// Minimal chroot rootfs with the static rootfs-helper and a sticky /tmp.
 fn build_rootfs(base: &Path) -> PathBuf {
@@ -1041,83 +978,50 @@ fn build_rootfs(base: &Path) -> PathBuf {
     rootfs
 }
 
+// ----------------------------------------------------------------
+// F10 shape, final state: chroot × privileged RunAs is refused before fork
+// ----------------------------------------------------------------
+
+/// The F10 shape is now a *refusal*, not a create/launch acceptance: root +
+/// chroot (path mediation) + `RunAs(10000)` is exactly the privileged
+/// mediator whose on-behalf opens would be owned by uid 0, and no downgrade
+/// tier exists to accept it.  The refusal must fire before the child is
+/// forked — before the chdir into the (root-owned 0700) cache, which is what
+/// made the old acceptance hang on when it was *allowed*.  Message pinned
+/// whole, with route B as the only remedy.
 #[tokio::test]
-async fn test_root_inprocess_mediation_with_caps_kept_would_leak() {
+async fn test_root_chroot_privileged_remap_is_refused_before_fork() {
     root_phase_env_check();
-    let base = dac_tmp_dir("c-leak");
+    let base = restrictive_tmp_dir("chroot-refused");
     let rootfs = build_rootfs(&base);
+    let ws = base.join("ws");
+    std::fs::create_dir_all(&ws).expect("create workspace host dir");
 
-    // Sandbox A (host uid 10000) creates a file inside the chroot's sticky
-    // /tmp through the root in-process mediator (explicit supervisor tier).
-    // Chroot mediation performs the open supervisor-side: the file is owned
-    // by uid 0, NOT by the sandbox's host uid — the downgrade is real.
-    let chroot_policy = |host_uid: u32| {
-        Sandbox::builder()
-            .chroot(&rootfs)
-            .fs_read("/usr")
-            .fs_read("/bin")
-            .fs_read("/etc")
-            .fs_read("/proc")
-            .fs_read("/dev")
-            .fs_write("/tmp")
-            .user(host_uid, host_uid)
-            .mediation_run_as(MediationRunAs::Supervisor)
-            .build()
-            .expect("chroot supervisor-tier policy builds")
-    };
-
-    let mut a = chroot_policy(HOST_UID_A);
-    let ra = a
-        .run(&["rootfs-helper", "sh", "-c", "echo XDATA > /tmp/x.txt"])
+    let mut sb = f10_chroot_policy(&rootfs, &ws, HOST_UID_A);
+    let err = sb
+        .run(&["rootfs-helper", "true"])
         .await
-        .expect("sandbox A runs");
-    assert!(ra.success(), "A create failed: {:?}", ra.stderr_str());
+        .expect_err("the privileged in-process chroot shape must be refused");
+    assert_run_refused(err, &refusal_msg(HOST_UID_A));
 
-    let host_file = rootfs.join("tmp/x.txt");
-    let meta = std::fs::metadata(&host_file).expect("host-side stat of root-mediated file");
-    use std::os::unix::fs::MetadataExt;
-    assert_eq!(
-        meta.uid(),
-        0,
-        "C档 control: the explicit supervisor tier must create the file as the \
-         root mediator (owner 0), not as the sandbox's host uid {HOST_UID_A} — \
-         proving the tier is a genuine downgrade"
-    );
-
-    // Sandbox B (host uid 10001) runs the SAME unlinkat the B档 test refuses
-    // (Y deleting X's file in a sticky dir).  Through the caps-kept root
-    // mediator it succeeds — the leak the caller-default refusal exists to
-    // prevent.
-    let mut b = chroot_policy(HOST_UID_B);
-    let rb = b
-        .run(&["rootfs-helper", "sh", "-c", "rm /tmp/x.txt && echo RM_OK"])
-        .await
-        .expect("sandbox B runs");
-    assert!(rb.success(), "B run failed: {:?}", rb.stderr_str());
-    assert_eq!(
-        rb.stdout_str(),
-        Some("RM_OK"),
-        "caps-kept root mediation must delete the other-host-uid sandbox's file \
-         (sticky bit bypassed by the mediator's root identity) — this is the leak \
-         the default caller tier refuses"
-    );
+    // Nothing was created: the refusal precedes the fork, so the sticky /tmp
+    // carve-out the mediator would have written remains empty.
     assert!(
-        !host_file.exists(),
-        "the root-mediated unlink must have removed the file"
+        std::fs::read_dir(rootfs.join("tmp"))
+            .expect("read the chroot's tmp")
+            .next()
+            .is_none(),
+        "a refused spawn must not have performed any mediated write"
     );
 
     let _ = std::fs::remove_dir_all(&base);
 }
 
-// ----------------------------------------------------------------
-// F10: supervisor tier × chroot × privileged RunAs must create/launch
-// ----------------------------------------------------------------
-
-/// Container-local scratch whose parent chain is NOT traversable by the
-/// remapped sandbox uid — the E2B image-cache shape (root-owned 0700).  This
-/// is what exposed the F10 regression: the confined child's initial real
-/// chdir to the chroot cwd ran *after* the userns remap dropped it to the
-/// sandbox host uid, so traversing to `rootfs/cwd` failed EACCES.
+/// Container-local scratch whose parent chain is NOT traversable by a
+/// remapped non-zero sandbox uid — the E2B image-cache shape (root-owned
+/// 0700).  The shapes below therefore still exercise the privileged
+/// create/launch order (chdir + Landlock before the remap); the difference
+/// is that a *non-zero* remap with chroot no longer reaches the fork at all.
 fn restrictive_tmp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("sandlock-f10-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1126,8 +1030,8 @@ fn restrictive_tmp_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// Supervisor-tier chroot policy with a chroot-visible workspace, mirroring
-/// the E2B M4 executor shape (rootfs + `/workspace`/`/home/user` mounts).
+/// Chroot policy with a chroot-visible workspace, mirroring the E2B M4
+/// executor shape (rootfs + `/workspace`/`/home/user` mounts).
 fn f10_chroot_policy(rootfs: &Path, ws: &Path, host_uid: u32) -> Sandbox {
     Sandbox::builder()
         .chroot(rootfs)
@@ -1142,93 +1046,67 @@ fn f10_chroot_policy(rootfs: &Path, ws: &Path, host_uid: u32) -> Sandbox {
         .fs_write("/home/user")
         .cwd("/workspace")
         .user(host_uid, host_uid)
-        .mediation_run_as(MediationRunAs::Supervisor)
         .build()
-        .expect("F10 chroot supervisor policy builds")
+        .expect("F10 chroot policy builds")
 }
 
-/// Acceptance 1: root holder + `RunAs(1000)` + chroot + explicit supervisor
-/// tier must create and run (one-shot) even when the rootfs cache is only
-/// traversable by the privileged holder.  Regression evidence (RED, pre-fix):
-/// `sandlock child: chdir: Permission denied (os error 13)` — the chdir ran
-/// after the remap had dropped the child to the sandbox host uid (E2B: 1000;
-/// this suite: HOST_UID_A = 10000).
-#[tokio::test]
-async fn test_root_chroot_supervisor_runas1000_one_shot_restrictive_cache() {
-    root_phase_env_check();
-    let base = restrictive_tmp_dir("one-shot-r1000");
-    let rootfs = build_rootfs(&base);
-    let ws = base.join("ws");
-    std::fs::create_dir_all(&ws).expect("create workspace host dir");
-    std::os::unix::fs::chown(&ws, Some(HOST_UID_A), Some(HOST_UID_A)).expect("chown ws");
-    chmod_dir(&ws, 0o700);
-
-    let mut sb = f10_chroot_policy(&rootfs, &ws, HOST_UID_A);
-    let r = sb
-        .run(&["rootfs-helper", "sh", "-c", "echo F10X > /workspace/out.txt"])
-        .await
-        .expect("the supervisor-tier chroot box must create and run");
-    assert!(
-        r.success(),
-        "one-shot create/run failed, stderr: {:?}",
-        r.stderr_str()
-    );
-    assert_eq!(
-        std::fs::read_to_string(ws.join("out.txt")).expect("read mediated output"),
-        "F10X\n",
-        "the mediated write through the /workspace mount must round-trip"
-    );
-
-    let _ = std::fs::remove_dir_all(&base);
-}
-
-/// Acceptance 2 (root half, RunAs == 1000): the mainless exec-only instance
-/// over the same restrictive chroot must launch and serve an `exec()` under
-/// the explicit supervisor tier.
+/// Reverse regression (the brief's "no误伤" case, root half): a
+/// `RunAs(10000)` instance with **no** path mediation in play — no chroot,
+/// no COW, no deny carve-out, no `policy_fn` — is a legal per-uid shape and
+/// must still build and launch.  `mediation_active` is what gates the
+/// identity refusal; a gate that demanded "the mediator must be the sandbox
+/// uid" in all cases would break this (and, with it, the pooled per-sandbox
+/// uid model E2B runs pure sandboxes on).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_root_chroot_supervisor_runas1000_instance_exec_only_restrictive_cache() {
+async fn test_root_pure_per_uid_run_as_is_still_accepted() {
     root_phase_env_check();
-    let base = restrictive_tmp_dir("inst-r1000");
-    let rootfs = build_rootfs(&base);
-    let ws = base.join("ws");
+    let base = dac_tmp_dir("pure-per-uid");
+    let ws = base.join("workspace");
     std::fs::create_dir_all(&ws).expect("create workspace host dir");
-    std::os::unix::fs::chown(&ws, Some(HOST_UID_A), Some(HOST_UID_A)).expect("chown ws");
-    chmod_dir(&ws, 0o700);
 
-    let mut inst = SandboxInstance::launch_exec_only(f10_chroot_policy(&rootfs, &ws, HOST_UID_A))
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(&ws)
+        .user(HOST_UID_A, HOST_UID_A)
+        .build()
+        .expect("no mediation => no identity gate => the policy builds");
+    let mut inst = SandboxInstance::launch_exec_only(policy)
         .await
-        .expect("exec-only chroot instance must launch under supervisor + RunAs");
+        .expect("a pure per-uid instance must still launch");
+
     let h = inst
-        .exec(
-            &["rootfs-helper", "echo", "instance-chroot-r1000-ok"],
-            ExecStdio::Piped,
-        )
+        .exec(&["/usr/bin/id", "-u"], ExecStdio::Piped)
         .await
-        .expect("exec in the RunAs(1000) chroot instance must succeed");
+        .expect("exec in the pure per-uid instance must succeed");
     let status = inst.wait_child(h.child_id).await.expect("wait child");
     assert_eq!(status, ExitStatus::Code(0), "exec child must exit 0");
     let stdout = h.stdout.expect("piped exec stdout");
-    use std::io::Read;
     let mut out = Vec::new();
     std::fs::File::from(stdout)
         .read_to_end(&mut out)
         .expect("read exec stdout");
     assert_eq!(
         String::from_utf8_lossy(&out),
-        "instance-chroot-r1000-ok\n",
-        "exec stdout must round-trip exactly"
+        "0\n",
+        "the privileged remap maps the sandbox host uid to in-namespace 0"
     );
     inst.shutdown().await.expect("instance shutdown");
 
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// Acceptance 2 (root half, RunAs == holder == 0): uid 0 + explicit
-/// supervisor tier over the same restrictive chroot must also launch and
-/// serve `exec()` — no remap, but the tier must never change the create
-/// outcome (regression pin for the instance exec-only path).
+/// Acceptance 2 (root half, RunAs == holder == 0): uid 0 over the same
+/// restrictive chroot must launch and serve `exec()` — `host_uid == 0`
+/// needs no remap at all, so the identity gate must leave it alone
+/// (regression pin for the instance exec-only create/launch order).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_root_chroot_supervisor_uid0_instance_exec_only_restrictive_cache() {
+async fn test_root_chroot_uid0_instance_exec_only_restrictive_cache() {
     root_phase_env_check();
     let base = restrictive_tmp_dir("inst-u0");
     let rootfs = build_rootfs(&base);
@@ -1238,7 +1116,7 @@ async fn test_root_chroot_supervisor_uid0_instance_exec_only_restrictive_cache()
 
     let mut inst = SandboxInstance::launch_exec_only(f10_chroot_policy(&rootfs, &ws, 0))
         .await
-        .expect("exec-only chroot instance must launch under supervisor tier (uid 0)");
+        .expect("exec-only chroot instance must launch when the holder is uid 0");
     let h = inst
         .exec(
             &["rootfs-helper", "echo", "instance-chroot-u0-ok"],
@@ -1265,11 +1143,11 @@ async fn test_root_chroot_supervisor_uid0_instance_exec_only_restrictive_cache()
 }
 
 // ----------------------------------------------------------------
-// CLI wiring (root observable tier difference)
+// CLI face of the refusal
 // ----------------------------------------------------------------
 
 #[test]
-fn test_cli_mediation_run_as_is_wired() {
+fn test_cli_refuses_the_root_remap_shape() {
     root_phase_env_check();
     let bin = cli_bin();
     let dir = dac_tmp_dir("cli-wire");
@@ -1301,134 +1179,26 @@ fn test_cli_mediation_run_as_is_wired() {
         base_args.push("/lib64".into());
     }
 
-    // Default tier (caller): the C档 shape must refuse with the exact message.
-    let mut caller_args = base_args.clone();
-    caller_args.push("--".into());
-    caller_args.push("true".into());
+    // The C档 shape (root + --user 10000 + --fs-deny) must refuse with the
+    // exact message, wrapped by the CLI's error prologue.  The message is the
+    // whole remedy an operator gets: route B, and nothing else.
+    let mut args = base_args.clone();
+    args.push("--".into());
+    args.push("true".into());
     let caller = Command::new(&bin)
-        .args(&caller_args)
+        .args(&args)
         .output()
-        .expect("run sandlock caller tier");
+        .expect("run sandlock");
     assert!(
         !caller.status.success(),
-        "the CLI default tier must refuse the root-remap shape"
+        "the CLI must refuse the root-remap shape"
     );
     let caller_err = String::from_utf8_lossy(&caller.stderr);
     let caller_line = caller_err.lines().next().unwrap_or_default();
     assert_eq!(
         caller_line.strip_prefix("Error: process error: child process error: "),
         Some(refusal_msg(HOST_UID_A).as_str()),
-        "the CLI must surface the exact mediation_run_as refusal"
-    );
-
-    // Explicit supervisor tier: wired flag → box builds and runs, with the
-    // downgrade warning on stderr.
-    let mut sup_args = base_args.clone();
-    sup_args.push("--mediation-run-as".into());
-    sup_args.push("supervisor".into());
-    sup_args.push("--".into());
-    sup_args.push("true".into());
-    let sup = Command::new(&bin)
-        .args(&sup_args)
-        .output()
-        .expect("run sandlock supervisor tier");
-    assert!(
-        sup.status.success(),
-        "--mediation-run-as supervisor must be wired to the runtime builder; \
-         stderr: {}",
-        String::from_utf8_lossy(&sup.stderr)
-    );
-    let sup_err = String::from_utf8_lossy(&sup.stderr);
-    assert_eq!(
-        sup_err.lines().next().unwrap_or_default(),
-        format!(
-            "sandlock: warning: mediation_run_as=supervisor: in-process path mediation runs \
-             as euid 0 while the sandbox's host uid is {HOST_UID_A}; on-behalf files are \
-             owned by the mediator, not the sandbox (SL-1 downgrade accepted explicitly)"
-        ),
-        "the explicit tier must warn on stderr (the downgrade is never silent)"
-    );
-
-    // FUP-07 no-clobber: a profile that carries `mediation_run_as =
-    // "supervisor"` with the CLI flag omitted behaves exactly like the
-    // explicit flag (the tier is retained, never reset to caller).
-    let profile_path = dir.join("sup-profile.toml");
-    let mut read_list = vec!["/usr", "/lib", "/bin", "/etc", "/proc", "/dev"];
-    if Path::new("/lib64").exists() {
-        read_list.push("/lib64");
-    }
-    let read_toml = read_list
-        .iter()
-        .map(|p| format!("\"{p}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
-    std::fs::write(
-        &profile_path,
-        format!(
-            r#"
-                [config]
-                mediation_run_as = "supervisor"
-
-                [program]
-                exec = "/bin/true"
-                uid = {HOST_UID_A}
-                gid = {HOST_UID_A}
-
-                [filesystem]
-                read = [{read_toml}]
-                write = ["{}"]
-                deny = ["{}"]
-            "#
-            ,
-            dir.display(),
-            deny.display()
-        ),
-    )
-    .expect("write supervisor profile");
-    let profile_only = Command::new(&bin)
-        .args(["run", "--profile-file", profile_path.to_str().unwrap()])
-        .output()
-        .expect("run sandlock with supervisor profile");
-    assert!(
-        profile_only.status.success(),
-        "a supervisor profile with the CLI flag omitted must keep the tier; stderr: {}",
-        String::from_utf8_lossy(&profile_only.stderr)
-    );
-    let profile_err = String::from_utf8_lossy(&profile_only.stderr);
-    assert_eq!(
-        profile_err.lines().next().unwrap_or_default(),
-        format!(
-            "sandlock: warning: mediation_run_as=supervisor: in-process path mediation runs \
-             as euid 0 while the sandbox's host uid is {HOST_UID_A}; on-behalf files are \
-             owned by the mediator, not the sandbox (SL-1 downgrade accepted explicitly)"
-        ),
-        "the profile tier must warn exactly like the explicit flag (no-clobber)"
-    );
-
-    // Explicit CLI flag overrides the profile tier: caller on the same root
-    // remap shape must refuse with the exact C档 message.
-    let overridden = Command::new(&bin)
-        .args([
-            "run",
-            "--profile-file",
-            profile_path.to_str().unwrap(),
-            "--mediation-run-as",
-            "caller",
-            "--",
-            "true",
-        ])
-        .output()
-        .expect("run sandlock with CLI caller override");
-    assert!(
-        !overridden.status.success(),
-        "--mediation-run-as caller must override the profile supervisor tier"
-    );
-    let overridden_err = String::from_utf8_lossy(&overridden.stderr);
-    let overridden_line = overridden_err.lines().next().unwrap_or_default();
-    assert_eq!(
-        overridden_line.strip_prefix("Error: process error: child process error: "),
-        Some(refusal_msg(HOST_UID_A).as_str()),
-        "the CLI override must surface the exact mediation_run_as refusal"
+        "the CLI must surface the exact mediated-path identity refusal"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

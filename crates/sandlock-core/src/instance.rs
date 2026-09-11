@@ -125,13 +125,6 @@ pub struct InstanceStats {
     /// it resolves to zero once the unregister lands. Reports 0 before the
     /// supervisor state exists.
     pub proc_count_vs_live: i64,
-    /// Count of sandboxes this process has launched in the explicit
-    /// `mediation_run_as=supervisor` downgrade tier (root in-process
-    /// mediator remapping to a non-zero sandbox host uid, fork-plan F6.1).
-    /// Process-wide and cumulative: each such launch warns on stderr and
-    /// increments this counter so the downgrade is observable through every
-    /// session's stats snapshot, never silent.
-    pub mediation_downgrades: u32,
     /// Live session-owned children.
     ///
     /// One-shot mode: the session has one direct child, so this is 0 or 1
@@ -2356,7 +2349,6 @@ impl SandboxInstance {
         };
         InstanceStats {
             proc_count_vs_live,
-            mediation_downgrades: crate::sandbox::supervisor_tier_launch_count(),
             children_live,
             instance_state: effective_phase,
         }

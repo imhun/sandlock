@@ -16,12 +16,13 @@ phases of the gate with no soft skip:
 * **unprivileged** (the gate's uid 65534 phase): a ``RunAs`` to a uid the
   single-entry user-namespace map cannot cover is refused before fork —
   ``crates/sandlock-core/src/sandbox.rs`` (``userns_remap && !privileged``);
-* **root**: the C档 shape (default ``mediation_run_as=caller`` + path
-  mediation + non-zero host uid) is refused with the route-B remedy —
-  ``crates/sandlock-core/src/sandbox.rs`` (``mediation_run_as=caller
+* **root**: the C档 shape (in-process privileged mediator + path mediation +
+  non-zero host uid) is refused with the route-B remedy —
+  ``crates/sandlock-core/src/sandbox.rs`` (``in-process path mediation
   refused:`` ... ``(route B)``); the E2B worker hits exactly this text when
-  an in-process supervisor-tier downgrade is attempted.  Run pytest as root
-  to exercise that branch (``docker run --user root`` / the B1 root runner).
+  an in-process chroot create is attempted on a privileged worker without a
+  slot.  Run pytest as root to exercise that branch (``docker run --user
+  root`` / the B1 root runner).
 
 Every assertion is whole-string equality against the core text; a substring
 or ``match=`` assertion would accept a truncated or reordered reason.
@@ -65,14 +66,13 @@ def _core_error_display() -> str:
     ``crates/sandlock-supervise/tests/mediation_2uid.rs`` ``refusal_msg``).
     """
     if os.geteuid() == 0:
-        # C档 (mediation_run_as=caller, root in-process remap, path mediation).
+        # C档 (root in-process remap, path mediation).
         return (
             "process error: child process error: "
-            "mediation_run_as=caller refused: in-process path mediation would run "
-            f"as euid 0 while the sandbox's host uid is {_TARGET_UID}; on-behalf "
-            "files would be owned by the mediator, not the sandbox (SL-1). Run "
-            f"sandlock-supervise as uid {_TARGET_UID} (route B), or pass "
-            "mediation_run_as=supervisor to explicitly accept the downgrade"
+            "in-process path mediation refused: mediation would run as euid 0 "
+            f"while the sandbox's host uid is {_TARGET_UID}; on-behalf files "
+            "would be owned by the mediator, not the sandbox (SL-1). Run "
+            f"sandlock-supervise as uid {_TARGET_UID} (route B)"
         )
     # Unprivileged RunAs remap: the single-entry map cannot cover this uid.
     return (

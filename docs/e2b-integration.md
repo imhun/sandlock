@@ -59,15 +59,15 @@ F13 行）。F14（2026-09-06）：core_lib 828 / mediation_2uid 9（root 档其
 | M1 `exec` 下沉 + child 句柄（fork-plan F3） | init/proto/fdpass 从 `sandlock-oci` 原样搬入 `core::init`（oci 走 re-export seam，oci-root 144 精确不变）；per-child `exec/wait_child/kill_child/resize_child` + SCM_RIGHTS stdio；FFI `sandlock_instance_*`（launch/exec/wait/kill/resize/free，F4 再加 exec_params/update_network，cbindgen 同步）；Python `SandboxInstance.exec() -> ExecProcess` | core::init + supervise 双传输 + FFI/Python | ✅ commit `d063437`、`4411c7b`、`3d42bc7` + fix `3fa0b95` | supervise 主退出顺序竞态等见 `docs/fork-plan-followups.md` |
 | M2 per-exec 参数 + 子集校验（fork-plan F4） | per-exec `cwd/env/extra_writable/bind_ports`（execve 前 chdir/envp）；S9 单 choke point（越出实例上限 ⇒ EPERM/`PolicyTooWide`）；`update_network` 只绑新 exec + staleness 回报；per-child 网络按 pid 血缘、未归因 fail-closed | `exec_params.rs` + network 按 pgid 绑定 | ✅ commit `b58b634`、`9f959f1`、`c5d1108` + fixes `902e522`/`e5c7214` | per-child 正向收窄非内核可强制等 seam 见 follow-ups |
 | M3 语义/默认/兜底（fork-plan F5） | 整箱 `max_processes` 默认 **256**（Q10）；多 child `checkpoint()` 显式拒绝；`pid_ns`+实例并存（PidKey 收窄 on-behalf /proc、init reaper）；统一 `InstanceDead`（FFI code 6 / python 消息）；idle `T_idle`/`T_max` | core + FFI/Python 错误面 | ✅ commit `b56fcbe`..`1321ba0`（F5.1–F5.5 + review fix） | **用户可见行为变化**已入 CHANGELOG（默认值/拒绝/Dead/寿命） |
-| SL-1/P1/P2 路径中介身份（fork-plan F6.1，F10 收口） | A 档（同 uid 属主正确）+ B 档（两 supervise 不同 uid 真内核隔离硬证据）+ C 档 fail-closed（root 进程内 remap + 路径中介 ⇒ 建箱前拒绝）；`mediation_run_as=caller|supervisor` 贯穿 builder/Policy/FFI+cbindgen/CLI/Python/supervise 全字段；F10 修复显式 supervisor 逃生门下 chroot × 特权 RunAs 的 create/launch 回归（remap 前做 chdir + Landlock） | notif/builder + 全栈 | ✅ commit `b62e201`、`dd5a7e8`、`7f81314` + fix `75bbe0b`；F10 本地提交 | `--pid-ns` CLI 旧漏线等见 follow-ups |
+| SL-1/P1/P2 路径中介身份（fork-plan F6.1，**B3 硬删收口**） | A 档（同 uid 属主正确）+ B 档（两 supervise 不同 uid 真内核隔离硬证据）+ C 档 fail-closed（特权进程内中介 + 路径中介 ⇒ 建箱前拒绝，唯一修法是 route B）；**`mediation_run_as` 降级档整体删除**（builder/Policy/profile/FFI+cbindgen/CLI/Python/supervise/stats 全字段，B3 2026-09-11）；拒绝**条件触发**（`mediation_active`），无中介的纯 per-uid RunAs 与 host uid 0 / 同 uid 形态照旧可用 | notif/builder + 全栈 | ✅ commit `b62e201`、`dd5a7e8`、`7f81314` + fix `75bbe0b`；F10 `75bbe0b`；B3 本地提交（**ABI 破坏**，需同批更新 wheel/`.so`） | `--pid-ns` CLI 旧漏线等见 follow-ups |
 | P5 `fs_mount` 单节点 + `minimal_dev`（fork-plan F6.2；F13 收尾） | 单文件/chardev bind-mount（不再 ENOTDIR、ro 保持、写家族 EBUSY 防宿主源被删/移）；`minimal_dev()`（`ptmx/pts/null/urandom/zero/tty`）免整树挂 /dev 与 `/dev/shm` carve-out | core + FFI + CLI `--fs-mount` + Python | ✅ commit `de2f749`、`dc0edf3` + fix `6fcb8e2`（ffi 98、python 454）；**F13（2026-09-06）补 link 直击 pin + 目录挂载点 rmdir EBUSY（ffi 100，见 §3.1/§5 F13 行）** | 挂载点卸载能力不在本期语义（= 与真实 bind-mount 一致，禁止删除） |
 
 ## 2. 待实施的修改方案（E2B 提出，需要改 fork）
 
 | 编号 | 方案 | 优先级 | 说明 |
 |---|---|---|---|
-| **P1** | **SL-1 修法**：路径中介必须以**调用方身份**执行（`setfsuid/setfsgid(caller)` 包住被中介的 syscall，或 `openat(O_CREAT)` 后 `fchown` 回调用 uid）；`unlinkat/renameat2/fchmodat/fchownat` 需按**调用方**复现内核 DAC 判定（owner / sticky / `CAP_FOWNER` 相对该 inode 所在 mount 的 userns），不成立返回 EPERM | 高（多租户隔离） | **F10 终态：由 F2b 取代，仅保留 fail-closed**（route B 的 supervise 进程 euid == 沙箱 host uid ⇒ 原修法不再需要；`mediation_run_as=caller` 下 root 进程内 remap + 路径中介在 spawn 前被拒）。F6.1 commit `b62e201` + B/C 档验收 `7f81314` + fix `75bbe0b`；F10 修复 supervisor 逃生门下 chroot × 特权 RunAs 的 create/launch 回归。详见 §3.1 |
-| **P2** | 提供 `mediation_run_as = caller \| supervisor` 开关，便于既有依赖 COW/chroot 语义的调用方渐进迁移 | 中 | **F10 终态：已落地**（F6.1，commit `b62e201`/`dd5a7e8`）：builder / Policy / profile / FFI+cbindgen / CLI `--mediation-run-as` / Python / supervise 全字段清单；显式 `supervisor` 档 WARN + `stats()` 计数；**F10 前该逃生门在 chroot × root-0700 缓存 × 特权 RunAs 形态仍 create/launch 失败，F10 修复后可用**（`confine_child` 前置 chdir+Landlock 到 remap 前，仅特权 remap 形态）。详见 §3.1 |
+| **P1** | **SL-1 修法**：路径中介必须以**调用方身份**执行（`setfsuid/setfsgid(caller)` 包住被中介的 syscall，或 `openat(O_CREAT)` 后 `fchown` 回调用 uid）；`unlinkat/renameat2/fchmodat/fchownat` 需按**调用方**复现内核 DAC 判定（owner / sticky / `CAP_FOWNER` 相对该 inode 所在 mount 的 userns），不成立返回 EPERM | 高（多租户隔离） | **终态：由 F2b 取代，只保留 fail-closed**（route B 的 supervise 进程 euid == 沙箱 host uid ⇒ 原修法不再需要；特权进程内 remap + 路径中介在 spawn 前被拒，**没有降级档可绕过** —— B3 2026-09-11 删掉）。F6.1 commit `b62e201` + B/C 档验收 `7f81314` + fix `75bbe0b`。详见 §3.1 |
+| **P2** | 提供 `mediation_run_as = caller \| supervisor` 开关，便于既有依赖 COW/chroot 语义的调用方渐进迁移 | 中 | **终态：档位已删除，不再提供**（B3 2026-09-11，用户拍板「不留逃生门」）。历史：F6.1 `b62e201`/`dd5a7e8` 落地全字段（builder / Policy / profile / FFI+cbindgen / CLI `--mediation-run-as` / Python / supervise）；F10 `75bbe0b` 修好该逃生门在 chroot × root-0700 缓存 × 特权 RunAs 形态的 create/launch 回归。B3 把这一档连字段一起删净（含 `--mediation-run-as`、profile 键、FFI 导出、Python 取值校验、`stats()` 计数），**需要同批更新 wheel/`.so`（ABI 破坏）**。详见 §3.1 与 fork `docs/CHANGELOG.md` |
 | **P3** ✅（commit `17ee48d`） | `_HANDLED_FIELDS` 登记 `notify_rate_limit`（**一行**） | 低（但污染每条日志） | **F9 终态：已修**：名字已登记入 `_HANDLED_FIELDS`，假告警消除；python 全量 454 已在 F0.1 基座 + F9 终局实测登记（`docs/test-baseline.md`） |
 | **P4** ✅（F7 前提证伪 + 回归 pin，commit `4e78c98`；文档 `da9c3a7`/`7183884`） | 修 T4：`net_isolation` + chroot（镜像 rootfs）下 MCP 入站端口映射起不来 | 中（该形态是 E2B 生产形态之一） | **F9 终态：fork 侧已闭环（非代码修复）**：chroot + `net_isolation` + `net_bind_map` 三合一形态经 9 种忠实构造（HEAD 与 T4 观测时代 `be387c7`）验证可用；新增 3 条镜像测试（mcp/epoll/poll under chroot，core_integ 529）。e2b 侧 T4 有真实 image-rootfs + netns 失败记录（strict-1 实跑，2026-09-03，与 §3.3 一致）；残差可能在 envd gateway 接线层，需 e2b 侧以 `E2B_BASE_IMAGE` + `xfail(run=True)` 复测 —— **显式 out-of-fork follow-up**（见 §3.3 / `docs/fork-plan-followups.md` FUP-E1）；**FUP-E1 已关闭（2026-09-06，E2B Task 10/11）**：残差根因 = envd 基镜像组成缺 mcp-gateway（ENOENT exit 2），MCP-capable 基镜像 `python-mcp:3.14`（E2B `deploy/docker/Dockerfile.mcp-base`）下 image-rootfs + netns MCP 契约两形态全绿，E2B 侧 xfail 已摘（见 §3.3） |
 | **P5** ✅（F6.2，commit `de2f749` + fix `6fcb8e2`） | `fs_mount` 目前只接受目录根（单文件/设备节点会以 `ENOTDIR` 失效）⇒ 调用方只能整树挂 `/dev`，进而**必须**下发 `fs_denied` 挡 `/dev/shm`，正好踩 SL-1。希望支持单节点挂载，或提供"最小可用 /dev（ptmx/pts/null/urandom）"构造 helper | 中（消除 SL-1 触发面） | **F9 终态：已修**：单文件/chardev 单节点 bind-mount（`resolv.conf`、`/dev/null` 形态不再 ENOTDIR，ro 保持、挂载点写家族 EBUSY）+ `minimal_dev()` helper（`ptmx/pts/null/urandom/zero/tty`），调用方可省整树 `/dev` 挂载与 `/dev/shm` carve-out；F6.1 chroot A档用例已改经 helper 构造 `/dev`（全程不下发 `fs_denied`）。详见 §3.1 |
@@ -81,15 +81,17 @@ F13 行）。F14（2026-09-06）：core_lib 828 / mediation_2uid 9（root 档其
 
 ### 3.1 SL-1 路径中介以 supervisor 身份执行系统调用（High，多租户 DAC 隔离）
 
-**已修（构造消除 + fail-closed，fork-plan F2b / F6.1；commit `b62e201`（core 拒绝+断言）、
-`dd5a7e8`（全栈 `mediation_run_as`）、`7f81314`（B/C 档验收 + runner 分层）、`75bbe0b`
-（review I1 policy_fn 谓词），2026-09-05）**：中介没有独立特权进程，
+**已修（构造消除 + fail-closed，fork-plan F2b / F6.1，2026-09-05；B3 硬删收口，
+2026-09-11）**：commit `b62e201`（core 拒绝+断言）、`dd5a7e8`（全栈
+`mediation_run_as`）、`7f81314`（B/C 档验收 + runner 分层）、`75bbe0b`
+（review I1 policy_fn 谓词）。**B3（2026-09-11）把 P2 的 `supervisor` 降级档整体
+删除**，终态只有一条形态：中介没有独立特权进程，
 `notif::supervisor(...)` 跑在持有实例的那个进程里，所以**中介身份恒等于该进程的 euid**。
 route B 下每个沙箱由一个 `sandlock-supervise` 进程服务、且该进程 euid == 沙箱 host uid
 （见 `docs/supervise-identity-handoff.md`），DAC 判定由构造正确：属主落 root、
 `chmod` 失效、1777+sticky 跨 uid 保护不成立这三个症状在 A/B 档下不存在。
 
-fork 侧 F6.1 把这一点固化成「断言 + 拒绝」：
+fork 侧把这一点固化成「断言 + 拒绝」：
 
 - **A 档（同 uid 行为正确，默认 gate）**：`test_nonroot_created_file_owned_by_self`、
   `test_denied_path_still_denied`，外加 chroot 与 COW 两形态的同一组断言
@@ -98,17 +100,22 @@ fork 侧 F6.1 把这一点固化成「断言 + 拒绝」：
   `test_two_supervisors_distinct_uids_isolate_files` —— uid X/Y 各起一个
   `sandlock-supervise`（setpriv，真实内核身份），双方都允许写同一 1777+sticky
   共享目录：X 建的文件属主 X、X 自 chmod 生效，Y 可读但 `rm`/`chmod` 均 EPERM。
-- **C 档（fail-closed）**：`mediation_run_as`（默认 `caller`）下，root 进程内中介
-  + `RunAs(非 0 host uid)` + 路径中介 ⇒ **建箱前拒绝**并点名 route B 修法与显式
-  `supervisor` 档；显式档建箱成功但 WARN 且 `stats()` 计数，对照组
-  （root 保留 caps、chroot 中介）证明降级档真实降级（文件属主 root、同一条
-  `unlinkat` 成功绕过 sticky）——默认档拒绝不是装饰。
+- **C 档（fail-closed，B3 后是唯一形态）**：特权进程内中介（euid 0，或持有效
+  CAP_SETUID/CAP_SETGID 的非 root launcher）+ `RunAs(非 0 host uid)` + **路径中介
+  活跃**（chroot / COW / `fs_denied` / `policy_fn` 任一）⇒ **建箱前拒绝**，错误文本
+  只点名 route B 修法（`Run sandlock-supervise as uid <N> (route B)`），
+  **不再提供任何降级出路**。判定谓词本身没变，所以拒绝是**条件触发**的：
+  `no_supervisor`、无中介的纯 per-uid `RunAs`（root worker 的既有合法形态）、
+  host uid 0、以及「中介 euid == 沙箱 host uid」的同身份形态全部放行——
+  反向回归见 `mediation_2uid::test_root_pure_per_uid_run_as_is_still_accepted`
+  与 `test_instance_chroot.rs::test_instance_exec_only_chroot_same_uid_launch_and_exec`。
 
-字段已贯通 builder / Policy / profile 序列化 / FFI setter + cbindgen 头 /
-CLI `--mediation-run-as`（真接线）/ Python `Sandbox(mediation_run_as=...)` /
-supervise 全字段 policy 清单。历史复现与影响分析见 git 历史与
-`docs/sandbox-exec-security.md` §4.12（SL-1 叠加说明）。唯一遗留：C 档对照组依赖
-chroot 形态的中介代执行。F6.1 新增的 chroot/COW 断言本身**不下发** `fs_denied`
+字段已从 builder / Policy / profile 序列化 / FFI setter + cbindgen 头 /
+CLI `--mediation-run-as` / Python `Sandbox(mediation_run_as=...)` /
+supervise 全字段 policy 清单 / `InstanceStats::mediation_downgrades` **全删**
+（`grep -rn 'mediation_run_as\|MediationRunAs\|mediation-run-as' crates/ python/`
+无输出）。历史复现与影响分析见 git 历史与
+`docs/sandbox-exec-security.md` §4.12（SL-1 叠加说明）。F6.1 新增的 chroot/COW 断言本身**不下发** `fs_denied`
 （chroot/COW dispatch 本身就是 on-behalf 触发）；F6.2 已按 plan 文字把 chroot
 A档用例的 `/dev` 提供者换成 `minimal_dev()`（`fs_mount` 单节点集合，
 `ptmx/pts/null/urandom/zero/tty`），用例在沙箱内写 `/dev/null` 且**全程不下发

@@ -628,37 +628,6 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_user(
     Box::into_raw(Box::new(builder.user(uid, gid)))
 }
 
-/// Set the mediation identity tier for on-behalf path operations:
-/// `0` = `caller` (root in-process remaps are refused), `1` =
-/// `supervisor` (explicit downgrade tier; warning + `stats()` counter).
-/// Unknown discriminants are ignored and **preserve the builder's current
-/// state** (on a fresh builder that current state is the fail-closed
-/// `caller` default).
-///
-/// # Safety
-/// `b` must be a valid builder pointer.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_sandbox_builder_mediation_run_as(
-    b: *mut SandboxBuilder,
-    tier: u8,
-) -> *mut SandboxBuilder {
-    if b.is_null() {
-        return b;
-    }
-    let builder = *Box::from_raw(b);
-    let tier = match tier {
-        0 => sandlock_core::sandbox::MediationRunAs::Caller,
-        1 => sandlock_core::sandbox::MediationRunAs::Supervisor,
-        _other => {
-            // Unknown discriminants preserve the builder's current state
-            // (fail-closed only when the builder is still at its fresh
-            // default).
-            return Box::into_raw(Box::new(builder));
-        }
-    };
-    Box::into_raw(Box::new(builder.mediation_run_as(tier)))
-}
-
 // ----------------------------------------------------------------
 // Sandbox Builder — HTTP ACL
 // ----------------------------------------------------------------
@@ -3829,9 +3798,9 @@ fn check_supervise_control_fd(fd: std::os::fd::RawFd) -> Result<(), String> {
 /// caller frees with [`sandlock_string_free`].
 ///
 /// Publishing the core's own text — rather than a per-symbol constant — is
-/// the point: a fail-closed refusal's remedy (e.g. the `mediation_run_as`
-/// route-B sentence) must survive the FFI boundary, since that is the only
-/// thing a caller can act on.
+/// the point: a fail-closed refusal's remedy (e.g. the mediated-path
+/// identity gate's route-B sentence) must survive the FFI boundary, since
+/// that is the only thing a caller can act on.
 ///
 /// # Safety
 /// `err` and `err_msg` may be null; when non-null they must point to

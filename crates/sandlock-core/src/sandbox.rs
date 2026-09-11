@@ -133,59 +133,6 @@ impl std::str::FromStr for RunAs {
     }
 }
 
-/// Identity tier for supervisor-side ("on-behalf") path mediation
-/// (fork-plan F6.1 / SL-1 / P2).
-///
-/// The seccomp-notify supervisor performs mediated path operations (open
-/// with `O_CREAT` under a deny carve-out, chroot resolution, COW staging)
-/// in the process that owns the instance, so the mediator's identity is
-/// that process's euid.  The tier declares whose identity that process is
-/// allowed to stand in for:
-///
-/// * [`MediationRunAs::Caller`] (default): mediation is only valid when the
-///   owning process's euid *is* the sandbox's host uid (route A, and route
-///   B's supervise slots where the process runs as the sandbox host uid).
-///   A privileged supervisor remapping the sandbox to a different host uid
-///   (the C档 shape: euid 0 + `RunAs(X)` with path mediation) would create
-///   and modify files as the mediator instead of as the sandbox — that
-///   combination is **refused** at spawn.
-/// * [`MediationRunAs::Supervisor`]: explicit compatibility tier: the
-///   caller acknowledges that mediated operations run as the owning
-///   process itself (e.g. a root supervisor that keeps privileges).  The
-///   downgrade is allowed with a warning and a `stats()` counter so it is
-///   never silent; the root-mode `mediation_2uid` acceptance proves the
-///   tier really is a downgrade (root-owned files, cross-uid deletion
-///   through chroot mediation) rather than a decorative flag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MediationRunAs {
-    #[default]
-    Caller,
-    Supervisor,
-}
-
-impl std::fmt::Display for MediationRunAs {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MediationRunAs::Caller => f.write_str("caller"),
-            MediationRunAs::Supervisor => f.write_str("supervisor"),
-        }
-    }
-}
-
-impl std::str::FromStr for MediationRunAs {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "caller" => Ok(MediationRunAs::Caller),
-            "supervisor" => Ok(MediationRunAs::Supervisor),
-            other => Err(format!(
-                "invalid mediation_run_as {other:?} (expected \"caller\" or \"supervisor\")"
-            )),
-        }
-    }
-}
-
 /// C档 fail-closed gate (fork-plan F6.1 Step 3; F14 extends the trigger from
 /// euid 0 to non-root effective CAP_SETUID/SETGID): refuse in-process path
 /// mediation when the mediator would run the sandbox at a *different*
@@ -247,8 +194,7 @@ fn effective_caps_allow_privileged_remap() -> bool {
 /// receives live `policy_fn`-issued `deny_path()` calls — a present
 /// `policy_fn` is treated as mediation-capable too.  Conservative by
 /// design: the refusal is about *capability*, not whether a deny has fired
-/// yet; the explicit `mediation_run_as=supervisor` tier is the escape
-/// hatch.  `no_supervisor` disables the notif supervisor entirely, so no
+/// yet.  `no_supervisor` disables the notif supervisor entirely, so no
 /// on-behalf path exists.
 pub(crate) fn mediation_active_for(
     no_supervisor: bool,
@@ -258,23 +204,6 @@ pub(crate) fn mediation_active_for(
     policy_fn: bool,
 ) -> bool {
     !no_supervisor && (fs_denies || chroot || cow || policy_fn)
-}
-
-/// Process-wide count of sandboxes launched in the explicit
-/// `mediation_run_as=supervisor` downgrade tier (root in-process remap).
-/// Exposed through [`InstanceStats::mediation_downgrades`] so a downgrade
-/// is observable, never silent.
-static MEDIATION_SUPERVISOR_TIER_LAUNCHES: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
-
-pub(crate) fn note_supervisor_tier_launch() {
-    use std::sync::atomic::Ordering;
-    MEDIATION_SUPERVISOR_TIER_LAUNCHES.fetch_add(1, Ordering::Relaxed);
-}
-
-pub(crate) fn supervisor_tier_launch_count() -> u32 {
-    use std::sync::atomic::Ordering;
-    MEDIATION_SUPERVISOR_TIER_LAUNCHES.load(Ordering::Relaxed)
 }
 
 /// Confinement for confining the current process in place.
@@ -720,14 +649,6 @@ pub struct Sandbox {
     // User-namespace identity (run-as uid/gid)
     pub user: Option<RunAs>,
 
-    /// Mediation identity tier for on-behalf path operations (see
-    /// [`MediationRunAs`]).  Defaults to [`MediationRunAs::Caller`].
-    /// Serialized so a profile round-trip preserves an explicit
-    /// `supervisor` declaration; documents without the key default to
-    /// `caller` (fail-closed).
-    #[serde(default)]
-    pub mediation_run_as: MediationRunAs,
-
     // Dynamic policy callback
     #[serde(skip)]
     pub policy_fn: Option<crate::policy_fn::PolicyCallback>,
@@ -856,7 +777,6 @@ impl Clone for Sandbox {
             userns_self_map: self.userns_self_map,
             control_socket: self.control_socket,
             user: self.user,
-            mediation_run_as: self.mediation_run_as,
             policy_fn: self.policy_fn.clone(),
             name: self.name.clone(),
             mode: self.mode.clone(),
@@ -2252,13 +2172,11 @@ impl Sandbox {
         // the seccomp-notify mediator runs in THIS process, so mediated path
         // operations carry this process's identity.  When this process can
         // remap the sandbox to a different host uid (`RunAs` through the
-        // privileged userns map) and runs on-behalf path operations, a
-        // default `caller` tier would create/modify files as the mediator —
-        // the SL-1 owner/chmod/sticky failure class.  Refuse before fork,
-        // with the route-B remedy (run a `sandlock-supervise` process as the
-        // sandbox's host uid) or the explicit `supervisor` downgrade named
-        // in the error.  The explicit tier is allowed but loud: a warning
-        // plus a `stats()` counter, so the downgrade is never silent.
+        // privileged userns map) and runs on-behalf path operations, the
+        // mediated files would be created/modified as the mediator — the
+        // SL-1 owner/chmod/sticky failure class.  There is no downgrade tier:
+        // refuse before fork with the one remedy that is safe (run a
+        // `sandlock-supervise` process as the sandbox's host uid, route B).
         let mediation_active = mediation_active_for(
             self.no_supervisor,
             resolved.features.fs_denies,
@@ -2272,46 +2190,24 @@ impl Sandbox {
             mediation_active,
             privileged_remap_caps,
         ) {
-            match self.mediation_run_as {
-                MediationRunAs::Caller => {
-                    // Distinguish the two privileged shapes for deployment
-                    // troubleshooting: euid 0 vs a non-root file-cap
-                    // launcher holding effective CAP_SETUID/CAP_SETGID.
-                    let privilege_clause = if mediator_euid == 0 {
-                        "as euid 0".to_string()
-                    } else {
-                        format!(
-                            "as euid {} with effective CAP_SETUID/CAP_SETGID",
-                            mediator_euid
-                        )
-                    };
-                    return Err(SandboxRuntimeError::Child(format!(
-                        "mediation_run_as=caller refused: in-process path mediation would run \
-                         {privilege_clause} while the sandbox's host uid is {host_uid}; \
-                         on-behalf files would be owned by the mediator, not the sandbox \
-                         (SL-1). Run sandlock-supervise as uid {host_uid} (route B), or pass \
-                         mediation_run_as=supervisor to explicitly accept the downgrade",
-                    ))
-                    .into());
-                }
-                MediationRunAs::Supervisor => {
-                    let privilege_clause = if mediator_euid == 0 {
-                        "as euid 0".to_string()
-                    } else {
-                        format!(
-                            "as euid {} with effective CAP_SETUID/CAP_SETGID",
-                            mediator_euid
-                        )
-                    };
-                    eprintln!(
-                        "sandlock: warning: mediation_run_as=supervisor: in-process path \
-                         mediation runs {privilege_clause} while the sandbox's host uid is \
-                         {host_uid}; on-behalf files are owned by the mediator, not the \
-                         sandbox (SL-1 downgrade accepted explicitly)"
-                    );
-                    note_supervisor_tier_launch();
-                }
-            }
+            // Distinguish the two privileged shapes for deployment
+            // troubleshooting: euid 0 vs a non-root file-cap launcher
+            // holding effective CAP_SETUID/CAP_SETGID.
+            let privilege_clause = if mediator_euid == 0 {
+                "as euid 0".to_string()
+            } else {
+                format!(
+                    "as euid {} with effective CAP_SETUID/CAP_SETGID",
+                    mediator_euid
+                )
+            };
+            return Err(SandboxRuntimeError::Child(format!(
+                "in-process path mediation refused: mediation would run {privilege_clause} \
+                 while the sandbox's host uid is {host_uid}; on-behalf files would be owned \
+                 by the mediator, not the sandbox (SL-1). Run sandlock-supervise as uid \
+                 {host_uid} (route B)",
+            ))
+            .into());
         }
 
         let pid = unsafe { libc::fork() };

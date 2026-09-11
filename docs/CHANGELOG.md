@@ -8,6 +8,39 @@
 
 ## 行为变化（升级 / 接线前必读）
 
+- **⚠️ BREAKING：删掉 `mediation_run_as` 降级档（B3，2026-09-11，SL-1 硬删）**：
+  「需要路径中介时，中介身份必须就是沙箱身份」现在是**唯一**形态，不再有任何降级
+  逃生门。删除面（全部一次删净，不留墓碑）：`MediationRunAs` 枚举（含
+  `Display`/`FromStr`/serde）、`Sandbox.mediation_run_as`、builder 的字段与
+  `mediation_run_as()` 方法、profile `[config].mediation_run_as`、
+  `InstanceStats::mediation_downgrades` 与其 supervise `stats` 报文字段、
+  FFI 导出 `sandlock_sandbox_builder_mediation_run_as`（+ cbindgen 头）、CLI
+  `--mediation-run-as`、Python `SandboxConfig.mediation_run_as`（字段与取值校验）。
+  **升级后果**：① 旧 CLI 命令行带 `--mediation-run-as` 会按未知参数失败；② 旧 profile
+  里带该键会按 unknown field 报错（`[config]` 是 `deny_unknown_fields`）；③ 旧的
+  supervise `--policy` 文档带该键会被 wire 按名拒绝；④ 旧的 C/Go/Python 绑定调用
+  `sandlock_sandbox_builder_mediation_run_as` 会**链接不到符号**（导出数 164→163）；
+  ⑤ 旧 `stats` 消费方读 `mediation_downgrades` 会读到缺字段。**必须同批更新 wheel /
+  `.so`**：ABI 少了这个导出，旧 wheel 配新 `.so`（或反之）会在建箱时炸；E2B 侧已
+  同步删掉对它的全部请求。
+  **拒绝路径只剩一条**（`mediation_remap_is_refused` 判定不变，唯一触发条件仍是
+  `mediation_active && host_uid != 0 && (euid == 0 || 特权 CAP_SETUID/SETGID + 跨
+  uid)`，即 chroot/COW/fs_deny/policy_fn 下特权中介跨 uid remap；`no_supervisor`
+  与「无需中介的纯 per-uid RunAs」「host uid 0」「同 uid」照旧放行）——错误文本删掉
+  了 `or pass mediation_run_as=supervisor to explicitly accept the downgrade` 这半句，
+  现在整句是：
+  `in-process path mediation refused: mediation would run as euid 0 while the sandbox's
+  host uid is <N>; on-behalf files would be owned by the mediator, not the sandbox
+  (SL-1). Run sandlock-supervise as uid <N> (route B)`（非 root 特权 launcher 形态把
+  `as euid 0` 换成 `as euid <E> with effective CAP_SETUID/CAP_SETGID`）。**按文本匹配
+  的调用方要改**：`mediation_run_as=caller refused:` 这个前缀不存在了，改按
+  `in-process path mediation refused:` 匹配或直接展示全文。测试/基线：core_lib
+  846→840、core_integ 539→540、ffi 106→104、cli 100→97、supervise 43→42、
+  python 467→464、mediation_2uid 10→9；新增的「不误伤」回归（root + 纯 per-uid
+  RunAs 仍可建箱、非 root 同 uid chroot 不受影响）见
+  `crates/sandlock-supervise/tests/mediation_2uid.rs` 与
+  `crates/sandlock-core/tests/integration/test_instance_chroot.rs`。
+
 - **B1 fix round 1（2026-09-11，SL-12 评审）**：四条修正，两条是安全相关的。
   ① **缺符号不再静默**：新的 Python 包配上旧的 `libsandlock_ffi.so`（源码树
   `target/` 陈旧、部分升级、wheel 与库路径混搭）以前会在 `import sandlock`
@@ -53,6 +86,8 @@
   `sandlock_create` / 2 参 `sandlock_instance_launch` 的 ABI 与行为不变（仍是 NULL；
   它们没有出参可看，是 `_with_err` 的 NULL 版包装）。本任务**不动**
   `mediation_run_as` 档位本身——那是 B3；这里只让它的拒绝可解释。
+  **（B3 更正：本条引用的拒绝文本是 B1 当时的形态；那半句降级出路与
+  `mediation_run_as` 字段本身已在 B3 删除，现行文本见本文件最上方的 B3 条目。）**
 
 - **cwd 由请求决定 + 挂载别名确定性（A2，2026-09-10）**：同一个宿主目录被挂在多个
   虚拟路径下时（E2B 的 `/workspace` 与 `/home/user` 就是同一个目录），此前有三处

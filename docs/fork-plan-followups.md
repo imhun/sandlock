@@ -27,7 +27,7 @@
   （`dd5a7e8` 时代仍无 main.rs 转发 `pb.pid_ns`；FFI/Python/profile 均已生效）。
   描述：`sandlock-cli` 从不暴露 `--pid-ns` 开关，用户会误以为 CLI 不支持该策略。
   为什么留：**既有历史缺陷**，真修 = 新增 clap arg + builder 接线 + CLI→运行时测试
-  （`--mediation-run-as`/`--fs-mount` 已示范正确形态），属 F9 文档范围之外的小代码改动。
+  （`--fs-mount` 已示范正确形态），属 F9 文档范围之外的小代码改动。
   **已关闭（2026-09-08，F15 台账收口）**：`--pid-ns` 在 flatten 后转发给运行时 builder
   （`262c0cf`；`main.rs:478-479` + 单测 `main.rs:1214 test_pid_ns_flag_reaches_runtime_policy`
   + `cli_test.rs` 端到端）。台账行漏写关闭结论，本次补记（无代码改动）。
@@ -92,6 +92,9 @@
   `profile.rs:60`/`profile.rs:821` 与 `profile_integration.rs:40`，I1 半在
   `sandbox/tests.rs:648 mediation_active_covers_policy_fn_deny_capability`（注释点名
   「the I1 shape」），落地于 `48968a5`。台账行漏写关闭结论，本次补记（无代码改动）。
+  **B3（2026-09-11）作废该关闭结论**：`mediation_run_as` 档位与 profile 键整体删除，
+  no-clobber 这条路径随之不存在（带该键的 profile 现在按 unknown field 拒绝）；
+  I1 半不受影响，仍是 live `policy_fn` deny 能力的守卫。
 - **FUP-08 knobs 未接生产配置** — 来源：F1.2（`c5a0fe7` early_exit_cap）、F1.8
   （`df5d77a` request deadline）、F5 review（`1321ba0` idle/T_max constructor-only）。
   描述：`early_exit_cap=1024`、`request` 默认 5 s、`T_idle`/`T_max` 目前只走
@@ -100,8 +103,8 @@
   **已关闭（2026-09-07，A/B cleanup wave，决策）**：无生产消费者需要调这些
   内部协议/生命周期旋钮（E2B 未请求端口/超时级配置），维持 constructor 默认 +
   测试 pin 的行为；若未来部署侧需要调优，从 `InstanceLifetime` /
-  `InitLink::with_options` 的既有 seam 接 CLI/profile/env（届时按 F6.1
-  `--mediation-run-as` 的接线纪律做端到端测试）。
+  `InitLink::with_options` 的既有 seam 接 CLI/profile/env（届时按 F6.1 的接线纪律
+  做端到端测试：flag 必须真的到运行时 builder，别只停在 parse 面）。
 - **FUP-09 egress flake 证据留存流程** — 来源：F2.1 ⚠️ / F5 gate / F8 gate
   （`8e22c5d`..`c8f76d4` 多轮观察；本 F9 终局一次即绿，未触发重试）。
   描述：`cli learn`（curl https://example.com）等外部 egress 用例与本环境偶发的

@@ -538,17 +538,6 @@ class Sandbox:
     user namespace maps exactly one gid; supplementary groups are not
     available on the privileged path."""
 
-    mediation_run_as: str = "caller"
-    """Identity tier for supervisor-side ("on-behalf") path mediation.
-    ``"caller"`` (default) requires the mediator (the process owning the
-    instance) to be the sandbox's host uid: a root in-process supervisor
-    remapping the sandbox to a different ``uid`` with path mediation active
-    is **refused** at spawn (SL-1 fail-closed).  ``"supervisor"`` is the
-    explicit compatibility tier: the same configuration is allowed with a
-    warning and a ``stats()`` downgrade counter.  The intended route-B
-    shape is a ``sandlock-supervise`` process running as the sandbox's host
-    uid — there ``"caller"`` is correct and no downgrade occurs."""
-
     # Seccomp user notification (filesystem virtualization)
     notif_policy: NotifPolicy | None = None
     """If set, enables a seccomp user notification supervisor that
@@ -611,11 +600,6 @@ class Sandbox:
     """Callback run in each COW clone, receives clone_id as argument."""
 
     def __post_init__(self):
-        if self.mediation_run_as not in ("caller", "supervisor"):
-            raise ValueError(
-                "mediation_run_as must be 'caller' or 'supervisor', got "
-                f"{self.mediation_run_as!r}"
-            )
         # Validate name
         if self.name is not None:
             if not self.name:

@@ -1,12 +1,16 @@
 //! Instance exec-only × chroot (fork-plan F10) — the non-root A档 half.
 //!
 //! The E2B M4 shape is a mainless `SandboxInstance` (launch_exec_only)
-//! running over a real image rootfs with `mediation_run_as=supervisor` and a
-//! chroot-visible workspace.  On the non-root gate the holder *is* the
-//! sandbox's host uid (route A), so no userns remap happens and the initial
-//! real chdir to the rootfs cwd succeeds with the caller's own credentials —
-//! the same-uid contract the root-mode acceptance (`mediation_2uid` F10
-//! cases) extends to a privileged remap.
+//! running over a real image rootfs with a chroot-visible workspace.  On the
+//! non-root gate the holder *is* the sandbox's host uid (route A), so no
+//! userns remap happens and the initial real chdir to the rootfs cwd succeeds
+//! with the caller's own credentials.
+//!
+//! That shape is also the reverse regression for the mediated-path identity
+//! gate: mediation is active (chroot) but the mediator's euid *is* the
+//! sandbox's host uid, so the gate must leave it alone.  A gate that demanded
+//! same-identity-in-all-cases instead of gating on `mediation_active` would
+//! break exactly this case.
 
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
@@ -14,7 +18,6 @@ use std::path::PathBuf;
 
 use sandlock_core::instance::{ExecStdio, SandboxInstance};
 use sandlock_core::result::ExitStatus;
-use sandlock_core::sandbox::MediationRunAs;
 use sandlock_core::Sandbox;
 
 /// Monotonic suffix for scratch directory names; see `temp_dir`.
@@ -89,11 +92,11 @@ fn cleanup(dir: &PathBuf) {
 }
 
 /// F10 acceptance 2 (non-root half): a mainless exec-only instance over a
-/// chroot with the explicit `mediation_run_as=supervisor` tier launches and
-/// serves an `exec()` — holder == sandbox host uid (route A), so the
-/// supervisor-tier downgrade shape is the same one E2B runs per-sandbox.
+/// chroot launches and serves an `exec()` — holder == sandbox host uid
+/// (route A), so the mediated-path identity gate must not fire even though
+/// path mediation is active.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_instance_exec_only_chroot_supervisor_same_uid_launch_and_exec() {
+async fn test_instance_exec_only_chroot_same_uid_launch_and_exec() {
     let base = temp_dir("ws");
     let rootfs = build_test_rootfs("rootfs");
     let ws = base.join("workspace");
@@ -111,16 +114,15 @@ async fn test_instance_exec_only_chroot_supervisor_same_uid_launch_and_exec() {
         .fs_write("/workspace")
         .fs_write("/home/user")
         .cwd("/workspace")
-        .mediation_run_as(MediationRunAs::Supervisor)
         .build()
-        .expect("instance chroot supervisor policy builds");
+        .expect("instance chroot policy builds");
 
     let mut inst = SandboxInstance::launch_exec_only(policy)
         .await
-        .expect("exec-only chroot instance must launch under the supervisor tier");
+        .expect("exec-only chroot instance must launch (mediator euid == host uid)");
     let h = inst
         .exec(
-            &["rootfs-helper", "echo", "instance-chroot-supervisor-ok"],
+            &["rootfs-helper", "echo", "instance-chroot-same-uid-ok"],
             ExecStdio::Piped,
         )
         .await
@@ -142,7 +144,7 @@ async fn test_instance_exec_only_chroot_supervisor_same_uid_launch_and_exec() {
         .expect("read exec stdout");
     assert_eq!(
         String::from_utf8_lossy(&out),
-        "instance-chroot-supervisor-ok\n",
+        "instance-chroot-same-uid-ok\n",
         "exec stdout must round-trip exactly"
     );
 

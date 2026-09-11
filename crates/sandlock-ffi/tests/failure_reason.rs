@@ -3,18 +3,18 @@
 //!
 //! Before this task the FFI returned a bare NULL and the SDK face could only
 //! say ``sandlock_create failed`` — a fail-closed refusal's remedy (name the
-//! route-B supervisor, or accept the downgrade explicitly) was lost at the
-//! boundary.  The `*_with_err` symbols publish that text through the same
-//! `err`/`err_msg` out-parameter contract the supervise exports use; these
-//! tests pin the *whole* string, not a fragment.
+//! route-B supervisor slot to run) was lost at the boundary.  The
+//! `*_with_err` symbols publish that text through the same `err`/`err_msg`
+//! out-parameter contract the supervise exports use; these tests pin the
+//! *whole* string, not a fragment.
 //!
 //! The refusal under test is chosen by privilege so the target runs in both
 //! phases with no soft skip:
 //!
 //! * unprivileged (the gate's uid 65534 phase): a `RunAs` to a uid the
 //!   single-entry user-namespace map cannot cover is refused before fork;
-//! * root: the C档 shape (default `mediation_run_as=caller` + path mediation
-//!   + non-zero host uid) is refused with the route-B remedy.
+//! * root: the C档 shape (in-process privileged mediator + path mediation +
+//!   non-zero host uid) is refused with the route-B remedy.
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
@@ -43,13 +43,12 @@ fn euid() -> u32 {
 /// `sandlock-supervise/tests/mediation_2uid.rs`).
 fn expected_refusal() -> String {
     if euid() == 0 {
-        // C档: root in-process remap with path mediation under `caller`.
+        // C档: root in-process remap with path mediation.
         format!(
-            "process error: child process error: mediation_run_as=caller refused: \
-             in-process path mediation would run as euid 0 while the sandbox's host uid is \
-             {TARGET_UID}; on-behalf files would be owned by the mediator, not the sandbox \
-             (SL-1). Run sandlock-supervise as uid {TARGET_UID} (route B), or pass \
-             mediation_run_as=supervisor to explicitly accept the downgrade"
+            "process error: child process error: in-process path mediation refused: \
+             mediation would run as euid 0 while the sandbox's host uid is {TARGET_UID}; \
+             on-behalf files would be owned by the mediator, not the sandbox (SL-1). Run \
+             sandlock-supervise as uid {TARGET_UID} (route B)"
         )
     } else {
         format!(
