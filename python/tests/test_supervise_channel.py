@@ -202,9 +202,16 @@ def _spawn_fd_slot(
 ):
     """Start `sandlock-supervise --control-fd N --serve` over a socketpair.
 
-    Returns ``(process, worker_end)``: the worker end stays open here (that is
-    the client), and the slot holds the other one, handed over as an inherited
-    descriptor the same way ``mediation_2uid`` does with ``pre_exec``.
+    Returns ``(process, worker_end, control_inode)``: the worker end stays open
+    here (that is the client), the slot holds the other one — handed over as an
+    inherited descriptor the same way ``mediation_2uid`` does with
+    ``pre_exec`` — and ``control_inode`` is that handed-over end's socket inode.
+
+    The inode has to be captured here because the two ends of a
+    ``socketpair()`` are two *distinct* sockets with different ``st_ino``s
+    (measured: ``socket:[13216002]`` vs ``socket:[13216003]``).  An fd-table
+    check that wants to name "the supervisor's own endpoint" must use the
+    handed-over end; comparing the client end matches nothing, ever.
     """
     import socket
 
@@ -216,6 +223,7 @@ def _spawn_fd_slot(
             json.dumps({"argv": program_argv}), encoding="utf-8"
         )
     worker, server = socket.socketpair()
+    control_inode = os.fstat(server.fileno()).st_ino
     argv = [
         str(SUPERVISE_BIN),
         "--policy",
@@ -240,7 +248,7 @@ def _spawn_fd_slot(
         stderr=subprocess.PIPE,
     )
     server.close()
-    return proc, worker
+    return proc, worker, control_inode
 
 
 def _exec_and_drain(channel, code: str) -> tuple[dict, bytes, bytes]:
@@ -265,7 +273,7 @@ def _exec_and_drain(channel, code: str) -> tuple[dict, bytes, bytes]:
 def test_fd_handoff_channel_runs_verbs_with_no_path_no_token(tmp_path: Path) -> None:
     """The SL-10 closure: the descriptor alone authenticates the worker."""
     assert SUPERVISE_BIN.exists(), f"missing {SUPERVISE_BIN}"
-    proc, worker = _spawn_fd_slot(tmp_path)
+    proc, worker, _control_inode = _spawn_fd_slot(tmp_path)
     try:
         channel = SuperviseChannel(fd=worker.fileno())
         stats = channel.request("stats")
@@ -297,44 +305,88 @@ def test_fd_handoff_channel_runs_verbs_with_no_path_no_token(tmp_path: Path) -> 
             proc.wait()
 
 
+def _socket_inode_fds(pid: int, inodes: set[int]) -> list[str]:
+    """Sorted fd names under ``/proc/<pid>/fd`` that point at one of the
+    given socket inodes (``socket:[<ino>]``).
+
+    A descriptor that closes between ``iterdir`` and ``readlink`` is skipped:
+    only surviving matches are reported, and the caller decides whether the
+    result must be empty or non-empty.
+    """
+    wanted = {f"socket:[{inode}]" for inode in inodes}
+    fd_dir = Path(f"/proc/{pid}/fd")
+    found = []
+    for entry in fd_dir.iterdir():
+        try:
+            target = os.readlink(fd_dir / entry.name)
+        except OSError:
+            continue
+        if target in wanted:
+            found.append(entry.name)
+    return sorted(found)
+
+
+def _fd_is_cloexec(pid: int, fd_name: str) -> bool:
+    """``flags:`` in ``/proc/<pid>/fdinfo/<fd>`` is the octal file-status
+    flags, where ``O_CLOEXEC`` is ``0o2000000``."""
+    fdinfo = Path(f"/proc/{pid}/fdinfo/{fd_name}").read_text(encoding="utf-8")
+    for line in fdinfo.splitlines():
+        if line.startswith("flags:"):
+            return bool(int(line.split(":", 1)[1].strip(), 8) & os.O_CLOEXEC)
+    raise AssertionError(f"no flags: line in /proc/{pid}/fdinfo/{fd_name}")
+
+
 def test_control_fd_does_not_leak_into_the_confined_tree(tmp_path: Path) -> None:
-    """Invariant: the confined `sandlock-init` must not hold the supervisor's
-    control endpoint.
+    """SL-11 guard: the supervisor's own control endpoint must not reach the
+    confined tree, and must carry `FD_CLOEXEC` on the slot's copy.
 
     Why it matters: a workload-visible copy of that socket could read the
     frames addressed to the worker (including the SCM_RIGHTS stdio ends) and
     would pin the connection open past a dead worker -- the SL-4 class of
-    inherited-control-fd bugs. Supervise now re-sets `FD_CLOEXEC` on the
-    handed-over descriptor before launching (serve.rs), so the property holds
-    regardless of how the launcher cleared it. Measured 2026-09-09: the fd
-    table was already clean before that change (core hands `sandlock-init` an
-    explicit fd set), so this test is a *guard*, not a bug reproduction; it
-    pins the property so neither side can regress into the leak silently.
+    inherited-control-fd bugs. `serve_control_fd` re-sets `FD_CLOEXEC` on the
+    handed-over descriptor before launching, so the property holds regardless
+    of how the launcher cleared it. Measured 2026-09-09: the confined fd table
+    was already clean before that restore (core hands `sandlock-init` an
+    explicit fd set), so this is a *guard*, not a bug reproduction -- which is
+    exactly why both halves are needed:
 
-    Both ends of a `socketpair()` share one socket inode, which is what makes
-    the check exact.
+      * the `fdinfo` half pins the `F_SETFD` call itself (with the restore
+        removed this assertion goes red; the fd table alone would not notice),
+      * the `/proc/<pid>/fd` half pins the invariant a future change to that
+        hand-off set would break,
+      * the slot-side scan is the positive control: it locates the endpoint by
+        the *handed-over* end's inode first, so an empty confined result is a
+        fact rather than a vacuous read.  The two ends of a `socketpair()` are
+        two distinct sockets with different inodes, so comparing the client
+        end would match nothing, ever (the shape this case used to have).
     """
-    proc, worker = _spawn_fd_slot(tmp_path)
-    inode = os.fstat(worker.fileno()).st_ino
+    proc, worker, control_inode = _spawn_fd_slot(tmp_path)
+    worker_inode = os.fstat(worker.fileno()).st_ino
     try:
         with SuperviseChannel(fd=worker.fileno()) as channel:
             stats = channel.request("stats")
             assert stats["launched"] is True, stats
             init_pid = stats["pid"]
-            leaked = []
-            fd_dir = Path(f"/proc/{init_pid}/fd")
-            for entry in fd_dir.iterdir():
-                try:
-                    target = os.readlink(fd_dir / entry.name)
-                except OSError:
-                    continue
-                if target == f"socket:[{inode}]":
-                    leaked.append(entry.name)
+
+            slot_fds = _socket_inode_fds(proc.pid, {control_inode})
+            assert slot_fds != [], (
+                f"the slot (pid {proc.pid}) must hold the handed-over control "
+                f"socket [inode {control_inode}]"
+            )
+            for fd_name in slot_fds:
+                assert _fd_is_cloexec(proc.pid, fd_name), (
+                    f"the slot's control fd {fd_name} must carry O_CLOEXEC "
+                    f"(the serve_control_fd restore); fdinfo flags say "
+                    f"otherwise"
+                )
+
+            leaked = _socket_inode_fds(init_pid, {control_inode, worker_inode})
             assert leaked == [], (
                 f"the confined init (pid {init_pid}) inherited the control "
-                f"socket on fd(s) {leaked}"
+                f"socket on fd(s) {leaked} (handed-over end inode "
+                f"{control_inode}, client end inode {worker_inode})"
             )
-            # The instance control dir must still be functional: the leak fix
+            # The instance control dir must still be functional: the guard
             # must not cost the session its own init channel.
             assert channel.request("stats")["instance_state"] == "Live"
     finally:
@@ -348,7 +400,7 @@ def test_fd_handoff_token_belt_refuses_a_mismatch(tmp_path: Path) -> None:
     """A token is optional on this transport, but when the slot was given one
     the belt still has to hold: a client that presents a different token is
     refused rather than admitted because it happens to own the descriptor."""
-    proc, worker = _spawn_fd_slot(tmp_path, token="belt-token")
+    proc, worker, _control_inode = _spawn_fd_slot(tmp_path, token="belt-token")
     try:
         with SuperviseChannel(fd=worker.fileno(), token="not-the-belt-token") as channel:
             with pytest.raises(Exception) as refused:
@@ -366,7 +418,7 @@ def test_wait_child_can_park_past_the_default_deadline(tmp_path: Path) -> None:
     2-second default: with the deadline lifted the status still comes back."""
     # M0 keeps the generation alive (its exit would collapse the container);
     # the *child* below is what outlives the 2-second default deadline.
-    proc, worker = _spawn_fd_slot(tmp_path)
+    proc, worker, _control_inode = _spawn_fd_slot(tmp_path)
     try:
         with SuperviseChannel(fd=worker.fileno()) as channel:
             channel.set_timeout(0)  # block until the slot answers
@@ -386,7 +438,7 @@ def test_failed_verb_retires_the_persistent_session(tmp_path: Path) -> None:
     """A half-finished frame must never be answered by the *next* request: any
     transport failure closes the session, and SL-9 guarantees the caller sees
     `SandlockError` (with text) rather than an unclassifiable Python error."""
-    proc, worker = _spawn_fd_slot(tmp_path)
+    proc, worker, _control_inode = _spawn_fd_slot(tmp_path)
     try:
         channel = SuperviseChannel(fd=worker.fileno(), timeout_ms=300)
         assert channel.request("stats")["instance_state"] == "Live"

@@ -151,7 +151,12 @@
   那半 socket——的 inode 做两次比对：同一扫描必须在槽位 `/proc/<pid>/fd` 找到它、且该 fd 的
   `fdinfo` 报 `O_CLOEXEC`（这一半才钉住 `F_SETFD` 本身：本树去掉该调用后 fd 表仍「干净」，
   只比 fd 表抓不住这次回归），同时必须在被 confine 的 init fd 表里找不到它（`socketpair`
-  两端是**两个不同的 socket / inode**，拿 client 端 inode 去比对会恒不命中）。附带收益：
+  两端是**两个不同的 socket / inode**，拿 client 端 inode 去比对会恒不命中）。python 面
+  同族用例（`python/tests/test_supervise_channel.py::
+  test_control_fd_does_not_leak_into_the_confined_tree`）在 B2 fix round 1 改成同一判据：
+  它原来正好踩了那个坑（比 client 端 inode ⇒ 恒真），现在同样先做槽位侧正对照（该 inode
+  必须出现在槽位 `/proc/<pid>/fd` 且 `fdinfo` 带 `O_CLOEXEC`；短路 `F_SETFD` 即红），再断言
+  confined init 的 fd 表里**任一端**的 inode 都不出现。附带收益：
   worker 崩溃后槽位按 EOF 走 `finish()` 异常收口（E2B 侧契约
   `test_worker_death_ends_the_generation` 实测槽位退出）。
 
