@@ -578,8 +578,10 @@ fn mediation_identity_gate_refuses_nonroot_effective_caps_remap() {
 /// shared `DeniedSet`, which receives both static `fs_denied` paths and
 /// live `policy_fn`-issued `deny_path()` calls — so spawn-time mediation
 /// capability must include a present `policy_fn`, not just the static
-/// triggers.  The refusal is capability-based (conservative): the explicit
-/// `supervisor` tier is the escape hatch.
+/// triggers.  The refusal is capability-based (conservative) and there is no
+/// longer any tier that accepts the shape: a privileged in-process mediator
+/// with this trigger is refused like the static ones, with route B as the
+/// only remedy.
 #[test]
 fn mediation_active_covers_policy_fn_deny_capability() {
     let active = |fs: bool, chroot: bool, cow: bool, pfn: bool| {
@@ -596,7 +598,7 @@ fn mediation_active_covers_policy_fn_deny_capability() {
     assert!(!mediation_active_for(true, true, true, true, true));
 
     // Composite: root in-process + RunAs(nonzero) + policy_fn-only
-    // mediation is refused under the default caller tier.
+    // mediation is refused (no tier accepts it any more).
     assert!(mediation_remap_is_refused(
         0,
         10000,

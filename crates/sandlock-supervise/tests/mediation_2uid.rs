@@ -894,7 +894,7 @@ fn test_nonroot_file_cap_launcher_is_refused_like_c_tier() {
     let err = String::from_utf8_lossy(&r.stderr);
     assert!(
         !r.status.success(),
-        "the file-cap launcher shape must be refused under the default caller tier"
+        "the file-cap launcher shape must be refused at the identity gate"
     );
     let line = err.lines().next().unwrap_or_default();
     assert_eq!(
