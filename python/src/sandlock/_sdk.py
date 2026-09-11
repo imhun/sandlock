@@ -402,6 +402,45 @@ _lib.sandlock_sandbox_free.argtypes = [_c_policy_p]
 _lib.sandlock_string_free.restype = None
 _lib.sandlock_string_free.argtypes = [ctypes.c_char_p]
 
+# Freeing a raw address read out of a `char **` out-parameter goes through a
+# `c_void_p`-typed wrapper: handing ctypes the *bytes* would copy them and free
+# the copy (the same fix `supervise._free_string` needed for fork issue SL-9).
+_free_native_string = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(
+    ctypes.cast(_lib.sandlock_string_free, ctypes.c_void_p).value
+)
+
+
+def _take_err_msg(err_msg: ctypes.c_void_p) -> str | None:
+    """Return and free the native message written into ``err_msg``.
+
+    ``err_msg`` is the ``c_void_p`` whose address went to the C call as the
+    ``char **`` out-parameter: the message is read from the returned *address*
+    and released with ``sandlock_string_free``, never through ctypes' own
+    deallocator and never by handing the bytes back (which would free a copy).
+    """
+    address = err_msg.value
+    if not address:
+        return None
+    try:
+        return ctypes.string_at(address).decode("utf-8", "replace")
+    finally:
+        _free_native_string(address)
+        err_msg.value = None
+
+
+def _failure_text(what: str, err_msg: ctypes.c_void_p) -> str:
+    """``<what> failed: <native reason>`` — the reason when the FFI carried one.
+
+    SL-12: the create/launch entry points used to drop the core's own error
+    text, leaving the SDK face with a bare ``<what> failed``. The core text is
+    what a caller can act on (a fail-closed refusal names its remedy; a
+    confinement failure names its errno), so it is appended verbatim, and the
+    generic message is kept as the fallback for a reason-less failure.
+    """
+    reason = _take_err_msg(err_msg)
+    return f"{what} failed: {reason}" if reason else f"{what} failed"
+
+
 # Run
 _lib.sandlock_run.restype = _c_result_p
 _lib.sandlock_run.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
@@ -414,6 +453,16 @@ _c_handle_p = ctypes.c_void_p
 
 _lib.sandlock_create.restype = _c_handle_p
 _lib.sandlock_create.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
+
+_lib.sandlock_create_with_err.restype = _c_handle_p
+_lib.sandlock_create_with_err.argtypes = [
+    _c_policy_p,
+    ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_char_p),
+    ctypes.c_uint,
+    ctypes.POINTER(ctypes.c_int),      # err
+    ctypes.POINTER(ctypes.c_void_p),   # err_msg (char **)
+]
 
 _lib.sandlock_create_for_run.restype = _c_handle_p
 _lib.sandlock_create_for_run.argtypes = [_c_policy_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint]
@@ -485,6 +534,13 @@ class _SandlockInstanceExecParams(ctypes.Structure):
 
 _lib.sandlock_instance_launch.restype = _c_instance_p
 _lib.sandlock_instance_launch.argtypes = [_c_policy_p, ctypes.c_char_p]
+_lib.sandlock_instance_launch_with_err.restype = _c_instance_p
+_lib.sandlock_instance_launch_with_err.argtypes = [
+    _c_policy_p,
+    ctypes.c_char_p,
+    ctypes.POINTER(ctypes.c_int),      # err
+    ctypes.POINTER(ctypes.c_void_p),   # err_msg (char **)
+]
 _lib.sandlock_instance_exec.restype = ctypes.c_int
 _lib.sandlock_instance_exec.argtypes = [
     _c_instance_p,

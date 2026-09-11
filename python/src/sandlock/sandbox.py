@@ -1085,9 +1085,14 @@ class Sandbox:
         waiting for ``start()``.
 
         Raises:
-            RuntimeError: If a process is already running.
+            RuntimeError: If a process is already running, or if the fork /
+                policy install failed -- the message carries the core's own
+                reason (a fail-closed refusal names its remedy) after the
+                ``sandlock_create failed:`` prefix.
         """
-        from ._sdk import _lib, _make_argv
+        import ctypes
+
+        from ._sdk import _failure_text, _lib, _make_argv
 
         self._check_not_running()
 
@@ -1095,11 +1100,16 @@ class Sandbox:
         argv, argc = _make_argv(list(cmd))
         resolved_name = self._resolve_name()
 
-        self._handle = _lib.sandlock_create(
+        err = ctypes.c_int(0)
+        err_msg = ctypes.c_void_p()
+        self._handle = _lib.sandlock_create_with_err(
             native.ptr, _encode(resolved_name), argv, argc,
+            ctypes.byref(err), ctypes.byref(err_msg),
         )
         if not self._handle:
-            raise RuntimeError("sandlock_create failed")
+            # `err` is -1 on this path too; the null handle is the same signal
+            # and `err_msg` carries the core's reason.
+            raise RuntimeError(_failure_text("sandlock_create", err_msg))
 
     def start(self) -> None:
         """Release a previously ``create()``d child to ``execve`` the
@@ -1931,7 +1941,9 @@ class SandboxInstance:
     _ERR_DEAD = 6
 
     def __init__(self, policy: "Sandbox", name: str | None = None):
-        from ._sdk import _lib
+        import ctypes
+
+        from ._sdk import _failure_text, _lib
 
         if not isinstance(policy, Sandbox):
             raise TypeError(
@@ -1941,11 +1953,20 @@ class SandboxInstance:
         native = policy._ensure_native()
         resolved = name if name is not None else None
         self._policy = policy
-        self._handle = _lib.sandlock_instance_launch(
-            native.ptr, _encode(resolved) if resolved is not None else None
+        err = ctypes.c_int(0)
+        err_msg = ctypes.c_void_p()
+        self._handle = _lib.sandlock_instance_launch_with_err(
+            native.ptr,
+            _encode(resolved) if resolved is not None else None,
+            ctypes.byref(err),
+            ctypes.byref(err_msg),
         )
         if not self._handle:
-            raise RuntimeError("sandlock_instance_launch failed")
+            # `err` is -1 on this path too; the null handle is the same signal
+            # and `err_msg` carries the core's reason.
+            raise RuntimeError(
+                _failure_text("sandlock_instance_launch", err_msg)
+            )
 
     def exec(
         self,

@@ -961,6 +961,24 @@ sandlock_result_t *sandlock_run(const sandlock_sandbox_t *policy,
                                 const char *const *argv,
                                 unsigned int argc);
 
+/**
+ * [`sandlock_create`] with the reason: same arguments plus the `err`/
+ * `err_msg` out-parameters (`*err` is 0 on success and -1 on failure;
+ * `*err_msg` receives the core error text the caller frees with
+ * [`sandlock_string_free`]). This is an additive symbol — the 4-argument
+ * `sandlock_create` keeps its ABI for existing C/Go consumers.
+ *
+ * # Safety
+ * Same constraints as `sandlock_create`; `err` and `err_msg` may be null
+ * and, when non-null, must point to writable storage.
+ */
+sandlock_handle_t *sandlock_create_with_err(const sandlock_sandbox_t *policy,
+                                            const char *name,
+                                            const char *const *argv,
+                                            unsigned int argc,
+                                            int *err,
+                                            char **err_msg);
+
 sandlock_handle_t *sandlock_create(const sandlock_sandbox_t *policy,
                                    const char *name,
                                    const char *const *argv,
@@ -1641,11 +1659,28 @@ char *sandlock_handle_restore_skipped_path(const sandlock_handle_t *h, uintptr_t
  * `sandlock_instance_wait_child` is not preempted at expiry.
  *
  * Returns an opaque instance handle, or NULL on any failure (the caller
- * frees it with `sandlock_instance_free`).
+ * frees it with `sandlock_instance_free`); when `err_msg` is non-null the
+ * core's own error text is published there (`*err` is -1 on failure, 0 on
+ * success) under the same out-parameter contract the supervise exports use.
+ * Pass null for both to discard the reason ([`sandlock_instance_launch`]).
  *
  * # Safety
  * `policy` must be a valid policy pointer. `name` may be NULL to
- * auto-generate an instance name.
+ * auto-generate an instance name. `err` and `err_msg` may be null and, when
+ * non-null, must point to writable storage.
+ */
+sandlock_instance_t *sandlock_instance_launch_with_err(const sandlock_sandbox_t *policy,
+                                                       const char *name,
+                                                       int *err,
+                                                       char **err_msg);
+
+/**
+ * Launch an exec-capable session, discarding the failure reason. Additive
+ * symbol kept at its original 2-argument ABI for existing consumers;
+ * [`sandlock_instance_launch_with_err`] is the same call with the reason.
+ *
+ * # Safety
+ * Same constraints as `sandlock_instance_launch_with_err`.
  */
 sandlock_instance_t *sandlock_instance_launch(const sandlock_sandbox_t *policy, const char *name);
 

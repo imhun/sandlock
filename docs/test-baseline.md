@@ -281,7 +281,19 @@ core_integ = 539 # A1+A2+A3 (2026-09-10): 534 -> 539, +5 in
                  # (test_exec_mode_main_exit_is_terminal_and_verbs_close);
                  # one-shot outlives regression stays green in
                  # test_instance_lifecycle.rs.
-ffi = 101 # F16 (2026-09-08): 100 -> 101, +1 C smoke
+ffi = 106 # B1 (2026-09-11, SL-12): 101 -> 106, +4 in the new
+          # tests/failure_reason.rs — the create/launch `*_with_err` symbols
+          # publish the core's own failure text through the supervise
+          # `err`/`err_msg` contract, and the legacy 4-arg `sandlock_create` /
+          # 2-arg `sandlock_instance_launch` keep their ABI/behaviour. The
+          # refusal fixture is phase-aware (unprivileged RunAs refusal in this
+          # phase; C档 mediation refusal when the target is run as root, which
+          # the root-phase reruns in tmp/sdd/b1-ffi-newtests-root.log cover),
+          # so no test is skipped in either phase. +1 C smoke
+          # (tests/c_smoke.rs create_error_smoke_compiles_and_runs over the new
+          # tests/c/create_error_smoke.c): the hand-maintained sandlock.h
+          # declarations must link from C and surface the prologue's reason.
+          #  F16 (2026-09-08): 100 -> 101, +1 C smoke
           # (tests/c_smoke.rs supervise_client_smoke_compiles_and_runs —
           # the route-B worker client symbols must compile + link + fail a
           # nonexistent slot's request with the err/err_msg contract)
@@ -476,7 +488,15 @@ oci = 150     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root.
               # 56 lib + 68 bin + 15 integration.rs + 2 reaper + 3 process
               # groups = 144).
 cli_build = 0 # workspace release build gate (no test binaries; 0 = build passed)
-python = 461  # F17 (2026-09-09): 455 -> 461, +6
+python = 463  # B1 (2026-09-11, SL-12): 461 -> 463, +2 in the new
+              # tests/test_failure_reason.py — `Sandbox.create` and
+              # `SandboxInstance` must raise RuntimeError whose *whole* text is
+              # `sandlock_create failed: <core Display>` /
+              # `sandlock_instance_launch failed: <core Display>`. The refused
+              # shape is phase-aware (unprivileged RunAs refusal in this phase;
+              # the C档 `mediation_run_as=caller` refusal naming the route-B
+              # remedy when pytest runs as root), so neither phase skips.
+              #  F17 (2026-09-09): 455 -> 461, +6
               # tests/test_supervise_channel.py -- the route-B transport-1
               # (fd handoff) face: persistent session with no path and no token
               # (argv keeps the secret out, SL-10), token belt still refuses a

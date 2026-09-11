@@ -8,6 +8,27 @@
 
 ## 行为变化（升级 / 接线前必读）
 
+- **create/launch 失败带原因（B1，2026-09-11，SL-12）**：`sandlock_create` /
+  `sandlock_instance_launch` 失败时 FFI 只回 NULL，SDK 面于是只剩
+  `RuntimeError("sandlock_create failed")` / `…instance_launch failed` ——
+  **E2B 实测**里 fail-closed 拒绝那句精心写的「why」（
+  `mediation_run_as=caller refused: … Run sandlock-supervise as uid X (route B), …`）
+  全被 FFI 边界吃掉，接线的人只看得到泛化错误、无从下手。**现在**：两个入口各有
+  一个增量符号 `sandlock_create_with_err(policy, name, argv, argc, err, err_msg)` /
+  `sandlock_instance_launch_with_err(policy, name, err, err_msg)`，沿用 route-B
+  supervise 客户端的 `err`/`err_msg` 出参约定（消息由调用方用
+  `sandlock_string_free` 释放；成功时 `*err` = 0 且 `*err_msg` 清空，不是只在失败时
+  才有意义），发布 core 的 `SandlockError` Display 文本 —— 拒绝带修法、confinement
+  失败带 errno。**用户可见**：Python 面异常文本变成
+  `sandlock_create failed: process error: child process error: mediation_run_as=caller
+  refused: in-process path mediation would run as euid 0 while the sandbox's host uid
+  is 4242; … Run sandlock-supervise as uid 4242 (route B), or pass
+  mediation_run_as=supervisor to explicitly accept the downgrade`（异常类型仍是
+  `RuntimeError`，`<what> failed: ` 前缀保留，便于既有匹配继续工作）。原 4 参
+  `sandlock_create` / 2 参 `sandlock_instance_launch` 的 ABI 与行为不变（仍是 NULL；
+  它们没有出参可看，是 `_with_err` 的 NULL 版包装）。本任务**不动**
+  `mediation_run_as` 档位本身——那是 B3；这里只让它的拒绝可解释。
+
 - **cwd 由请求决定 + 挂载别名确定性（A2，2026-09-10）**：同一个宿主目录被挂在多个
   虚拟路径下时（E2B 的 `/workspace` 与 `/home/user` 就是同一个目录），此前有三处
   行为由「宿主路径反查」决定，结果既歧义又依挂载声明顺序：
@@ -310,9 +331,15 @@ sandlock_instance_wait_child                        # F3.3
 sandlock_instance_kill_child                        # F3.3
 sandlock_instance_resize_child                      # F3.3
 sandlock_instance_free                              # F3.3
+sandlock_create_with_err                             # B1 (SL-12)
+sandlock_instance_launch_with_err                    # B1 (SL-12)
 ```
 
 - 新增错误码 `SANDLOCK_INSTANCE_ERR_DEAD`（= 6，头文件宏，F5.4 `d67a363`）。
+- B1（SL-12）：`_with_err` 两个符号复用 supervise 客户端的 `err`/`err_msg` 出参约定
+  （共享同一个 `ffi_fail` 错误路径：`err=-1` + 由 `sandlock_string_free` 释放的消息），
+  而不是新发明一条错误通道；`sandlock.h` 增量补这两处声明 —— 既有 supervise 文档
+  是手工润色过的，整份 cbindgen 重生成会把这些文档回退成较短的源码注释。
 - `sandlock.h` 重生成顺带修复既有声明漂移（补 `notify_rate_limit` builder 声明）。
 - wheel 符号集双向相等（缺/多即红）是 verify 硬门（F0.2/F2b.5；F9 已在最终 tip
   重建 verify，见 `tmp/sdd/f9-wheel-verify.log`）。

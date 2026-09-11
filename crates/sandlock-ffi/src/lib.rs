@@ -1325,8 +1325,9 @@ pub struct sandlock_handle_t {
 /// Shared entry-point prologue for the create/popen family: validate the
 /// pointers, parse the optional name and argv, build the requested runtime,
 /// and apply the name to a cloned policy. Returns the owned
-/// `(Sandbox, Runtime, args)` triple, or `None` on any invalid input or
-/// runtime-build failure (callers map `None` to a null handle).
+/// `(Sandbox, Runtime, args)` triple, or the reason the prologue failed
+/// (callers either report it through `err`/`err_msg` or map it to a null
+/// handle).
 ///
 /// The tail stays with each caller: `sandlock_create*` drive `sb.create()`,
 /// `sandlock_popen` drives `sb.popen()` + fd hand-off. Factoring the prologue
@@ -1342,24 +1343,29 @@ unsafe fn prepare(
     argv: *const *const c_char,
     argc: c_uint,
     build_rt: fn() -> Option<tokio::runtime::Runtime>,
-) -> Option<(Sandbox, tokio::runtime::Runtime, Vec<String>)> {
+) -> Result<(Sandbox, tokio::runtime::Runtime, Vec<String>), String> {
     if policy.is_null() || argv.is_null() {
-        return None;
+        return Err("policy and argv are required".to_string());
     }
     let policy = &(*policy)._private;
-    let name = optional_name(name).ok()?;
+    let name = optional_name(name).map_err(|_| "name is not valid UTF-8".to_string())?;
     let args = read_argv(argv, argc);
-    let rt = build_rt()?;
+    let rt = build_rt().ok_or("failed to build the sandbox runtime")?;
     let sb = match name {
         Some(ref n) => policy.clone().with_name(n.clone()),
         None => policy.clone(),
     };
-    Some((sb, rt, args))
+    Ok((sb, rt, args))
 }
 
 /// Fork the child and install policy; the child is parked between policy
 /// install and execve. Returns a live handle. Call `sandlock_start` to
 /// release the child to execve.
+///
+/// On failure the handle is null; when `err_msg` is non-null it receives the
+/// core's own error text (`*err` is -1), the same out-parameter contract the
+/// supervise exports use. Callers that only care about success pass null for
+/// both and call [`sandlock_create`].
 ///
 /// # Safety
 /// `policy` must be a valid policy pointer. `name` may be NULL to
@@ -1371,21 +1377,69 @@ unsafe fn sandlock_create_with_runtime(
     argv: *const *const c_char,
     argc: c_uint,
     build_rt: fn() -> Option<tokio::runtime::Runtime>,
+    err: *mut c_int,
+    err_msg: *mut *mut c_char,
 ) -> *mut sandlock_handle_t {
+    if !err_msg.is_null() {
+        *err_msg = ptr::null_mut();
+    }
     let (mut sb, rt, args) = match prepare(policy, name, argv, argc, build_rt) {
-        Some(t) => t,
-        None => return ptr::null_mut(),
+        Ok(t) => t,
+        Err(why) => {
+            ffi_fail(err, err_msg, &format!("sandlock_create: {why}"));
+            return ptr::null_mut();
+        }
     };
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
-    if !matches!(block_on_runtime(&rt, sb.create(&arg_refs)), Some(Ok(()))) {
-        return ptr::null_mut();
+    match block_on_runtime(&rt, sb.create(&arg_refs)) {
+        Some(Ok(())) => {
+            if !err.is_null() {
+                *err = 0;
+            }
+        }
+        Some(Err(e)) => {
+            // The core's text (thiserror Display) is what names the reason:
+            // a fail-closed refusal carries its remedy, a confinement failure
+            // its errno, and so on.
+            ffi_fail(err, err_msg, &format!("{e}"));
+            return ptr::null_mut();
+        }
+        None => {
+            ffi_fail(
+                err,
+                err_msg,
+                "sandlock_create: the sandbox runtime is unavailable",
+            );
+            return ptr::null_mut();
+        }
     }
 
     Box::into_raw(Box::new(sandlock_handle_t {
         sandbox: sb,
         runtime: rt,
     }))
+}
+
+/// [`sandlock_create`] with the reason: same arguments plus the `err`/
+/// `err_msg` out-parameters (`*err` is 0 on success and -1 on failure;
+/// `*err_msg` receives the core error text the caller frees with
+/// [`sandlock_string_free`]). This is an additive symbol — the 4-argument
+/// `sandlock_create` keeps its ABI for existing C/Go consumers.
+///
+/// # Safety
+/// Same constraints as `sandlock_create`; `err` and `err_msg` may be null
+/// and, when non-null, must point to writable storage.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_create_with_err(
+    policy: *const sandlock_sandbox_t,
+    name: *const c_char,
+    argv: *const *const c_char,
+    argc: c_uint,
+    err: *mut c_int,
+    err_msg: *mut *mut c_char,
+) -> *mut sandlock_handle_t {
+    sandlock_create_with_runtime(policy, name, argv, argc, build_live_runtime, err, err_msg)
 }
 
 #[no_mangle]
@@ -1395,7 +1449,15 @@ pub unsafe extern "C" fn sandlock_create(
     argv: *const *const c_char,
     argc: c_uint,
 ) -> *mut sandlock_handle_t {
-    sandlock_create_with_runtime(policy, name, argv, argc, build_live_runtime)
+    sandlock_create_with_runtime(
+        policy,
+        name,
+        argv,
+        argc,
+        build_live_runtime,
+        ptr::null_mut(),
+        ptr::null_mut(),
+    )
 }
 
 /// Create a sandbox handle for immediate start+wait use on the calling
@@ -1416,7 +1478,15 @@ pub unsafe extern "C" fn sandlock_create_for_run(
     argv: *const *const c_char,
     argc: c_uint,
 ) -> *mut sandlock_handle_t {
-    sandlock_create_with_runtime(policy, name, argv, argc, build_runtime)
+    sandlock_create_with_runtime(
+        policy,
+        name,
+        argv,
+        argc,
+        build_runtime,
+        ptr::null_mut(),
+        ptr::null_mut(),
+    )
 }
 
 /// Map a raw `StdioMode` discriminant (0=inherit, 1=piped, 2=null) to the enum.
@@ -1511,8 +1581,10 @@ pub unsafe extern "C" fn sandlock_popen(
     // `sb.popen()` + fd-handoff tail. build_live_runtime: the multi-threaded
     // runtime keeps the seccomp supervisor pumping during the caller's blocking IO.
     let (mut sb, rt, args) = match prepare(policy, name, argv, argc, build_live_runtime) {
-        Some(t) => t,
-        None => return ptr::null_mut(),
+        Ok(t) => t,
+        // popen has no err/err_msg surface yet; the prologue reason is not
+        // propagated here (the create family's `_with_err` symbols are).
+        Err(_) => return ptr::null_mut(),
     };
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
@@ -3224,27 +3296,51 @@ fn exec_stdio_from_raw(mode: u32) -> Option<sandlock_core::instance::ExecStdio> 
 /// `sandlock_instance_wait_child` is not preempted at expiry.
 ///
 /// Returns an opaque instance handle, or NULL on any failure (the caller
-/// frees it with `sandlock_instance_free`).
+/// frees it with `sandlock_instance_free`); when `err_msg` is non-null the
+/// core's own error text is published there (`*err` is -1 on failure, 0 on
+/// success) under the same out-parameter contract the supervise exports use.
+/// Pass null for both to discard the reason ([`sandlock_instance_launch`]).
 ///
 /// # Safety
 /// `policy` must be a valid policy pointer. `name` may be NULL to
-/// auto-generate an instance name.
+/// auto-generate an instance name. `err` and `err_msg` may be null and, when
+/// non-null, must point to writable storage.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_instance_launch(
+pub unsafe extern "C" fn sandlock_instance_launch_with_err(
     policy: *const sandlock_sandbox_t,
     name: *const c_char,
+    err: *mut c_int,
+    err_msg: *mut *mut c_char,
 ) -> *mut sandlock_instance_t {
+    if !err_msg.is_null() {
+        *err_msg = ptr::null_mut();
+    }
     if policy.is_null() {
+        ffi_fail(err, err_msg, "sandlock_instance_launch: policy is required");
         return ptr::null_mut();
     }
     let policy = &(*policy)._private;
     let name = match optional_name(name) {
         Ok(n) => n,
-        Err(_) => return ptr::null_mut(),
+        Err(_) => {
+            ffi_fail(
+                err,
+                err_msg,
+                "sandlock_instance_launch: name is not valid UTF-8",
+            );
+            return ptr::null_mut();
+        }
     };
     let rt = match build_live_runtime() {
         Some(rt) => rt,
-        None => return ptr::null_mut(),
+        None => {
+            ffi_fail(
+                err,
+                err_msg,
+                "sandlock_instance_launch: failed to build the sandbox runtime",
+            );
+            return ptr::null_mut();
+        }
     };
     let sb = match name {
         Some(ref n) => policy.clone().with_name(n.clone()),
@@ -3252,12 +3348,44 @@ pub unsafe extern "C" fn sandlock_instance_launch(
     };
     let launched = block_on_runtime(&rt, sandlock_core::SandboxInstance::launch_exec_only(sb));
     match launched {
-        Some(Ok(instance)) => Box::into_raw(Box::new(sandlock_instance_t {
-            instance,
-            runtime: rt,
-        })),
-        _ => ptr::null_mut(),
+        Some(Ok(instance)) => {
+            if !err.is_null() {
+                *err = 0;
+            }
+            Box::into_raw(Box::new(sandlock_instance_t {
+                instance,
+                runtime: rt,
+            }))
+        }
+        Some(Err(e)) => {
+            // As with `sandlock_create_with_err`: the core text (thiserror
+            // Display) carries the refusal's remedy or the confinement errno.
+            ffi_fail(err, err_msg, &format!("{e}"));
+            ptr::null_mut()
+        }
+        None => {
+            ffi_fail(
+                err,
+                err_msg,
+                "sandlock_instance_launch: the sandbox runtime is unavailable",
+            );
+            ptr::null_mut()
+        }
     }
+}
+
+/// Launch an exec-capable session, discarding the failure reason. Additive
+/// symbol kept at its original 2-argument ABI for existing consumers;
+/// [`sandlock_instance_launch_with_err`] is the same call with the reason.
+///
+/// # Safety
+/// Same constraints as `sandlock_instance_launch_with_err`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_instance_launch(
+    policy: *const sandlock_sandbox_t,
+    name: *const c_char,
+) -> *mut sandlock_instance_t {
+    sandlock_instance_launch_with_err(policy, name, ptr::null_mut(), ptr::null_mut())
 }
 
 /// Exec one command inside the session with one stdio mode for all three
@@ -3699,14 +3827,20 @@ fn check_supervise_control_fd(fd: std::os::fd::RawFd) -> Result<(), String> {
     Ok(())
 }
 
-/// Shared error path for the supervise client exports: set `*err` to -1 and,
-/// when `err_msg` is non-null, publish `msg` as a heap C string the caller
-/// frees with [`sandlock_string_free`].
+/// Shared error path for the exports that carry a reason to the caller
+/// (`sandlock_supervise_*` and the create/launch family): set `*err` to -1
+/// and, when `err_msg` is non-null, publish `msg` as a heap C string the
+/// caller frees with [`sandlock_string_free`].
+///
+/// Publishing the core's own text — rather than a per-symbol constant — is
+/// the point: a fail-closed refusal's remedy (e.g. the `mediation_run_as`
+/// route-B sentence) must survive the FFI boundary, since that is the only
+/// thing a caller can act on.
 ///
 /// # Safety
 /// `err` and `err_msg` may be null; when non-null they must point to
 /// writable storage.
-unsafe fn supervise_ffi_fail(err: *mut c_int, err_msg: *mut *mut c_char, msg: &str) {
+unsafe fn ffi_fail(err: *mut c_int, err_msg: *mut *mut c_char, msg: &str) {
     if !err.is_null() {
         *err = -1;
     }
@@ -3736,25 +3870,25 @@ pub unsafe extern "C" fn sandlock_supervise_connect(
         *err_msg = ptr::null_mut();
     }
     if path.is_null() || token.is_null() {
-        supervise_ffi_fail(err, err_msg, "sandlock_supervise_connect: path and token are required");
+        ffi_fail(err, err_msg, "sandlock_supervise_connect: path and token are required");
         return ptr::null_mut();
     }
     let path = match CStr::from_ptr(path).to_str() {
         Ok(p) => p,
         Err(_) => {
-            supervise_ffi_fail(err, err_msg, "sandlock_supervise_connect: path is not UTF-8");
+            ffi_fail(err, err_msg, "sandlock_supervise_connect: path is not UTF-8");
             return ptr::null_mut();
         }
     };
     let token = match CStr::from_ptr(token).to_str() {
         Ok(t) => t,
         Err(_) => {
-            supervise_ffi_fail(err, err_msg, "sandlock_supervise_connect: token is not UTF-8");
+            ffi_fail(err, err_msg, "sandlock_supervise_connect: token is not UTF-8");
             return ptr::null_mut();
         }
     };
     if path.is_empty() || token.is_empty() {
-        supervise_ffi_fail(
+        ffi_fail(
             err,
             err_msg,
             "sandlock_supervise_connect: path and token must be non-empty",
@@ -3819,7 +3953,7 @@ pub unsafe extern "C" fn sandlock_supervise_connect_fd(
         match CStr::from_ptr(token).to_str() {
             Ok(t) => t,
             Err(_) => {
-                supervise_ffi_fail(
+                ffi_fail(
                     err,
                     err_msg,
                     "sandlock_supervise_connect_fd: token is not UTF-8",
@@ -3829,12 +3963,12 @@ pub unsafe extern "C" fn sandlock_supervise_connect_fd(
         }
     };
     if let Err(msg) = check_supervise_control_fd(fd) {
-        supervise_ffi_fail(err, err_msg, &msg);
+        ffi_fail(err, err_msg, &msg);
         return ptr::null_mut();
     }
     let dup = unsafe { libc::dup(fd) };
     if dup < 0 {
-        supervise_ffi_fail(
+        ffi_fail(
             err,
             err_msg,
             &format!("dup control fd {fd}: {}", std::io::Error::last_os_error()),
@@ -3882,7 +4016,7 @@ pub unsafe extern "C" fn sandlock_supervise_set_timeout(
         *err_msg = ptr::null_mut();
     }
     if h.is_null() {
-        supervise_ffi_fail(err, err_msg, "sandlock_supervise_set_timeout: null handle");
+        ffi_fail(err, err_msg, "sandlock_supervise_set_timeout: null handle");
         return -1;
     }
     match &(*h)._private {
@@ -3899,7 +4033,7 @@ pub unsafe extern "C" fn sandlock_supervise_set_timeout(
             0
         }
         SuperviseClient::Registered { .. } => {
-            supervise_ffi_fail(
+            ffi_fail(
                 err,
                 err_msg,
                 "sandlock_supervise_set_timeout: the registered transport opens one \
@@ -3939,7 +4073,7 @@ pub unsafe extern "C" fn sandlock_supervise_request(
         *err_msg = ptr::null_mut();
     }
     if h.is_null() || verb.is_null() || args_json.is_null() {
-        supervise_ffi_fail(
+        ffi_fail(
             err,
             err_msg,
             "sandlock_supervise_request: handle, verb and args_json are required",
@@ -3949,14 +4083,14 @@ pub unsafe extern "C" fn sandlock_supervise_request(
     let verb = match CStr::from_ptr(verb).to_str() {
         Ok(v) => v,
         Err(_) => {
-            supervise_ffi_fail(err, err_msg, "sandlock_supervise_request: verb is not UTF-8");
+            ffi_fail(err, err_msg, "sandlock_supervise_request: verb is not UTF-8");
             return ptr::null_mut();
         }
     };
     let args_json = match CStr::from_ptr(args_json).to_str() {
         Ok(s) => s,
         Err(_) => {
-            supervise_ffi_fail(
+            ffi_fail(
                 err,
                 err_msg,
                 "sandlock_supervise_request: args_json is not UTF-8",
@@ -3967,7 +4101,7 @@ pub unsafe extern "C" fn sandlock_supervise_request(
     let args: serde_json::Value = match serde_json::from_str(args_json) {
         Ok(v) => v,
         Err(e) => {
-            supervise_ffi_fail(
+            ffi_fail(
                 err,
                 err_msg,
                 &format!("sandlock_supervise_request: bad args_json: {e}"),
@@ -3978,7 +4112,7 @@ pub unsafe extern "C" fn sandlock_supervise_request(
     let fd_slice: &[c_int] = if n_fds == 0 {
         &[]
     } else if fds.is_null() {
-        supervise_ffi_fail(
+        ffi_fail(
             err,
             err_msg,
             "sandlock_supervise_request: n_fds > 0 but fds is null",
@@ -4003,7 +4137,7 @@ pub unsafe extern "C" fn sandlock_supervise_request(
             // borrows the guard mutably for the whole request.
             let (token, timeout) = (guard.token.clone(), guard.timeout);
             let Some(stream) = guard.stream.as_mut() else {
-                supervise_ffi_fail(
+                ffi_fail(
                     err,
                     err_msg,
                     "control stream was lost by an earlier request that did not \
@@ -4031,7 +4165,7 @@ pub unsafe extern "C" fn sandlock_supervise_request(
                 match CString::new(bytes) {
                     Ok(c) => c.into_raw(),
                     Err(_) => {
-                        supervise_ffi_fail(
+                        ffi_fail(
                             err,
                             err_msg,
                             "sandlock_supervise_request: response contains NUL",
@@ -4041,7 +4175,7 @@ pub unsafe extern "C" fn sandlock_supervise_request(
                 }
             }
             Err(e) => {
-                supervise_ffi_fail(
+                ffi_fail(
                     err,
                     err_msg,
                     &format!("sandlock_supervise_request: serialize response: {e}"),
@@ -4050,7 +4184,7 @@ pub unsafe extern "C" fn sandlock_supervise_request(
             }
         },
         Err(e) => {
-            supervise_ffi_fail(err, err_msg, &e);
+            ffi_fail(err, err_msg, &e);
             ptr::null_mut()
         },
     }

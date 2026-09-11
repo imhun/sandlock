@@ -106,3 +106,17 @@ fn supervise_client_smoke_compiles_and_runs() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// B1 (SL-12): the create/launch `*_with_err` exports must be declared in
+/// `sandlock.h` and linkable from C with the err/err_msg contract.  Same RED
+/// shape as the F16 pin: before the exports exist this fails at compile time.
+#[test]
+fn create_error_smoke_compiles_and_runs() {
+    let out = compile_and_run_c("create_error_smoke.c");
+    assert!(
+        out.status.success(),
+        "create_error_smoke exited non-zero: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
