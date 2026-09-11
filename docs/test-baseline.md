@@ -341,7 +341,14 @@ cli = 100     # FUP-01/FUP-07 (2026-09-07, A/B cleanup wave): 98 -> 100,
               # after F0.4 wiring (cli suite includes net_bind_map tests);
               # F5.1 updates the no-supervisor default validation to
               # DEFAULT_MAX_PROCESSES (256), no count change
-supervise = 42 # FUP-11 (2026-09-07, A/B cleanup): 36 -> 42, +2 lib units
+supervise = 43 # SL-11 (2026-09-11, B2): 42 -> 43, +1 integration
+               # (test_supervise_control_fd_stays_out_of_the_confined_tree:
+               # the fd transport's own socket inode — the handed-over
+               # `--control-fd` end — must appear in the slot's
+               # `/proc/<pid>/fd` with `O_CLOEXEC` in `fdinfo`, and must not
+               # appear in the confined init's fd table; a guard, not a bug
+               # reproduction, measured clean 2026-09-09).
+               # FUP-11 (2026-09-07, A/B cleanup): 36 -> 42, +2 lib units
                # (serve::tests::abnormal_end_log_reports_first_then_throttles,
                # registered_abnormal_end_line_is_pinned — the registered slot's
                # throttled abnormal-end log) +4 integration

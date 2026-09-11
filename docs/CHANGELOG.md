@@ -121,8 +121,13 @@
   发给 worker 的帧、含 SCM_RIGHTS 的 stdio 描述符；并会把连接吊住，使这一代沙箱熬死 worker）。
   本树实测：core 交给 init 的是显式 fd 集合，**未观察到泄漏**（把 fix 前后都跑过一遍，
   `/proc/<stats.pid>/fd` 比对结果相同），因此这是**护栏**而非 bug 复现：仍在 launch 前无条件
-  `fcntl(F_SETFD, FD_CLOEXEC)`，并用 fork python 用例把不变量钉住（比对 worker 端 socket
-  inode）。附带收益：worker 崩溃后槽位按 EOF 走 `finish()` 异常收口（E2B 侧契约
+  `fcntl(F_SETFD, FD_CLOEXEC)`。守卫用例（B2，SL-11）落在非 root `supervise` 档：
+  `test_supervise_control_fd_stays_out_of_the_confined_tree` 取**交接端**——supervisor 自己
+  那半 socket——的 inode 做两次比对：同一扫描必须在槽位 `/proc/<pid>/fd` 找到它、且该 fd 的
+  `fdinfo` 报 `O_CLOEXEC`（这一半才钉住 `F_SETFD` 本身：本树去掉该调用后 fd 表仍「干净」，
+  只比 fd 表抓不住这次回归），同时必须在被 confine 的 init fd 表里找不到它（`socketpair`
+  两端是**两个不同的 socket / inode**，拿 client 端 inode 去比对会恒不命中）。附带收益：
+  worker 崩溃后槽位按 EOF 走 `finish()` 异常收口（E2B 侧契约
   `test_worker_death_ends_the_generation` 实测槽位退出）。
 
 - **route-B worker 侧客户端暴露给 C 与 Python（F16，2026-09-08）**：registered-path

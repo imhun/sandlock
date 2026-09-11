@@ -715,6 +715,13 @@ pub fn serve_control_fd(
     // connection open so the generation outlives a dead worker instead of
     // tearing itself down on EOF.  The flag is per descriptor, so the worker's
     // own end is untouched.
+    //
+    // SL-11 tracks this as a *guard*, not a repair: measured 2026-09-09, core
+    // hands `sandlock-init` an explicit fd set, so the confined fd table was
+    // observably clean both with and without the restore.  It is applied
+    // unconditionally anyway, so a future change to that hand-off set cannot
+    // silently reopen the SL-4 family (pinned by
+    // `test_supervise_control_fd_stays_out_of_the_confined_tree`).
     if unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
         return Err(format!(
             "set FD_CLOEXEC on the handed-over control fd: {}",

@@ -235,16 +235,25 @@ fn registered_exec(
 }
 
 /// Spawn `sandlock-supervise --serve` (fd handoff) with an instance-launching
-/// program and return the child plus the worker end the test drives.
+/// program and return the child, the worker end the test drives, and the
+/// socket inode of the descriptor handed over as `--control-fd`.
+///
+/// That third element is the supervisor's *own* endpoint as the child sees
+/// it.  The two ends of a `socketpair()` are two distinct sockets with
+/// different `st_ino`s (measured on this tree), so an fd-table invariant about
+/// the supervisor's copy must be compared against the handed-over end — the
+/// test's own end is a different socket and would make the comparison
+/// vacuous.
 fn spawn_serve_supervisor_with_program(
     policy: &PathBuf,
     program: &PathBuf,
     extra_args: &[&str],
-) -> (std::process::Child, std::os::unix::net::UnixStream) {
+) -> (std::process::Child, std::os::unix::net::UnixStream, u64) {
     use std::os::unix::process::CommandExt;
 
     let (worker, server) = std::os::unix::net::UnixStream::pair().expect("control socketpair");
     let control_fd = server.as_raw_fd();
+    let control_inode = socket_inode(control_fd);
     let mut cmd = Command::new(bin());
     cmd.arg("--policy")
         .arg(policy.to_str().unwrap())
@@ -272,7 +281,7 @@ fn spawn_serve_supervisor_with_program(
     }
     let child = cmd.spawn().expect("spawn serve supervise");
     drop(server);
-    (child, worker)
+    (child, worker, control_inode)
 }
 
 #[test]
@@ -850,7 +859,8 @@ fn test_supervise_fd_serve_launches_instance_and_serves_instance_verbs() {
         &serde_json::json!({ "argv": ["/bin/sh", "-c", script] }).to_string(),
     );
 
-    let (child, mut worker) = spawn_serve_supervisor_with_program(&policy, &program, &[]);
+    let (child, mut worker, _control_inode) =
+        spawn_serve_supervisor_with_program(&policy, &program, &[]);
 
     // config: policy snapshot served against the live generation.
     let resp = roundtrip_frame(
@@ -1083,6 +1093,177 @@ fn test_supervise_fd_serve_launches_instance_and_serves_instance_verbs() {
         Instant::now() + Duration::from_secs(10),
         "workload process reap",
         || !process_alive(pid as i32),
+    );
+    let _ = std::fs::remove_file(&policy);
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+/// `st_ino` of an open descriptor.  For a unix socket that is the socket
+/// inode, which is what `/proc/<pid>/fd` reports as `socket:[<ino>]`; the
+/// fd-table comparison in the SL-11 case below reads it from the handed-over
+/// end (an inherited copy is a dup of that same socket, so it shares the
+/// inode).  The two *ends* of a `socketpair()` are distinct sockets and do
+/// **not** share an inode — see the case's comment.
+fn socket_inode(fd: std::os::unix::io::RawFd) -> u64 {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::fstat(fd, &mut st) },
+        0,
+        "fstat: {}",
+        std::io::Error::last_os_error()
+    );
+    st.st_ino as u64
+}
+
+/// Descriptor names under `/proc/<pid>/fd` whose symlink target is exactly
+/// `socket:[<inode>]`, sorted.  A descriptor that closes between `read_dir`
+/// and `read_link` (or that the caller may not stat) is skipped: only
+/// surviving matches are reported, and the caller decides whether the result
+/// must be empty or non-empty.
+fn fd_table_socket_fds(pid: i32, inode: u64) -> Vec<String> {
+    let dir = PathBuf::from(format!("/proc/{pid}/fd"));
+    let want = format!("socket:[{inode}]");
+    let mut found = Vec::new();
+    for entry in
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+    {
+        let entry = entry.expect("fd entry");
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        if target.to_string_lossy().into_owned() == want {
+            found.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Read the octal `flags:` line of `/proc/<pid>/fdinfo/<fd>` (the file-status
+/// flags, where `O_CLOEXEC` is bit `02000000`) and assert the descriptor
+/// carries `O_CLOEXEC`.
+fn assert_fd_is_cloexec(pid: i32, fd_name: &str) {
+    let path = PathBuf::from(format!("/proc/{pid}/fdinfo/{fd_name}"));
+    let info = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let flags_line = info
+        .lines()
+        .find(|line| line.starts_with("flags:"))
+        .unwrap_or_else(|| panic!("{} must have a flags: line; got {info:?}", path.display()));
+    let flags = u32::from_str_radix(flags_line["flags:".len()..].trim(), 8)
+        .unwrap_or_else(|e| panic!("{} flags must be octal: {e}; got {flags_line:?}", path.display()));
+    assert_ne!(
+        flags & libc::O_CLOEXEC as u32,
+        0,
+        "{} must carry O_CLOEXEC (02000000); got {flags:o}",
+        path.display()
+    );
+}
+
+/// SL-11 guard: the supervisor's own control endpoint must not be reachable
+/// from the confined tree.
+///
+/// `--control-fd` only arrives exec-inheritable, i.e. the launcher had to
+/// clear `FD_CLOEXEC` on it; `serve::serve_control_fd` re-sets the flag on its
+/// own copy before anything is launched.  The property can be checked exactly
+/// by reading the socket inode: an inherited copy is a dup of that very
+/// socket, so it appears as the same `socket:[<ino>]` in the confined fd
+/// table.  Note the inode has to come from the *handed-over* end
+/// (`spawn_serve_supervisor_with_program` returns it) — the two ends of a
+/// `socketpair()` are distinct sockets with different inodes, so comparing
+/// the test's own (client) end would silently match nothing and make the case
+/// vacuous.
+///
+/// This is a *guard*, not a bug reproduction.  Measured (2026-09-09): core
+/// already hands `sandlock-init` an explicit fd set, so the confined tree was
+/// observably clean with and without the restore -- which is exactly why the
+/// `fdinfo` half matters: it pins the `F_SETFD` call itself, while the
+/// `/proc/<pid>/fd` half pins the invariant and will bite if a future change
+/// to that hand-off set puts the control endpoint into a confined process
+/// (reading frames addressed to the worker, including the SCM_RIGHTS stdio
+/// ends, and pinning the connection open past a dead worker -- the SL-4
+/// family).  The supervisor-side half is also what keeps the negative half
+/// honest: an empty confined scan is only meaningful once the same scan has
+/// located the endpoint on the supervisor.
+#[test]
+fn test_supervise_control_fd_stays_out_of_the_confined_tree() {
+    isolate_ctl_root();
+    let workdir = repo_tmp_dir().join(format!("supervise-fd-no-leak-{}", std::process::id()));
+    std::fs::create_dir_all(&workdir).expect("create fd-no-leak workdir");
+    let policy = write_policy(
+        "fd-no-leak",
+        &instance_policy(workdir.to_str().expect("workdir utf8")),
+    );
+    let program = write_policy(
+        "fd-no-leak-program",
+        &serde_json::json!({ "argv": ["/bin/sh", "-c", "exec sleep 30"] }).to_string(),
+    );
+
+    let (child, mut worker, control_inode) =
+        spawn_serve_supervisor_with_program(&policy, &program, &[]);
+
+    // The slot answers `stats` with the confined init's pid once the
+    // launch-first instance is Live; that fd table is the thing under test.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let pid = loop {
+        let resp = roundtrip_frame(
+            &mut worker,
+            &serde_json::json!({ "v": 1, "verb": "stats", "args": {} }),
+        );
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "stats: {resp:?}");
+        if resp["data"]["instance_state"] == "Live" {
+            break resp["data"]["pid"]
+                .as_i64()
+                .expect("the Live instance reports its pid") as i32;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the launch-first instance must reach Live; last stats: {resp:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(process_alive(pid), "the confined init (pid {pid}) must be running");
+
+    // Positive control: the same scan finds the control socket in the
+    // supervisor's own fd table, and the supervisor's copy carries
+    // `O_CLOEXEC` (the `serve_control_fd` restore).  Without this half an
+    // empty confined result could be a vacuous read (wrong pid, unreadable
+    // /proc, or an inode nothing ever compared).
+    let slot_fds = fd_table_socket_fds(child.id() as i32, control_inode);
+    assert!(
+        !slot_fds.is_empty(),
+        "the supervise slot itself must hold the control socket [inode {control_inode}]"
+    );
+    for fd_name in &slot_fds {
+        assert_fd_is_cloexec(child.id() as i32, fd_name);
+    }
+
+    let confined_fds = fd_table_socket_fds(pid, control_inode);
+    assert_eq!(
+        confined_fds,
+        Vec::<String>::new(),
+        "the confined tree (pid {pid}) must not inherit the supervisor's control \
+         socket [inode {control_inode}]; it was visible as fd(s) {confined_fds:?}"
+    );
+
+    // The guard must not have cost the generation its own channel: the same
+    // session still serves verbs, and shutdown tears the workload down.
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "shutdown", "args": {} }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "shutdown: {resp:?}");
+    let out = child.wait_with_output().expect("wait fd-no-leak supervise");
+    assert!(
+        out.status.success(),
+        "generation must exit 0 after shutdown; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    wait_until(
+        Instant::now() + Duration::from_secs(10),
+        "confined workload reap",
+        || !process_alive(pid),
     );
     let _ = std::fs::remove_file(&policy);
     let _ = std::fs::remove_file(&program);
@@ -1336,7 +1517,8 @@ fn test_supervise_main_exit_ends_generation_cleanly() {
         "main-exit-program",
         &serde_json::json!({ "argv": ["/bin/sh", "-c", "exit 0"] }).to_string(),
     );
-    let (child, mut worker) = spawn_serve_supervisor_with_program(&policy, &program, &[]);
+    let (child, mut worker, _control_inode) =
+        spawn_serve_supervisor_with_program(&policy, &program, &[]);
 
     // Poll stats until the instance reports the terminal Exited state (main
     // exit collapsed init; the serve loop stays responsive to worker verbs).
