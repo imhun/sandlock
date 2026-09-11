@@ -1160,6 +1160,36 @@ fn assert_fd_is_cloexec(pid: i32, fd_name: &str) {
     );
 }
 
+/// Kill-on-drop guard for a spawned `sandlock-supervise`: the SL-11 case
+/// below asserts *before* the normal `wait_with_output`, so a panicking assert
+/// would otherwise leave the slot (and its `sleep 30` workload) alive for the
+/// rest of the suite. `disarm()` hands the child back to the normal reaping
+/// path.
+struct SuperviseChild(Option<std::process::Child>);
+
+impl SuperviseChild {
+    fn new(child: std::process::Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn id(&self) -> u32 {
+        self.0.as_ref().expect("supervise child armed").id()
+    }
+
+    fn disarm(mut self) -> std::process::Child {
+        self.0.take().expect("supervise child armed")
+    }
+}
+
+impl Drop for SuperviseChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// SL-11 guard: the supervisor's own control endpoint must not be reachable
 /// from the confined tree.
 ///
@@ -1201,6 +1231,7 @@ fn test_supervise_control_fd_stays_out_of_the_confined_tree() {
 
     let (child, mut worker, control_inode) =
         spawn_serve_supervisor_with_program(&policy, &program, &[]);
+    let child = SuperviseChild::new(child);
 
     // The slot answers `stats` with the confined init's pid once the
     // launch-first instance is Live; that fd table is the thing under test.
@@ -1253,7 +1284,10 @@ fn test_supervise_control_fd_stays_out_of_the_confined_tree() {
         &serde_json::json!({ "v": 1, "verb": "shutdown", "args": {} }),
     );
     assert_eq!(resp["ok"], serde_json::Value::Bool(true), "shutdown: {resp:?}");
-    let out = child.wait_with_output().expect("wait fd-no-leak supervise");
+    let out = child
+        .disarm()
+        .wait_with_output()
+        .expect("wait fd-no-leak supervise");
     assert!(
         out.status.success(),
         "generation must exit 0 after shutdown; stderr: {}",
