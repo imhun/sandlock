@@ -521,9 +521,14 @@ pub fn send_command(id: &str, cmd: SupervisorCmd) -> Result<SupervisorReply> {
         .with_context(|| format!("connect to supervisor socket {:?}", path))?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
 
-    let msg = serde_json::to_string(&cmd)?;
+    // The protocol is newline-delimited JSON: send the request and its
+    // delimiter in ONE write. Two writes are legal on a stream socket but let
+    // the receiver act (and close) between them, which turns the tail write
+    // into an `EPIPE` — and `kill --all` treats any send error as "the daemon
+    // never got it" and re-delivers the signal by hand.
+    let mut msg = serde_json::to_string(&cmd)?;
+    msg.push('\n');
     stream.write_all(msg.as_bytes())?;
-    stream.write_all(b"\n")?;
     stream.flush()?;
 
     let mut reader = std::io::BufReader::new(&stream);
@@ -600,7 +605,7 @@ async fn supervisor_main(
     sock_path: PathBuf,
     pid_write_fd: i32,
 ) -> Result<Option<crate::state::ExitInfo>> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::UnixListener;
 
     // Bind the socket BEFORE create() so the CLI can call `start` the moment
@@ -709,13 +714,21 @@ async fn supervisor_main(
             Err(_) => return Ok(None),
         };
 
-        let mut buf = vec![0u8; 4096];
-        let n = stream.read(&mut buf).await.unwrap_or(0);
-        if n == 0 {
-            continue;
-        }
+        // Same newline-delimited framing rule as the running loop: never act
+        // on (or answer) a request fragment.
+        let buf = match read_control_request(&mut stream, 0).await {
+            Ok(Some((buf, _fds))) => buf,
+            Ok(None) => continue,
+            Err(e) => {
+                let reply = serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() })
+                    .unwrap_or_default();
+                let _ = stream.write_all(&reply).await;
+                let _ = stream.write_all(b"\n").await;
+                continue;
+            }
+        };
 
-        let incoming: SupervisorCmd = match serde_json::from_slice(&buf[..n]) {
+        let incoming: SupervisorCmd = match serde_json::from_slice(&buf) {
             Ok(c) => c,
             Err(e) => {
                 let reply = serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() })
@@ -883,6 +896,80 @@ async fn serve_running_init(
     }
 }
 
+/// Largest control request the supervisor will assemble (exec argv/env can be
+/// large; the pre-fix single-`recvmsg` read silently truncated anything past
+/// its 8 KiB buffer).
+const MAX_CONTROL_REQUEST: usize = 64 * 1024;
+
+/// How long a client may take to finish a request it has started. A peer that
+/// never sends the frame's `\n` delimiter is a protocol violation (see
+/// [`read_control_request`]); the deadline only bounds how long the
+/// single-connection accept loop waits on such a peer.
+const CONTROL_REQUEST_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Read one **complete** control request from an accepted connection: the
+/// newline-delimited JSON frame the CLI sends, plus whatever SCM_RIGHTS
+/// descriptors ride with it.
+///
+/// A stream socket preserves no write boundaries. The CLI writes the payload
+/// and its `\n` delimiter as two sends, and under load the receiver's first
+/// `recvmsg` returns only the payload — so a supervisor that treats one
+/// `recvmsg` as the whole request answers before the client has finished
+/// writing, and the client's delimiter write then fails with `EPIPE`.
+/// `kill --all` reacts to any send error by falling back to a direct
+/// `killpg(state.pid, signum)`, which delivers the instance signal a *second*
+/// time (the F1.7/SECE-6 exactly-once contract, pinned by
+/// `test_signal_to_sibling_pid_rejected`). Read to the delimiter instead,
+/// bounded in size and time; a request that never terminates is rejected
+/// rather than half-acted on.
+///
+/// `Ok(None)` means the peer closed without sending a request (nothing to
+/// answer); `Err` is a request-level failure the caller reports as `Err`.
+async fn read_control_request(
+    stream: &mut tokio::net::UnixStream,
+    max_fds: usize,
+) -> std::io::Result<Option<(Vec<u8>, Vec<std::os::unix::io::OwnedFd>)>> {
+    let (mut buf, fds) = crate::fdpass::recv_with_fds_async(stream, max_fds).await?;
+    if buf.is_empty() {
+        // EOF: a probe connection (or a client that gave up). No reply.
+        return Ok(None);
+    }
+    if !buf.contains(&b'\n') {
+        let deadline = tokio::time::Instant::now() + CONTROL_REQUEST_DEADLINE;
+        loop {
+            if buf.contains(&b'\n') || buf.len() >= MAX_CONTROL_REQUEST {
+                break;
+            }
+            let read =
+                tokio::time::timeout_at(deadline, crate::fdpass::recv_with_fds_async(stream, 0))
+                    .await;
+            match read {
+                // Only the frame's first fragment carries its descriptors.
+                Ok(Ok((bytes, extra))) => {
+                    drop(extra);
+                    if bytes.is_empty() {
+                        break; // peer half-closed: no delimiter is coming
+                    }
+                    buf.extend_from_slice(&bytes);
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => break, // deadline: no delimiter is coming
+            }
+        }
+        if !buf.contains(&b'\n') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "control request is not newline-terminated ({} bytes buffered); the CLI \
+                     and the supervisor must come from the same build",
+                    buf.len()
+                ),
+            ));
+        }
+    }
+    Ok(Some((buf, fds)))
+}
+
 /// Handle one accepted connection while the container is RUNNING (init path).
 /// Reads the command via recvmsg so exec stdio fds arrive with the bytes.
 async fn serve_one_running_init(
@@ -894,13 +981,18 @@ async fn serve_one_running_init(
 ) -> RunningCmd {
     use tokio::io::AsyncWriteExt;
 
-    let (buf, fds) = match crate::fdpass::recv_with_fds_async(&stream, 3).await {
-        Ok(pair) => pair,
-        Err(_) => return RunningCmd::Continue,
+    let (buf, fds) = match read_control_request(&mut stream, 3).await {
+        Ok(Some(pair)) => pair,
+        // Peer closed without a request, or the request never terminated.
+        Ok(None) => return RunningCmd::Continue,
+        Err(e) => {
+            let reply = serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() })
+                .unwrap_or_default();
+            let _ = stream.write_all(&reply).await;
+            let _ = stream.write_all(b"\n").await;
+            return RunningCmd::Continue;
+        }
     };
-    if buf.is_empty() {
-        return RunningCmd::Continue;
-    }
     let incoming: SupervisorCmd = match serde_json::from_slice(&buf) {
         Ok(c) => c,
         Err(e) => {
@@ -1119,13 +1211,19 @@ async fn serve_one_running(
     id: &str,
     child_pid: i32,
 ) -> RunningCmd {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut buf = vec![0u8; 4096];
-    let n = stream.read(&mut buf).await.unwrap_or(0);
-    if n == 0 {
-        return RunningCmd::Continue;
-    }
-    let incoming: SupervisorCmd = match serde_json::from_slice(&buf[..n]) {
+    use tokio::io::AsyncWriteExt;
+    let buf = match read_control_request(stream, 0).await {
+        Ok(Some((buf, _fds))) => buf,
+        Ok(None) => return RunningCmd::Continue,
+        Err(e) => {
+            let reply = serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() })
+                .unwrap_or_default();
+            let _ = stream.write_all(&reply).await;
+            let _ = stream.write_all(b"\n").await;
+            return RunningCmd::Continue;
+        }
+    };
+    let incoming: SupervisorCmd = match serde_json::from_slice(&buf) {
         Ok(c) => c,
         Err(e) => {
             let reply = serde_json::to_vec(&SupervisorReply::Err { msg: e.to_string() })

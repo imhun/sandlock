@@ -8,6 +8,21 @@
 
 ## 行为变化（升级 / 接线前必读）
 
+- **控制面请求以 `\n` 结尾才算一条；CLI 与 supervisor 必须同批升级（f1oci，
+  2026-09-14）**：CLI↔supervisor 控制通道是「换行结尾 JSON」。修复前 supervisor 把
+  **一次 `recvmsg` 读到的字节**当成整条请求，而 CLI 把 payload 与 `\n` **分两次
+  `write`**：机器有负载时第一次 `recvmsg` 只拿到 payload，supervisor 随即应答并关闭
+  连接，客户端补写 `\n` 的那一次拿到 `EPIPE`；`kill --all` 把任何发送错误都当成
+  「daemon 没收到」并自行 `killpg(state.pid, signum)` 兜底 ⇒ **实例级信号被投递两次**
+  （非幂等信号重复投递破坏 F1.7/SECE-6 的 exactly-once 语义，也只在「整档顺序跑」的
+  负载下才复现）。现在 supervisor 的 running-init / pre-start / restore 三个 accept
+  循环都读到 `\n` 才成帧（上限 64 KiB、等待 2 s），CLI 的 `send_command` 与 exec 请求
+  把 payload 与分隔符合成**一次**写发出；没有 `\n` 的请求被**拒绝**
+  （`err: control request is not newline-terminated …`）而不是被半执行。
+  **升级后果**：只影响「旧 CLI 的新鲜 exec 请求对新 supervisor」这种混版形态
+  （旧 exec 请求不带 `\n`）——它会收到显式拒绝；新 CLI 对旧 supervisor 照旧可用
+  （多出的 `\n` 是 JSON 尾随空白）。同批 wheel 的 CLI/supervisor 不踩这条。
+
 - **⚠️ BREAKING：删掉 `mediation_run_as` 降级档（B3，2026-09-11，SL-1 硬删）**：
   「需要路径中介时，中介身份必须就是沙箱身份」现在是**唯一**形态，不再有任何降级
   逃生门。删除面（全部一次删净，不留墓碑）：`MediationRunAs` 枚举（含
@@ -428,6 +443,19 @@
   与 release supervise_cost 分档（各 commit 见 test-baseline）。
 
 ## 安全修复（M0′：SL-4/5/6/7/8 + 进程组/上限/deadline）
+
+- **控制面分帧竞态（f1oci，2026-09-14）**：`crates/sandlock-oci/src/supervisor.rs` 新增
+  `read_control_request` —— 读到请求的 `\n` 才算一条（`MAX_CONTROL_REQUEST` 64 KiB、
+  `CONTROL_REQUEST_DEADLINE` 2 s），三个 accept 循环共用；`send_command` 与
+  `cmd_exec` 把分隔符并进同一次 `write`/`sendmsg`。回归 pin：
+  `crates/sandlock-oci/tests/test_process_groups.rs::raw_supervisor_cmd` 现在**故意**
+  把 payload 与 `\n` 分两次写，并要求 supervisor 在分隔符到达前既不应答也不关连接
+  （恢复旧行为 ⇒ 该断言**确定性**变红，`tmp/f1oci-mutation-M1-fragment-red.log`）；
+  「恰好一次投递」语义同样做了变异证明（无条件补一次 `pidfd_send_signal` ⇒ phase-2
+  断言红，`tmp/f1oci-mutation-M2-pidfd-red.log`）。确定性证据：oci 档**连续 10 轮
+  150 passed / 0 failed**（`tmp/f1oci-oci10-r01..r10.log`），phase-2 单场景
+  **100/100 恰好一次**（`tmp/f1oci-probe2-fixed-iters100.log`）、phase-1 双兄弟
+  40/40 两帧均 `Ok`（`tmp/f1oci-probe1-fixed-iters40.log`）。
 
 - SL-4 控制 fd 泄漏（F1.1 `3d804b1`）；H1/H2 early_exits 上限 + 登记校验（F1.2
   `c5a0fe7`）；SL-7 控制面鉴权 + 目录身份（F1.3 `95608be`/`ceaa069` + F2b.2 双传输

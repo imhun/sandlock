@@ -527,6 +527,17 @@ mediation_2uid = 9 # B3 (2026-09-11, SL-1 hard delete): 10 -> 9. Removed with
                    # test_cli_mediation_run_as_is_wired (root-tier CLI
                    # refusal vs --mediation-run-as supervisor warning).
 oci = 150     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root.
+              # f1oci (2026-09-14): count unchanged. The control channel now
+              # frames a request at its `\n` (supervisor) and the CLI sends
+              # payload+delimiter in one write, so the
+              # test_signal_to_sibling_pid_rejected flake (instance signal
+              # delivered twice via the CLI's daemon-gone killpg fallback after
+              # the supervisor answered a request fragment) is deterministic:
+              # 10/10 sequential `--oci-root` rounds 150 passed / 0 failed
+              # (tmp/f1oci-oci10-r01..r10.log). The in-file raw-frame helper now
+              # pins the framing boundary (no reply before the delimiter) and
+              # both protected semantics were mutation-proved red
+              # (tmp/f1oci-mutation-M{1,2}-*-red.log).
               # F15 (2026-09-08): 145 -> 150, +2 header-validation tests in
               # oci/src/init.rs (TooManyFds declaration + pre-F15 10-byte v1
               # header reports the version gap; the seam module recompiles in

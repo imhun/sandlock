@@ -906,7 +906,11 @@ fn cmd_exec(
         // by the exec proxy below, which still needs that exit status.
         detach: false,
     };
-    let payload = serde_json::to_vec(&cmd).context("serialize exec command")?;
+    let mut payload = serde_json::to_vec(&cmd).context("serialize exec command")?;
+    // Newline-delimited control protocol: the delimiter ships in the same
+    // write (and the same sendmsg as the stdio fds), so the supervisor can
+    // never see — or answer — a request fragment.
+    payload.push(b'\n');
 
     let sock = supervisor::socket_path(id);
     let stream = UnixStream::connect(&sock)

@@ -645,6 +645,16 @@ fn init_signal_surface(req: &Req) {
 
 /// Send one raw supervisor frame (host-side, over the state-dir socket) and
 /// return the parsed reply.
+///
+/// The control protocol is newline-delimited JSON, so the payload and its `\n`
+/// delimiter are sent as **two** writes — a legal client pattern the CLI itself
+/// used, and the one that used to make this suite flake. A stream socket
+/// preserves no write boundaries, so the supervisor must not answer (or close)
+/// the connection until the delimiter arrives: answering the payload fragment
+/// makes the delimiter write fail with `EPIPE`, and `kill --all` reacts to any
+/// send error by falling back to a direct `killpg(state.pid, …)` — delivering
+/// an instance signal a *second* time. The readiness probe below pins that
+/// boundary explicitly instead of hoping the two writes coalesce.
 fn raw_supervisor_cmd(root: &Path, json: &str) -> Result<SupervisorReply, String> {
     let socks: Vec<PathBuf> = fs::read_dir(root)
         .map_err(|e| format!("read state root {:?}: {e}", root))?
@@ -659,18 +669,59 @@ fn raw_supervisor_cmd(root: &Path, json: &str) -> Result<SupervisorReply, String
     }
     let mut stream = UnixStream::connect(&socks[0]).map_err(|e| format!("connect {}: {e}", socks[0].display()))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
+        .set_read_timeout(Some(Duration::from_millis(250)))
         .map_err(|e| format!("set timeout: {e}"))?;
     stream
         .write_all(json.as_bytes())
         .map_err(|e| format!("write frame: {e}"))?;
+    stream.flush().map_err(|e| format!("flush frame: {e}"))?;
+    // A reply or an end-of-stream here means the supervisor acted on a request
+    // that is not complete yet.
+    let mut probe = [0u8; 1];
+    let peeked = unsafe {
+        libc::recv(
+            std::os::unix::io::AsRawFd::as_raw_fd(&stream),
+            probe.as_mut_ptr() as *mut libc::c_void,
+            1,
+            libc::MSG_PEEK,
+        )
+    };
+    if peeked > 0 {
+        return Err(format!(
+            "supervisor answered the connection before the request's delimiter arrived \
+             (frame {json:?}); a control request is only complete at its newline"
+        ));
+    }
+    if peeked == 0 {
+        return Err(format!(
+            "supervisor closed the connection before the request's delimiter arrived \
+             (frame {json:?}); a control request is only complete at its newline"
+        ));
+    }
+    let probe_err = std::io::Error::last_os_error();
+    if !matches!(
+        probe_err.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ) {
+        return Err(format!("probe for an early reply: {probe_err}"));
+    }
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| format!("set read timeout: {e}"))?;
     stream.write_all(b"\n").map_err(|e| format!("write newline: {e}"))?;
     stream.flush().map_err(|e| format!("flush: {e}"))?;
     let mut line = String::new();
-    BufReader::new(stream)
+    let read = BufReader::new(stream)
         .read_line(&mut line)
-        .map_err(|e| format!("read reply: {e}"))?;
-    serde_json::from_str(line.trim()).map_err(|e| format!("parse reply {line:?}: {e}"))
+        .map_err(|e| format!("read reply to frame {json:?}: {e}"))?;
+    if read == 0 {
+        return Err(format!(
+            "supervisor closed the connection without answering frame {json:?} \
+             (the request was newline-terminated)"
+        ));
+    }
+    serde_json::from_str(line.trim())
+        .map_err(|e| format!("parse reply {line:?} to frame {json:?}: {e}"))
 }
 
 /// Boot a three-command instance (main keepalive + two exec'd `beat`
@@ -977,17 +1028,8 @@ fn test_signal_to_sibling_pid_rejected() {
         info_b.pid,
         libc::SIGSTOP
     );
-    let stop_ok = match raw_supervisor_cmd(&c.root, &stop_frame) {
-        Ok(SupervisorReply::Ok) => true,
-        Ok(other) => {
-            eprintln!("pid-addressed signal frame got non-Ok reply: {other:?}");
-            false
-        }
-        Err(msg) => {
-            eprintln!("pid-addressed signal frame error: {msg}");
-            false
-        }
-    };
+    let stop_reply = raw_supervisor_cmd(&c.root, &stop_frame);
+    let stop_ok = matches!(stop_reply, Ok(SupervisorReply::Ok));
     // Settle past init's poll round, then require both siblings frozen.
     std::thread::sleep(Duration::from_millis(400));
     let a_frozen = read_counter(&a_cnt).unwrap_or(0);
@@ -1000,10 +1042,8 @@ fn test_signal_to_sibling_pid_rejected() {
     // Resume with a plain instance-level SIGCONT (no pid), then verify both
     // siblings actually run again.
     let cont_frame = format!(r#"{{"cmd":"signal","signum":{}}}"#, libc::SIGCONT);
-    let cont_ok = matches!(
-        raw_supervisor_cmd(&c.root, &cont_frame),
-        Ok(SupervisorReply::Ok)
-    );
+    let cont_reply = raw_supervisor_cmd(&c.root, &cont_frame);
+    let cont_ok = matches!(cont_reply, Ok(SupervisorReply::Ok));
     let resumed = cont_ok
         && wait_counter_gt(&a_cnt, a_frozen, Duration::from_secs(3))
         && wait_counter_gt(&b_cnt, b_frozen, Duration::from_secs(3));
@@ -1020,13 +1060,16 @@ fn test_signal_to_sibling_pid_rejected() {
         "a pid-addressed signal frame must not stop a single sibling: the only \
          signal verb is instance-level, so both siblings (and the main workload) \
          stop together. A pid={} B pid={}; counters froze unevenly or kept \
-         advancing (a per-pid channel or a rejected-instance fallback)",
+         advancing (a per-pid channel or a rejected-instance fallback). \
+         Stop frame {stop_frame} replied {stop_reply:?}",
         info_a.pid,
         info_b.pid
     );
     assert!(
         resumed,
-        "instance-level SIGCONT must resume every stopped child group (A pid={}, B pid={})",
+        "instance-level SIGCONT must resume every stopped child group (A pid={}, B pid={}; \
+         stop frame {stop_frame} replied {stop_reply:?}, cont frame {cont_frame} replied \
+         {cont_reply:?})",
         info_a.pid,
         info_b.pid
     );
