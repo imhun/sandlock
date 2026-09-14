@@ -7,6 +7,21 @@
 
 ## A. 代码 / 接线类（需要小代码 + 测试）
 
+- **FUP-24 `kill --all` 的兜底判据仍是「任何发送错误」而不是「连不上」（f1oci，
+  2026-09-14）** — 来源：f1oci 对 oci `test_signal_to_sibling_pid_rejected` flake
+  的定真因（见 `docs/CHANGELOG.md` 的 f1oci 两条 + `.superpowers/sdd/task-f1oci-report.md`）。
+  描述：修复前 CLI 把控制请求的 payload 与 `\n` 分两次写、supervisor 把一次 `recvmsg`
+  当成整条请求，于是 supervisor 在两次写之间应答并关闭连接 ⇒ 客户端补写 `\n` 拿到
+  `EPIPE`；而 `cmd_kill` 的 `if sent.is_err() { killpg(state.pid, signum) }`
+  把这次 EPIPE 当成「daemon 没收到」自行再投一次 ⇒ 实例级非幂等信号被投递两次。
+  **本次已修**分帧（supervisor 读到 `\n` 才成帧；CLI 与 exec 请求把分隔符并进同一次写），
+  该触发路径消失；但兜底判据本身仍过宽：真正「请求已送达、答复丢失」（例如 supervisor
+  卡到 10 s 答复超时）时仍会再投一次。为什么留：把兜底收窄成「socket 连不上才兜底」
+  必须同时给「daemon 已死仍要能 kill」这条降级路径补验收（SIGKILL supervisor 后
+  `kill --all` 仍须成功），属独立小改动；当前无已知活 bug（正常路径不可能再触发）。
+  建议修法：`cmd_kill` 只在 `UnixStream::connect(socket_path(id))` 失败时兜底，
+  其余错误原样上抛（`crates/sandlock-oci/src/main.rs` 的 `cmd_kill` 分支）。
+
 - **F12（2026-09-06，已完成）** — ProcessIndex 一 TGID 一 entry
   （线程 tid 懒登记建模收口）。来源：F11 report concern #1 / e2b task-backlog
   row #2 残余。描述：`register_pid_if_new` 对发出被中介 syscall 的非 leader
