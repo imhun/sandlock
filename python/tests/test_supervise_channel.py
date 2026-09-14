@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from sandlock.exceptions import SandlockError
+from sandlock.exceptions import SandlockError, SandboxError, SlotRefusal
 from sandlock.supervise import SuperviseChannel
 
 
@@ -450,6 +450,73 @@ def test_failed_verb_retires_the_persistent_session(tmp_path: Path) -> None:
         with pytest.raises(SandlockError) as second:
             channel.request("stats")
         assert "frame alignment" in str(second.value), str(second.value)
+    finally:
+        worker.close()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_a_served_refusal_is_typed_and_carries_its_stable_code(
+    tmp_path: Path,
+) -> None:
+    """F19/SL-13: a served ``ok:false`` reaches Python as a classified refusal.
+
+    The slot is a separate process, so the native ``InstanceClosedError`` /
+    ``InstanceDeadError`` cannot cross the channel: the frame carries prose
+    plus a **stable code**, and :class:`SlotRefusal` is that pair. The code is
+    what a host branches on -- the message carries the core's own free text,
+    so matching it would be unsound. Pinned here on the two shapes the E2B
+    worker's rebuild decision depends on: a *Live* ceiling refusal must be
+    ``policy_denied`` (never a session-gone code), and a session-gone refusal
+    must be ``generation_closed``.
+    """
+    assert SUPERVISE_BIN.exists(), f"missing {SUPERVISE_BIN}"
+    proc, worker, _control_inode = _spawn_fd_slot(tmp_path)
+    try:
+        channel = SuperviseChannel(fd=worker.fileno())
+        assert channel.request("stats")["instance_state"] == "Live"
+
+        # A per-exec grant wider than the (empty) instance ceiling: a Live
+        # refusal, i.e. policy_denied -- not a gone session.
+        r_in, w_in = os.pipe()
+        r_out, w_out = os.pipe()
+        r_err, w_err = os.pipe()
+        try:
+            with pytest.raises(SlotRefusal) as refusal:
+                channel.request(
+                    "exec",
+                    {"argv": ["true"], "bind_ports": [65000]},
+                    fds=[r_in, w_out, w_err],
+                )
+        finally:
+            for fd in (r_in, w_in, r_out, w_out, r_err, w_err):
+                os.close(fd)
+        assert str(refusal.value) == (
+            "instance exec failed: process error: exec params exceed the "
+            "instance policy ceiling: bind_ports 65000 is outside the allowed "
+            "set (EPERM)"
+        ), str(refusal.value)
+        assert refusal.value.code == "policy_denied", refusal.value.code
+
+        # The field's wire value and the class constant are the same string:
+        # a host may spell either.
+        assert refusal.value.code == SlotRefusal.POLICY_DENIED
+        assert isinstance(refusal.value, SandboxError)
+        assert isinstance(refusal.value, SandlockError)
+
+        # An unknown verb is the generation refusing for its own reason, i.e.
+        # the catch-all code -- still never a session-gone one.
+        with pytest.raises(SlotRefusal) as other:
+            channel.request("map-uid")
+        assert str(other.value) == "unknown verb: map-uid", str(other.value)
+        assert other.value.code == "verb_refused", other.value.code
+
+        # ...and an uncoded answer is never guessed from the prose: the
+        # transport-level refusals (a wrong token, a bad frame) never reach
+        # the generation, so they carry no code at all.
+        assert SlotRefusal("plain").code is None
+        channel.request("shutdown")
     finally:
         worker.close()
         if proc.poll() is None:

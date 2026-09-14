@@ -35,7 +35,7 @@ import json
 from typing import Any, Dict, Sequence
 
 from . import _sdk
-from .exceptions import SandboxError, SandlockError
+from .exceptions import SlotRefusal, SandlockError
 
 
 _lib = _sdk._lib
@@ -137,7 +137,8 @@ class SuperviseChannel:
     the credential (``token`` may be empty), no path exists, and one
     connection carries every verb until it is closed.  A transport/refusal
     error raises :class:`SandlockError`; a served ``ok:false`` response raises
-    :class:`SandboxError` with the server's error text.
+    :class:`SlotRefusal` (a :class:`SandboxError`) with the server's error
+    text *and* its stable refusal code.
     """
 
     def __init__(
@@ -241,8 +242,13 @@ class SuperviseChannel:
         finally:
             _free_string(ctypes.c_void_p(resp_p))
         if not response.get("ok"):
-            raise SandboxError(
-                response.get("err") or f"supervise verb {verb!r} refused"
+            # F19/SL-13: the refusal's stable code rides the same frame as its
+            # prose, so a host can branch on "the generation is over" without
+            # parsing the sentence. `code` is None only for a slot older than
+            # the field; it is never guessed from the message.
+            raise SlotRefusal(
+                response.get("err") or f"supervise verb {verb!r} refused",
+                code=response.get("code"),
             )
         return response.get("data")
 

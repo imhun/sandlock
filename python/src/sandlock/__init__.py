@@ -34,6 +34,7 @@ from .exceptions import (
     BranchConflictError,
     InstanceClosedError,
     InstanceDeadError,
+    SlotRefusal,
 )
 
 __all__ = [
@@ -90,4 +91,5 @@ __all__ = [
     "BranchConflictError",
     "InstanceClosedError",
     "InstanceDeadError",
+    "SlotRefusal",
 ]

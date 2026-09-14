@@ -587,6 +587,12 @@ pub struct ControlResponse {
     pub data: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub err: Option<String>,
+    /// F19/SL-13: the **stable refusal code** of an `ok: false` answer
+    /// ([`crate::error::RefusalCode`]'s wire string), so a worker can act on
+    /// a refused verb without parsing `err`. Optional on the wire in both
+    /// directions: an older server omits it, and an older client ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 async fn serve_one(
@@ -619,6 +625,7 @@ async fn serve_one(
                 v: 1,
                 ok: false,
                 data: None,
+                code: None,
                 err: Some(format!("parse error: {}", e)),
             };
             let _ = write_response(&mut stream, &resp).await;
@@ -631,6 +638,7 @@ async fn serve_one(
             v: 1,
             ok: false,
             data: None,
+            code: None,
             err: Some(format!("unsupported protocol version: {}", req.v)),
         };
         let _ = write_response(&mut stream, &resp).await;
@@ -653,6 +661,7 @@ async fn serve_one(
                 v: 1,
                 ok: false,
                 data: None,
+                code: None,
                 err: Some(format!(
                     "permission denied: verb '{}' requires a valid control token \
                      (missing or mismatched)",
@@ -672,6 +681,7 @@ async fn serve_one(
                 v: 1,
                 ok: false,
                 data: None,
+                code: None,
                 err: Some(format!("unknown verb: {}", req.verb)),
             };
             let _ = write_response(&mut stream, &resp).await;
@@ -709,6 +719,7 @@ async fn handle_config(
                 v: 1,
                 ok: false,
                 data: None,
+                code: None,
                 err: Some(format!("serialize error: {}", e)),
             };
             let _ = write_response(stream, &resp).await;
@@ -721,6 +732,7 @@ async fn handle_config(
         ok: true,
         data: Some(data),
         err: None,
+        code: None,
     };
     let _ = write_response(stream, &resp).await;
 }
@@ -745,6 +757,7 @@ async fn handle_ports(
                 v: 1,
                 ok: false,
                 data: None,
+                code: None,
                 err: Some(format!("serialize error: {}", e)),
             };
             let _ = write_response(stream, &resp).await;
@@ -757,6 +770,7 @@ async fn handle_ports(
         ok: true,
         data: Some(data),
         err: None,
+        code: None,
     };
     let _ = write_response(stream, &resp).await;
 }
@@ -775,6 +789,7 @@ async fn write_response(
             v: 1,
             ok: false,
             data: None,
+            code: None,
             err: Some("internal error".to_string()),
         })
         .unwrap_or_default()
@@ -786,6 +801,7 @@ async fn write_response(
             v: 1,
             ok: false,
             data: None,
+            code: None,
             err: Some(format!(
                 "response too large ({} bytes, max {})",
                 body.len(),
@@ -1203,6 +1219,7 @@ pub fn write_response_frame(
             v: 1,
             ok: false,
             data: None,
+            code: None,
             err: Some("internal error".to_string()),
         })
         .unwrap_or_default()
@@ -1212,6 +1229,7 @@ pub fn write_response_frame(
             v: 1,
             ok: false,
             data: None,
+            code: None,
             err: Some(format!(
                 "response too large ({} bytes, max {})",
                 body.len(),
@@ -1315,6 +1333,7 @@ pub fn serve_fd_connection(
                     v: 1,
                     ok: false,
                     data: None,
+                    code: None,
                     err: Some(format!("parse error: {}", e)),
                 };
                 let _ = write_response_frame(&mut stream, &resp);
@@ -1326,6 +1345,7 @@ pub fn serve_fd_connection(
                 v: 1,
                 ok: false,
                 data: None,
+                code: None,
                 err: Some(format!("unsupported protocol version: {}", req.v)),
             };
             let _ = write_response_frame(&mut stream, &resp);
@@ -1341,6 +1361,7 @@ pub fn serve_fd_connection(
                     v: 1,
                     ok: false,
                     data: None,
+                    code: None,
                     err: Some(format!(
                         "permission denied: verb '{}' requires a valid channel token \
                          (missing or mismatched)",
@@ -1403,6 +1424,7 @@ pub fn serve_connection(
                 v: 1,
                 ok: false,
                 data: None,
+                code: None,
                 err: Some(format!("parse error: {}", e)),
             };
             let _ = write_response_frame(&mut stream, &resp);
@@ -1415,6 +1437,7 @@ pub fn serve_connection(
             v: 1,
             ok: false,
             data: None,
+            code: None,
             err: Some(format!("unsupported protocol version: {}", req.v)),
         };
         let _ = write_response_frame(&mut stream, &resp);
@@ -1434,6 +1457,7 @@ pub fn serve_connection(
                 v: 1,
                 ok: false,
                 data: None,
+                code: None,
                 err: Some(format!(
                     "permission denied: verb '{}' requires a valid channel token \
                      (missing or mismatched)",
@@ -1785,5 +1809,55 @@ mod tests {
         // May or may not be empty depending on test environment; just ensure
         // it doesn't error.
         assert!(result.iter().all(|(_, pid)| *pid > 0));
+    }
+
+    /// F19/SL-13: the refusal `code` rides the same frame as `err`, and both
+    /// directions of the wire stay compatible with the pre-code shape.
+    #[test]
+    fn refusal_code_rides_the_response_frame_without_breaking_the_old_shape() {
+        let with_code = ControlResponse {
+            v: 1,
+            ok: false,
+            data: None,
+            err: Some("instance exec failed: process error: instance is closed".to_string()),
+            code: Some("generation_closed".to_string()),
+        };
+        let body = serde_json::to_value(&with_code).expect("serialize response");
+        assert_eq!(body["ok"], serde_json::Value::Bool(false));
+        assert_eq!(body["code"], serde_json::json!("generation_closed"));
+        assert_eq!(
+            body["err"],
+            serde_json::json!("instance exec failed: process error: instance is closed")
+        );
+
+        // Round trip: the code is a first-class field, not a convention.
+        let parsed: ControlResponse =
+            serde_json::from_value(body.clone()).expect("parse coded response");
+        assert_eq!(parsed.code.as_deref(), Some("generation_closed"));
+
+        // An older server's answer (no `code` key at all) still parses, with
+        // `None` -- the documented fallback shape, not an error.
+        let legacy = serde_json::json!({
+            "v": 1,
+            "ok": false,
+            "err": "instance exec failed: process error: instance is closed",
+        });
+        let parsed: ControlResponse =
+            serde_json::from_value(legacy).expect("parse legacy uncoded response");
+        assert_eq!(parsed.code, None);
+        assert!(parsed.err.is_some());
+
+        // A success answer never carries a code, so the field costs nothing
+        // on the hot path.
+        let ok = ControlResponse {
+            v: 1,
+            ok: true,
+            data: Some(serde_json::json!({"launched": true})),
+            err: None,
+            code: None,
+        };
+        let body = serde_json::to_value(&ok).expect("serialize ok response");
+        assert_eq!(body.get("code"), None);
+        assert_eq!(body.get("err"), None);
     }
 }

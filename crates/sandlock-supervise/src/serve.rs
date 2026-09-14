@@ -54,6 +54,7 @@ use sandlock_core::control::{
     serve_fd_connection, serve_registered_once, write_response_frame, ControlHandler,
     ControlRequest, ControlResponse, ServeOutcome,
 };
+use sandlock_core::error::{refusal_code, RefusalCode};
 use sandlock_core::instance::{
     ExecParams, InstanceLifetime, InstancePhase, SandboxInstance,
 };
@@ -347,21 +348,26 @@ impl Generation {
         &mut self,
         args: &serde_json::Value,
         fds: &[OwnedFd],
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, Refusal> {
         if fds.len() < 3 {
-            return Err("exec requires 3 stdio fds attached via SCM_RIGHTS".to_string());
+            return Err(Refusal::refused(
+                "exec requires 3 stdio fds attached via SCM_RIGHTS",
+            ));
         }
         let argv: Vec<String> = args
             .get("argv")
             .and_then(|a| serde_json::from_value(a.clone()).ok())
-            .ok_or_else(|| "exec requires an `argv` string array".to_string())?;
+            .ok_or_else(|| Refusal::refused("exec requires an `argv` string array"))?;
         if argv.is_empty() {
-            return Err("exec: empty argv (argv[0] is the executable)".to_string());
+            return Err(Refusal::refused(
+                "exec: empty argv (argv[0] is the executable)",
+            ));
         }
         let instance = self.instance.as_mut().ok_or_else(|| {
-            "generation has no instance: exec requires a launched session \
-             (provision --program at slot start)"
-                .to_string()
+            Refusal::refused(
+                "generation has no instance: exec requires a launched session \
+                 (provision --program at slot start)",
+            )
         })?;
         // Dup all three fds into owned handles first: if a mid-loop dup fails,
         // the Vec's Drop closes the earlier dups (no fd leak on the error
@@ -370,23 +376,23 @@ impl Generation {
         for (i, fd) in fds.iter().take(3).enumerate() {
             let dup = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
             if dup < 0 {
-                return Err(format!(
+                return Err(Refusal::refused(format!(
                     "dup stdio fd {} for exec: {}",
                     i,
                     std::io::Error::last_os_error()
-                ));
+                )));
             }
             owned.push(unsafe { OwnedFd::from_raw_fd(dup) });
         }
         let child_fds: [OwnedFd; 3] = owned
             .try_into()
-            .map_err(|_| "exec requires exactly 3 stdio fds".to_string())?;
-        let params = exec_params_from_args(args)?;
+            .map_err(|_| Refusal::refused("exec requires exactly 3 stdio fds"))?;
+        let params = exec_params_from_args(args).map_err(Refusal::refused)?;
         let arg_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         let handle = self
             .rt
             .block_on(instance.exec_with_fds_params(&arg_refs, &params, child_fds))
-            .map_err(|e| format!("instance exec failed: {e}"))?;
+            .map_err(|e| Refusal::from_core("instance exec failed", &e))?;
         Ok(serde_json::json!({
             "child_id": handle.child_id,
             "pid": handle.pid,
@@ -400,7 +406,7 @@ impl Generation {
     fn handle_update_network(
         &mut self,
         args: &serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, Refusal> {
         let ips: Vec<std::net::IpAddr> = args
             .get("ips")
             .and_then(|v| v.as_array())
@@ -410,17 +416,21 @@ impl Generation {
                     .filter_map(|s| s.parse().ok())
                     .collect()
             })
-            .ok_or_else(|| "update_network requires an `ips` string array".to_string())?;
+            .ok_or_else(|| Refusal::refused("update_network requires an `ips` string array"))?;
         if ips.len() != args.get("ips").and_then(|v| v.as_array()).map_or(0, Vec::len) {
-            return Err("update_network: every `ips` entry must be an IP literal".to_string());
+            return Err(Refusal::refused(
+                "update_network: every `ips` entry must be an IP literal",
+            ));
         }
         let instance = self.instance.as_mut().ok_or_else(|| {
-            "generation has no instance: update_network requires a launched session".to_string()
+            Refusal::refused(
+                "generation has no instance: update_network requires a launched session",
+            )
         })?;
         let report = self
             .rt
             .block_on(instance.update_network(&ips))
-            .map_err(|e| format!("instance update_network failed: {e}"))?;
+            .map_err(|e| Refusal::from_core("instance update_network failed", &e))?;
         Ok(serde_json::json!({
             "stale_child_ids": report.stale_child_ids,
         }))
@@ -429,39 +439,49 @@ impl Generation {
     /// Serve a `wait_child` verb: block until the named child exits and
     /// report its status (exit routing runs through the core executor's F1.2
     /// announced registry).
-    fn handle_wait_child(&mut self, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+    fn handle_wait_child(
+        &mut self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, Refusal> {
         let child_id: u64 = args
             .get("child_id")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| "wait_child requires a numeric `child_id`".to_string())?;
+            .ok_or_else(|| Refusal::refused("wait_child requires a numeric `child_id`"))?;
         let instance = self.instance.as_mut().ok_or_else(|| {
-            "generation has no instance: wait_child requires a launched session".to_string()
+            Refusal::refused(
+                "generation has no instance: wait_child requires a launched session",
+            )
         })?;
         let status = self
             .rt
             .block_on(instance.wait_child(child_id))
-            .map_err(|e| format!("instance wait_child failed: {e}"))?;
+            .map_err(|e| Refusal::from_core("instance wait_child failed", &e))?;
         Ok(exit_status_json(&status))
     }
 
     /// Serve a `kill_child` verb: deliver `signum` to the named child through
     /// its registered pid/pidfd (never an arbitrary-pid verb).
-    fn handle_kill_child(&mut self, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+    fn handle_kill_child(
+        &mut self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, Refusal> {
         let child_id: u64 = args
             .get("child_id")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| "kill_child requires a numeric `child_id`".to_string())?;
+            .ok_or_else(|| Refusal::refused("kill_child requires a numeric `child_id`"))?;
         let signum: i32 = args
             .get("signum")
             .and_then(|v| v.as_i64())
             .and_then(|v| i32::try_from(v).ok())
-            .ok_or_else(|| "kill_child requires a numeric `signum`".to_string())?;
+            .ok_or_else(|| Refusal::refused("kill_child requires a numeric `signum`"))?;
         let instance = self.instance.as_mut().ok_or_else(|| {
-            "generation has no instance: kill_child requires a launched session".to_string()
+            Refusal::refused(
+                "generation has no instance: kill_child requires a launched session",
+            )
         })?;
         instance
             .kill_child(child_id, signum)
-            .map_err(|e| format!("instance kill_child failed: {e}"))?;
+            .map_err(|e| Refusal::from_core("instance kill_child failed", &e))?;
         Ok(serde_json::json!({}))
     }
 }
@@ -533,15 +553,61 @@ fn ok_response(data: serde_json::Value) -> ControlResponse {
         ok: true,
         data: Some(data),
         err: None,
+        code: None,
     }
 }
 
-fn err_response(err: &str) -> ControlResponse {
+/// A refused verb: the prose the caller has always seen, plus the **stable
+/// code** that names *why* it was refused (F19/SL-13).
+///
+/// A route-B slot is a separate process, so the native error type cannot
+/// survive the channel: before the code the worker received only
+/// ``{"ok": false, "err": "<prose>"}`` and had to ask the slot for `stats`
+/// and reverse-infer "the generation is over ⇒ rebuild" from `InstancePhase`.
+/// The code carries that same fact as data, so the worker branches on it and
+/// never reads the sentence. The message is unchanged, byte for byte.
+///
+/// Every `ok: false` this module writes carries a code — including the
+/// malformed-payload and unknown-verb paths (those are
+/// [`RefusalCode::VerbRefused`], a *Live* generation refusing for its own
+/// reason). An *uncoded* refusal therefore only ever comes from a wheel older
+/// than this one.
+struct Refusal {
+    code: RefusalCode,
+    message: String,
+}
+
+impl Refusal {
+    /// The generation is Live and refused the verb for a reason of its own:
+    /// an unknown child id, a child without a pty, a malformed or missing
+    /// payload field, a verb this generation cannot serve.
+    fn refused(message: impl Into<String>) -> Refusal {
+        Refusal {
+            code: RefusalCode::VerbRefused,
+            message: message.into(),
+        }
+    }
+
+    /// A failure out of the generation's instance. The code is the core
+    /// error's own classification when it has one (closed / dead / policy
+    /// ceiling) and the generic Live refusal otherwise; `what` is applied
+    /// verbatim, so the message stays exactly what it was before the code
+    /// existed.
+    fn from_core(what: &str, e: &sandlock_core::SandlockError) -> Refusal {
+        Refusal {
+            code: refusal_code(e).unwrap_or(RefusalCode::VerbRefused),
+            message: format!("{what}: {e}"),
+        }
+    }
+}
+
+fn err_response(refusal: &Refusal) -> ControlResponse {
     ControlResponse {
         v: 1,
         ok: false,
         data: None,
-        err: Some(err.to_string()),
+        err: Some(refusal.message.clone()),
+        code: Some(refusal.code.as_str().to_string()),
     }
 }
 
@@ -586,17 +652,17 @@ impl ControlHandler for Generation {
             }
             "run" => {
                 let resp = if !req.args.as_object().map(|o| o.is_empty()).unwrap_or(true) {
-                    err_response(
+                    err_response(&Refusal::refused(
                         "run takes no arguments in this fork stage: the generation's program \
                          is provisioned at slot start (--program)",
-                    )
+                    ))
                 } else {
                     match self.launch_first() {
                         Ok(()) => {
                             let pid = self.instance.as_ref().and_then(|i| i.pid());
                             ok_response(serde_json::json!({ "launched": true, "pid": pid }))
                         }
-                        Err(e) => err_response(&e),
+                        Err(e) => err_response(&Refusal::refused(e)),
                     }
                 };
                 let _ = write_response_frame(stream, &resp);
@@ -639,7 +705,7 @@ impl ControlHandler for Generation {
                 ServeOutcome::Shutdown
             }
             other => {
-                let resp = err_response(&format!("unknown verb: {other}"));
+                let resp = err_response(&Refusal::refused(format!("unknown verb: {other}")));
                 let _ = write_response_frame(stream, &resp);
                 ServeOutcome::Continue
             }

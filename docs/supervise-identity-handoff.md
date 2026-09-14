@@ -143,6 +143,19 @@ Instance-level verb surface (all served against the live `SandboxInstance`):
 | `wait_child` / `kill_child` | F3.2 per-child verbs by `child_id`: exit status round-trip / registered signal delivery |
 | `shutdown` | Ends the generation: response, then full §5.3 teardown, exit 0 |
 
+**Refusals carry a code, not just prose (F19/SL-13).** Every `ok: false` this
+serve loop writes — and every one the core serve loop writes — answers
+`{"ok": false, "err": "<prose>", "code": "<stable code>"}`. The code is one of
+`generation_closed` / `generation_dead` / `policy_denied` / `verb_refused`
+(`crates/sandlock-core/src/error.rs::RefusalCode`), and it exists so a worker
+never has to *infer* "the generation is over, rebuild" from `stats`
+`instance_state` or from the sentence. Only the first two mean "session
+gone"; the other two are a Live generation refusing for its own reason. The
+key is absent when the answering wheel predates it — treat that as unknown,
+never as one of the four. The Python face is
+`sandlock.exceptions.SlotRefusal.code`; the C face is the `code` key of the
+`sandlock_supervise_request` JSON.
+
 `--program <fd|PATH.json>` carries the generation's first-process argv
 (`{"argv": [...]}`), deliberately separate from the policy wire (the policy
 describes what the sandbox allows, not what it runs; env/cwd/workdir/user

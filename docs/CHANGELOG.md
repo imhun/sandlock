@@ -41,6 +41,56 @@
   `crates/sandlock-supervise/tests/mediation_2uid.rs` 与
   `crates/sandlock-core/tests/integration/test_instance_chroot.rs`。
 
+- **拒绝带类型化 code（F19/SL-13，2026-09-14）**：`sandlock-supervise` 拒绝一个 verb
+  时，除了原有的 `err` 文案，还回一个**稳定的机器可读 code**，宿主不必再靠「反查状态
+  机」推断。
+
+  **为什么**：route-B 槽位是独立进程，native 异常类型过不了控制通道，于是
+  `{"ok": false, "err": "<文案>"}` 是 worker 能拿到的全部。E2B 的 SL-12 修复要在
+  「generation 已结束 ⇒ 重建一次」上做决定，却没有类型可看——只能 `stats` 取
+  `InstancePhase` 反推（`Exited/ShutDown/Draining ⇒ closed`；`Dead/无答复/
+  launched:false ⇒ dead`）。那是**推断**：多一次往返、多一处与 fork 内部状态机的
+  隐式耦合，且「文案」永远不能作为判据（SL-12 之后文案带 core 的自由文本）。
+
+  **现在**：`ControlResponse` 增量一个可选字段 `code`（`skip_serializing_if`，老
+  server 不写、老 client 忽略），取值是固定的四个字符串（
+  `sandlock-core/src/error.rs::RefusalCode`）：
+
+  | code | 含义 | 宿主应做 |
+  |---|---|---|
+  | `generation_closed` | 会话已关闭（`shutdown` 完成，或 main 退出后 init 收拢、控制通道关闭） | 视作「会话结束」：换一个新的 |
+  | `generation_dead` | 会话机器坏了（请求超时 / `sandlock-init` 意外终止 / 通道致命错误） | 同上，且与 closed 区分开 |
+  | `policy_denied` | **Live** 会话拒绝了超上限的 per-exec 参数（EPERM） | 原样上抛，**不得**重建 |
+  | `verb_refused` | **Live** 会话因其它原因拒绝（未知 child、无 pty、报文缺字段、该代不支持该 verb、未知 verb） | 原样上抛，**不得**重建 |
+
+  取值只由 core 的错误分类决定（`InstanceClosed` / `InstanceDead` /
+  `PolicyTooWide`；其余一律 `verb_refused`），**文案一个字节都没改**——本轮只加字段。
+  `sandlock-supervise` 写出的每个 `ok:false` 都带 code；**没有 code 的 `ok:false`
+  只可能来自更老的 wheel**（见下）。
+
+  **覆盖到 Python / FFI 面**：`sandlock_supervise_request` 返回的就是整个
+  `ControlResponse` JSON（`err`/`err_msg` 出参约定不变，ABI 无新增符号），所以 code
+  自动随帧到达 Python；`sandlock.exceptions` 新增 `SlotRefusal(SandboxError)`，带
+  `.code`（`sandlock/supervise.py` 在 `ok:false` 时抛它，`SandboxError` 既有捕获照旧
+  生效）。cbindgen 头 `crates/sandlock-ffi/include/sandlock.h` 的
+  `sandlock_supervise_request` 文档同步写明字段与四个取值。
+
+  **向后兼容 / 升级形态（必须同批）**：envd 与 `sandlock-supervise` 由**同一个 wheel**
+  出厂（`sandlock/bin/sandlock-supervise`），唯一支持的形态是**同批升级**。若真的混搭：
+  ① 新 worker + 老槽位 ⇒ 帧里没有 `code`，worker 读到 `None`；② 老 `.so` + 新槽位
+  ⇒ FFI 把响应 parse 成 `ControlResponse` 再序列化，老 `.so` 的字段集里没有 `code`，
+  同样丢成 `None`。两种形态下 E2B 侧一律**不猜**（`None` 不是那四个值之一），拒绝
+  原样上抛：症状是**可见的失败**，不是静默误判或错误重建。**不支持**「按文案子串
+  兜底回推」——那正是本轮要拆掉的东西（SL-12 已证明文案不可作为判据）。
+
+  测试：fork `core_lib` 840→843（+3：code 字符串与 serde 形态、三类错误到 code 的
+  映射、`ControlResponse` 带 code 的帧往返与老帧解析）、`supervise` 42→43（+1：真
+  崩塌的 generation 上 `exec`/`wait_child` 回 `generation_closed` 而 `ok:true` 不带
+  code，未知 verb 回 `verb_refused`；既有 S9 用例补 `policy_denied` 断言）、`python`
+  464→465（+1：`SlotRefusal.code` 走真槽位）。E2B 侧 `envd_service/executors/
+  sandlock.py` 改为按 code 分支并删掉 `stats`/`InstancePhase` 反推（新增单测 6 条、
+  contract 3 条改动 + 1 条新增）。
+
 - **B1 fix round 1（2026-09-11，SL-12 评审）**：四条修正，两条是安全相关的。
   ① **缺符号不再静默**：新的 Python 包配上旧的 `libsandlock_ffi.so`（源码树
   `target/` 陈旧、部分升级、wheel 与库路径混搭）以前会在 `import sandlock`

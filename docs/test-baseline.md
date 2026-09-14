@@ -49,7 +49,15 @@
 # and core_integ (534 -> 539) move, by the A1/A2 test cases registered below;
 # ffi / cli / supervise / supervise_cost / cli_build / python / oci /
 # supervise_root / mediation_2uid are unchanged.
-core_lib = 840 # B3 (2026-09-11, SL-1 hard delete): 846 -> 840, -6 unit tests
+core_lib = 843 # F19/SL-13 (2026-09-14): 840 -> 843, +3 unit tests — the
+               # refusal code's stable wire strings + serde form, the
+               # closed/dead/policy-to-code mapping in error.rs
+               # (only_the_classified_runtime_errors_carry_a_refusal_code,
+               # refusal_codes_are_the_stable_wire_strings), and the
+               # ControlResponse frame round-trip with/without `code`
+               # (control.rs: refusal_code_rides_the_response_frame_without_
+               # breaking_the_old_shape).
+               # B3 (2026-09-11, SL-1 hard delete): 846 -> 840, -6 unit tests
                # removed with the privileged-mediator downgrade tier:
                # sandbox/tests.rs (-3: the MediationRunAs parse /
                # default / serde round-trip cases) and profile.rs (-3: the
@@ -376,7 +384,15 @@ cli = 97      # B3 (2026-09-11, SL-1 hard delete): 100 -> 97, -3 with the
               # after F0.4 wiring (cli suite includes net_bind_map tests);
               # F5.1 updates the no-supervisor default validation to
               # DEFAULT_MAX_PROCESSES (256), no count change
-supervise = 42 # B3 (2026-09-11, SL-1 hard delete): 43 -> 42, -1 lib unit
+supervise = 43 # F19/SL-13 (2026-09-14): 42 -> 43, +1 integration
+               # (test_supervise_refusal_carries_the_generation_closed_code:
+               # a generation whose M0 main exits collapses to `Exited` and
+               # every later verb answers the unified closed-instance prose
+               # **plus** code `generation_closed`; `wait_child` carries it
+               # too, an unknown verb answers `verb_refused`, and `ok:true`
+               # carries no code at all). The existing S9 case additionally
+               # pins `policy_denied` on the ceiling refusal.
+               # B3 (2026-09-11, SL-1 hard delete): 43 -> 42, -1 lib unit
                # (policy::tests::mediation_run_as_rejects_unknown_wire_value
                # went with the wire field; the field-list drift guard and the
                # full-field round-trip doc both lost the entry, same count).
@@ -547,7 +563,13 @@ oci = 150     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root.
               # 56 lib + 68 bin + 15 integration.rs + 2 reaper + 3 process
               # groups = 144).
 cli_build = 0 # workspace release build gate (no test binaries; 0 = build passed)
-python = 464  # B3 (2026-09-11, SL-1 hard delete): 467 -> 464, -3 in
+python = 465  # F19/SL-13 (2026-09-14): 464 -> 465, +1 in
+              # tests/test_supervise_channel.py
+              # (test_a_served_refusal_is_typed_and_carries_its_stable_code:
+              # a real slot's served `ok:false` surfaces as SlotRefusal with
+              # `code` = policy_denied / verb_refused, and an uncoded answer
+              # stays None rather than being guessed from the prose).
+              # B3 (2026-09-11, SL-1 hard delete): 467 -> 464, -3 in
               # tests/test_sandbox_config.py (the whole TestMediationRunAs
               # class: default / native round-trip / invalid-value cases).
               # tests/test_failure_reason.py keeps its count (only the pinned

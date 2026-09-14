@@ -101,3 +101,45 @@ class InstanceDeadError(RuntimeError):
     """
 
     pass
+
+
+class SlotRefusal(SandboxError):
+    """A ``sandlock-supervise`` slot answered ``ok: false`` for a verb.
+
+    This is the *served* refusal of route B: the slot process is a separate
+    process, so the native exception types (:class:`InstanceClosedError` /
+    :class:`InstanceDeadError`) cannot survive the channel — the frame
+    carries prose plus a **stable code** instead, and this class is that pair
+    on the Python side.
+
+    :attr:`code` is one of the fork's ``RefusalCode`` wire strings
+    (``sandlock-core/src/error.rs``), or ``None`` when the answer came from a
+    wheel older than the one that introduced the field::
+
+        generation_closed   the session is closed (shutdown, or the init
+                            channel closed after the main-exit container end)
+        generation_dead     the session machinery failed (listener / reaper /
+                            control-channel failure)
+        policy_denied       a Live session refused a request wider than the
+                            instance-time policy ceiling (EPERM)
+        verb_refused        a Live session refused for any other reason
+
+    A host must branch on :attr:`code`, never on the message: the message
+    carries the core's own free text (a refusal's remedy, a confinement
+    errno), so substring matching it is unsound. ``None`` means "cannot tell
+    from this answer" — it is *not* a synonym for any of the four values.
+
+    A :class:`SandboxError` subclass, so every existing handler that catches
+    ``SandboxError`` / ``SandlockError`` keeps working unchanged.
+    """
+
+    #: The four stable wires values, for callers that would rather not spell
+    #: them out (``sandlock-core/src/error.rs::RefusalCode``).
+    GENERATION_CLOSED = "generation_closed"
+    GENERATION_DEAD = "generation_dead"
+    POLICY_DENIED = "policy_denied"
+    VERB_REFUSED = "verb_refused"
+
+    def __init__(self, message: str, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code

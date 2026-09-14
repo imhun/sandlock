@@ -134,6 +134,94 @@ pub enum SandboxRuntimeError {
     Io(#[from] std::io::Error),
 }
 
+/// Stable, machine-readable *why* a verb was refused by a session
+/// (route-B F19 / SL-13).
+///
+/// A refusal has always carried its prose (`SandboxRuntimeError`'s message,
+/// unchanged); the code is the same fact in a form a host may branch on
+/// without parsing that prose. It exists because a route-B slot is a
+/// *separate process*: `sandlock-supervise` answers a refused verb over the
+/// control channel, where the native error type cannot survive, so before
+/// this code the worker had to ask the slot what state its generation was in
+/// and reverse-infer "rebuild or not" from `stats`. The code removes that
+/// inference.
+///
+/// The string values are part of the wire contract with the E2B worker
+/// (`envd_service/executors/sandlock.py`, `envd_service/route_b.py`) and with
+/// `sandlock.exceptions`; the fork-side test
+/// `refusal_codes_are_the_stable_wire_strings` pins them.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalCode {
+    /// The session is closed: `shutdown` completed, or the init channel
+    /// closed after the main-exit container collapse. The session is never
+    /// silently relaunched; a host's recovery is a fresh one.
+    GenerationClosed,
+    /// The session machinery failed (request deadline, unexpected
+    /// `sandlock-init` termination, fatal channel error). Distinct from
+    /// [`RefusalCode::GenerationClosed`] (a *clean* end) exactly like the
+    /// two error variants; a host's recovery is again a fresh session.
+    GenerationDead,
+    /// A **Live** session refused the verb for its own reason: the request
+    /// was wider than the instance-time policy ceiling (EPERM). The session
+    /// is healthy; no recovery applies and the refusal must reach the caller
+    /// unchanged.
+    PolicyDenied,
+    /// A **Live** session refused the verb for a reason that is neither a
+    /// gone generation nor a policy ceiling (an unknown child id, a child
+    /// with no pty, a malformed verb payload, a verb this generation cannot
+    /// serve). Same treatment as [`RefusalCode::PolicyDenied`].
+    VerbRefused,
+}
+
+impl RefusalCode {
+    /// The stable wire string (see the enum doc for the contract).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RefusalCode::GenerationClosed => "generation_closed",
+            RefusalCode::GenerationDead => "generation_dead",
+            RefusalCode::PolicyDenied => "policy_denied",
+            RefusalCode::VerbRefused => "verb_refused",
+        }
+    }
+}
+
+impl std::fmt::Display for RefusalCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl SandboxRuntimeError {
+    /// The refusal code this failure maps to, or `None` when it is not a
+    /// verb refusal at all (a build/fork/confinement failure, an io error).
+    ///
+    /// `None` is deliberately not [`RefusalCode::VerbRefused`]: the caller
+    /// that answers a *served* verb knows it is answering a refusal and picks
+    /// the catch-all itself, while a failure that never reached a session has
+    /// no refusal to describe.
+    pub fn refusal_code(&self) -> Option<RefusalCode> {
+        match self {
+            SandboxRuntimeError::InstanceClosed => Some(RefusalCode::GenerationClosed),
+            SandboxRuntimeError::InstanceDead => Some(RefusalCode::GenerationDead),
+            SandboxRuntimeError::PolicyTooWide { .. } => Some(RefusalCode::PolicyDenied),
+            _ => None,
+        }
+    }
+}
+
+/// The refusal code of a top-level sandlock error, or `None` when the error
+/// is not a session verb refusal (see
+/// [`SandboxRuntimeError::refusal_code`]).
+pub fn refusal_code(err: &SandlockError) -> Option<RefusalCode> {
+    match err {
+        SandlockError::Runtime(runtime) => runtime.refusal_code(),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ConfinementError {
     #[error("landlock unavailable: {0}")]
@@ -210,3 +298,63 @@ pub enum BranchError {
 
 /// Convenience type alias.
 pub type Result<T> = std::result::Result<T, SandlockError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The refusal-code strings are a wire contract with the E2B worker
+    /// (``envd_service/executors/sandlock.py`` branches on them) and with
+    /// ``sandlock.exceptions``. Pinned verbatim so a rename cannot land
+    /// silently; the serde form must be the same string.
+    #[test]
+    fn refusal_codes_are_the_stable_wire_strings() {
+        assert_eq!(RefusalCode::GenerationClosed.as_str(), "generation_closed");
+        assert_eq!(RefusalCode::GenerationDead.as_str(), "generation_dead");
+        assert_eq!(RefusalCode::PolicyDenied.as_str(), "policy_denied");
+        assert_eq!(RefusalCode::VerbRefused.as_str(), "verb_refused");
+        assert_eq!(
+            serde_json::to_string(&RefusalCode::GenerationClosed).expect("serialize code"),
+            "\"generation_closed\""
+        );
+        assert_eq!(
+            serde_json::from_str::<RefusalCode>("\"generation_dead\"").expect("parse code"),
+            RefusalCode::GenerationDead
+        );
+    }
+
+    /// The three session-gone / policy classes map to their code; every other
+    /// failure (a build, a fork, an io error, an unknown child id) maps to
+    /// ``None`` so the caller picks the catch-all only where it *is* answering
+    /// a refused verb.
+    #[test]
+    fn only_the_classified_runtime_errors_carry_a_refusal_code() {
+        assert_eq!(
+            SandboxRuntimeError::InstanceClosed.refusal_code(),
+            Some(RefusalCode::GenerationClosed)
+        );
+        assert_eq!(
+            SandboxRuntimeError::InstanceDead.refusal_code(),
+            Some(RefusalCode::GenerationDead)
+        );
+        assert_eq!(
+            SandboxRuntimeError::PolicyTooWide {
+                field: "bind_ports",
+                value: "65000".to_string(),
+            }
+            .refusal_code(),
+            Some(RefusalCode::PolicyDenied)
+        );
+        assert_eq!(SandboxRuntimeError::NotRunning.refusal_code(), None);
+        assert_eq!(SandboxRuntimeError::UnknownChild(7).refusal_code(), None);
+        assert_eq!(SandboxRuntimeError::NoPtyMaster(7).refusal_code(), None);
+        assert_eq!(
+            refusal_code(&SandlockError::Runtime(SandboxRuntimeError::InstanceClosed)),
+            Some(RefusalCode::GenerationClosed)
+        );
+        assert_eq!(
+            refusal_code(&SandlockError::MemoryProtect("nope".to_string())),
+            None
+        );
+    }
+}

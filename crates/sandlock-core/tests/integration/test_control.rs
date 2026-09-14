@@ -1441,6 +1441,7 @@ impl ControlHandler for ProbeHandler {
                     ok: true,
                     data: Some(serde_json::json!({"pong": true})),
                     err: None,
+                    code: None,
                 };
                 let _ = write_response_frame(stream, &resp);
                 ServeOutcome::Continue
@@ -1451,6 +1452,7 @@ impl ControlHandler for ProbeHandler {
                     ok: true,
                     data: None,
                     err: None,
+                    code: None,
                 };
                 let _ = write_response_frame(stream, &resp);
                 ServeOutcome::Shutdown
@@ -1461,6 +1463,7 @@ impl ControlHandler for ProbeHandler {
                     ok: false,
                     data: None,
                     err: Some(format!("unknown verb: {other}")),
+                    code: None,
                 };
                 let _ = write_response_frame(stream, &resp);
                 ServeOutcome::Continue

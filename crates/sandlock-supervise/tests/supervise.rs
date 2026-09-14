@@ -1045,6 +1045,14 @@ fn test_supervise_fd_serve_launches_instance_and_serves_instance_verbs() {
         ),
         "cross-process S9 refusal must be pinned in full: {resp:?}"
     );
+    // F19/SL-13: the same refusal is machine-readable -- a *Live* session
+    // refusing a wider-than-ceiling grant is `policy_denied`, never a
+    // generation-gone code (the worker must not rebuild on it).
+    assert_eq!(
+        resp["code"].as_str(),
+        Some("policy_denied"),
+        "the S9 ceiling refusal must carry the policy_denied code: {resp:?}"
+    );
 
     // update_network verb (F4.3): the main workload (child id 0) is still
     // running under the pre-update policy, so the verb reports it stale;
@@ -1787,4 +1795,130 @@ fn test_validate_exit_mode_refuses_unreadable_program() {
 /// Process-liveness probe used for post-shutdown residue assertions.
 fn process_alive(pid: i32) -> bool {
     (unsafe { libc::kill(pid, 0) }) == 0
+}
+
+/// F19/SL-13: a refused verb carries a **stable code** beside its prose.
+///
+/// The generation is a container: when its M0 main exits, `sandlock-init`
+/// collapses every group and the *slot keeps serving*, answering every later
+/// verb with the unified closed-instance refusal. That refusal used to cross
+/// the channel as prose alone, so the E2B worker had to ask the slot for
+/// `stats` and reverse-infer "the generation is over ⇒ rebuild" from
+/// `InstancePhase` (SL-12). Pinning the code here is what makes that
+/// inference droppable: the worker can branch on `code` and never read the
+/// sentence.
+#[test]
+fn test_supervise_refusal_carries_the_generation_closed_code() {
+    isolate_ctl_root();
+    let workdir = repo_tmp_dir().join(format!("supervise-closed-code-{}", std::process::id()));
+    std::fs::create_dir_all(&workdir).expect("create closed-code workdir");
+    let policy = write_policy(
+        "closed-code",
+        &instance_policy(workdir.to_str().expect("workdir utf8")),
+    );
+    // A main that leaves at once: the container's natural end. The *slot*
+    // is untouched by it -- that is the shape under test.
+    let program = write_policy("closed-code-program", r#"{ "argv": ["/bin/true"] }"#);
+
+    let (child, mut worker, _inode) =
+        spawn_serve_supervisor_with_program(&policy, &program, &[]);
+
+    // Wait for the collapse to be observable, and assert the phase is the
+    // clean one (`Exited`), not `Dead`: the two forms must not be conflated
+    // by the code they produce.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut state = String::new();
+    while Instant::now() < deadline {
+        let resp = roundtrip_frame(
+            &mut worker,
+            &serde_json::json!({ "v": 1, "verb": "stats", "args": {} }),
+        );
+        assert_eq!(resp["ok"], serde_json::Value::Bool(true), "stats: {resp:?}");
+        state = resp["data"]["instance_state"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if state == "Exited" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        state, "Exited",
+        "the killed-main generation must settle to the clean Exited phase"
+    );
+
+    // The refused verb, byte for byte what the worker has always received,
+    // plus the code that says *why* without reading that sentence.
+    let (_host_stdin, _host_stdout, _host_stderr, child_ends) = make_exec_stdio();
+    let resp = roundtrip_frame_with_fds(
+        &mut worker,
+        &serde_json::json!({
+            "v": 1,
+            "verb": "exec",
+            "args": { "argv": ["/bin/true"] },
+        }),
+        &child_ends,
+    );
+    for fd in child_ends {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+    assert_eq!(
+        resp["ok"],
+        serde_json::Value::Bool(false),
+        "a collapsed generation must refuse the verb: {resp:?}"
+    );
+    assert_eq!(
+        resp["err"].as_str(),
+        Some(
+            "instance exec failed: process error: instance is closed (shut down, or the init channel closed after the main-exit container end); no new work is accepted"
+        ),
+        "the closed refusal's prose must stay byte-identical: {resp:?}"
+    );
+    assert_eq!(
+        resp["code"].as_str(),
+        Some("generation_closed"),
+        "the collapsed generation's refusal must carry generation_closed: {resp:?}"
+    );
+
+    // Every verb of that generation answers the same way -- the code is a
+    // property of the generation, not of the `exec` handler.
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "wait_child", "args": { "child_id": 3 } }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(false), "{resp:?}");
+    assert_eq!(resp["code"].as_str(), Some("generation_closed"), "{resp:?}");
+
+    // A *Live* generation's refusal is a different code again: an unknown
+    // verb is the generation refusing for its own reason, i.e. verb_refused.
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "map-uid", "args": {} }),
+    );
+    assert_eq!(
+        resp["err"].as_str(),
+        Some("unknown verb: map-uid"),
+        "{resp:?}"
+    );
+    assert_eq!(resp["code"].as_str(), Some("verb_refused"), "{resp:?}");
+
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "shutdown", "args": {} }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "shutdown: {resp:?}");
+    // A clean answer carries no code at all (the field is for refusals).
+    assert_eq!(resp.get("code"), None, "an ok response must not carry a code: {resp:?}");
+    let out = child.wait_with_output().expect("wait closed-code supervise");
+    assert!(
+        out.status.success(),
+        "the generation must still end cleanly; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_file(&policy);
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_dir_all(&workdir);
 }

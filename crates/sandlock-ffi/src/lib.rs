@@ -4030,11 +4030,19 @@ pub unsafe extern "C" fn sandlock_supervise_set_timeout(
 /// persistent session stream (F17). Either way the call attaches the channel
 /// token, hands over `n_fds` descriptors (empty for every verb but `exec`,
 /// which needs exactly three), and returns the serialized `ControlResponse`
-/// JSON (`{"v":1,"ok":...,"data":...,"err":...}`) as a C string the caller
-/// frees with [`sandlock_string_free`]. A refused connect, transport error or
-/// unparseable `args_json` sets `*err` to -1 and `*err_msg`; an `ok:false`
-/// server response still returns JSON with `*err` 0 -- the caller inspects
-/// `ok`.
+/// JSON (`{"v":1,"ok":...,"data":...,"err":...,"code":...}`) as a C string
+/// the caller frees with [`sandlock_string_free`]. A refused connect,
+/// transport error or unparseable `args_json` sets `*err` to -1 and
+/// `*err_msg`; an `ok:false` server response still returns JSON with `*err`
+/// 0 -- the caller inspects `ok`.
+///
+/// F19/SL-13: an `ok:false` response carries a stable machine-readable
+/// `code` next to its prose, so a worker can act on a refusal without
+/// parsing `err`. The values are `generation_closed`, `generation_dead`,
+/// `policy_denied` and `verb_refused` (`sandlock_core::error::RefusalCode`;
+/// the E2B worker branches on them). The key is absent when the slot is
+/// older than the field -- treat that as "code unknown", never as one of the
+/// four values.
 ///
 /// # Safety
 /// `h` must be a valid handle from a `sandlock_supervise_connect*` call;
