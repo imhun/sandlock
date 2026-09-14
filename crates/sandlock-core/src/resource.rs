@@ -380,6 +380,24 @@ fn detach_traced(tid: i32) {
     let _ = unsafe { libc::ptrace(libc::PTRACE_DETACH, tid, 0, 0) };
 }
 
+/// Detach a traced task *and* hand it a signal to take with it.
+///
+/// `PTRACE_DETACH` delivers `data` to the tracee as it leaves the ptrace stop,
+/// so a job-control stop that landed while we held the task is *re-armed*
+/// instead of being discarded (a bare detach, or a `PTRACE_CONT` that
+/// re-injects the stop, lets the kernel treat the stop as consumed and the
+/// task resumes: the host's `SIGSTOP` then silently does nothing).
+fn detach_traced_with_signal(tid: i32, signum: i32) {
+    let _ = unsafe {
+        libc::ptrace(
+            libc::PTRACE_DETACH as libc::c_uint,
+            tid,
+            0,
+            signum as libc::c_ulong,
+        )
+    };
+}
+
 fn wait_for_ptrace_stop(tid: i32) -> io::Result<libc::c_int> {
     let mut status: libc::c_int = 0;
     loop {
@@ -471,6 +489,32 @@ fn run_creation_event_loop(caller_tid: i32, ctx: &Arc<SupervisorCtx>) -> io::Res
             // `finish`'s watchdog fired: the fork-like syscall created no child
             // (it returned without a fork event, e.g. EAGAIN/ENOMEM). Swallow
             // the wake signal — the worker detaches the tracee next.
+            return Ok(false);
+        }
+
+        // A job-control stop is not ours to swallow. SIGSTOP reaches a traced
+        // task as a stop *event* -- a signal-delivery-stop, or
+        // `PTRACE_EVENT_STOP` carrying `WSTOPSIG == SIGSTOP` once it is a group
+        // stop -- and re-injecting it with `PTRACE_CONT` turns it into a ptrace
+        // stop the tracee discards: it resumes, the stop is gone, and the
+        // sender's SIGSTOP did nothing.
+        // That is how an external pause (envd `pause_all`'s
+        // `killpg(..., SIGSTOP)`, route-B `kill_child` with SIGSTOP) silently
+        // failed to freeze a sandbox command whose own fork loop kept opening
+        // this window. Detach *with* the stop signal so the kernel re-delivers
+        // it to the now-untraced task: the stop then sticks as a real
+        // job-control stop (`/proc/<pid>/stat` shows `T`, no tracer). The
+        // fork-like syscall this window tracked has not run yet, so the window
+        // ends as "no child"; the fork completes untracked when the sandbox is
+        // resumed with SIGCONT, exactly as it would for any process stopped
+        // inside a syscall.
+        // The stop signal is the discriminator, not the event code: a group
+        // stop reports `PTRACE_EVENT_STOP` with `WSTOPSIG == SIGSTOP`, while a
+        // group stop *resumed* by the host's SIGCONT reports
+        // `PTRACE_EVENT_STOP` with `WSTOPSIG == SIGCONT` -- that one must be
+        // left alone so the thaw still thaws.
+        if stopsig == libc::SIGSTOP {
+            detach_traced_with_signal(caller_tid, libc::SIGSTOP);
             return Ok(false);
         }
 
@@ -1273,6 +1317,100 @@ mod tests {
         assert_eq!(waited, caller, "wait caller");
         assert_eq!(flags.read(FORK_FAILED), 0, "fork in caller failed");
         caller_guard.disarm();
+    }
+
+    /// A job-control stop that lands inside the fork-tracking window must be
+    /// handed back to the kernel, not swallowed by the window.
+    ///
+    /// A host-side pause delivers `SIGSTOP` (`envd`'s `pause_all` does
+    /// `killpg(getpgid(pid), SIGSTOP)`, route B's `kill_child` delivers the
+    /// same number) and the tests prove the freeze by the kernel's own `T`
+    /// state. While this window holds the task, the stop arrives as a ptrace
+    /// stop: re-injecting it with `PTRACE_CONT` lets the tracee resume with the
+    /// stop *discarded*, so the pause silently did nothing and the child kept
+    /// running (`test_pause_resume_sandlock_multinode.py` "no exec child
+    /// reached the kernel's stopped state", `test_route_b_executor.py` "child
+    /// pid N was not stopped by SIGSTOP"). The window must instead detach with
+    /// `SIGSTOP`, which re-arms the stop on the now-untraced task.
+    ///
+    /// Deterministic: the caller never forks (so no fork event can race the
+    /// stop in), the window is confirmed open, and the assertion is the
+    /// kernel's own state -- `T` with no tracer -- exactly what the contract
+    /// tests demand.
+    #[test]
+    fn sigstop_inside_the_fork_tracking_window_ends_as_a_real_stop() {
+        let mut caller = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("spawn a caller that will not fork");
+        let tid = caller.id() as i32;
+        let ctx = fake_supervisor_ctx(true);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        let trace = match rt.block_on(prepare_process_creation_tracking(&ctx, tid)) {
+            Ok(trace) => trace,
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EPERM | libc::EACCES)) => {
+                eprintln!("skipping ptrace fork-event test: ptrace denied: {e}");
+                let _ = unsafe { libc::kill(tid, libc::SIGKILL) };
+                let _ = caller.wait();
+                return;
+            }
+            Err(e) => panic!("prepare process-creation tracking: {e}"),
+        };
+
+        // The host's pause, delivered while this window is open.
+        assert_eq!(unsafe { libc::kill(tid, libc::SIGSTOP) }, 0, "send SIGSTOP");
+
+        // The window must close *on the stop*, immediately: the mutant that
+        // re-injected the stop with PTRACE_CONT instead lingers until the
+        // failed-fork watchdog (2 s) and can leave the task resumed.
+        let started = std::time::Instant::now();
+        let finished = rt.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                finish_process_creation_tracking(trace),
+            )
+            .await
+        });
+        let elapsed = started.elapsed();
+        let created = finished
+            .expect("the tracking window must close instead of ping-ponging on the stop")
+            .expect("finish process-creation tracking");
+        assert!(
+            !created,
+            "the tracked syscall was stopped before it forked: no child exists"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "a job-control stop must end the window at once, not after the \
+             failed-fork watchdog (took {elapsed:?})"
+        );
+
+        let status = std::fs::read_to_string(format!("/proc/{tid}/status"))
+            .expect("caller status");
+        let state = status
+            .lines()
+            .find(|line| line.starts_with("State:"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|word| word.chars().next());
+        let tracer = status
+            .lines()
+            .find(|line| line.starts_with("TracerPid:"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("<missing>");
+        assert_eq!(
+            state,
+            Some('T'),
+            "the SIGSTOP must stick as a job-control stop (state {state:?}, tracer {tracer})"
+        );
+        assert_eq!(tracer, "0", "the window must leave no tracer behind");
+
+        let _ = unsafe { libc::kill(tid, libc::SIGKILL) };
+        let _ = caller.wait();
     }
 
     /// A counted child's proc_count release fires exactly once no matter how
