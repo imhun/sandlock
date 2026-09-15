@@ -6783,8 +6783,26 @@ mod tests {
             "the default base must carry NO pid component, got {}",
             chosen_base.display(),
         );
+        // FUP-27: compare digit *tokens* of the base name, not a substring of
+        // the whole path. The default base is either `sandlock-cow` (XDG) or
+        // the tmp fallback `sandlock-cow-<uid>`, and the gate runs as uid
+        // 65534 — whose decimal spelling contains the digits of pids like 34,
+        // 53 and 55, so a *correct* base failed that substring check whenever
+        // the test process happened to draw such a pid (measured on the
+        // pre-change tip: 1/30 and 2/24, tmp/f26-f27-preexisting-*.log). The
+        // intent — `create(None)` must not put the pid back into the base name
+        // (e.g. `sandlock-cow-<pid>`) — is preserved, and the base *equality*
+        // assertion above still catches that revert directly.
+        let embedded_pid_token = chosen_base
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|name| {
+                name.split(|c: char| !c.is_ascii_digit())
+                    .any(|token| token == pid)
+            })
+            .unwrap_or(false);
         assert!(
-            !chosen_base.to_string_lossy().contains(&pid),
+            !embedded_pid_token,
             "the default base name must not embed the pid, got {}",
             chosen_base.display(),
         );
