@@ -8,6 +8,41 @@
 
 ## 行为变化（升级 / 接线前必读）
 
+- **`openat2(RESOLVE_IN_ROOT)` 的 `EAGAIN` 现在有界重试；exec 失败不再被改写成「文件不存在」
+  （FUP-26，2026-09-15）**：当内核无法**证明**某个 `..` 组件没有逃出 root 时（竞态或潜在
+  攻击；openat2(2) 原文：「The caller may choose to retry the openat2() call.」），它返回
+  **`EAGAIN`**，而不是「这个路径不存在」。fork 以前把它当硬失败，且 chroot executor 打开
+  待执行二进制与它的 `PT_INTERP` 两处把**任何**失败一律映射成 `Errno(ENOENT)` ⇒ 子进程
+  `execvp` 拿到 ENOENT、`sandlock-init` 走 `_exit(127)`，**一个字都不输出**。Debian/Ubuntu
+  镜像的动态链接器路径恰好就是这种 `..` 软链
+  （`/lib64/ld-linux-x86-64.so.2 -> ../lib/x86_64-linux-gnu/ld-linux-x86-64.so.2`），所以
+  **任何动态链接的 workload（bash、python、沙箱内 gateway…）都会周期性踩到**：实测同一
+  受管 lookup 形态（真实镜像 rootfs，等价竞态负载下）**343 / 97482** 次失败，其中
+  300 条 `exec` 里 **44 条**是「exit 127 + 空 stderr」。
+  现在：① `crates/sandlock-core/src/sys/fs.rs::openat2_in_root[_with_resolve]` 对 `EAGAIN`
+  有界重试（首次 + 4 次，`EAGAIN_RETRY_BUDGET`）—— 有界是刻意的：竞态在重命名/挂载操作
+  完成后立即收敛，但**重试方可以是沙箱内的敌意负载**，无界重试等于让它把中介钉死在单线程
+  dispatch 里；② 额度用尽后**原样返回 `EAGAIN`**（仍然可重试），绝不改写成 `ENOENT`；
+  ③ exec 路径（二进制 + `PT_INTERP`）把内核 errno 原样透传，与 chdir 路径一直以来的行为
+  对齐；④ `sandlock-init` 在 `execvp` 失败且 errno **不是 `ENOENT`** 时，先往子进程 stderr
+  写一行 `sandlock-init: exec "<argv0>" failed (errno N)` 再退 127；`ENOENT` **保持静默**
+  （POSIX「命令不存在」形态，E2B 契约把它钉成「127 + 无输出」）。
+  修后同一形态端到端：**0 / 97482** 受管 open 失败、**0 / 300** 条命令 127；同一次运行里
+  内核侧的原始 `EAGAIN` 仍有 **284916 / 1916861** 次（即「打点归零」来自重试，不是来自
+  内核不再报）。RED→GREEN：`sys/fs.rs` 4 条确定性单测用测试专用故障注入让产品函数收到
+  注入的 `EAGAIN`（注入 2 次 ⇒ 第 3 次成功，计数精确；永久 `EAGAIN` ⇒ 恰好 1+4 次后返回
+  `EAGAIN`；`ENOENT` ⇒ 1 次尝试）；变异（预算改 0）必红。core_integ +2：
+  `test_exec_through_a_dotdot_relative_symlink_resolves`、
+  `test_exec_failure_names_the_kernel_errno_instead_of_exiting_127_silently`（ELOOP=40 现
+  在出现在子进程 stderr 上；旧代码下该断言确定红）。
+  **升级后果**：退出码语义不变（125/126/127 仍是 setup/exec 失败码）；只是「127 且 stderr
+  为空」不再掩盖 EACCES/ELOOP/EAGAIN 这类失败 —— 那些现场现在多一行可判原因。
+  同批两条**测试侧**修正：FUP-25（oci fd 计数用例的 baseline 采样竞态：探针发布 `r` 早于
+  `run_init` 建进程级 signalfd，负载下 baseline 少算 1；现在先做一次零 fd 的请求/应答往返
+  再采样，断言判据不变）与 FUP-27（core_lib 的 `list_preserved_default_base_spans_pids`
+  用「整条路径 substring」判 pid 是否进了 base 名，而 tmp 兜底名里带 uid 65534，pid 34/53/55…
+  会误判；现在只比较 base 名里的**数字 token**）。
+
 - **控制面请求以 `\n` 结尾才算一条；CLI 与 supervisor 必须同批升级（f1oci，
   2026-09-14）**：CLI↔supervisor 控制通道是「换行结尾 JSON」。修复前 supervisor 把
   **一次 `recvmsg` 读到的字节**当成整条请求，而 CLI 把 payload 与 `\n` **分两次

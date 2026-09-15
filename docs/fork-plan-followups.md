@@ -29,6 +29,53 @@
   或让探针的 `r` 在 `run_init` 建好进程级 fd 之后才发布。
   为什么留：是测试夹具的采样时机竞态、不在 FUP-24 范围（本次只做 `kill --all` 的兜底判据），
   且修法要先定「谁代表 fd 表已终态」这一观测边界，属独立小改动。
+  **已关闭（2026-09-15，FUP-26/25 批次）**：采样点改为「先拿到一次**请求/应答往返**再读
+  `/proc/<pid>/fd`」，断言判据**一字未放宽**。往返用的是一条**零 fd**、payload 不能解析的帧
+  （`{"req":…}` 解析失败 ⇒ init 回 `Err`）——它与 `Resp::Err` 的既有契约一致，且证明「服务循环
+  已在跑」＝「进程级 fd（signalfd）已建好」，于是 baseline 就是终态表；三处采样点全部改用它
+  （`test_eof_closes_received_fd`、`test_malformed_frames_do_not_leak_fds`，以及本轮门禁又暴露的
+  第三处 `exec_frames_deliver_their_own_output_and_leave_no_descriptor_behind`，它的红是同一签名
+  `baseline 5 -> now 6`，见 `tmp/f26-f25-loadprec-fixed-r04.log`）。
+  机制确定性证据（临时探针 harness，已随任务删除，副本 `tmp/f26/keep-f26_f25_probe.rs.txt`）：
+  把竞态窗口人为放宽 10 ms 后，**旧采样顺序** 50/50 次读到未终态 baseline（恒为 5，断言必红），
+  **新采样顺序** 50/50 次读到终态 baseline（恒为 6，断言必绿）；不放大窗口时 50/50 两边都读到 6
+  —— 与「无负载 9 轮全绿、8 核占用 10 轮 3 红」一致（`tmp/f26-f25-race-mechanism-r02.log`）。
+  负载回归：8 个 CPU 占用进程下 10 轮 **10/10 绿**，16 个下再 10 轮 **10/10 绿**
+  （`tmp/f26-f25-loadprec-fixed-r05.log` / `-r06.log`）。计数不变（oci 仍 157）。
+
+- **FUP-27 core_lib `list_preserved_default_base_spans_pids` 的 pid/uid 子串误判
+  （FUP-26 门禁中发现，2026-09-15）** — 来源：本轮非 root 门禁 `core_lib` 红
+  （`crates/sandlock-core/src/cow/seccomp.rs:6786`，`the default base name must not embed the
+  pid, got /tmp/sandlock-cow-65534`；`tmp/f26-gate-nonroot-r01.log` 的后续轮次）。
+  描述：该用例用「整条路径的 substring」判断 pid 是否进了 base 名，而 tmp 兜底名是
+  `sandlock-cow-<uid>`；门禁以 uid **65534** 跑，其十进制串本身就含有 34/53/55 等 pid 的数字，
+  于是**正确**的 base 名会被误判 —— 实测在**改动前的 tip**（把本批改动全部 stash 后重编译）
+  30 次里 1 次红（pid=34）、另一次 24 次里 2 次红（pid=53/55）：`tmp/f26-f27-preexisting-*.log`。
+  与 FUP-26/FUP-25 无关，但会让任何一次门禁随机变红（约 3–8%/轮）。
+  **已关闭（2026-09-15，FUP-26/25 批次）**：判据改为只比较 base 名里的**数字 token**
+  （`name.split(!is_ascii_digit)` 后与 pid 比较），语义仍是「base 名里不许有 pid token」，
+  而「`create(None)` 选到了 per-pid base」这条 revert 仍由它上面的 `chosen_base == expected_base`
+  等价断言与本条一起抓住。验证：修后 uid 65534 下 60 次 **0 红**（`tmp/f26-f27-fixed-r02.log`）；
+  变异证明：把 `tmp_storage_base` 改回 `sandlock-cow-<uid>-<pid>` ⇒ 每次必红
+  （`tmp/f26-f27-mutant-r03.log`）。计数不变（core_lib 仍 848）。
+
+- **FUP-28 e2b 侧「`..` 相对软链改写」可以撤掉的条件（跨仓 follow-up，2026-09-15）** —
+  来源：FUP-26（本批）在 fork 侧吃掉了这一切。
+  背景：`envd_service/runtime/image_resolver.py::_root_absolute_links` 会把镜像里带 `..` 的
+  相对软链改写为等价的 root-absolute 目标，用来绕开「`openat2(RESOLVE_IN_ROOT)` 的 `EAGAIN`
+  被当硬失败 ⇒ exit 127 + 空 stderr」。**本轮保留不动**（fork 修复必须先落地并随 wheel 上线）。
+  前提（撤之前必须全部满足）：① fork 侧 `EAGAIN` 有界重试已随 wheel 上线（`# HEAD=` 指向
+  含 FUP-26 的提交，且镜像内 `sandlock-supervise`/`libsandlock_ffi.so` 指纹与 manifest 一致）；
+  ② 目标平台的宿主内核在 `RESOLVE_IN_ROOT` + `..` 上确实会返回 `EAGAIN`（而不是只在我们
+  这台 orbstack 内核上）—— 即上线的**所有** worker 宿主都跑过 ③ 的验证；
+  ③ 验证方式（按宿主逐个跑，任何一次不为 0 就不要撤）：取一个**未改写**的镜像 rootfs
+  （对任意 entry 复制一份、把 `lib64/ld-linux-x86-64.so.2` 还原成 `../lib/x86_64-linux-gnu/…`），
+  在**等价竞态负载**下用产品路径打点：受管 open 连续 97482 次必须 0 失败、300 条
+  `exec /bin/echo` 必须 0 次「127 + 空 stderr」，同时内核侧原始 `EAGAIN` 必须 > 0（证明
+  重试真的在起作用）。本批的这条命令与数字见 `.superpowers/sdd/task-f26-report.md` §3。
+  撤掉后的回归网：`tests/unit/test_image_rootfs_links.py`（整树无 `..` 相对软链）与
+  `tests/unit/test_oci_registry.py` 的「chroot 内解析到同一 inode」钉子需要同步调整/删除，
+  这正是当初为了绕开本 bug 才加的那两条。
 
 - **FUP-24 `kill --all` 的兜底判据仍是「任何发送错误」而不是「连不上」（f1oci，
   2026-09-14）** — 来源：f1oci 对 oci `test_signal_to_sibling_pid_rejected` flake

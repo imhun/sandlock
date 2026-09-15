@@ -49,7 +49,26 @@
 # and core_integ (534 -> 539) move, by the A1/A2 test cases registered below;
 # ffi / cli / supervise / supervise_cost / cli_build / python / oci /
 # supervise_root / mediation_2uid are unchanged.
-core_lib = 844 # sigstop (2026-09-14, fork `1f113cf`): 843 -> 844, +1 unit test —
+core_lib = 848 # FUP-26 (2026-09-15): 844 -> 848, +4 unit tests in
+               # `sys/fs.rs::tests` pinning the bounded `EAGAIN` retry of
+               # `openat2(RESOLVE_IN_ROOT)` (openat2(2): the kernel could not
+               # prove a `..` did not escape — a race, and the caller "may
+               # choose to retry"): two injected `EAGAIN`s are absorbed and
+               # the third attempt returns the fd (exact attempt/EAGAIN
+               # counts); a permanent `EAGAIN` stops after the documented
+               # budget of 4 retries and is handed back as `EAGAIN` — never
+               # rewritten into `ENOENT`; a non-retryable errno (`ENOENT`) is
+               # returned after exactly one attempt; and the injected path
+               # still calls the kernel when nothing is injected. The seam is
+               # a thread-local test-only fault injection inside the product
+               # function, so the *product* retry loop, its budget and its
+               # errno classification are what the tests exercise (a real
+               # `EAGAIN` needs a racing rename on the walked path; the
+               # kernel-level rate is measured in tmp/f26-eagain-*.log).
+               # Evidence: tmp/f26-lib-redgreen-r03-green.log (848 passed),
+               # mutant (budget forced to 0) red in
+               # tmp/f26-lib-redgreen-r02-mutant.log.
+               # sigstop (2026-09-14, fork `1f113cf`): 843 -> 844, +1 unit test —
                # `resource.rs::tests::sigstop_inside_the_fork_tracking_window_
                # ends_as_a_real_stop` (the job-control stop handed back with
                # PTRACE_DETACH(SIGSTOP) must end as a real kernel `T` stop with
@@ -171,7 +190,21 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 540 # B3 (2026-09-11, SL-1 hard delete): 539 -> 540, +1 in
+core_integ = 542 # FUP-26 (2026-09-15): 540 -> 542, +2 in
+                 # crates/sandlock-core/tests/integration/test_instance_chroot.rs:
+                 # `test_exec_through_a_dotdot_relative_symlink_resolves` (the
+                 # exec path reached through a relative symlink whose target
+                 # has `..` — the shape images ship as
+                 # `/lib64/ld-linux-x86-64.so.2 -> ../lib/x86_64-linux-gnu/…` —
+                 # must be served, not refused) and
+                 # `test_exec_failure_names_the_kernel_errno_instead_of_exiting_
+                 # 127_silently` (a symlink loop is `ELOOP`=40 at every
+                 # attempt for every uid: the child's stderr must carry
+                 # `sandlock-init: exec "/usr/bin/loop-a" failed (errno 40)`,
+                 # and the genuinely-missing case stays the stock silent 127).
+                 # RED on the pre-FUP-26 errno collapse:
+                 # tmp/f26-integ-errno-r02-mutant.log (stderr empty).
+                 # B3 (2026-09-11, SL-1 hard delete): 539 -> 540, +1 in
                  # crates/sandlock-core/tests/integration/test_mediation_identity.rs
                  # (privileged_in_process_mediation_is_refused_with_route_b_remedy:
                  # the C档 shape is refused before fork with the route-B
@@ -536,6 +569,25 @@ mediation_2uid = 9 # B3 (2026-09-11, SL-1 hard delete): 10 -> 9. Removed with
                    # test_cli_mediation_run_as_is_wired (root-tier CLI
                    # refusal vs --mediation-run-as supervisor warning).
 oci = 157     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root.
+              # FUP-25 (2026-09-15): count unchanged. The three fd-count
+              # assertions (test_eof_closes_received_fd,
+              # test_malformed_frames_do_not_leak_fds,
+              # exec_frames_deliver_their_own_output_and_leave_no_descriptor_
+              # behind) sampled `/proc/<pid>/fd` straight after the probe
+              # child published `r` — i.e. before `run_init` armed its
+              # process-level SIGCHLD signalfd — so under load the baseline
+              # could be short by exactly one fd and read as a leak
+              # (`baseline 5 -> after return 6`; a real SCM_RIGHTS leak would
+              # be +2). The sampling premise is now true instead of the
+              # assertion being relaxed: a zero-fd request/response round trip
+              # (a frame whose payload cannot parse, answered with an `Err`
+              # reply) proves the serving loop — and therefore its fd table —
+              # exists before the baseline is read. Evidence: the mechanism
+              # harness tmp/f26-f25-race-mechanism-r02.log (pre-fix order:
+              # baseline 5 and mismatch 50/50 with the race window widened;
+              # fixed order: baseline 6, mismatch 0/50) and the loaded suite
+              # tmp/f26-f25-loadprec-fixed-r05/r06.log (10/10 green at 8 and
+              # at 16 CPU hogs).
               # FUP-24 (2026-09-15): 150 -> 157, +7 net. `kill --all`'s
               # daemon-gone fallback is now gated on `SendCommandError::
               # was_delivered()` (only a request the daemon cannot have
