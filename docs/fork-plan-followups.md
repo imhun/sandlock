@@ -7,6 +7,29 @@
 
 ## A. 代码 / 接线类（需要小代码 + 测试）
 
+- **FUP-25 oci fd 计数测试的 baseline 采样竞态（FUP-24 门禁中发现，2026-09-15）** —
+  来源：FUP-24 的 `--oci-root` 第一轮红（`crates/sandlock-oci/tests/integration.rs:1152`，
+  `baseline 5 -> after return 6`；日志 `tmp/fup24-gate-oci-red1.log`）。
+  描述：`spawn_run_init_probe` 让探针子进程在**调用 `run_init` 之前**先写 `r`（`integration.rs`
+  的 `libc::write(ready_w, b"r")` 紧接 `run_init()`），父进程一读到 `r` 就采 `baseline` fd 数；
+  而 `run_init` 的 SIGCHLD `signalfd`（`crates/sandlock-core/src/init/mod.rs` 的 `sigfd`，
+  进程级、`run_init` 返回时**从不关闭**）是在那**之后**才创建。父进程的 `/proc/<pid>/fd`
+  读取一旦赢下这场启动竞态，baseline 就少算这一个 fd，EOF 之后的计数永远 = baseline + 1。
+  算术上可排除产品泄漏：若收到并泄漏了 `SCM_RIGHTS` fd，计数应是 baseline + 2（signalfd + fd），
+  实测恒为 +1；两条用例（`test_eof_closes_received_fd`、`test_malformed_frames_do_not_leak_fds`）
+  共用同一采样点，因此同红同绿。
+  **实证（在改动前的 tip `1f113cf` 上复现，与本任务改动无关）**：集成目标单跑 10 轮 + 8 个
+  CPU 占用进程，**3 轮红**（`test_eof_closes_received_fd` ×1 / `test_malformed_frames_do_not_leak_fds`
+  ×2，断言文本与数字逐字相同：`baseline 5 -> after return 6` / `baseline 5 -> after 6`）——
+  `tmp/fup24-eof-loadprec-head-r01.log`；同 tip 无负载 9 轮全绿（`tmp/fup24-eof-precedent-r01..r09.log`），
+  集成目标单跑 15 轮 1 红（另一条 `oci_stop_collapses_process_group`，`integration.rs:824`，
+  同属该目标的负载敏感家族）——`tmp/fup24-eof-precedent2-r01.log`。
+  建议修法（**测试侧**，必须保住「fd 表已终态」这一语义、不放宽断言）：把 baseline 推迟到
+  子进程**跑完一轮完整请求/应答**之后再采（例如先发一条 `Ping`、读回 `Pid` 再采样），
+  或让探针的 `r` 在 `run_init` 建好进程级 fd 之后才发布。
+  为什么留：是测试夹具的采样时机竞态、不在 FUP-24 范围（本次只做 `kill --all` 的兜底判据），
+  且修法要先定「谁代表 fd 表已终态」这一观测边界，属独立小改动。
+
 - **FUP-24 `kill --all` 的兜底判据仍是「任何发送错误」而不是「连不上」（f1oci，
   2026-09-14）** — 来源：f1oci 对 oci `test_signal_to_sibling_pid_rejected` flake
   的定真因（见 `docs/CHANGELOG.md` 的 f1oci 两条 + `.superpowers/sdd/task-f1oci-report.md`）。
@@ -21,6 +44,16 @@
   `kill --all` 仍须成功），属独立小改动；当前无已知活 bug（正常路径不可能再触发）。
   建议修法：`cmd_kill` 只在 `UnixStream::connect(socket_path(id))` 失败时兜底，
   其余错误原样上抛（`crates/sandlock-oci/src/main.rs` 的 `cmd_kill` 分支）。
+  **已关闭（2026-09-15，FUP-24 收口）**：`supervisor::send_command` 现在返回带分类的
+  `SendCommandError`（`NotDelivered` = 连接从未建立、或整条帧的 `\n` 分隔符没写出去；
+  `Delivered` = 整条帧已交给 socket，之后的失败只是**答复**丢了）。`cmd_kill --all` 只在
+  `!err.was_delivered()` 时兜底 `killpg(state.pid, signum)`（daemon 已死仍能 kill 的降级路径
+  保持），`Delivered` 则把错误原样上抛（退出码 1），不再重复投递。`cmd_delete` 的 Shutdown
+  兜底**有意保持**原样（SIGKILL 幂等，且 delete 必须把状态拆干净）。RED→GREEN：新增
+  `crates/sandlock-oci/tests/test_kill_all_delivery.rs` 三条（「答复丢失但帧已送达」老代码
+  确定红：投递 2 次；ENOENT/ECONNREFUSED 仍兜底 1 次；正常回环 1 次 + exit 0）+ 2 条
+  `supervisor::tests` 分类单测；oci 150 → 157；wheel 按口径重建 + verify（manifest
+  `# HEAD=` = 本次提交）。报告 `.superpowers/sdd/task-fup24-report.md`。
 
 - **F12（2026-09-06，已完成）** — ProcessIndex 一 TGID 一 entry
   （线程 tid 懒登记建模收口）。来源：F11 report concern #1 / e2b task-backlog

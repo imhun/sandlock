@@ -506,36 +506,142 @@ fn fnv1a_hex(id: &str) -> String {
 /// Lives directly under the state dir as `<fnv16(id)>.sock` (not under the
 /// per-id state subdir) so the path stays well under the `sun_path` limit.
 pub fn socket_path(id: &str) -> PathBuf {
-    PathBuf::from(crate::state::state_dir()).join(format!("{}.sock", fnv1a_hex(id)))
+    socket_path_in(Path::new(&crate::state::state_dir()), id)
+}
+
+/// [`socket_path`] for an explicit state root — the location a CLI that was
+/// given `--root <root>` will connect to (and the one its supervisor binds).
+///
+/// [`crate::state::state_dir`] is a process-wide value resolved once in `main`,
+/// so a process that drives several roots (tests, embedders) has no other way
+/// to name the socket; it is also what lets a test stand in for the daemon
+/// without touching the real state directory.
+pub fn socket_path_in(state_root: &Path, id: &str) -> PathBuf {
+    state_root.join(format!("{}.sock", fnv1a_hex(id)))
+}
+
+/// Why a control request did not produce a reply — and, crucially, whether the
+/// daemon can already have acted on it.
+///
+/// The distinction exists for callers that must guarantee delivery: a request
+/// the daemon never saw may be delivered again by hand, a request it *did* see
+/// must not (that would deliver the signal twice — F1.7/SECE-6).
+#[derive(Debug)]
+pub enum SendCommandError {
+    /// The request frame never reached the socket: the connection was never
+    /// established, or the write failed before the frame's trailing delimiter
+    /// went out. A supervisor frames a request at its `\n` (see
+    /// [`read_control_request`]), and `serde_json` never emits a raw newline
+    /// inside the payload, so a frame that was not written whole is one the
+    /// daemon cannot have acted on. A caller that must deliver may retry.
+    NotDelivered(anyhow::Error),
+    /// The complete frame (payload + `\n`) was handed to the socket, so the
+    /// daemon either acted on it already or is about to. Everything after that
+    /// — a lost reply, a short read, an unparsable reply — is a failure on the
+    /// **reply** leg, not the request leg: re-sending would deliver the request
+    /// twice, so callers must surface this instead.
+    Delivered(anyhow::Error),
+}
+
+impl SendCommandError {
+    /// True when the whole request frame was written, i.e. the daemon may
+    /// already have acted on it. Callers that would otherwise retry the
+    /// request must check this: retrying on `true` breaks exactly-once.
+    pub fn was_delivered(&self) -> bool {
+        matches!(self, SendCommandError::Delivered(_))
+    }
+
+    fn not_delivered(err: impl Into<anyhow::Error>) -> Self {
+        SendCommandError::NotDelivered(err.into())
+    }
+
+    fn delivered(err: impl Into<anyhow::Error>) -> Self {
+        SendCommandError::Delivered(err.into())
+    }
+}
+
+impl std::fmt::Display for SendCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Only the classification: the cause is the `source()`, so anyhow's
+        // `{:#}` chain reads "…: <context>: <cause>" without repeating itself.
+        match self {
+            SendCommandError::NotDelivered(_) => {
+                write!(f, "the supervisor never received the request")
+            }
+            SendCommandError::Delivered(_) => write!(
+                f,
+                "the supervisor received the request but the reply was lost"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SendCommandError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SendCommandError::NotDelivered(e) | SendCommandError::Delivered(e) => Some(e.as_ref()),
+        }
+    }
 }
 
 /// Send a command to a running supervisor and return its reply (blocking).
 ///
-/// The protocol is newline-delimited JSON over a Unix socket.
-pub fn send_command(id: &str, cmd: SupervisorCmd) -> Result<SupervisorReply> {
+/// The protocol is newline-delimited JSON over a Unix socket. The error says
+/// whether the request was delivered — see [`SendCommandError`].
+pub fn send_command(id: &str, cmd: SupervisorCmd) -> Result<SupervisorReply, SendCommandError> {
+    send_command_at(&socket_path(id), cmd)
+}
+
+/// [`send_command`] against an explicit socket path.
+///
+/// Everything up to and including the frame's write is *delivery*: if any of
+/// it fails, the daemon cannot hold a complete request. From the reply read on,
+/// the request is on the wire, so a failure there is a lost reply and must not
+/// be retried by a caller under a deliver-exactly-once contract.
+fn send_command_at(path: &Path, cmd: SupervisorCmd) -> Result<SupervisorReply, SendCommandError> {
     use std::io::{BufRead, Write};
     use std::os::unix::net::UnixStream;
 
-    let path = socket_path(id);
-    let mut stream = UnixStream::connect(&path)
-        .with_context(|| format!("connect to supervisor socket {:?}", path))?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut stream = UnixStream::connect(path)
+        .with_context(|| format!("connect to supervisor socket {:?}", path))
+        .map_err(SendCommandError::not_delivered)?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .context("set supervisor reply timeout")
+        .map_err(SendCommandError::not_delivered)?;
 
     // The protocol is newline-delimited JSON: send the request and its
     // delimiter in ONE write. Two writes are legal on a stream socket but let
     // the receiver act (and close) between them, which turns the tail write
-    // into an `EPIPE` — and `kill --all` treats any send error as "the daemon
-    // never got it" and re-delivers the signal by hand.
-    let mut msg = serde_json::to_string(&cmd)?;
+    // into an `EPIPE` on a request the daemon has already executed.
+    let mut msg = serde_json::to_string(&cmd)
+        .context("encode supervisor command")
+        .map_err(SendCommandError::not_delivered)?;
+    debug_assert!(
+        !msg.contains('\n'),
+        "a payload newline would make the delimiter ambiguous: {msg:?}"
+    );
     msg.push('\n');
-    stream.write_all(msg.as_bytes())?;
-    stream.flush()?;
+    stream
+        .write_all(msg.as_bytes())
+        .with_context(|| format!("send control request {msg:?}"))
+        .map_err(SendCommandError::not_delivered)?;
+    stream
+        .flush()
+        .context("flush control request")
+        .map_err(SendCommandError::not_delivered)?;
 
+    // Past this point the request is complete on the wire.
     let mut reader = std::io::BufReader::new(&stream);
     let mut line = String::new();
-    reader.read_line(&mut line)?;
+    reader
+        .read_line(&mut line)
+        .context("read supervisor reply")
+        .map_err(SendCommandError::delivered)?;
 
-    serde_json::from_str(line.trim()).context("parse supervisor reply")
+    serde_json::from_str(line.trim())
+        .context("parse supervisor reply")
+        .map_err(SendCommandError::delivered)
 }
 
 /// Run the supervisor in the **current process**.
@@ -916,12 +1022,14 @@ const CONTROL_REQUEST_DEADLINE: Duration = Duration::from_secs(2);
 /// `recvmsg` returns only the payload — so a supervisor that treats one
 /// `recvmsg` as the whole request answers before the client has finished
 /// writing, and the client's delimiter write then fails with `EPIPE`.
-/// `kill --all` reacts to any send error by falling back to a direct
-/// `killpg(state.pid, signum)`, which delivers the instance signal a *second*
-/// time (the F1.7/SECE-6 exactly-once contract, pinned by
-/// `test_signal_to_sibling_pid_rejected`). Read to the delimiter instead,
-/// bounded in size and time; a request that never terminates is rejected
-/// rather than half-acted on.
+/// That `EPIPE` is a *send*-side error on a request the supervisor had already
+/// executed, which is exactly the shape [`SendCommandError`] has to classify:
+/// `kill --all` used to answer any send error with a direct
+/// `killpg(state.pid, signum)` and delivered the instance signal a *second*
+/// time (breaking the F1.7/SECE-6 exactly-once contract, pinned by
+/// `test_signal_to_sibling_pid_rejected` and `test_kill_all_delivery`). Read to
+/// the delimiter instead, bounded in size and time; a request that never
+/// terminates is rejected rather than half-acted on.
 ///
 /// `Ok(None)` means the peer closed without sending a request (nothing to
 /// answer); `Err` is a request-level failure the caller reports as `Err`.
@@ -1572,6 +1680,83 @@ mod tests {
         assert!(json.contains("signal"));
         let back: SupervisorCmd = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, SupervisorCmd::Signal { signum: 9 }));
+    }
+
+    // ── FUP-24: what a send failure says about delivery ───────────────────
+    //
+    // A caller under a deliver-exactly-once contract (`kill --all`) has to
+    // know whether the daemon can already have acted on the request. Both
+    // halves are pinned against real sockets: a peer that reads a *complete*
+    // frame and then goes silent is a lost reply; an unreachable peer is a
+    // lost request.
+
+    /// Read one newline-delimited frame from `stream`.
+    fn read_one_frame(stream: &mut std::os::unix::net::UnixStream) -> Vec<u8> {
+        use std::io::Read;
+        let mut frame = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let n = stream.read(&mut byte).expect("read control frame");
+            assert_ne!(n, 0, "peer closed mid-frame");
+            frame.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        frame
+    }
+
+    #[test]
+    fn a_lost_reply_after_a_complete_frame_is_a_delivered_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("sup.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // The daemon's whole side of the request: read the complete frame,
+            // then close without answering.
+            read_one_frame(&mut stream)
+        });
+
+        let err = send_command_at(&sock, SupervisorCmd::Ping).unwrap_err();
+        let frame = server.join().unwrap();
+
+        assert_eq!(
+            String::from_utf8(frame).unwrap(),
+            "{\"cmd\":\"ping\"}\n",
+            "the request must reach the daemon as one complete frame before the \
+             reply leg can fail"
+        );
+        assert!(
+            err.was_delivered(),
+            "a peer that answered nothing on a complete frame is a lost REPLY, not \
+             a lost request; callers must not re-send: {err}"
+        );
+        assert!(matches!(err, SendCommandError::Delivered(_)), "{err}");
+    }
+
+    #[test]
+    fn an_unreachable_socket_is_a_lost_request() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // No socket file at all (ENOENT).
+        let absent = dir.path().join("absent.sock");
+        let err = send_command_at(&absent, SupervisorCmd::Ping).unwrap_err();
+        assert!(
+            !err.was_delivered(),
+            "a connect that never happened cannot have delivered a request: {err}"
+        );
+        assert!(matches!(err, SendCommandError::NotDelivered(_)), "{err}");
+
+        // A socket file left behind by an exited supervisor (ECONNREFUSED).
+        let stale = dir.path().join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        let err = send_command_at(&stale, SupervisorCmd::Ping).unwrap_err();
+        assert!(
+            !err.was_delivered(),
+            "a refused connect cannot have delivered a request: {err}"
+        );
+        assert!(matches!(err, SendCommandError::NotDelivered(_)), "{err}");
     }
 
     // ── F1.2 H1/H2: bounded early_exits + registered-pid exit routing ──────

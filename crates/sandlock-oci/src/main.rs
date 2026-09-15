@@ -723,18 +723,25 @@ fn cmd_kill(id: &str, signal: &str, all: bool) -> Result<()> {
     if all {
         // Instance-wide signals go through the daemon so sandlock-init can
         // traverse its registered per-child group set (every exec'd child is
-        // its own group leader; SECE-6/F1.7). Fall back to a direct killpg
-        // only when the daemon is unreachable (already exited) — that fallback
-        // is best-effort and semantically degraded: killpg(state.pid) reaches
-        // only the recorded pid's own group, missing exec'd children in their
-        // own groups.
-        let sent = supervisor::send_command(
-            id,
-            supervisor::SupervisorCmd::Signal { signum },
-        );
-        if sent.is_err() {
-            // Daemon gone: best-effort direct killpg on the recorded pid.
-            unsafe { libc::killpg(state.pid, signum) };
+        // its own group leader; SECE-6/F1.7).
+        //
+        // Fall back to a direct killpg only for a request the daemon never
+        // received (socket unreachable — usually an exited daemon). That
+        // fallback is best-effort and semantically degraded: killpg(state.pid)
+        // reaches only the recorded pid's own group, missing exec'd children in
+        // their own groups. A request the daemon *did* receive must never be
+        // re-delivered: the daemon may already have relayed it, and a second
+        // delivery breaks the exactly-once contract for non-idempotent signals.
+        // Its (lost) reply is reported to the caller instead.
+        match supervisor::send_command(id, supervisor::SupervisorCmd::Signal { signum }) {
+            Ok(_) => {}
+            Err(err) if !err.was_delivered() => {
+                // Daemon gone: best-effort direct killpg on the recorded pid.
+                unsafe { libc::killpg(state.pid, signum) };
+            }
+            Err(err) => {
+                return Err(err.into());
+            }
         }
     } else {
         let ret = unsafe { libc::kill(state.pid, signum) };
@@ -778,6 +785,10 @@ fn cmd_delete(id: &str, force: bool) -> Result<()> {
     // only).
     if state.status == Status::Running && state.pid > 0 && state.is_alive() {
         let sent = supervisor::send_command(id, supervisor::SupervisorCmd::Shutdown);
+        // Unlike `kill --all`, the breadth of this arm is harmless: SIGKILL is
+        // idempotent (a group already dying is not killed twice) and `delete`
+        // must still finish tearing the state down, so a Shutdown whose reply
+        // was lost may safely take the same fallback.
         if sent.is_err() {
             // Daemon already gone: kill whatever we can reach.
             unsafe { libc::killpg(state.pid, libc::SIGKILL) };

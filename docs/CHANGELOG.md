@@ -23,6 +23,23 @@
   （旧 exec 请求不带 `\n`）——它会收到显式拒绝；新 CLI 对旧 supervisor 照旧可用
   （多出的 `\n` 是 JSON 尾随空白）。同批 wheel 的 CLI/supervisor 不踩这条。
 
+- **`kill --all` 只在「daemon 确实没收到」时才自行投递（FUP-24，2026-09-15）**：
+  `kill --all` 经 supervisor 控制通道投递实例级信号，失败时原先把**任何**发送错误
+  都当成「daemon 没收到」，再自行 `killpg(state.pid, signum)` 兜底。分帧修复（见上
+  一条）后 `EPIPE` 那条触发路径没了，但判据仍过宽：请求**已送达**、只是**答复在回程
+  丢了**（例如 supervisor 卡住、答复超时）时同样会再投一次 —— 破坏 F1.7/SECE-6 的
+  「恰好投递一次」。现在 `supervisor::send_command` 返回带分类的 `SendCommandError`：
+  `NotDelivered`（连接从未建立、或整条帧的 `\n` 分隔符没写出去）**仍然**兜底投递，
+  daemon 已死时 `kill --all` 照旧有降级路径；`Delivered`（整条帧已交给 socket）**不再**
+  重复投递，错误原样上抛（`Error: the supervisor received the request but the reply was
+  lost: …`，退出码 1）。判据的锚点是「帧是否整条写出」：supervisor 以 `\n` 成帧，而
+  `serde_json` 不会在 payload 里产生裸换行，所以「没写整条」==「daemon 不可能执行过」。
+  `cmd_delete` 的 Shutdown 兜底**保持**原样（SIGKILL 幂等，且 delete 必须把状态拆干净）。
+  **升级后果**：`kill --all` 在「信号已送达、答复丢失」这一窗口里以非零退出码返回，而
+  不是静默成功 —— 调用方应当把它读成「结果未知、需复核」，不是「没送到」；daemon 不在
+  的降级路径行为不变。测试：新增 `tests/test_kill_all_delivery.rs`（在同一形态上老代码
+  确定红：投递 2 次）+ 2 条 `supervisor::tests` 分类单测；oci 150 → 157。
+
 - **⚠️ BREAKING：删掉 `mediation_run_as` 降级档（B3，2026-09-11，SL-1 硬删）**：
   「需要路径中介时，中介身份必须就是沙箱身份」现在是**唯一**形态，不再有任何降级
   逃生门。删除面（全部一次删净，不留墓碑）：`MediationRunAs` 枚举（含

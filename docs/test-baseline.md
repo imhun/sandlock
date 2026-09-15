@@ -49,7 +49,16 @@
 # and core_integ (534 -> 539) move, by the A1/A2 test cases registered below;
 # ffi / cli / supervise / supervise_cost / cli_build / python / oci /
 # supervise_root / mediation_2uid are unchanged.
-core_lib = 843 # F19/SL-13 (2026-09-14): 840 -> 843, +3 unit tests — the
+core_lib = 844 # sigstop (2026-09-14, fork `1f113cf`): 843 -> 844, +1 unit test —
+               # `resource.rs::tests::sigstop_inside_the_fork_tracking_window_
+               # ends_as_a_real_stop` (the job-control stop handed back with
+               # PTRACE_DETACH(SIGSTOP) must end as a real kernel `T` stop with
+               # no tracer). That fix was verified in the e2b lanes and did not
+               # re-run this fork gate, so the entry is a catch-up: the first
+               # FUP-24 gate run reported "baseline says 843 passed, run
+               # produced 844" (tmp/fup24-gate-nonroot-r01.log) and the count
+               # above is that run's, unchanged by FUP-24 itself.
+               # F19/SL-13 (2026-09-14): 840 -> 843, +3 unit tests — the
                # refusal code's stable wire strings + serde form, the
                # closed/dead/policy-to-code mapping in error.rs
                # (only_the_classified_runtime_errors_carry_a_refusal_code,
@@ -526,7 +535,24 @@ mediation_2uid = 9 # B3 (2026-09-11, SL-1 hard delete): 10 -> 9. Removed with
                    # unlink prove the downgrade is real), and
                    # test_cli_mediation_run_as_is_wired (root-tier CLI
                    # refusal vs --mediation-run-as supervisor warning).
-oci = 150     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root.
+oci = 157     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root.
+              # FUP-24 (2026-09-15): 150 -> 157, +7 net. `kill --all`'s
+              # daemon-gone fallback is now gated on `SendCommandError::
+              # was_delivered()` (only a request the daemon cannot have
+              # received — connect refused/absent, or a write that never got
+              # the frame's delimiter out — takes the direct killpg path; a
+              # lost *reply* is reported instead of re-delivering the signal).
+              # +2 unit tests in `supervisor.rs::tests`
+              # (a_lost_reply_after_a_complete_frame_is_a_delivered_request,
+              # an_unreachable_socket_is_a_lost_request — the bin target
+              # recompiles the crate module tests, so they count twice: +4) and
+              # +3 tests in the new `tests/test_kill_all_delivery.rs` target
+              # (lost_reply_after_a_delivered_frame_is_not_redelivered,
+              # unreachable_socket_still_falls_back_to_a_direct_group_delivery,
+              # normal_round_trip_delivers_exactly_once). Evidence:
+              # tmp/fup24-oci-count-r01.log (157 passed / 0 failed) and the
+              # --oci-root gate log tmp/fup24-gate-oci-final-r01.log.
+              # f1oci (2026-09-14): count unchanged. The control channel now
               # f1oci (2026-09-14): count unchanged. The control channel now
               # frames a request at its `\n` (supervisor) and the CLI sends
               # payload+delimiter in one write, so the
