@@ -971,6 +971,44 @@ fn open_fd_count(pid: i32) -> Option<usize> {
     fs::read_dir(format!("/proc/{pid}/fd")).ok().map(|it| it.count())
 }
 
+/// FUP-25: sample a probe child's fd table only once that table is *final*.
+///
+/// `run_init` blocks SIGCHLD and arms its process-level `signalfd` at the top
+/// of the function (`crates/sandlock-core/src/init/mod.rs`) and never closes
+/// it. The probe child publishes `r` *before* calling `run_init`, so a parent
+/// that counts `/proc/<pid>/fd` as soon as it sees `r` is racing that
+/// creation: when the parent wins, the baseline is short by exactly one fd and
+/// every later comparison reads `baseline + 1` -- measured as
+/// `baseline 5 -> after return 6` under load, with the identical assertion
+/// text every time (`tmp/fup24-eof-loadprec-head-r01.log`). The arithmetic
+/// rules a real leak out: a received `SCM_RIGHTS` fd leaking would show
+/// `baseline + 2`.
+///
+/// The premise is made *true* rather than the assertion weakened: a zero-fd
+/// request whose payload does not parse is answered with an `Err` reply by the
+/// serving loop, and that loop is only entered after the process-level fds
+/// (the signalfd) exist. Once the reply is read, the fd table is settled, so
+/// the baseline is the count the leak checks are supposed to compare against.
+fn prime_run_init_probe(ctl: &UnixStream) {
+    let frame = frame_bytes(SLK_TYPE_REQ, 0, b"{ not a valid request");
+    sandlock_oci::fdpass::send_with_fds(ctl, &frame, &[]).expect("send the priming frame");
+    let reply = read_init_reply(ctl, Instant::now() + Duration::from_secs(5)).expect(
+        "init must answer the priming frame -- the run_init loop is only \
+         reachable once its process-level fds exist",
+    );
+    assert!(
+        is_err_resp(&reply),
+        "the priming frame must be refused with an Err reply, got {:?}",
+        String::from_utf8_lossy(&reply)
+    );
+}
+
+/// The fd-table baseline of a probe child that has already served one request.
+fn settled_fd_baseline(pid: i32, ctl: &UnixStream) -> usize {
+    prime_run_init_probe(ctl);
+    open_fd_count(pid).expect("read the settled child fd table")
+}
+
 /// Read one init reply, returning its JSON payload. Accepts both wire shapes:
 /// the F1.6 framed replies and the legacy newline-JSON shape — the RED phase
 /// runs this harness against the un-framed init, which answers in newline
@@ -1049,7 +1087,7 @@ fn test_malformed_frames_do_not_leak_fds() {
         Some(b'r'),
         "probe child never entered run_init"
     );
-    let baseline = open_fd_count(pid).expect("read child fd table before the storm");
+    let baseline = settled_fd_baseline(pid, &ctl);
     let (attach_r, attach_w) = new_attach_fd();
 
     const ROUNDS: usize = 1000;
@@ -1130,7 +1168,7 @@ fn test_eof_closes_received_fd() {
         Some(b'r'),
         "probe child never entered run_init"
     );
-    let baseline = open_fd_count(pid).expect("read child fd table before the frame");
+    let baseline = settled_fd_baseline(pid, &ctl);
     let (attach_r, attach_w) = new_attach_fd();
 
     let frame = frame_bytes(SLK_TYPE_REQ, 0, br#"{"req":"signal","signum":9}"#);
@@ -1273,7 +1311,7 @@ fn exec_frames_deliver_their_own_output_and_leave_no_descriptor_behind() {
         Some(b'r'),
         "probe child never entered run_init"
     );
-    let baseline = open_fd_count(pid).expect("read child fd table before the execs");
+    let baseline = settled_fd_baseline(pid, &ctl);
     let mut reader = FrameReader::new(&ctl);
 
     for round in 0..ROUNDS {
