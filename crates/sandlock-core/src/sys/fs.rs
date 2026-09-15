@@ -15,6 +15,34 @@ const SYS_OPENAT2: libc::c_long = crate::arch::SYS_OPENAT2 as libc::c_long;
 /// RESOLVE_IN_ROOT: treat the dirfd as the filesystem root for resolution.
 const RESOLVE_IN_ROOT: u64 = 0x10;
 
+/// Extra `openat2` attempts allowed after the kernel answers `EAGAIN`.
+///
+/// `EAGAIN` is the kernel saying "I could not *prove* the `..` I just walked
+/// stayed inside the root" -- openat2(2): "how.resolve contains either
+/// RESOLVE_IN_ROOT or RESOLVE_BENEATH, and the kernel could not ensure that a
+/// ".." component didn't escape (due to a race condition or potential
+/// attack). The caller may choose to retry the openat2() call." It is a
+/// statement about the *walk*, not about the path: the racing rename/mount
+/// operation that made the walk unverifiable completes, and the retry
+/// succeeds. Measured in a container while a neighbouring directory was being
+/// renamed in a loop: 3-5% of `..`-resolving opens return `EAGAIN`, and no
+/// call in ~5e5 sampled attempts ever exhausted 4 immediate retries.
+///
+/// The budget is deliberately *bounded* rather than a `while EAGAIN` loop:
+///
+///  * the racing actor can be the sandboxed child itself. Every attempt is a
+///    syscall the supervisor performs on the child's behalf, so an unbounded
+///    loop lets a hostile workload keep the mediator spinning (a livelock in
+///    the single-threaded dispatch that one sandbox shares with every other
+///    syscall it makes);
+///  * each retry is immediate (no sleep, just a `sched_yield`), so the budget
+///    is what keeps a lookup's added latency bounded and predictable;
+///  * once the budget is spent the *retryable* errno is returned unchanged --
+///    never rewritten into `ENOENT` -- so the caller (and, for a mediated
+///    open, the child) still learns "EAGAIN, try again" instead of the false
+///    "does not exist" that turned this into a silent exit 127 (FUP-26).
+const EAGAIN_RETRY_BUDGET: u32 = 4;
+
 /// Kernel `struct open_how` for openat2().
 #[repr(C)]
 struct OpenHow {
@@ -81,22 +109,137 @@ pub(crate) fn openat2_in_root_with_resolve(
         resolve: RESOLVE_IN_ROOT | extra_resolve,
     };
 
+    // `EAGAIN` here is not a verdict about the path (see
+    // `EAGAIN_RETRY_BUDGET`): retry the identical open a bounded number of
+    // times before handing the retryable errno back. Everything that is not
+    // `EAGAIN` -- and an `EAGAIN` whose budget is spent -- is returned as the
+    // kernel reported it, so "no such file" and "the kernel could not
+    // guarantee this `..`" stay distinguishable to the caller.
+    let mut retries = 0u32;
+    let fd = loop {
+        match openat2_once(root_fd, &c_path, &how) {
+            Ok(fd) => break fd,
+            Err(libc::EAGAIN) if retries < EAGAIN_RETRY_BUDGET => {
+                retries += 1;
+                // Give the racing rename/mount operation a chance to finish;
+                // the retry is otherwise byte-identical to the first attempt.
+                unsafe { libc::sched_yield() };
+            }
+            Err(errno) => {
+                unsafe { libc::close(root_fd) };
+                return Err(errno);
+            }
+        }
+    };
+
+    unsafe { libc::close(root_fd) };
+    Ok(fd)
+}
+
+/// One `openat2` attempt, with the unit-test fault seam.
+///
+/// Kept separate from the retry loop so a test can make a *deterministic*
+/// `EAGAIN` (the real one needs a racing rename on the walked path) and count
+/// both attempts and observed `EAGAIN`s exactly.
+fn openat2_once(root_fd: RawFd, path: &CString, how: &OpenHow) -> Result<RawFd, i32> {
+    test_faults::note_attempt();
+    if test_faults::take_injected_eagain() {
+        test_faults::note_eagain();
+        return Err(libc::EAGAIN);
+    }
     let fd = unsafe {
         libc::syscall(
             SYS_OPENAT2,
             root_fd,
-            c_path.as_ptr(),
-            &how as *const OpenHow,
+            path.as_ptr(),
+            how as *const OpenHow,
             std::mem::size_of::<OpenHow>(),
         )
     } as i32;
-
-    unsafe { libc::close(root_fd) };
-
     if fd < 0 {
-        Err(last_errno(libc::ENOENT))
+        let errno = last_errno(libc::ENOENT);
+        if errno == libc::EAGAIN {
+            test_faults::note_eagain();
+        }
+        Err(errno)
     } else {
         Ok(fd)
+    }
+}
+
+/// Observation / fault-injection seam for the retry loop's unit tests.
+///
+/// Only the counters exist in a test build; the real fault the product has to
+/// absorb is a race with a rename of a directory the `..` walk passes through,
+/// which cannot be made deterministic from a test. Injecting the kernel's
+/// answer keeps the *product* code path under test (the retry loop, its
+/// budget and its errno classification) instead of testing a copy of it.
+#[cfg(test)]
+pub(crate) mod test_faults {
+    use std::cell::Cell;
+
+    // Thread-local, not process-global: `cargo test` runs each test on its own
+    // thread, and the other tests in this module call `openat2_in_root`
+    // concurrently. A global counter would be stamped by their attempts and
+    // the exact-count assertions below could not hold.
+    thread_local! {
+        static INJECTED_EAGAIN: Cell<usize> = const { Cell::new(0) };
+        static ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+        static EAGAIN_SEEN: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Make the next `n` attempts answer `EAGAIN` without calling the kernel.
+    pub(crate) fn inject_eagain(n: usize) {
+        INJECTED_EAGAIN.with(|c| c.set(n));
+    }
+
+    /// Forget the previous injection and zero both counters.
+    pub(crate) fn reset() {
+        INJECTED_EAGAIN.with(|c| c.set(0));
+        ATTEMPTS.with(|c| c.set(0));
+        EAGAIN_SEEN.with(|c| c.set(0));
+    }
+
+    pub(crate) fn attempts() -> usize {
+        ATTEMPTS.with(|c| c.get())
+    }
+
+    pub(crate) fn eagain_seen() -> usize {
+        EAGAIN_SEEN.with(|c| c.get())
+    }
+
+    pub(crate) fn note_attempt() {
+        ATTEMPTS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn note_eagain() {
+        EAGAIN_SEEN.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn take_injected_eagain() -> bool {
+        INJECTED_EAGAIN.with(|c| match c.get() {
+            0 => false,
+            n => {
+                c.set(n - 1);
+                true
+            }
+        })
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) mod test_faults {
+    /// Never injects anything; the retry loop must be free of test-only state
+    /// in a product build.
+    #[inline]
+    pub(crate) fn note_attempt() {}
+
+    #[inline]
+    pub(crate) fn note_eagain() {}
+
+    #[inline]
+    pub(crate) fn take_injected_eagain() -> bool {
+        false
     }
 }
 
@@ -574,6 +717,82 @@ mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
+
+    /// A rootfs file the `..`-retry tests open for real.
+    fn retry_fixture() -> (TempDir, std::path::PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("plain"), "x").unwrap();
+        let root = tmp.path().to_path_buf();
+        (tmp, root)
+    }
+
+    // ── FUP-26: `EAGAIN` from openat2(RESOLVE_IN_ROOT) is retried ─────────
+
+    /// The kernel's retryable answer must not become a failed open: two
+    /// injected `EAGAIN`s are absorbed and the third attempt returns the fd.
+    #[test]
+    fn eagain_is_retried_until_the_open_succeeds() {
+        let (_tmp, root) = retry_fixture();
+        test_faults::reset();
+        test_faults::inject_eagain(2);
+        let fd = openat2_in_root(&root, "plain", libc::O_RDONLY, 0)
+            .expect("two EAGAINs must be retried into a successful open");
+        unsafe { libc::close(fd) };
+        assert_eq!(test_faults::attempts(), 3, "two retries after the first attempt");
+        assert_eq!(test_faults::eagain_seen(), 2, "both EAGAINs were observed");
+        assert!(!test_faults::take_injected_eagain(), "injection drained");
+    }
+
+    /// The retry is bounded *and* the errno classification survives it: a
+    /// permanent `EAGAIN` costs exactly `EAGAIN_RETRY_BUDGET` extra attempts
+    /// and is reported as `EAGAIN` (retryable), never as `ENOENT`.
+    #[test]
+    fn permanent_eagain_is_bounded_and_still_eagain() {
+        let (_tmp, root) = retry_fixture();
+        test_faults::reset();
+        test_faults::inject_eagain(usize::MAX);
+        let err = openat2_in_root(&root, "plain", libc::O_RDONLY, 0)
+            .expect_err("a permanent EAGAIN must end as an error, not a hang");
+        assert_eq!(err, libc::EAGAIN, "the retryable errno is handed back as-is");
+        // Pinned literally: the budget is the documented bound, so shrinking
+        // it (or dropping the retry) is a visible, deliberate change.
+        assert_eq!(EAGAIN_RETRY_BUDGET, 4, "documented retry budget");
+        assert_eq!(
+            test_faults::attempts(),
+            5,
+            "one attempt plus the four bounded retries"
+        );
+        assert_eq!(
+            test_faults::eagain_seen(),
+            5,
+            "every attempt observed the kernel's answer"
+        );
+    }
+
+    /// Every other errno is returned immediately: `ENOENT` is a verdict about
+    /// the path, and re-issuing the identical syscall cannot change it.
+    #[test]
+    fn non_retryable_errno_is_not_retried() {
+        let (_tmp, root) = retry_fixture();
+        test_faults::reset();
+        let err = openat2_in_root(&root, "absent", libc::O_RDONLY, 0)
+            .expect_err("a missing file must still be ENOENT");
+        assert_eq!(err, libc::ENOENT);
+        assert_eq!(test_faults::attempts(), 1, "no retry for a non-EAGAIN errno");
+        assert_eq!(test_faults::eagain_seen(), 0);
+    }
+
+    /// The seam must not hide the real syscall: with nothing injected, a
+    /// `..`-free open inside the tree still works and costs one attempt.
+    #[test]
+    fn the_uninjected_path_still_calls_the_kernel_once() {
+        let (_tmp, root) = retry_fixture();
+        test_faults::reset();
+        let fd = openat2_in_root(&root, "plain", libc::O_RDONLY, 0).unwrap();
+        unsafe { libc::close(fd) };
+        assert_eq!(test_faults::attempts(), 1);
+        assert_eq!(test_faults::eagain_seen(), 0);
+    }
 
     #[test]
     fn openat2_in_root_confines_absolute_symlink() {

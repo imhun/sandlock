@@ -414,6 +414,22 @@ fn spawn(
         unsafe {
             libc::execvp(exec_path.as_ptr() as *const libc::c_char, ptrs.as_ptr());
         }
+        // FUP-26: `execvp` only returns on failure, and the reserved 127 alone
+        // is not a diagnosis -- in a lane log it reads as "the command died
+        // and said nothing". `ENOENT` stays silent on purpose (it is the
+        // POSIX "not found" shape every execvp caller already handles, and the
+        // e2b contract pins "127 with no output" for a missing binary); every
+        // *other* errno is a failure the sandbox hid from the child and gets
+        // the one line that names it -- 13 a DAC refusal, 40 a symlink loop,
+        // 11/35 the *retryable* `EAGAIN` openat2(RESOLVE_IN_ROOT) reports for
+        // a `..` it could not prove stayed inside the root.
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if errno != libc::ENOENT {
+            exec_fail(&format!(
+                "sandlock-init: exec {argv0:?} failed (errno {errno})\n",
+                argv0 = cargv[0].to_string_lossy()
+            ));
+        }
     }
     unsafe { libc::_exit(127) };
 }
@@ -424,6 +440,18 @@ fn child_fail(msg: &str) -> ! {
     unsafe {
         libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
         libc::_exit(125);
+    }
+}
+
+/// Write a child-side *exec* failure to fd 2 and `_exit(127)`.
+///
+/// 127 stays the reserved "the workload never started" code (125 is the
+/// chdir/stdio setup failure, 126 a failed `setpgid`); the message is what
+/// makes it diagnosable, exactly as [`child_fail`] does for 125.
+fn exec_fail(msg: &str) -> ! {
+    unsafe {
+        libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+        libc::_exit(127);
     }
 }
 

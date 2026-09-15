@@ -252,6 +252,179 @@ async fn test_relative_open_from_second_workspace_alias_resolves_the_submount() 
     cleanup(&base);
 }
 
+// ── FUP-26: a `..`-relative symlink lookup must not be a silent exit 127 ──
+
+/// The exec path itself may be reached through a *relative* symlink whose
+/// target has a `..` component -- the shape Debian/Ubuntu images ship as
+/// `/lib64/ld-linux-x86-64.so.2 -> ../lib/x86_64-linux-gnu/...`, i.e. the
+/// PT_INTERP every dynamically linked workload resolves first.
+///
+/// The kernel may refuse such a walk with the documented, *retryable*
+/// `EAGAIN` ("could not ensure that a `..` component didn't escape ... due to
+/// a race condition or potential attack. The caller may choose to retry"), so
+/// the lookup has to be retried and, if it still fails, must surface as
+/// `EAGAIN` rather than as a fabricated `ENOENT`. This case pins that the
+/// shape resolves at all through the mediator (the fix's regression net; the
+/// retry path itself is pinned deterministically by the `sys::fs` unit tests).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_exec_through_a_dotdot_relative_symlink_resolves() {
+    let base = temp_dir("dotdot-exec");
+    let rootfs = build_test_rootfs("rootfs");
+    let ws = base.join("workspace");
+    std::fs::create_dir_all(&ws).expect("create workspace host dir");
+
+    // <rootfs>/usr/lib64/echo -> ../bin/rootfs-helper: the final component is
+    // a symlink whose target walks `..`, exactly like the image's ld-linux.
+    std::fs::create_dir_all(rootfs.join("usr/lib64")).expect("create usr/lib64");
+    std::os::unix::fs::symlink("../bin/rootfs-helper", rootfs.join("usr/lib64/echo"))
+        .expect("create the ..-relative exec symlink");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/")
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_mount("/workspace", &ws)
+        .fs_mount("/home/user", &ws)
+        .fs_write("/workspace")
+        .fs_write("/home/user")
+        .cwd("/workspace")
+        .build()
+        .expect("dotdot exec policy builds");
+
+    let mut inst = SandboxInstance::launch_exec_only(policy)
+        .await
+        .expect("exec-only chroot instance must launch");
+    let h = inst
+        .exec(&["/usr/lib64/echo", "dotdot-relative-exec-ok"], ExecStdio::Piped)
+        .await
+        .expect("exec through the ..-relative symlink must be served");
+    let status = inst.wait_child(h.child_id).await.expect("wait exec child");
+    let mut out = Vec::new();
+    std::fs::File::from(h.stdout.expect("piped exec stdout"))
+        .read_to_end(&mut out)
+        .expect("read exec stdout");
+    let mut err = Vec::new();
+    std::fs::File::from(h.stderr.expect("piped exec stderr"))
+        .read_to_end(&mut err)
+        .expect("read exec stderr");
+    assert_eq!(
+        status,
+        ExitStatus::Code(0),
+        "the workload behind the ..-relative symlink must run; stderr={:?}",
+        String::from_utf8_lossy(&err)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "dotdot-relative-exec-ok\n",
+        "exact stdout through the ..-relative symlink; stderr={:?}",
+        String::from_utf8_lossy(&err)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&err),
+        "",
+        "a served exec emits nothing on stderr"
+    );
+
+    inst.shutdown().await.expect("instance shutdown");
+    cleanup(&rootfs);
+    cleanup(&base);
+}
+
+/// A mediated exec failure the sandbox *hides* from the child must leave
+/// evidence behind. Before FUP-26 every failure of the supervisor's own
+/// `openat2(RESOLVE_IN_ROOT)` -- including the retryable `EAGAIN` -- was
+/// reported to the child as `ENOENT`, so `execvp` failed, `sandlock-init`
+/// exited 127 and the command produced no output at all: "127 with an empty
+/// stderr" was indistinguishable from a genuinely missing binary.
+///
+/// Deterministic form: a symlink loop is `ELOOP` (40) at every attempt, on
+/// every kernel version, for every uid -- the kernel's answer must reach the
+/// child's stderr instead of being rewritten into "not found".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_exec_failure_names_the_kernel_errno_instead_of_exiting_127_silently() {
+    let base = temp_dir("exec-errno");
+    let rootfs = build_test_rootfs("rootfs");
+    let ws = base.join("workspace");
+    std::fs::create_dir_all(&ws).expect("create workspace host dir");
+
+    std::os::unix::fs::symlink("loop-b", rootfs.join("usr/bin/loop-a"))
+        .expect("create loop-a");
+    std::os::unix::fs::symlink("loop-a", rootfs.join("usr/bin/loop-b"))
+        .expect("create loop-b");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/")
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_mount("/workspace", &ws)
+        .fs_mount("/home/user", &ws)
+        .fs_write("/workspace")
+        .fs_write("/home/user")
+        .cwd("/workspace")
+        .build()
+        .expect("errno-reporting policy builds");
+
+    let mut inst = SandboxInstance::launch_exec_only(policy)
+        .await
+        .expect("exec-only chroot instance must launch");
+    let h = inst
+        .exec(&["/usr/bin/loop-a"], ExecStdio::Piped)
+        .await
+        .expect("the refused exec is the child's own exit status, not a driver error");
+    let status = inst.wait_child(h.child_id).await.expect("wait exec child");
+    let mut out = Vec::new();
+    std::fs::File::from(h.stdout.expect("piped exec stdout"))
+        .read_to_end(&mut out)
+        .expect("read exec stdout");
+    let mut err = Vec::new();
+    std::fs::File::from(h.stderr.expect("piped exec stderr"))
+        .read_to_end(&mut err)
+        .expect("read exec stderr");
+
+    assert_eq!(String::from_utf8_lossy(&out), "", "no stdout from a failed exec");
+    assert_eq!(
+        status,
+        ExitStatus::Code(127),
+        "127 stays the reserved exec-failure code; stderr={:?}",
+        String::from_utf8_lossy(&err)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&err),
+        "sandlock-init: exec \"/usr/bin/loop-a\" failed (errno 40)\n",
+        "the kernel's ELOOP must reach the operator, not a fabricated ENOENT"
+    );
+
+    // The genuinely-missing-binary shape keeps its stock, silent 127: ENOENT
+    // is the POSIX "not found" answer every execvp caller already handles
+    // (and the shape e2b's contract tests pin as "127 with no output").
+    let m = inst
+        .exec(&["/usr/bin/absent-binary"], ExecStdio::Piped)
+        .await
+        .expect("a missing binary is the child's exit status");
+    let mstatus = inst.wait_child(m.child_id).await.expect("wait missing child");
+    let mut merr = Vec::new();
+    std::fs::File::from(m.stderr.expect("piped stderr"))
+        .read_to_end(&mut merr)
+        .expect("read stderr");
+    assert_eq!(
+        mstatus,
+        ExitStatus::Code(127),
+        "missing binary still exits 127; stderr={:?}",
+        String::from_utf8_lossy(&merr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&merr),
+        "",
+        "ENOENT stays silent: 'command not found' is not a hidden failure"
+    );
+
+    inst.shutdown().await.expect("instance shutdown");
+    cleanup(&rootfs);
+    cleanup(&base);
+}
+
 /// Guard, not a RED: this is the post-fix guarding assertion. The launch cwd
 /// does not go through the mount tie-break — `context.rs` turns it into a real
 /// `chdir` to the host path under the rootfs, which the chroot-root rule alone

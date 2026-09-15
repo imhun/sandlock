@@ -1104,7 +1104,15 @@ pub(crate) async fn handle_chroot_exec(
         0,
     ) {
         Ok(fd) => fd,
-        Err(_) => return NotifAction::Errno(libc::ENOENT),
+        // FUP-26: hand the child the kernel's own errno. Collapsing every
+        // failure into ENOENT made a *retryable* `EAGAIN` (openat2(2):
+        // RESOLVE_IN_ROOT could not prove a `..` did not escape) look exactly
+        // like "no such file": `execvp` reports "not found", init exits 127
+        // and the operator sees a workload that produced no output at all.
+        // The chdir path below has always worked this way; the exec path is
+        // what every dynamically linked binary's PT_INTERP goes through, so
+        // it is the one that has to be diagnosable.
+        Err(errno) => return NotifAction::Errno(errno),
     };
 
     // Read PT_INTERP from the binary. If it has one, open the image's
@@ -1123,9 +1131,13 @@ pub(crate) async fn handle_chroot_exec(
             0,
         ) {
             Ok(fd) => fd,
-            Err(_) => {
+            // Same rule as the binary open above: the interpreter is opened by
+            // the supervisor on the child's behalf, and its errno is the only
+            // thing that can tell "the image has no ld-linux" (ENOENT) from
+            // "the kernel could not guarantee this `..`" (EAGAIN).
+            Err(errno) => {
                 unsafe { libc::close(src_fd) };
-                return NotifAction::Errno(libc::ENOENT);
+                return NotifAction::Errno(errno);
             }
         };
 
