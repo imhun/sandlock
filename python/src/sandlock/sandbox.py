@@ -448,6 +448,19 @@ class Sandbox:
     socket fd now refers to the host-connected socket.  Defaults to
     ``False`` (legacy on-behalf connect)."""
 
+    net_bind_inject: bool = False
+    """S2.5 bind-injection mode for :attr:`port_mappings`: the supervisor
+    answers the sandbox's ``bind()`` on a mapped *sandbox* port by creating a
+    socket bound to ``127.0.0.1:<host_port>`` in the host netns and replacing
+    the sandbox's socket with it (``SECCOMP_ADDFD_FLAG_SETFD``).  The sandbox's
+    ``listen()``/``accept()`` then run on a real host-netns listening socket,
+    so ``accept()`` needs no interception and the event loop's
+    ``poll``/``epoll_wait`` are never trapped for readiness synthesis.
+    Requires :attr:`net_isolation` and at least one :attr:`port_mappings`
+    entry; the host socket binds loopback only (never ``0.0.0.0``), so
+    ``getsockname()`` reports the loopback address.  Defaults to ``False``
+    (host-listener mapping)."""
+
     port_mappings: Mapping[int, int] | None = None
     """Inbound port mappings ``{host_port: sandbox_port}`` for
     :attr:`net_isolation` sandboxes: the sandbox's ``listen()`` on

@@ -780,6 +780,25 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
+    // Bind — S2.5 injection for inbound-mapped ports
+    //
+    // Registered before the on-behalf handler so a mapped port is answered by
+    // fd replacement and never reaches the port-remap/bind-deny logic; every
+    // non-mapped bind returns Continue and keeps its existing chain.
+    // ------------------------------------------------------------------
+    if policy.net_bind_inject {
+        let __sup = Arc::clone(ctx);
+        table.register(libc::SYS_bind, move |cx: &HandlerCtx| {
+            let notif = cx.notif;
+            let sup = Arc::clone(&__sup);
+            let notif_fd = cx.notif_fd;
+            async move {
+                crate::network::bind_inject::handle_bind(&notif, &sup, notif_fd).await
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------
     // Bind — on-behalf
     // ------------------------------------------------------------------
     if policy.port_remap || policy.has_net_destination_policy || policy.has_bind_denylist {

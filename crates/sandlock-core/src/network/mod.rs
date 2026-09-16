@@ -32,6 +32,7 @@ mod connect;
 pub(crate) mod dns_synth;
 pub(crate) mod dns_gateway;
 pub(crate) mod egress;
+pub(crate) mod bind_inject;
 pub(crate) mod inbound;
 pub(crate) mod materialize;
 pub(crate) mod readiness;

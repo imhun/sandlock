@@ -256,6 +256,7 @@ impl TryFrom<&Sandbox> for Confinement {
         if !sandbox.net_allow_bind.is_default() { unsupported.push("net_allow_bind"); }
         if !sandbox.net_deny_bind.is_empty() { unsupported.push("net_deny_bind"); }
         if !sandbox.net_bind_map.is_empty() { unsupported.push("net_bind_map"); }
+        if sandbox.net_bind_inject { unsupported.push("net_bind_inject"); }
         if sandbox.allows_sysv_ipc() { unsupported.push("extra_allow_syscalls=[\"sysv_ipc\"]"); }
         if !sandbox.http_allow.is_empty() { unsupported.push("http_allow"); }
         if !sandbox.http_deny.is_empty() { unsupported.push("http_deny"); }
@@ -496,6 +497,27 @@ pub struct Sandbox {
     /// external gateway -> host mapped port -> sandbox listener).
     #[serde(default)]
     pub net_bind_map: Vec<(u16, u16)>,
+    /// S2.5 bind-injection mode: instead of letting the sandbox bind inside
+    /// its own netns and serving `accept()` from a supervisor-side host
+    /// listener, the supervisor *replaces the sandbox's socket* at `bind()`
+    /// time with a socket it created and bound on the host loopback at the
+    /// mapped `host_port` (`SECCOMP_ADDFD_FLAG_SETFD`, the mechanism
+    /// `fd_inject_connect` already uses).
+    ///
+    /// The sandbox then `listen()`s and `accept()`s on a real host-netns
+    /// listening socket: `accept()` needs no interception, the event loop's
+    /// `ppoll`/`epoll_pwait` never enter the supervisor (no host-side queued
+    /// connection needs synthesizing), and accepted connections are ordinary
+    /// kernel accepts. The trade-off is the bind address — the host socket is
+    /// bound to `127.0.0.1`/`::1`, never `0.0.0.0`, so that is what
+    /// `getsockname()` reports.
+    ///
+    /// Requires `net_isolation` (the injected socket must not collide with the
+    /// sandbox's own netns sockets) and a non-empty `net_bind_map` (the mapped
+    /// pairs are exactly the ports that may be injected, and on which host
+    /// port).
+    #[serde(default)]
+    pub net_bind_inject: bool,
     // HTTP ACL
     pub http_allow: Vec<HttpRule>,
     pub http_deny: Vec<HttpRule>,
@@ -728,6 +750,7 @@ impl Clone for Sandbox {
             net_allow_bind: self.net_allow_bind.clone(),
             net_deny_bind: self.net_deny_bind.clone(),
             net_bind_map: self.net_bind_map.clone(),
+            net_bind_inject: self.net_bind_inject,
             http_allow: self.http_allow.clone(),
             http_deny: self.http_deny.clone(),
             inject: self.inject.clone(),
@@ -852,6 +875,34 @@ impl Sandbox {
                 return Err(SandboxError::Invalid(
                     "net_bind_map (inbound port mapping) requires the seccomp \
                      supervisor and is incompatible with no_supervisor=true"
+                        .into(),
+                ));
+            }
+        }
+        // Bind-injection mode answers `bind()` by replacing the sandbox's
+        // socket with a host-loopback one, so it needs the mapped port set
+        // (which ports, on which host port) and the same supervisor the
+        // mapping path needs.
+        if self.net_bind_inject {
+            if self.net_bind_map.is_empty() {
+                return Err(SandboxError::Invalid(
+                    "net_bind_inject requires net_bind_map: the mappings define \
+                     which sandbox ports are injectable and on which host port"
+                        .into(),
+                ));
+            }
+            if !self.net_isolation {
+                return Err(SandboxError::Invalid(
+                    "net_bind_inject requires net_isolation(true): the injected \
+                     host socket only makes sense while the sandbox owns its \
+                     own loopback-only netns"
+                        .into(),
+                ));
+            }
+            if self.no_supervisor {
+                return Err(SandboxError::Invalid(
+                    "net_bind_inject requires the seccomp supervisor and is \
+                     incompatible with no_supervisor=true"
                         .into(),
                 ));
             }
@@ -2800,6 +2851,7 @@ impl Sandbox {
                 fd_inject_connect: resolved.features.fd_inject_connect,
                 net_isolation: resolved.features.net_isolation,
                 inbound_port_map: resolved.features.inbound_port_map,
+                net_bind_inject: resolved.features.net_bind_inject,
                 cow_enabled: resolved.features.cow,
                 chroot_root: chroot_root.clone(),
                 chroot_readable: self.fs_readable.clone(),

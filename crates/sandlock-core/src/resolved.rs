@@ -46,6 +46,7 @@ pub(crate) struct SandboxFeatures {
     pub(crate) fd_inject_connect: bool,
     pub(crate) net_isolation: bool,
     pub(crate) inbound_port_map: bool,
+    pub(crate) net_bind_inject: bool,
     pub(crate) http_acl: bool,
     pub(crate) argv_safety_required: bool,
     pub(crate) sysv_ipc_allowed: bool,
@@ -88,6 +89,7 @@ impl SandboxFeatures {
             fd_inject_connect: sandbox.fd_inject_connect,
             net_isolation: sandbox.net_isolation,
             inbound_port_map: !sandbox.net_bind_map.is_empty(),
+            net_bind_inject: sandbox.net_bind_inject,
             http_acl,
             // F5.1 (M3 S1): an in-child-main control session (the confined
             // `sandlock-init` of an exec-capable `SandboxInstance`, and every

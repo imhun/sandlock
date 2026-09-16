@@ -199,6 +199,9 @@ _b_fd_inject_connect = _builder_fn(
 _b_net_bind_map = _builder_fn(
     "sandlock_sandbox_builder_net_bind_map", ctypes.c_uint16, ctypes.c_uint16
 )
+_b_net_bind_inject = _builder_fn(
+    "sandlock_sandbox_builder_net_bind_inject", ctypes.c_bool
+)
 _b_http_allow = _builder_fn("sandlock_sandbox_builder_http_allow", ctypes.c_char_p)
 _b_http_deny = _builder_fn("sandlock_sandbox_builder_http_deny", ctypes.c_char_p)
 _b_credential = _builder_fn(
@@ -1330,6 +1333,7 @@ class _NativePolicy:
         "net_allow", "net_deny", "net_allow_bind", "net_deny_bind",
         "port_remap",
         "pid_ns", "net_isolation", "fd_inject_connect", "port_mappings",
+        "net_bind_inject",
         "http_allow", "http_deny", "http_ports", "http_ca", "http_key",
         "http_inject_ca", "http_ca_out", "http_inject", "host_mask",
         "egress_proxy", "uid", "gid",
@@ -1477,6 +1481,8 @@ class _NativePolicy:
             b = _b_fd_inject_connect(b, True)
         for host_port, sandbox_port in sorted((policy.port_mappings or {}).items()):
             b = _b_net_bind_map(b, int(host_port), int(sandbox_port))
+        if policy.net_bind_inject:
+            b = _b_net_bind_inject(b, True)
 
         if policy.uid is not None or policy.gid is not None:
             if policy.uid is None or policy.gid is None:

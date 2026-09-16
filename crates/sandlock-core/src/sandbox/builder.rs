@@ -66,6 +66,13 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "net-bind-map", value_name = "HOST:SANDBOX", value_parser = parse_port_pair))]
     pub net_bind_map: Vec<(u16, u16)>,
 
+    /// S2.5 bind-injection mode for the mapped ports (see
+    /// [`super::Sandbox::net_bind_inject`]). Off by default: the mapping path
+    /// (host listener + readiness synthesis) stays the default until a
+    /// deployment opts in.
+    #[cfg_attr(feature = "cli", arg(long = "net-bind-inject"))]
+    pub net_bind_inject: bool,
+
     #[cfg_attr(feature = "cli", arg(long = "http-allow", value_name = "RULE"))]
     pub http_allow: Vec<String>,
 
@@ -348,6 +355,7 @@ impl Default for SandboxBuilder {
             net_allow_bind: Vec::new(),
             net_deny_bind: Vec::new(),
             net_bind_map: Vec::new(),
+            net_bind_inject: false,
             http_allow: Vec::new(),
             http_deny: Vec::new(),
             credentials: Vec::new(),
@@ -422,6 +430,7 @@ impl Clone for SandboxBuilder {
             net_allow_bind: self.net_allow_bind.clone(),
             net_deny_bind: self.net_deny_bind.clone(),
             net_bind_map: self.net_bind_map.clone(),
+            net_bind_inject: self.net_bind_inject,
             http_allow: self.http_allow.clone(),
             http_deny: self.http_deny.clone(),
             credentials: self.credentials.clone(),
@@ -613,6 +622,17 @@ impl SandboxBuilder {
     /// Requires `net_isolation(true)` and the seccomp supervisor.
     pub fn net_bind_map(mut self, host_port: u16, sandbox_port: u16) -> Self {
         self.net_bind_map.push((host_port, sandbox_port));
+        self
+    }
+
+    /// S2.5 bind-injection mode for the mapped ports: replace the sandbox's
+    /// socket with a supervisor-created host-loopback socket at `bind()` time
+    /// instead of serving `accept()` from a host listener. Removes the
+    /// readiness synthesis (`poll`/`ppoll`/`epoll_wait` interception) from the
+    /// data path; see [`super::Sandbox::net_bind_inject`]. Requires
+    /// `net_bind_map` and `net_isolation`.
+    pub fn net_bind_inject(mut self, v: bool) -> Self {
+        self.net_bind_inject = v;
         self
     }
 
@@ -1280,6 +1300,7 @@ impl SandboxBuilder {
             net_allow_bind,
             net_deny_bind,
             net_bind_map: self.net_bind_map.clone(),
+            net_bind_inject: self.net_bind_inject,
             http_allow,
             http_deny,
             inject,

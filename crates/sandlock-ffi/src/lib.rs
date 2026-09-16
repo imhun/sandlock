@@ -581,6 +581,29 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fd_inject_connect(
     Box::into_raw(Box::new(builder.fd_inject_connect(v)))
 }
 
+/// S2.5 bind injection for the ports configured with
+/// `sandlock_sandbox_builder_net_bind_map`: at `bind()` time the supervisor
+/// creates a socket bound to `127.0.0.1:<host_port>` in the host netns and
+/// *replaces the sandbox's socket* with it (`SECCOMP_ADDFD_FLAG_SETFD`), so
+/// the sandbox's `listen()`/`accept()` run on a real host-netns listening
+/// socket and the event loop's `poll`/`epoll_wait` are never trapped for
+/// readiness synthesis. Requires `net_isolation(true)` and at least one
+/// `net_bind_map` entry. Defaults to `false` (host-listener mapping).
+///
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_net_bind_inject(
+    b: *mut SandboxBuilder,
+    v: bool,
+) -> *mut SandboxBuilder {
+    if b.is_null() {
+        return b;
+    }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.net_bind_inject(v)))
+}
+
 /// Add an inbound port mapping: the sandbox's `listen()` on `sandbox_port`
 /// (inside its `net_isolation` netns) is served from the supervisor's
 /// host-loopback listener on `host_port` (>= 50005, the reserved inbound

@@ -830,6 +830,11 @@ pub struct NotifPolicy {
     /// inject accepted connection fds into the sandbox. Requires
     /// `net_isolation` (build-time validated).
     pub inbound_port_map: bool,
+    /// S2.5 bind-injection mode: mapped ports are served by replacing the
+    /// sandbox's socket at `bind()` time with a supervisor-created
+    /// host-loopback socket, so there is no host listener, no eager-accept
+    /// queue and no readiness synthesis.
+    pub net_bind_inject: bool,
     pub cow_enabled: bool,
     pub chroot_root: Option<std::path::PathBuf>,
     /// Virtual paths allowed for reading under chroot (original user-specified paths).

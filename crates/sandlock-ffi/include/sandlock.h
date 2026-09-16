@@ -651,6 +651,18 @@ sandlock_builder_t *sandlock_sandbox_builder_net_isolation(sandlock_builder_t *b
 sandlock_builder_t *sandlock_sandbox_builder_fd_inject_connect(sandlock_builder_t *b, bool v);
 
 /**
+ * S2.5 bind injection for the ports configured with
+ * `sandlock_sandbox_builder_net_bind_map` (see the Rust doc comment):
+ * `bind()` on a mapped port is answered by replacing the sandbox's socket
+ * with a host-loopback one, so `listen()`/`accept()` are ordinary kernel work
+ * and the event loop's readiness syscalls stay out of the supervisor.
+ *
+ * # Safety
+ * `b` must be a valid builder pointer.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_net_bind_inject(sandlock_builder_t *b, bool v);
+
+/**
  * Add an inbound port mapping: the sandbox's `listen()` on `sandbox_port`
  * (inside its `net_isolation` netns) is served from the supervisor's
  * host-loopback listener on `host_port` (>= 50005, the reserved inbound

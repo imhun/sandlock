@@ -31,6 +31,7 @@
 //! | `port_remap` | `[network].port_remap` | same | same |
 //! | `pid_ns`/`net_isolation`/`fd_inject_connect` | not in profile | same | same |
 //! | `port_mappings` (object) | not in profile | `net_bind_map` | `port_mappings` dict |
+//! | `net_bind_inject` (bool) | not in profile | same | same |
 //! | `random_seed`/`time_start` | `[determinism]` | same | same |
 //! | `no_randomize_memory`/`no_huge_pages`/`no_coredump`/`deterministic_dirs` | `[determinism]` + `[program].no_*` | same | same |
 //! | `chroot`/`fs_mount` (spec list `VIRTUAL:HOST[:ro]`) | `[filesystem].chroot/mount` | `chroot`/`fs_mount`+`fs_mount_ro` | `chroot`/`fs_mount` (rw dict only) |
@@ -121,6 +122,7 @@ pub const POLICY_FIELDS: &[&str] = &[
     "max_processes",
     "net_allow",
     "net_allow_bind",
+    "net_bind_inject",
     "net_deny",
     "net_deny_bind",
     "net_isolation",
@@ -184,6 +186,11 @@ pub struct SupervisePolicy {
     pub pid_ns: bool,
     pub net_isolation: bool,
     pub fd_inject_connect: bool,
+    /// S2.5 bind injection: mapped ports are answered by replacing the
+    /// sandbox's socket with a host-loopback one at `bind()` time, instead of
+    /// serving `accept()` from a host listener with readiness synthesis.
+    #[serde(default)]
+    pub net_bind_inject: bool,
     pub port_mappings: Option<BTreeMap<u16, u16>>,
     pub random_seed: Option<u64>,
     pub time_start: Option<TimeSpec>,
@@ -546,6 +553,9 @@ fn apply(parsed: &ParsedPolicy) -> Result<SandboxBuilder, String> {
     }
     if prov.contains("fd_inject_connect") && p.fd_inject_connect {
         b = b.fd_inject_connect(true);
+    }
+    if prov.contains("net_bind_inject") && p.net_bind_inject {
+        b = b.net_bind_inject(true);
     }
     if prov.contains("port_mappings") {
         if let Some(map) = &p.port_mappings {
@@ -1177,6 +1187,13 @@ fn verify(sandbox: &Sandbox, parsed: &ParsedPolicy) -> Result<(), String> {
             &sandbox.fd_inject_connect
         );
     }
+    if prov.contains("net_bind_inject") {
+        check!(
+            "net_bind_inject",
+            &p.net_bind_inject,
+            &sandbox.net_bind_inject
+        );
+    }
     if prov.contains("port_mappings") {
         let expected: Vec<(u16, u16)> = p
             .port_mappings
@@ -1363,6 +1380,7 @@ pub fn example_policy_json(secret_path: &Path) -> String {
         "net_isolation": true,
         "fd_inject_connect": true,
         "port_mappings": {"50005": 8080},
+        "net_bind_inject": true,
         "random_seed": 42,
         "time_start": "2026-01-01T00:00:00Z",
         "no_randomize_memory": true,

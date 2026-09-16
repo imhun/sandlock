@@ -652,6 +652,12 @@ pub struct NetworkState {
     /// an entry — the `close` handler, or NetworkState teardown with the
     /// sandbox — closes the host listener.
     pub inbound: HashMap<u64, crate::network::inbound::InboundListener>,
+    /// S2.5 bind-injection mode: inodes of the host-loopback listening sockets
+    /// the supervisor created and injected over the sandbox's own socket at
+    /// `bind()` time. `listen()` on such a socket must reach the kernel (it is
+    /// already a host-netns listener), and `accept()`/`epoll_wait` need no
+    /// mapping, so every inbound path checks this set before doing anything.
+    pub injected_listeners: HashSet<u64>,
     /// E7.1: epoll registration tracking for inbound-mapped listeners.
     /// Keyed by `(pid, epoll fd)` — fd numbers are per-process, and the
     /// sandbox runs several processes (the gateway plus its stdio MCP
@@ -684,6 +690,7 @@ impl NetworkState {
             egress_proxy: None,
             inbound_map: HashMap::new(),
             inbound: HashMap::new(),
+            injected_listeners: HashSet::new(),
             epoll_registrations: HashMap::new(),
         }
     }
