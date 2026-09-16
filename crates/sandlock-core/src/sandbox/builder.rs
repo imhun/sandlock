@@ -288,6 +288,9 @@ pub struct SandboxBuilder {
     /// `sandlock-supervise` only after it probes that an unprivileged userns is
     /// actually available; nothing else opts in, and a caller that asks for it
     /// without a usable userns falls back to today's shape rather than failing.
+    /// Honoured whether the user namespace is created by the confining child
+    /// itself or by the pid-ns intermediate process (which writes the maps
+    /// before the final fork).
     #[cfg_attr(feature = "cli", clap(skip))]
     pub userns_self_map: bool,
 

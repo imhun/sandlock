@@ -658,7 +658,10 @@ pub struct Sandbox {
 
     /// Self-map the supervisor's own host uid to in-namespace uid 0 (see
     /// `SandboxBuilder::userns_self_map`): how a route-B slot restores
-    /// "root inside the sandbox, host uid outside".
+    /// "root inside the sandbox, host uid outside". Honoured by both writers
+    /// of the generation's uid_map: `confine_child` here, and the pid-ns
+    /// intermediate process, which creates the user namespace before the
+    /// final fork.
     #[serde(skip, default)]
     pub userns_self_map: bool,
 
@@ -2310,11 +2313,37 @@ impl Sandbox {
                     );
                     unsafe { libc::_exit(127) };
                 }
-                let (map_uid, map_gid) = match self.user {
-                    Some(run_as) if run_as.uid != real_uid || run_as.gid != real_gid => {
-                        (run_as.uid, run_as.gid)
-                    }
-                    _ => (real_uid, real_gid),
+                // The same three shapes `confine_child` chooses between
+                // (`context.rs`, step 5) -- this process writes the maps for
+                // the whole generation on the unprivileged path, so it must
+                // not invent a fourth one:
+                //
+                //   * privileged remap: `RunAs` is a *different* host uid, so
+                //     the supervisor writes `0 -> RunAs` over the handshake
+                //     pipes (the `map_ready_w` branch below); the pair here is
+                //     only the fallback for a remap that reached this process
+                //     without pipes (defense in depth, refused before fork);
+                //   * route-B self-map (F18): the requested identity *is*
+                //     ours, so map `0 -> euid` -- root inside, sandbox uid
+                //     outside. Without this branch the intermediate would map
+                //     `euid -> euid` and a route-B guest would come up as its
+                //     host uid instead of root, i.e. the one shape route B
+                //     has and the non-pid-ns path already restores;
+                //   * plain: map our own identity through unchanged
+                //     (`net_isolation` needs the namespace, not a new uid).
+                let remap = matches!(
+                    self.user,
+                    Some(run_as) if run_as.uid != real_uid || run_as.gid != real_gid
+                );
+                let self_map =
+                    self.userns_self_map && !remap && self.user.is_some() && real_uid != 0;
+                let (map_uid, map_gid) = if remap {
+                    let run_as = self.user.expect("a remap implies RunAs");
+                    (run_as.uid, run_as.gid)
+                } else if self_map {
+                    (0, 0)
+                } else {
+                    (real_uid, real_gid)
                 };
                 if map_ready_w.is_some() {
                     // Privileged: hand the namespace to the parent, which

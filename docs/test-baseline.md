@@ -190,7 +190,19 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 542 # FUP-26 (2026-09-15): 540 -> 542, +2 in
+core_integ = 543 # pid-ns route-B self-map (2026-09-16): 542 -> 543, +1 in
+                 # crates/sandlock-core/tests/integration/test_pid_ns.rs:
+                 # `pid_ns_self_map_restores_guest_root` — with pid_ns the
+                 # generation's user namespace is created by the *intermediate*
+                 # process (before the final fork), and that process only knew
+                 # "privileged remap" and "own identity": a route-B guest came
+                 # up as its host uid (`id -u` = 65534 in the non-root phase)
+                 # instead of the 0 the same policy yields without pid_ns. The
+                 # intermediate now honours `userns_self_map` (`0 -> euid`), so
+                 # the guest is root inside while its writes stay owned by the
+                 # sandbox's host uid. RED on the pre-fix two-arm map (captured
+                 # in the E2B parent repo's tmp/pidns-fork-red.log).
+                 # FUP-26 (2026-09-15): 540 -> 542, +2 in
                  # crates/sandlock-core/tests/integration/test_instance_chroot.rs:
                  # `test_exec_through_a_dotdot_relative_symlink_resolves` (the
                  # exec path reached through a relative symlink whose target

@@ -8,6 +8,7 @@
 //! (pause/resume/checkpoint/throttle/tty) keep working.
 
 use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::FromRawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
@@ -947,6 +948,72 @@ fn parse_spin_elapsed(out: &str) -> u64 {
         .find_map(|l| l.strip_prefix("spin_elapsed_ms="))
         .and_then(|v| v.parse().ok())
         .expect("spin_elapsed_ms missing from probe output")
+}
+
+/// Route B + pid_ns (F18 ⋈ S1.1): the intermediate process must restore guest
+/// root the same way the non-pid-ns path does (`Sandbox::userns_self_map`).
+///
+/// A route-B slot's supervisor *is* the sandbox's host uid, so the privileged
+/// `0 -> host_uid` map cannot be written (it needs CAP_SETUID in the parent
+/// user namespace) and the guest gets root by self-mapping `0 -> its own euid`.
+/// With pid_ns the user namespace is created by the *intermediate* process,
+/// before the final fork, and that process used to know only two shapes
+/// ("privileged remap" and "own identity"): the guest therefore came up as its
+/// host uid -- `id -u` = the slot uid, not the 0 the same policy yields
+/// without pid_ns.
+///
+/// Asserted in the shape the deployment runs: this suite's default phase is
+/// uid 65534, i.e. exactly a route-B slot. As root the same policy takes the
+/// plain identity path (`euid == 0` never self-maps -- `probe_userns_self_map`
+/// returns false there), and the same two assertions still have to hold.
+#[tokio::test]
+async fn pid_ns_self_map_restores_guest_root() {
+    let dir = std::env::temp_dir().join(format!(
+        "sandlock-test-pidns-selfmap-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    // World-writable so the sandbox's identity can create its file; what is
+    // under test is the *owner* of what it writes, not the directory.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))
+        .expect("chmod scratch dir");
+    let owned = dir.join("owned.txt");
+
+    let me = unsafe { libc::geteuid() };
+    let my_gid = unsafe { libc::getegid() };
+    let mut sb = exec_base_policy()
+        .user(me, my_gid)
+        .fs_write(&dir)
+        .build()
+        .unwrap();
+    // What `sandlock-supervise` sets for every route-B slot it spawns (it
+    // probes first; here the phase itself already says which shape we are).
+    sb.userns_self_map = true;
+
+    let cmd = format!("id -u; printf owned > {}", owned.display());
+    let r = sb.run(&["sh", "-c", &cmd]).await.unwrap();
+    assert!(
+        r.success(),
+        "route-B pid-ns sandbox failed: {:?}, stderr: {:?}",
+        r.exit_status,
+        r.stderr_str()
+    );
+    assert_eq!(
+        r.stdout_str(),
+        Some("0"),
+        "the guest must be uid 0 inside its user namespace (route-B self-map), \
+         not its host uid {me}"
+    );
+    assert_eq!(
+        std::fs::metadata(&owned)
+            .expect("the sandbox's file must exist on the host")
+            .uid(),
+        me,
+        "the guest's writes must still land owned by the sandbox's host uid"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Default `pid_ns=false`: the shared host PID namespace stays in effect —
