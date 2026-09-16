@@ -144,8 +144,19 @@ userns 只增不减，限制不削弱）；非 remap / netns 自映射 / pid-ns 
 C 档 fail-closed 不变。回归用例：root 档 `mediation_2uid` 新增 one-shot
 `RunAs(10000)`、instance `RunAs(10000)`、instance uid-0 三个 restrictive-cache
 验收（5→8），非 root 档新增 `test_instance_chroot.rs` 同 uid exec-only 验收
-（core_integ 531→532）。**E2B 侧需在 fork wheel 重建后复跑 §8/M4 探针**
-（`tmp/mediation_probe.py` / `tmp/instance_probe.py`；修复已按探针根因对应）。
+（core_integ 531→532）。
+
+**E2B 侧现状（2026-09-16 更新：那一轮"重建 wheel 后复跑探针"不再是待办）**：
+修复已随 wheel 切源进部署 —— worker 装的是 fork `wheels/fork` 的 wheel（E7 切源，
+wheel 与 fork 提交由 `python/verify-wheel.sh` 的 manifest 钉住），route B 是
+chroot / 镜像 rootfs 形态的**部署默认**（`E2B_PER_SANDBOX_UID=true` 让 root worker
+拿到 per-sandbox host uid，`E2B_ROUTE_B` 走 `auto` ⇒ 槽位自动生效），线上两个 worker
+的每个沙箱都有 `route-B instance ready … uid=<池内 uid> … guest-uid=uid-0-in-userns`
+槽位日志（2026-09-16 目标机实测）。原来计划的一次性探针（`tmp/mediation_probe.py` /
+`tmp/instance_probe.py`）已由入库契约接替：fork 侧 A/B/C 三档（本节的
+`test_nonroot_created_file_owned_by_self`、`--mediation-2uid` 的
+`test_two_supervisors_distinct_uids_isolate_files`、特权中介建箱前拒绝）+ E2B 侧
+`test_uid_permissions.py`、`test_route_b_executor.py`、`test_route_b_slot_pool.py`。
 
 ### 3.2 `notify_rate_limit` 假告警（Low）
 
