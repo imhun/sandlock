@@ -1059,6 +1059,7 @@ mod tests {
             fd_inject_connect: false,
             net_isolation: false,
             inbound_port_map: false,
+            net_bind_inject: false,
             cow_enabled: false,
             chroot_root: None,
             chroot_readable: Vec::new(),
