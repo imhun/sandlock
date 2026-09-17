@@ -122,60 +122,66 @@ pub(crate) const MEDIATED_PATH_SYSCALLS: &[&str] = &[
 /// [`NON_PATH_SYSCALLS`], whose job is to make the classification total.
 pub(crate) const UNMEDIATED_PATH_TAKING: &[(&str, Disposition)] = &[
     // ---- open items: unmediated, no demonstrated gate ---------------------
+    // The new mount API, refused in every shape (see the blocklist):
+    // `open_tree` without OPEN_TREE_CLONE measured to hand the sandbox an
+    // O_PATH fd for a host directory, and the CLONE form is CAP_SYS_ADMIN.
+    ("open_tree", Disposition::Blocked),
     (
-        "open_tree",
+        "fchmodat2",
         Disposition::Open(
-            "mount API without OPEN_TREE_CLONE is an O_PATH open; MEASURED to return an fd \
-             for a host directory. Traversal through that fd was refused (openat -> EACCES, \
-             the mediator will not resolve a dirfd outside the virtual root) and \
-             getdents64 -> EBADF, so no content leak was demonstrated -- but the path was \
-             resolved by the kernel against the host root, which is the property this \
-             ledger tracks.",
+            "at-style chmod (kernel syscall 452). The kernel implements it; what refuses it is \
+             the *shipped worker seccomp profile*, whose default action returns ENOSYS for \
+             anything not in its allow list (measured: ENOSYS under the deploy profile, EINVAL \
+             with seccomp=unconfined). So it is unreachable in the deployed shape and reachable \
+             on any host running a wider profile. Mediate it there, do not blocklist it: glibc \
+             already uses it for chmod variants, and glibc will adopt the rest of this group",
         ),
     ),
     (
-        "fchmodat2",
-        Disposition::Open("at-style chmod; ENOSYS on the audit kernel, live on kernels >= 6.6"),
-    ),
-    (
         "getxattrat",
-        Disposition::Open("at-style xattr read; ENOSYS on the audit kernel, live on kernels >= 6.13"),
+        Disposition::Open(
+            "at-style xattr read (kernel 464). Implemented by the kernel; refused by the shipped \
+             worker seccomp profile (ENOSYS-by-default-action), reachable under a wider profile. \
+             Same disposition as fchmodat2: mediate when a deployment widens the profile",
+        ),
     ),
     (
         "setxattrat",
-        Disposition::Open("at-style xattr write; ENOSYS on the audit kernel, live on kernels >= 6.13"),
+        Disposition::Open("at-style xattr write (kernel 463); see getxattrat for the mechanism"),
     ),
     (
         "listxattrat",
-        Disposition::Open("at-style xattr list; ENOSYS on the audit kernel, live on kernels >= 6.13"),
+        Disposition::Open("at-style xattr list (kernel 465); see getxattrat for the mechanism"),
     ),
     (
         "removexattrat",
-        Disposition::Open("at-style xattr remove; ENOSYS on the audit kernel, live on kernels >= 6.13"),
+        Disposition::Open("at-style xattr remove (kernel 466); see getxattrat for the mechanism"),
     ),
-    (
-        "open_tree_attr",
-        Disposition::Open("same family as open_tree; ENOSYS on the audit kernel"),
-    ),
+    ("open_tree_attr", Disposition::Blocked),
     (
         "statmount",
         Disposition::Open(
-            "takes a mount id, not a path, but returns host mount metadata \
-             (root/mountpoint strings): an information-disclosure surface rather than a \
-             path-resolution one. ENOSYS on the audit kernel.",
+            "takes a mount id, not a path, but returns host mount metadata (root/mountpoint \
+             strings): a disclosure surface rather than a path-resolution one. Kernel 457, \
+             refused by the shipped profile like the rest of this group",
         ),
     ),
     (
         "listmount",
-        Disposition::Open("mount enumeration by id; same disclosure class as statmount; ENOSYS on the audit kernel"),
+        Disposition::Open("mount enumeration by id (kernel 458); see statmount"),
     ),
     (
         "file_getattr",
-        Disposition::Open("kernel 6.13+; signature not verified on the audit kernel (ENOSYS). Review before enabling"),
+        Disposition::Open(
+            "kernel 468; signature not verified. Refused by the shipped profile; review before \
+             enabling on a wider-profile host",
+        ),
     ),
     (
         "file_setattr",
-        Disposition::Open("kernel 6.13+; signature not verified on the audit kernel (ENOSYS). Review before enabling"),
+        Disposition::Open(
+            "kernel 469; signature not verified; see file_getattr",
+        ),
     ),
     // ---- gated: measured --------------------------------------------------
     (
@@ -285,6 +291,8 @@ pub(crate) const PURE_LANDLOCK_GATED: &[&str] = &[
 /// seccomp blocklist every shape installs (reason strings say which).
 pub(crate) const PURE_GATED_ELSEWHERE: &[(&str, &str)] = &[
     ("chroot", "blocklisted in every shape (OBS-1)"),
+    ("open_tree", "blocklisted in every shape: the new mount API, no Landlock right covers it"),
+    ("open_tree_attr", "blocklisted in every shape, see open_tree"),
     ("chown", "ownership/DAC only, no Landlock right: the sandbox owns nothing outside its workspace"),
     ("lchown", "ownership/DAC only, see chown"),
     ("fchownat", "ownership/DAC only, see chown"),
@@ -292,7 +300,6 @@ pub(crate) const PURE_GATED_ELSEWHERE: &[(&str, &str)] = &[
     ("move_mount", "CAP_SYS_ADMIN in the mount namespace's userns (measured EPERM)"),
     ("fspick", "mount API, CAP_SYS_ADMIN-gated like move_mount"),
     ("mount_setattr", "mount API, CAP_SYS_ADMIN-gated"),
-    ("open_tree_attr", "same family as open_tree; ENOSYS on the audit kernel"),
     ("file_getattr", "kernel 6.13+; ENOSYS on the audit kernel, signature unverified"),
     ("file_setattr", "kernel 6.13+; ENOSYS on the audit kernel, signature unverified"),
     ("statmount", "takes a mount id, not a path; ENOSYS on the audit kernel. Would disclose mount metadata when it lands"),
@@ -342,9 +349,8 @@ pub(crate) const PURE_UNGATED: &[(&str, &str)] = &[
     ("removexattr", "attribute removal, DAC-gated only"),
     ("lremovexattr", "see removexattr"),
     ("inotify_add_watch", "directory events + host file names (measured leak, OBS-2)"),
-    ("open_tree", "O_PATH fd for a host object (measured); traversal refused by the mediator only in the chroot shape"),
-    ("fchmodat2", "at-style chmod; ENOSYS on the audit kernel, live on kernels >= 6.6"),
-    ("getxattrat", "at-style xattr read; ENOSYS on the audit kernel, live on kernels >= 6.13"),
+    ("fchmodat2", "at-style chmod; refused by the shipped worker seccomp profile, reachable on a wider-profile host"),
+    ("getxattrat", "at-style xattr read; refused by the shipped profile, reachable on a wider-profile host"),
     ("setxattrat", "at-style xattr write; ENOSYS on the audit kernel"),
     ("listxattrat", "at-style xattr list; ENOSYS on the audit kernel"),
     ("removexattrat", "at-style xattr remove; ENOSYS on the audit kernel"),
@@ -517,13 +523,11 @@ mod tests {
         assert_eq!(
             open,
             vec![
-                "open_tree",
                 "fchmodat2",
                 "getxattrat",
                 "setxattrat",
                 "listxattrat",
                 "removexattrat",
-                "open_tree_attr",
                 "statmount",
                 "listmount",
                 "file_getattr",
@@ -575,7 +579,7 @@ mod tests {
                 "utimensat", "utime", "utimes", "futimesat",
                 "getxattr", "lgetxattr", "setxattr", "lsetxattr",
                 "listxattr", "llistxattr", "removexattr", "lremovexattr",
-                "inotify_add_watch", "open_tree",
+                "inotify_add_watch",
                 "fchmodat2", "getxattrat", "setxattrat", "listxattrat", "removexattrat",
             ]
         );

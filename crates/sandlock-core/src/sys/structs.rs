@@ -310,6 +310,15 @@ pub const DEFAULT_BLOCKLIST_SYSCALLS: &[&str] = &[
     "mount",
     "umount2",
     "pivot_root",
+    // The new mount API is the same capability through a newer interface.
+    // `mount`/`umount2`/`pivot_root` are already refused above, a container
+    // runtime is what uses these rather than a workload, and no Landlock
+    // access right covers them -- `open_tree` without OPEN_TREE_CLONE is an
+    // O_PATH open, measured to hand a sandbox an fd for a *host* directory
+    // (E2B audit 2026-09-17, path-surface ledger). With OPEN_TREE_CLONE it is
+    // CAP_SYS_ADMIN in the initial userns, which the sandbox does not have.
+    "open_tree",
+    "open_tree_attr",
     // `chroot` is *not* mediated: it is absent from `chroot_path_syscalls()`,
     // and in the emulated-chroot shape the confined child's kernel root is
     // still the host root (the supervisor translates every path syscall to
