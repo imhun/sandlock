@@ -210,7 +210,7 @@ fn cow_path_syscalls() -> Vec<i64> {
     v
 }
 
-fn chroot_path_syscalls() -> Vec<i64> {
+pub(crate) fn chroot_path_syscalls() -> Vec<i64> {
     let mut v = vec![
         libc::SYS_openat,
         // openat2 resolves paths like openat and must be mediated the same
