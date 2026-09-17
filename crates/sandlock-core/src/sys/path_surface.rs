@@ -85,6 +85,7 @@ pub(crate) const MEDIATED_PATH_SYSCALLS: &[&str] = &[
     "getdents64",
     "chdir",
     "fchdir",
+    "inotify_add_watch",
     "getcwd",
     "statfs",
     "utimensat",
@@ -121,18 +122,6 @@ pub(crate) const MEDIATED_PATH_SYSCALLS: &[&str] = &[
 /// [`NON_PATH_SYSCALLS`], whose job is to make the classification total.
 pub(crate) const UNMEDIATED_PATH_TAKING: &[(&str, Disposition)] = &[
     // ---- open items: unmediated, no demonstrated gate ---------------------
-    (
-        "inotify_add_watch",
-        Disposition::Open(
-            "MEASURED LEAK: resolves against the host root. From inside the sandbox a \
-             watch registered on a host directory and then delivered IN_CREATE/IN_MODIFY \
-             carrying the host file name -- in BOTH the mediated and the pure shape (no \
-             Landlock hook covers inotify). In a worker this exposes the workspace base, \
-             i.e. other tenants' sandbox ids and their file activity. Needs a decision: \
-             mediate the path in the virtual root (keeps watch-mode tooling working) or \
-             blocklist it (breaks webpack/vite/tsc --watch).",
-        ),
-    ),
     (
         "open_tree",
         Disposition::Open(
@@ -423,7 +412,6 @@ mod tests {
         assert_eq!(
             open,
             vec![
-                "inotify_add_watch",
                 "open_tree",
                 "fchmodat2",
                 "getxattrat",

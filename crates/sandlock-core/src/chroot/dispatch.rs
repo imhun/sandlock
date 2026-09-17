@@ -2279,6 +2279,86 @@ pub(crate) async fn handle_chroot_statfs(
 // utimensat handler
 // ============================================================
 
+/// `inotify_add_watch(2)` — a path-bearing syscall Landlock does not cover.
+///
+/// Landlock's access rights are a closed set (execute/read/write/remove/make/
+/// refer/truncate/ioctl-dev), and adding a watch is none of them. Left to fall
+/// through, the kernel therefore resolves the child's string against the
+/// **host** root — the very property the rest of this module exists to remove —
+/// and a sandbox could watch any host directory it can traverse. Measured from
+/// inside a real sandbox (E2B audit 2026-09-17, OBS-2): `inotify_add_watch` on
+/// a host directory succeeded and then delivered `IN_CREATE`/`IN_MODIFY`
+/// carrying the host file's name; pointed at the worker's workspace base that
+/// is other tenants' sandbox ids and their file activity.
+///
+/// Mediated rather than blocklisted because file-watching is a legitimate
+/// workload (`webpack`/`vite`/`tsc --watch`, test watchers): the path is
+/// resolved inside the virtual root and the watch is registered on the
+/// rootfs-resolved object, so in-sandbox watching keeps working and nothing
+/// outside the root is reachable.
+///
+/// The registration is performed **on behalf** of the child on a duplicated
+/// copy of its inotify fd (the `handle_bind` pattern): the kernel never
+/// re-reads the child's path string, so a racing sibling thread cannot point
+/// the watch at a host path. A `Continue` with a rewritten path pointer — the
+/// shape `handle_chroot_exec` uses — would be racy here, because for `exec`
+/// the race is bounded by Landlock and for inotify it is not. The watch
+/// descriptor returned belongs to the child's own inotify instance (same
+/// object, duplicated fd), so `inotify_rm_watch`/`read` on its side agree.
+pub(crate) async fn handle_chroot_inotify_add_watch(
+    notif: &SeccompNotif,
+    _chroot_state: &Arc<Mutex<ChrootState>>,
+    _cow_state: &Arc<Mutex<CowState>>,
+    notif_fd: RawFd,
+    ctx: &ChrootCtx<'_>,
+) -> NotifAction {
+    let inotify_fd = notif.data.args[0] as i32;
+    let path_ptr = notif.data.args[1];
+    let mask = notif.data.args[2] as u32;
+
+    if path_ptr == 0 {
+        return NotifAction::Errno(libc::EFAULT);
+    }
+    let path = match read_path(notif, path_ptr, notif_fd) {
+        Some(p) => p,
+        None => return NotifAction::Errno(libc::EFAULT),
+    };
+
+    // `inotify_add_watch` has no dirfd argument: a relative name resolves
+    // against the child's cwd, which the supervisor tracks rather than moving
+    // (see handle_chroot_chdir).
+    let (host_path, virtual_path) =
+        match resolve_chroot_path(notif, libc::AT_FDCWD as i64, &path, ctx) {
+            Some(r) => r,
+            None => return NotifAction::Errno(libc::EACCES),
+        };
+    if !ctx.can_read(&virtual_path) {
+        return NotifAction::Errno(libc::EACCES);
+    }
+
+    let c_host = match CString::new(host_path.as_os_str().as_encoded_bytes()) {
+        Ok(c) => c,
+        Err(_) => return NotifAction::Errno(libc::EINVAL),
+    };
+
+    let dup = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, inotify_fd) {
+        Ok(fd) => fd,
+        Err(e) => {
+            return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF));
+        }
+    };
+
+    let rc = unsafe { libc::inotify_add_watch(dup.as_raw_fd(), c_host.as_ptr(), mask) };
+    if rc < 0 {
+        return NotifAction::Errno(
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EACCES),
+        );
+    }
+    NotifAction::ReturnValue(rc as i64)
+}
+
 pub(crate) async fn handle_chroot_utimensat(
     notif: &SeccompNotif,
     _chroot_state: &Arc<Mutex<ChrootState>>,

@@ -1147,6 +1147,12 @@ fn register_chroot_handlers(
     // chdir, fchdir, getcwd, statfs, utimensat
     table.register(libc::SYS_chdir as i64, chroot_handler!(policy,
         crate::chroot::dispatch::handle_chroot_chdir));
+
+    // inotify_add_watch: path-bearing and *not* covered by any Landlock access
+    // right, so an unmediated call resolves against the host root. See the
+    // handler for the measurement and why it is mediated rather than refused.
+    table.register(libc::SYS_inotify_add_watch as i64, chroot_handler!(policy,
+        crate::chroot::dispatch::handle_chroot_inotify_add_watch));
     table.register(libc::SYS_fchdir as i64, chroot_handler!(policy,
         crate::chroot::dispatch::handle_chroot_fchdir));
     table.register(libc::SYS_getcwd as i64, chroot_handler!(policy,

@@ -238,6 +238,11 @@ pub(crate) fn chroot_path_syscalls() -> Vec<i64> {
         // later relative path resolves against, so the supervisor has to
         // see it to keep its own notion in step.
         libc::SYS_fchdir,
+        // inotify_add_watch carries a path and no dirfd. Landlock has no
+        // access right for it, so left unmediated the kernel resolves the
+        // child's string against the host root and the sandbox can watch
+        // host directories (see handle_chroot_inotify_add_watch).
+        libc::SYS_inotify_add_watch,
         libc::SYS_getcwd,
         libc::SYS_statfs,
         libc::SYS_utimensat,
