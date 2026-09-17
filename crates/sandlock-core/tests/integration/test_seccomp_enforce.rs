@@ -50,6 +50,50 @@ async fn test_mount_blocked() {
 }
 
 // ------------------------------------------------------------------
+// 1b. chroot() is blocked by the default seccomp blocklist
+// ------------------------------------------------------------------
+//
+// `chroot` is deliberately absent from `chroot_path_syscalls()`, so before it
+// was blocklisted the kernel executed it for real -- and in the
+// emulated-chroot shape (the one image-rootfs sandboxes use) the child's kernel
+// root is still the *host* root: the supervisor chdirs into the host path
+// under the rootfs and translates every path syscall, but never calls
+// `chroot(2)` itself. A sandboxed `chroot("/")` therefore succeeded against the
+// host filesystem, which is exactly the "seccomp fallthrough" that
+// `landlock.rs` documents as needing to be empty.
+//
+// The assertion is on the errno the sandbox observes, not on "the command
+// failed": a missing interpreter or a bad path would also produce a non-zero
+// exit and prove nothing.
+#[tokio::test]
+async fn test_chroot_blocked() {
+    let out = temp_out("chroot-blocked");
+    let script = format!(concat!(
+        "import ctypes, os\n",
+        "ctypes.set_errno(0)\n",
+        "try:\n",
+        "  os.chroot('/')\n",
+        "  result = 'ALLOWED'\n",
+        "except OSError as e:\n",
+        "  result = 'BLOCKED:%d' % e.errno\n",
+        "open('{out}', 'w').write(result)\n",
+    ), out = out.display());
+    let policy = base_policy().build().unwrap();
+    let result = policy.clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success());
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(
+        content, "BLOCKED:1",
+        "chroot must be denied with EPERM by the default blocklist"
+    );
+}
+
+// ------------------------------------------------------------------
 // 2. ptrace is blocked (strace should fail)
 // ------------------------------------------------------------------
 #[tokio::test]

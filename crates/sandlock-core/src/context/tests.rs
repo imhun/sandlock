@@ -459,6 +459,25 @@ fn test_syscall_name_to_nr_covers_defaults() {
 }
 
 #[test]
+fn test_chroot_is_blocklisted() {
+    // `chroot(2)` is not mediated (`chroot_path_syscalls()` does not list it)
+    // and the emulated-chroot shape leaves the child's kernel root at the host
+    // root, so an unblocked `chroot` runs against the host filesystem. Pin it
+    // into the resolved plan, not just the name list: a name that fails to
+    // resolve to a syscall number is silently dropped from the filter.
+    let policy = Sandbox::builder().build().unwrap();
+    let numbers = crate::seccomp_plan::blocklist_syscall_numbers(&policy);
+    let chroot_nr = syscall_name_to_nr("chroot").expect("chroot resolves on this arch");
+    assert!(
+        numbers.contains(&chroot_nr),
+        "chroot must be in the default blocklist (resolved {numbers:?})"
+    );
+    // Sanity: the resolved list is the plan's, so the assertion above is about
+    // what actually reaches the cBPF filter.
+    assert!(numbers.contains(&(libc::SYS_mount as u32)));
+}
+
+#[test]
 fn test_effective_nofile_clamps_to_both_inherited_bounds() {
     // A request below both bounds is applied verbatim, the ordinary case.
     let split = libc::rlimit { rlim_cur: 1024, rlim_max: 1_048_576 };
@@ -484,3 +503,4 @@ fn test_effective_nofile_clamps_to_both_inherited_bounds() {
     };
     assert_eq!(effective_nofile(4096, &unlimited), 4096);
 }
+

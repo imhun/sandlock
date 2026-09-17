@@ -310,6 +310,20 @@ pub const DEFAULT_BLOCKLIST_SYSCALLS: &[&str] = &[
     "mount",
     "umount2",
     "pivot_root",
+    // `chroot` is *not* mediated: it is absent from `chroot_path_syscalls()`,
+    // and in the emulated-chroot shape the confined child's kernel root is
+    // still the host root (the supervisor translates every path syscall to
+    // `<chroot_root>/<virtual>`; `context.rs` chdirs into the *host* path
+    // under the rootfs precisely because no real chroot happens). So a
+    // sandboxed `chroot(2)` executes against the host filesystem as the
+    // id-0-in-userns child and succeeds on any host directory -- a genuine
+    // hole in the seccomp fallthrough set that `landlock.rs` relies on being
+    // empty ("any seccomp fallthrough is blocked by Landlock, fail-closed").
+    // It grants nothing by itself today (every later path syscall is either
+    // mediated against the static root or denied by Landlock), but it is
+    // exactly the class of syscall that turns a future fallthrough into an
+    // escape, and a sandbox has no legitimate use for it.
+    "chroot",
     "swapon",
     "swapoff",
     "reboot",
