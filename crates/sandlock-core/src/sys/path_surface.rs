@@ -245,6 +245,111 @@ pub(crate) const UNMEDIATED_PATH_TAKING: &[(&str, Disposition)] = &[
     ("chroot", Disposition::Blocked),
 ];
 
+/// What confines a path-taking syscall in the **pure** (no-chroot) shape.
+///
+/// The pure shape has no rootfs and *no mediator at all*: the sandbox's view is
+/// the host's and Landlock is the only barrier. Landlock's access rights are a
+/// closed set (execute / read_file / read_dir / write_file / remove_file /
+/// remove_dir / make_* / refer / truncate / ioctl_dev), so a path-taking
+/// syscall outside that set is **ungated** there even though the chroot shape
+/// mediates it. Measured on the audit kernel against a host directory the
+/// sandbox may traverse (`/obs6_hostdir`, 0755) and a host file (0644):
+/// `statx` -> OK, `faccessat` -> OK, `readlinkat` -> resolved (EINVAL, not a
+/// link), `listxattr` -> OK, `getxattr` -> reached the inode (ENODATA), and
+/// from the unmediated list `inotify_add_watch` -> watched and delivered host
+/// file names, `open_tree` -> returned an fd.
+///
+/// The three lists below partition the path surface *by pure-shape verdict*
+/// and `pure_shape_classifies_every_path_taking_syscall` keeps that partition
+/// exact, so the ungated set is the worklist for the pure shape rather than
+/// something to re-derive by probing.
+
+/// Landlock refuses the operation itself.
+pub(crate) const PURE_LANDLOCK_GATED: &[&str] = &[
+    // read / write / execute
+    "open", "openat", "openat2", "execve", "execveat",
+    // directory enumeration
+    "getdents", "getdents64",
+    // creation
+    "mkdir", "mkdirat", "mknod", "mknodat", "creat",
+    // removal
+    "unlink", "unlinkat", "rmdir",
+    // refer (rename/link) and symlink creation
+    "rename", "renameat", "renameat2", "link", "linkat", "symlink", "symlinkat",
+    // truncate
+    "truncate",
+];
+
+/// Not Landlock, but a kernel-side gate the sandbox cannot pass: a capability
+/// held only in the initial user namespace, an obsolete syscall, or the
+/// seccomp blocklist every shape installs (reason strings say which).
+pub(crate) const PURE_GATED_ELSEWHERE: &[(&str, &str)] = &[
+    ("chroot", "blocklisted in every shape (OBS-1)"),
+    ("chown", "ownership/DAC only, no Landlock right: the sandbox owns nothing outside its workspace"),
+    ("lchown", "ownership/DAC only, see chown"),
+    ("fchownat", "ownership/DAC only, see chown"),
+    ("fanotify_mark", "fanotify_init needs CAP_SYS_ADMIN in the initial userns (measured EPERM)"),
+    ("move_mount", "CAP_SYS_ADMIN in the mount namespace's userns (measured EPERM)"),
+    ("fspick", "mount API, CAP_SYS_ADMIN-gated like move_mount"),
+    ("mount_setattr", "mount API, CAP_SYS_ADMIN-gated"),
+    ("open_tree_attr", "same family as open_tree; ENOSYS on the audit kernel"),
+    ("file_getattr", "kernel 6.13+; ENOSYS on the audit kernel, signature unverified"),
+    ("file_setattr", "kernel 6.13+; ENOSYS on the audit kernel, signature unverified"),
+    ("statmount", "takes a mount id, not a path; ENOSYS on the audit kernel. Would disclose mount metadata when it lands"),
+    ("listmount", "mount enumeration by id, see statmount; ENOSYS on the audit kernel"),
+    ("uselib", "obsolete, ENOSYS"),
+    ("mq_open", "resolves in the mqueue filesystem, which the worker does not mount"),
+    ("mq_unlink", "same as mq_open"),
+];
+
+/// **Ungated in the pure shape**: no Landlock access right covers it and no
+/// other kernel-side gate was found, so the call reaches the host object. In
+/// the chroot shape these are mediated (the first column of
+/// [`MEDIATED_PATH_SYSCALLS`]) or already recorded as open above.
+///
+/// Read as a leak list rather than an exploit list: what it exposes is host
+/// **metadata** (existence, size, timestamps, inode, symlink targets, xattr
+/// names and values) plus directory-change events -- information about files
+/// the sandbox cannot read. That is the pure shape's actual confinement
+/// boundary, and the reason the pure shape is not a security boundary for
+/// tenants that must not learn about each other.
+pub(crate) const PURE_UNGATED: &[(&str, &str)] = &[
+    ("stat", "metadata: existence, size, timestamps, inode (measured OK)"),
+    ("lstat", "metadata, see stat"),
+    ("newfstatat", "metadata, see stat"),
+    ("statx", "metadata, see stat (measured OK)"),
+    ("statfs", "filesystem metadata (size/free/type)"),
+    ("access", "existence + permission probe (measured OK via faccessat)"),
+    ("faccessat", "existence + permission probe (measured OK)"),
+    ("faccessat2", "existence + permission probe, see faccessat"),
+    ("readlink", "symlink target (measured: path resolved)"),
+    ("readlinkat", "symlink target, see readlink"),
+    ("chdir", "moves the cwd; no Landlock right covers it"),
+    ("fchdir", "see chdir"),
+    ("getcwd", "see chdir"),
+    ("chmod", "mode change is ownership-gated (DAC), not Landlock-gated"),
+    ("fchmodat", "see chmod"),
+    ("utimensat", "timestamps are DAC-gated only, not Landlock-gated"),
+    ("utime", "see utimensat"),
+    ("utimes", "see utimensat"),
+    ("futimesat", "see utimensat"),
+    ("getxattr", "attribute value (measured: reached the inode)"),
+    ("lgetxattr", "attribute value, see getxattr"),
+    ("setxattr", "attribute write, DAC-gated only"),
+    ("lsetxattr", "see setxattr"),
+    ("listxattr", "attribute names (measured OK)"),
+    ("llistxattr", "attribute names, see listxattr"),
+    ("removexattr", "attribute removal, DAC-gated only"),
+    ("lremovexattr", "see removexattr"),
+    ("inotify_add_watch", "directory events + host file names (measured leak, OBS-2)"),
+    ("open_tree", "O_PATH fd for a host object (measured); traversal refused by the mediator only in the chroot shape"),
+    ("fchmodat2", "at-style chmod; ENOSYS on the audit kernel, live on kernels >= 6.6"),
+    ("getxattrat", "at-style xattr read; ENOSYS on the audit kernel, live on kernels >= 6.13"),
+    ("setxattrat", "at-style xattr write; ENOSYS on the audit kernel"),
+    ("listxattrat", "at-style xattr list; ENOSYS on the audit kernel"),
+    ("removexattrat", "at-style xattr remove; ENOSYS on the audit kernel"),
+];
+
 /// Every syscall this architecture knows that is neither mediated nor in the
 /// path-taking ledger above -- i.e. the reviewed claim "this syscall cannot
 /// name a filesystem object outside the virtual root".
@@ -425,6 +530,54 @@ mod tests {
                 "file_setattr",
             ],
             "the open (needs-a-decision) set changed: update the ledger and this pin together"
+        );
+    }
+
+    /// The pure-shape verdicts must cover exactly the path surface: every
+    /// mediated syscall and every unmediated path-taking entry needs one, and
+    /// nothing else may appear. Adding a path-taking syscall to either side
+    /// without a pure verdict fails here.
+    #[test]
+    fn pure_shape_classifies_every_path_taking_syscall() {
+        let mut expected: BTreeSet<String> = MEDIATED_PATH_SYSCALLS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for (name, _) in UNMEDIATED_PATH_TAKING {
+            expected.insert((*name).to_string());
+        }
+        let mut got: BTreeSet<String> = PURE_LANDLOCK_GATED.iter().map(|s| s.to_string()).collect();
+        for (name, _) in PURE_GATED_ELSEWHERE {
+            assert!(got.insert((*name).to_string()), "{name} listed twice");
+        }
+        for (name, _) in PURE_UNGATED {
+            assert!(got.insert((*name).to_string()), "{name} listed twice");
+        }
+        assert_eq!(
+            got, expected,
+            "the pure-shape verdicts and the path surface disagree"
+        );
+    }
+
+    /// Pin the pure shape's ungated set: it is the worklist for that shape, so
+    /// shrinking it should be a deliberate diff, not a silent one.
+    #[test]
+    fn pure_shape_ungated_set_is_pinned() {
+        let names: Vec<&str> = PURE_UNGATED.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names,
+            vec![
+                "stat", "lstat", "newfstatat", "statx", "statfs",
+                "access", "faccessat", "faccessat2",
+                "readlink", "readlinkat",
+                "chdir", "fchdir", "getcwd",
+                "chmod", "fchmodat",
+                "utimensat", "utime", "utimes", "futimesat",
+                "getxattr", "lgetxattr", "setxattr", "lsetxattr",
+                "listxattr", "llistxattr", "removexattr", "lremovexattr",
+                "inotify_add_watch", "open_tree",
+                "fchmodat2", "getxattrat", "setxattrat", "listxattrat", "removexattrat",
+            ]
         );
     }
 
