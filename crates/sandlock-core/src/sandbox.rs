@@ -273,6 +273,7 @@ impl TryFrom<&Sandbox> for Confinement {
             unsupported.push("max_processes");
         }
         if sandbox.max_open_files.is_some() { unsupported.push("max_open_files"); }
+        if sandbox.max_file_size.is_some() { unsupported.push("max_file_size"); }
         if sandbox.max_cpu.is_some() { unsupported.push("max_cpu"); }
         if sandbox.random_seed.is_some() { unsupported.push("random_seed"); }
         if sandbox.time_start.is_some() { unsupported.push("time_start"); }
@@ -567,6 +568,15 @@ pub struct Sandbox {
     pub max_memory: Option<ByteSize>,
     pub max_processes: u32,
     pub max_open_files: Option<u32>,
+    /// Per-**file** size ceiling (RLIMIT_FSIZE, soft and hard), in bytes.
+    ///
+    /// A single file may not exceed it; a tree may. That asymmetry is the
+    /// point: this is the one disk bound the kernel enforces *during* a write,
+    /// so a runaway `dd`/`cat` hits it with no supervisor, no accounting and
+    /// no polling in the loop -- which is exactly what a per-write ENOSPC
+    /// would cost instead. Set to a caller's whole box budget it can never
+    /// refuse a file that box was allowed to hold.
+    pub max_file_size: Option<ByteSize>,
     pub max_cpu: Option<u8>,
     /// Max seccomp user-notifications processed per second (see builder).
     #[serde(skip)]
@@ -722,6 +732,7 @@ impl std::fmt::Debug for Sandbox {
             .field("fs_writable", &self.fs_writable)
             .field("max_memory", &self.max_memory)
             .field("max_processes", &self.max_processes)
+            .field("max_file_size", &self.max_file_size)
             .field("policy_fn", &self.policy_fn.as_ref().map(|_| "<callback>"))
             .field("name", &self.name)
             .field("runtime", &self.runtime.as_ref().map(|_| "<runtime>"))
@@ -769,6 +780,7 @@ impl Clone for Sandbox {
             max_memory: self.max_memory,
             max_processes: self.max_processes,
             max_open_files: self.max_open_files,
+            max_file_size: self.max_file_size,
             max_cpu: self.max_cpu,
             notify_rate_limit: self.notify_rate_limit,
             random_seed: self.random_seed,

@@ -226,6 +226,9 @@ _b_time_start = _builder_fn("sandlock_sandbox_builder_time_start", ctypes.c_uint
 _b_extra_deny_syscalls = _builder_fn("sandlock_sandbox_builder_extra_deny_syscalls", ctypes.c_char_p)
 _b_extra_allow_syscalls = _builder_fn("sandlock_sandbox_builder_extra_allow_syscalls", ctypes.c_char_p)
 _b_max_open_files = _builder_fn("sandlock_sandbox_builder_max_open_files", ctypes.c_uint32)
+_b_max_file_size = _builder_fn(
+    "sandlock_sandbox_builder_max_file_size", ctypes.c_ulonglong
+)
 _b_no_randomize_memory = _builder_fn("sandlock_sandbox_builder_no_randomize_memory", ctypes.c_bool)
 _b_no_huge_pages = _builder_fn("sandlock_sandbox_builder_no_huge_pages", ctypes.c_bool)
 _b_no_coredump = _builder_fn("sandlock_sandbox_builder_no_coredump", ctypes.c_bool)
@@ -1340,6 +1343,7 @@ class _NativePolicy:
         "notify_rate_limit",
         "random_seed", "time_start", "clean_env", "env",
         "extra_deny_syscalls", "extra_allow_syscalls", "max_open_files",
+        "max_file_size",
         "no_randomize_memory", "no_huge_pages", "no_coredump", "deterministic_dirs",
         # Landlock protection opt-out (see Protection IntEnum):
         "allow_degraded", "disable",
@@ -1505,6 +1509,12 @@ class _NativePolicy:
             b = _b_extra_allow_syscalls(b, _encode(",".join(policy.extra_allow_syscalls or [])))
         if policy.max_open_files is not None:
             b = _b_max_open_files(b, policy.max_open_files)
+        if policy.max_file_size is not None:
+            if isinstance(policy.max_file_size, str):
+                file_bytes = parse_memory_size(policy.max_file_size)
+            else:
+                file_bytes = int(policy.max_file_size)
+            b = _b_max_file_size(b, file_bytes)
 
         if policy.no_randomize_memory:
             b = _b_no_randomize_memory(b, True)

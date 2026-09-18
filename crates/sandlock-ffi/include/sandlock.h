@@ -851,6 +851,12 @@ sandlock_builder_t *sandlock_sandbox_builder_max_open_files(sandlock_builder_t *
  * # Safety
  * `b` must be a valid builder pointer.
  */
+sandlock_builder_t *sandlock_sandbox_builder_max_file_size(sandlock_builder_t *b, unsigned long long n);
+
+/**
+ * # Safety
+ * `b` must be a valid builder pointer.
+ */
 sandlock_builder_t *sandlock_sandbox_builder_no_randomize_memory(sandlock_builder_t *b, bool v);
 
 /**

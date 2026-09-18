@@ -154,6 +154,14 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "max-open-files"))]
     pub max_open_files: Option<u32>,
 
+    /// Per-file size ceiling (RLIMIT_FSIZE, soft and hard) [default: inherit]
+    ///
+    /// See `Sandbox::max_file_size`: the kernel refuses the write past it
+    /// (EFBIG, with the signal ignored), so it bounds one file to an amount
+    /// the caller chose *before* the write started.
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub max_file_size: Option<ByteSize>,
+
     #[cfg_attr(feature = "cli", arg(short = 'c', long = "cpu"))]
     pub max_cpu: Option<u8>,
     /// Max seccomp user-notifications processed per second for this sandbox.
@@ -340,6 +348,7 @@ impl std::fmt::Debug for SandboxBuilder {
             .field("fs_writable", &self.fs_writable)
             .field("max_memory", &self.max_memory)
             .field("max_processes", &self.max_processes)
+            .field("max_file_size", &self.max_file_size)
             .field("policy_fn", &self.policy_fn.as_ref().map(|_| "<callback>"))
             .finish_non_exhaustive()
     }
@@ -376,6 +385,7 @@ impl Default for SandboxBuilder {
             max_memory: None,
             max_processes: None,
             max_open_files: None,
+            max_file_size: None,
             max_cpu: None,
             notify_rate_limit: None,
             random_seed: None,
@@ -451,6 +461,7 @@ impl Clone for SandboxBuilder {
             max_memory: self.max_memory,
             max_processes: self.max_processes,
             max_open_files: self.max_open_files,
+            max_file_size: self.max_file_size,
             max_cpu: self.max_cpu,
             notify_rate_limit: self.notify_rate_limit,
             random_seed: self.random_seed,
@@ -774,6 +785,19 @@ impl SandboxBuilder {
     /// more.
     pub fn max_open_files(mut self, n: u32) -> Self {
         self.max_open_files = Some(n);
+        self
+    }
+
+    /// Cap any single file the sandbox writes at `size` bytes.
+    ///
+    /// Enforced as ``RLIMIT_FSIZE`` (soft *and* hard) in the child, with
+    /// ``SIGXFSZ`` ignored so the failing write reports ``EFBIG`` instead of
+    /// killing the process that made it -- a caller sees "file too large" the
+    /// way it would see ENOSPC, rather than a command that vanished. Kernel-
+    /// enforced, survives exec, inherited by descendants, and needs nothing in
+    /// the supervisor's hot path.
+    pub fn max_file_size(mut self, size: ByteSize) -> Self {
+        self.max_file_size = Some(size);
         self
     }
 
@@ -1111,6 +1135,19 @@ impl SandboxBuilder {
             ));
         }
 
+        // Validate: max_file_size must be non-zero. A zero RLIMIT_FSIZE would
+        // refuse every write, including the ones a command needs to start
+        // (a shell writing a temp file, a compiler emitting output) -- so it
+        // reads as "this sandbox is broken", not as "this sandbox is full".
+        // Omit the limit to inherit the system one.
+        if self.max_file_size == Some(ByteSize(0)) {
+            return Err(SandboxError::Invalid(
+                "max_file_size must be greater than 0; omit it to inherit the \
+                 system limit (RLIMIT_FSIZE)"
+                    .into(),
+            ));
+        }
+
         // Validate: http_ca and http_key must both be set or both unset
         if self.http_ca.is_some() != self.http_key.is_some() {
             return Err(SandboxError::Invalid(
@@ -1328,6 +1365,7 @@ impl SandboxBuilder {
             max_memory: self.max_memory,
             max_processes: self.max_processes.unwrap_or(super::DEFAULT_MAX_PROCESSES),
             max_open_files: self.max_open_files,
+            max_file_size: self.max_file_size,
             max_cpu: self.max_cpu,
             notify_rate_limit: self.notify_rate_limit,
             random_seed: self.random_seed,

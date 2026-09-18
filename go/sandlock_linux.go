@@ -133,7 +133,7 @@ func (s *Sandbox) validateStrings() error {
 		s.HTTPAllow, s.HTTPDeny,
 		s.ExtraAllowSyscalls, s.ExtraDenySyscalls,
 		{s.Workdir, s.Cwd, s.Chroot, s.FSStorage, s.MaxMemory, s.MaxDisk,
-			s.TimeStart, s.HTTPCAFile, s.HTTPKeyFile, s.Name},
+			s.MaxFileSize, s.TimeStart, s.HTTPCAFile, s.HTTPKeyFile, s.Name},
 	}
 	for _, g := range groups {
 		for _, v := range g {
@@ -291,6 +291,14 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 	}
 	if s.MaxOpenFiles > 0 {
 		b = C.sandlock_sandbox_builder_max_open_files(b, C.uint(s.MaxOpenFiles))
+	}
+	if s.MaxFileSize != "" {
+		v, err := policy.ParseMemory(s.MaxFileSize)
+		if err != nil {
+			freeBuilderViaBuild(b)
+			return nil, err
+		}
+		b = C.sandlock_sandbox_builder_max_file_size(b, C.ulonglong(v))
 	}
 	if s.NumCPUs > 0 {
 		b = C.sandlock_sandbox_builder_num_cpus(b, C.uint32_t(s.NumCPUs))

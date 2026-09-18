@@ -27,6 +27,7 @@
 //! | `http_inject` (dict list) | not in profile | `credentials`+`http_auth` | `http_inject` dict list |
 //! | `max_memory`/`max_disk` | `[limits].memory/disk` (size strings) | `max_memory`/`max_disk` | `max_memory`/`max_disk` (str/int) |
 //! | `max_processes`/`max_open_files`/`max_cpu`/`notify_rate_limit` | `[limits].processes/open_files/cpu`; rl not in profile | same; `notify_rate_limit` | same |
+//! | `max_file_size` (RLIMIT_FSIZE) | `[limits].file_size` (size string) | `max_file_size` | same (str/int) |
 //! | `cpu_cores`/`num_cpus`/`gpu_devices` | `[limits]` | same | same |
 //! | `port_remap` | `[network].port_remap` | same | same |
 //! | `pid_ns`/`net_isolation`/`fd_inject_connect` | not in profile | same | same |
@@ -119,6 +120,7 @@ pub const POLICY_FIELDS: &[&str] = &[
     "max_disk",
     "max_memory",
     "max_open_files",
+    "max_file_size",
     "max_processes",
     "net_allow",
     "net_allow_bind",
@@ -176,6 +178,9 @@ pub struct SupervisePolicy {
     pub max_memory: Option<ByteSpec>,
     pub max_processes: Option<u32>,
     pub max_open_files: Option<u32>,
+    /// Per-file size ceiling (RLIMIT_FSIZE); same `ByteSpec` shape as
+    /// `max_memory`/`max_disk` so a caller can say `"1G"` or a byte count.
+    pub max_file_size: Option<ByteSpec>,
     pub max_cpu: Option<u8>,
     pub max_disk: Option<ByteSpec>,
     pub notify_rate_limit: Option<u32>,
@@ -510,6 +515,11 @@ fn apply(parsed: &ParsedPolicy) -> Result<SandboxBuilder, String> {
     if prov.contains("max_open_files") {
         if let Some(n) = p.max_open_files {
             b = b.max_open_files(n);
+        }
+    }
+    if prov.contains("max_file_size") {
+        if let Some(spec) = &p.max_file_size {
+            b = b.max_file_size(bytes_of(spec, "max_file_size")?);
         }
     }
     if prov.contains("max_cpu") {
@@ -1140,6 +1150,21 @@ fn verify(sandbox: &Sandbox, parsed: &ParsedPolicy) -> Result<(), String> {
     if prov.contains("max_open_files") {
         check!("max_open_files", &p.max_open_files, &sandbox.max_open_files);
     }
+    if prov.contains("max_file_size") {
+        let expected = bytes_of(
+            p.max_file_size
+                .as_ref()
+                .expect("provided max_file_size has a value"),
+            "max_file_size",
+        )?;
+        if sandbox.max_file_size != Some(expected) {
+            return Err(format!(
+                "policy field `max_file_size` did not land: provided {expected:?}, \
+                 effective {:?}",
+                sandbox.max_file_size
+            ));
+        }
+    }
     if prov.contains("max_cpu") {
         check!("max_cpu", &p.max_cpu, &sandbox.max_cpu);
     }
@@ -1369,6 +1394,7 @@ pub fn example_policy_json(secret_path: &Path) -> String {
         "max_memory": "512M",
         "max_processes": 7,
         "max_open_files": 256,
+        "max_file_size": "48M",
         "max_cpu": 42,
         "max_disk": "64M",
         "notify_rate_limit": 1000,

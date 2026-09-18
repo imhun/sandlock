@@ -1024,6 +1024,34 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         }
     }
 
+    // 13d. Optional: cap the size of any single file (RLIMIT_FSIZE).
+    //
+    // Same reasoning as 13c about soft vs hard: a soft-only cap is advisory,
+    // because setrlimit/prlimit64 are not in the seccomp filter and the guest
+    // could raise it back (soft caps are always raisable; only the hard cap
+    // needs CAP_SYS_RESOURCE). Unlike 13c this is deliberately *not* sold as
+    // confinement either: a privileged child can raise the hard cap too.
+    //
+    // SIGXFSZ is set to SIG_IGN first, and that ordering is the whole UX: the
+    // kernel's default action for "a write past the limit" is to terminate
+    // the process, so without it a runaway `dd` disappears silently and the
+    // caller sees a killed command instead of a full disk. With the signal
+    // ignored the write itself fails with EFBIG, which is what every program
+    // already handles. An *ignored* disposition survives execve (a caught one
+    // would be reset), so the commands the sandbox runs inherit it.
+    if let Some(size) = sandbox.max_file_size {
+        if unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) } == libc::SIG_ERR {
+            fail!("signal(SIGXFSZ, SIG_IGN)");
+        }
+        let rlim = libc::rlimit {
+            rlim_cur: size.0,
+            rlim_max: size.0,
+        };
+        if unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &rlim) } != 0 {
+            fail!(format!("setrlimit(RLIMIT_FSIZE, {})", size.0));
+        }
+    }
+
     // 14. Terminal action: run the in-process entrypoint, or fall through to
     // execve the command. The in-process arm diverges (`_exit`), so the match
     // yields the command slice only on the `Exec` path.

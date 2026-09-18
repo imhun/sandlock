@@ -392,6 +392,15 @@ class Sandbox:
     CAP_SYS_RESOURCE and can raise the cap back.  None = inherit system
     default."""
 
+    max_file_size: int | None = None
+    """Maximum size in bytes of any **single** file the sandbox writes.
+    Enforced via RLIMIT_FSIZE (soft and hard) in the child, with
+    ``SIGXFSZ`` ignored so the write fails with ``EFBIG`` instead of
+    killing the process: kernel-enforced, survives exec, inherited by
+    descendants.  It bounds one file, not the tree -- set it to a box's
+    whole disk budget and it can never refuse a file that box was
+    allowed to hold.  None = inherit system default."""
+
     max_cpu: int | None = None
     """CPU throttle as a percentage of one core (1–100).  E.g. ``50``
     means the sandbox process group gets at most 50% of one core.

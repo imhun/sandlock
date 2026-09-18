@@ -4,7 +4,7 @@
 //! using opaque handle patterns.  Each `*mut` / `*const` pointer returned by
 //! these functions must be freed with its corresponding `_free` function.
 
-use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_uint, c_ulonglong, c_void, CStr, CString};
 use std::ptr;
 use std::time::Duration;
 
@@ -999,6 +999,20 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_max_open_files(
     }
     let builder = *Box::from_raw(b);
     Box::into_raw(Box::new(builder.max_open_files(n)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_max_file_size(
+    b: *mut SandboxBuilder,
+    n: c_ulonglong,
+) -> *mut SandboxBuilder {
+    if b.is_null() {
+        return b;
+    }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.max_file_size(ByteSize::bytes(n))))
 }
 
 /// # Safety

@@ -241,6 +241,7 @@ type Sandbox struct {
 	MaxProcesses uint32   // peak concurrent process cap; 0 = sandlock default
 	MaxCPU       uint8    // CPU throttle, percent of one core (1-100); 0 = unset
 	MaxOpenFiles uint32   // RLIMIT_NOFILE soft+hard in the child, clamped to sandlock's own limits; 0 = inherit
+	MaxFileSize  string   // RLIMIT_FSIZE soft+hard, the ceiling on any single file, e.g. "1G"; "" = inherit
 	CPUCores     []uint32 // cores to pin to via sched_setaffinity
 	NumCPUs      uint32   // synthetic /proc/cpuinfo processor count; 0 = unset
 	GPUDevices   []uint32 // GPU device indices to expose; nil = none

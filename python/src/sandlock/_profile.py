@@ -25,8 +25,9 @@ Rust CLI). Each section maps to a subset of ``Sandbox`` fields:
     [syscalls]    → extra_allow_syscalls (extra_allow),
                     extra_deny_syscalls (extra_deny)
     [limits]      → max_memory (memory), max_processes (processes),
-                    max_open_files (open_files), max_cpu (cpu),
-                    max_disk (disk), gpu_devices, cpu_cores, num_cpus
+                    max_open_files (open_files), max_file_size (file_size),
+                    max_cpu (cpu), max_disk (disk), gpu_devices,
+                    cpu_cores, num_cpus
 """
 
 from __future__ import annotations
@@ -112,6 +113,7 @@ _SECTIONS: dict[str, dict[str, tuple[str | None, type]]] = {
         "memory":      ("max_memory",     str),
         "processes":   ("max_processes",  int),
         "open_files":  ("max_open_files", int),
+        "file_size":   ("max_file_size",   str),
         "cpu":         ("max_cpu",        int),
         "disk":        ("max_disk",       str),
         "gpu_devices": ("gpu_devices",    list),

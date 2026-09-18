@@ -179,6 +179,10 @@ pub struct LimitsSection {
     pub processes: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub open_files: Option<u32>,
+    /// `ByteSize` string, e.g. `"1G"`. Maps to `Sandbox::max_file_size`: the
+    /// ceiling on any **single** file (RLIMIT_FSIZE), not on the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<String>,
     /// CPU cap as a percentage (0–100). Maps to `Sandbox::max_cpu`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<u8>,
@@ -343,6 +347,9 @@ pub fn parse_input(input: ProfileInput) -> Result<(Sandbox, ProgramSpec), Sandlo
     }
     if let Some(n) = input.limits.processes            { b = b.max_processes(n); }
     if let Some(n) = input.limits.open_files           { b = b.max_open_files(n); }
+    if let Some(s) = input.limits.file_size.as_deref() {
+        b = b.max_file_size(ByteSize::parse(s).map_err(SandlockError::Sandbox)?);
+    }
     if let Some(p) = input.limits.cpu                  { b = b.max_cpu(p); }
     if let Some(s) = input.limits.disk.as_deref()      {
         b = b.max_disk(ByteSize::parse(s).map_err(SandlockError::Sandbox)?);
@@ -608,6 +615,7 @@ pub fn sandbox_to_profile(s: &Sandbox, extra_denied: &[String]) -> ProfileInput 
                 Some(s.max_processes)
             },
             open_files: s.max_open_files,
+            file_size: s.max_file_size.map(byte_size_str),
             cpu: s.max_cpu,
             disk: s.max_disk.map(byte_size_str),
             gpu_devices: s.gpu_devices.clone(),
