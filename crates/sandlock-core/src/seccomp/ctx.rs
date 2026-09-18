@@ -24,6 +24,10 @@ pub struct SupervisorCtx {
     pub policy_fn: Arc<Mutex<PolicyFnState>>,
     /// Chroot-specific runtime state.
     pub chroot: Arc<Mutex<ChrootState>>,
+    /// N25/L2c: directories this sandbox has written to since the last drain.
+    /// Filled by the chroot path handlers (the only component that sees every
+    /// write) and drained by whoever does the disk accounting.
+    pub dirty: Arc<crate::dirty::DirtyDirs>,
     /// NETLINK_ROUTE virtualization state.
     pub netlink: Arc<crate::netlink::NetlinkState>,
     /// Per-process registry: pid → PidKey. This anchors unified

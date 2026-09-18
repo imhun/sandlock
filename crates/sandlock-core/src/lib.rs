@@ -1,5 +1,6 @@
 pub mod error;
 pub mod exec_params;
+pub mod dirty;
 pub mod http;
 pub(crate) mod credential;
 pub mod sandbox;     // formerly `policy`; contains Sandbox + SandboxBuilder + Confinement

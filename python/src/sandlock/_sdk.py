@@ -598,6 +598,16 @@ _instance_launch_with_err = _bind_export(
     ],
 )
 _require_export(_INSTANCE_LAUNCH_WITH_ERR_EXPORT, _instance_launch_with_err)
+
+# N25/L2c: the written-directory ledger (JSON, caller frees the pointer). Additive
+# symbol: an older wheel simply lacks it, and callers feature-detect.
+_INSTANCE_DIRTY_DIRS_EXPORT = "sandlock_instance_drain_dirty_dirs"
+_instance_drain_dirty_dirs = _bind_export(
+    _INSTANCE_DIRTY_DIRS_EXPORT,
+    ctypes.c_void_p,
+    [_c_instance_p],
+)
+_has_instance_dirty_dirs = hasattr(_lib, _INSTANCE_DIRTY_DIRS_EXPORT)
 _lib.sandlock_instance_exec.restype = ctypes.c_int
 _lib.sandlock_instance_exec.argtypes = [
     _c_instance_p,

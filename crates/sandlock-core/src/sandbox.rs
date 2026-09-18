@@ -1075,6 +1075,24 @@ impl Sandbox {
         HashMap::new()
     }
 
+    /// N25/L2c: take the written-directory ledger (see [`crate::dirty::DirtyDirs`]).
+    ///
+    /// Returns `(directories, overflow)`; `overflow` means the sandbox touched
+    /// more directories than the ledger remembers, so the caller must fall
+    /// back to one whole-tree walk instead of trusting the list. Empty and
+    /// `false` when the sandbox was never spawned or runs without a mediator
+    /// that resolves paths (the pure shape has no path notifications at all).
+    pub fn drain_dirty_dirs(&self) -> (Vec<std::path::PathBuf>, bool) {
+        match self
+            .runtime
+            .as_ref()
+            .and_then(|rt| rt.supervisor_dirty.as_ref())
+        {
+            Some(dirty) => dirty.drain(),
+            None => (Vec::new(), false),
+        }
+    }
+
     /// Return observed resource peaks from the supervisor state.
     /// Returns `(peak_mem_used_bytes, peak_proc_count)`.
     pub async fn resource_peaks(&self) -> (u64, u32) {
@@ -1708,6 +1726,7 @@ impl Sandbox {
                 supervisor_resource: None,
                 supervisor_processes: None,
                 supervisor_cow: None,
+                supervisor_dirty: None,
                 supervisor_network: None,
                 ctrl_fd: None,
                 stdout_pipe: pipe,
@@ -1826,6 +1845,7 @@ impl Sandbox {
             supervisor_resource: None,
             supervisor_processes: None,
             supervisor_cow: None,
+            supervisor_dirty: None,
             supervisor_network: None,
             ctrl_fd: None,
             stdout_pipe: None,
@@ -3062,6 +3082,12 @@ impl Sandbox {
             };
             self.rt_mut().supervisor_cow = Some(Arc::clone(&cow_state));
 
+            // N25/L2c: the written-directory ledger. Created here (the
+            // supervisor side) and shared with the parent, so a consumer
+            // outside the sandbox can drain it -- see `dirty::DirtyDirs`.
+            let dirty_state = Arc::new(crate::dirty::DirtyDirs::new());
+            self.rt_mut().supervisor_dirty = Some(Arc::clone(&dirty_state));
+
             let net_state = Arc::new(tokio::sync::Mutex::new(net_state));
             self.rt_mut().supervisor_network = Some(Arc::clone(&net_state));
 
@@ -3081,6 +3107,7 @@ impl Sandbox {
                 time_random: Arc::clone(&time_random_state),
                 policy_fn: Arc::clone(&policy_fn_state),
                 chroot: Arc::clone(&chroot_state),
+                dirty: Arc::clone(&dirty_state),
                 netlink: netlink_state,
                 processes: Arc::clone(&processes),
                 policy: Arc::new(notif_policy),

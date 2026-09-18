@@ -459,6 +459,29 @@ impl Generation {
         Ok(exit_status_json(&status))
     }
 
+    /// Serve a `dirty_dirs` verb: drain the written-directory ledger (N25/L2c).
+    ///
+    /// The slot owns the session's supervisor, so it is the only process that
+    /// can answer "which directories has this sandbox written to since the
+    /// last drain" -- the worker that does the accounting asks here. Draining
+    /// is a take, not a read: the caller is the one consumer, and a second
+    /// drain must not re-report what the first already re-walked.
+    fn handle_dirty_dirs(&mut self) -> Result<serde_json::Value, Refusal> {
+        let instance = self.instance.as_ref().ok_or_else(|| {
+            Refusal::refused(
+                "generation has no instance: dirty_dirs requires a launched session",
+            )
+        })?;
+        let (dirs, overflow) = instance.drain_dirty_dirs();
+        Ok(serde_json::json!({
+            "dirs": dirs
+                .iter()
+                .map(|d| d.to_string_lossy().into_owned())
+                .collect::<Vec<String>>(),
+            "overflow": overflow,
+        }))
+    }
+
     /// Serve a `kill_child` verb: deliver `signum` to the named child through
     /// its registered pid/pidfd (never an arbitrary-pid verb).
     fn handle_kill_child(
@@ -648,6 +671,14 @@ impl ControlHandler for Generation {
             }
             "ports" => {
                 let _ = write_response_frame(stream, &ok_response(self.ports_value()));
+                ServeOutcome::Continue
+            }
+            "dirty_dirs" => {
+                let resp = match self.handle_dirty_dirs() {
+                    Ok(data) => ok_response(data),
+                    Err(e) => err_response(&e),
+                };
+                let _ = write_response_frame(stream, &resp);
                 ServeOutcome::Continue
             }
             "run" => {

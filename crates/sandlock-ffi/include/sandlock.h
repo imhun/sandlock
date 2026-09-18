@@ -945,6 +945,20 @@ sandlock_sandbox_t *sandlock_sandbox_build(sandlock_builder_t *b, int *err, char
 void sandlock_sandbox_free(sandlock_sandbox_t *p);
 
 /**
+ * N25/L2c: drain this session's written-directory ledger.
+ *
+ * Returns a JSON object `{"dirs": [...], "overflow": bool}` that the caller
+ * releases with `sandlock_string_free`, or NULL for a NULL handle. `dirs` are
+ * the absolute *parent* directories of the paths this sandbox has written;
+ * `overflow` true means the set stopped recording and the caller must fall
+ * back to a whole-tree walk.
+ *
+ * # Safety
+ * `inst` must be a valid instance pointer or NULL.
+ */
+char *sandlock_instance_drain_dirty_dirs(sandlock_instance_t *inst);
+
+/**
  * Confine the calling process with Landlock filesystem rules.
  * This is irreversible. Returns 0 on success, -1 on error.
  *

@@ -3181,6 +3181,39 @@ pub struct sandlock_instance_t {
     runtime: tokio::runtime::Runtime,
 }
 
+/// N25/L2c: drain this session's written-directory ledger.
+///
+/// Returns a JSON object `{"dirs": ["<absolute host dir>", ...], "overflow":
+/// bool}` that the caller releases with [`sandlock_string_free`], or null for
+/// a null handle (or if the payload somehow cannot be encoded). See
+/// `sandlock_core::dirty::DirtyDirs`: the directories are the *parents* of the
+/// paths this sandbox has written, and `overflow` means the caller must fall
+/// back to a whole-tree walk.
+///
+/// # Safety
+/// `inst` must be a valid instance pointer or null.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_instance_drain_dirty_dirs(
+    inst: *mut sandlock_instance_t,
+) -> *mut c_char {
+    if inst.is_null() {
+        return ptr::null_mut();
+    }
+    let handle = &*inst;
+    let (dirs, overflow) = handle.instance.drain_dirty_dirs();
+    let payload = serde_json::json!({
+        "dirs": dirs
+            .iter()
+            .map(|d| d.to_string_lossy().into_owned())
+            .collect::<Vec<String>>(),
+        "overflow": overflow,
+    });
+    match CString::new(payload.to_string()) {
+        Ok(s) => s.into_raw(),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
 /// Error code 0: success.
 pub const SANDLOCK_INSTANCE_OK: i32 = 0;
 /// The instance is closed (shut down, or the init channel closed after the

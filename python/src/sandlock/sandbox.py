@@ -1754,6 +1754,37 @@ class Process:
         self._pid = _lib.sandlock_handle_pid(handle) or -1
         self._handle = handle
 
+    def drain_dirty_dirs(self) -> tuple[list[str], bool]:
+        """Take the written-directory ledger (N25/L2c).
+
+        Returns `(directories, overflow)`: the absolute host directories this
+        session has written to since the last drain, and whether the set
+        overflowed (in which case the caller must fall back to a whole-tree
+        walk). Empty in the pure shape: without a chroot there are no path
+        notifications to mark from.
+
+        Draining is a *take*: the caller is the one consumer, and a second
+        drain must not re-report what the first one already re-walked.
+        """
+        import ctypes
+        import json
+
+        from ._sdk import _free_native_string, _instance_drain_dirty_dirs
+
+        if _instance_drain_dirty_dirs is None:
+            raise RuntimeError(
+                "this sandlock build has no sandlock_instance_drain_dirty_dirs "
+                "(rebuild the wheel from a newer fork revision)"
+            )
+        raw = _instance_drain_dirty_dirs(self._handle)
+        if not raw:
+            return [], False
+        try:
+            payload = json.loads(ctypes.string_at(raw).decode("utf-8"))
+        finally:
+            _free_native_string(raw)
+        return list(payload.get("dirs") or []), bool(payload.get("overflow"))
+
     @property
     def pid(self) -> int | None:
         """The child PID while running, else ``None`` (after :meth:`wait`)."""

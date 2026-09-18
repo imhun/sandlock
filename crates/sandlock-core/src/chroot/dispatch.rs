@@ -79,6 +79,10 @@ pub(crate) struct ChrootCtx<'a> {
     /// Per-process supervisor state, for handlers that track the caller's
     /// filesystem context rather than just resolving one path.
     pub processes: &'a Arc<ProcessIndex>,
+    /// N25/L2c: the written-directory ledger (see [`crate::dirty::DirtyDirs`]).
+    /// Handlers that perform a *write* record the resolved host path's parent
+    /// here; nothing else does.
+    pub dirty: &'a Arc<crate::dirty::DirtyDirs>,
 }
 
 impl<'a> ChrootCtx<'a> {
@@ -86,7 +90,11 @@ impl<'a> ChrootCtx<'a> {
     ///
     /// Only ever called from handlers registered when `chroot_root` is set,
     /// which is what makes the unwrap sound.
-    pub(crate) fn new(policy: &'a NotifPolicy, processes: &'a Arc<ProcessIndex>) -> Self {
+    pub(crate) fn new(
+        policy: &'a NotifPolicy,
+        processes: &'a Arc<ProcessIndex>,
+        dirty: &'a Arc<crate::dirty::DirtyDirs>,
+    ) -> Self {
         ChrootCtx {
             root: policy.chroot_root.as_ref().expect("chroot handlers are only registered with a chroot root"),
             readable: &policy.chroot_readable,
@@ -95,7 +103,16 @@ impl<'a> ChrootCtx<'a> {
             mounts: &policy.chroot_mounts,
             mount_ro: &policy.chroot_mount_ro,
             processes,
+            dirty,
         }
+    }
+
+    /// N25/L2c: note that this sandbox wrote to `host_path`.
+    ///
+    /// Called with the *resolved host* path, after the access check, so the
+    /// ledger only ever names directories the sandbox was allowed to touch.
+    pub(crate) fn mark_dirty(&self, host_path: &Path) {
+        self.dirty.mark(host_path);
     }
 }
 
@@ -699,6 +716,19 @@ pub(crate) async fn handle_chroot_open(
         return NotifAction::Errno(libc::EACCES);
     }
 
+    // N25/L2c: an open that can change the file's bytes or existence is what
+    // makes its directory worth re-walking. The flag set is wider than the
+    // access check above: `O_CREAT`/`O_TRUNC`/`O_APPEND` change a file even
+    // when the descriptor itself is read-only (`O_RDONLY|O_CREAT` is legal),
+    // and a directory the accounting never re-walks is how a size becomes
+    // invisible. Marking before the COW branch keeps the two paths identical.
+    if (flags as i32
+        & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND))
+        != 0
+    {
+        ctx.mark_dirty(&host_path);
+    }
+
     // COW path — COW operates on host paths, must use libc::open.
     {
         let mut cs = cow_state.lock().await;
@@ -1248,6 +1278,7 @@ pub(crate) async fn handle_chroot_write(
             Err(a) => return a,
         };
         if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
+        ctx.mark_dirty(&host_path);
         let is_dir = (notif.data.args[2] & libc::AT_REMOVEDIR as u64) != 0;
         // A mount point is a policy object, not a name the guest owns. Real
         // bind mounts refuse unlink(2) at the mount point with EBUSY; here,
@@ -1289,6 +1320,7 @@ pub(crate) async fn handle_chroot_write(
             Err(a) => return a,
         };
         if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
+        ctx.mark_dirty(&host_path);
         let mode = notif.data.args[2] as u32;
 
         {
@@ -1332,6 +1364,10 @@ pub(crate) async fn handle_chroot_write(
         if !ctx.can_write(&old_vp) || !ctx.can_write(&new_vp) {
             return NotifAction::Errno(libc::EACCES);
         }
+        // N25/L2c: both ends change the tree's shape -- the name is added
+        // under one parent and removed from the other.
+        ctx.mark_dirty(&old_host);
+        ctx.mark_dirty(&new_host);
         // Real bind mounts refuse rename(2) of (or onto) a mount point with
         // EBUSY. Resolving either leaf to the host source and renaming there
         // would move the HOST object behind the mount (I1/P5 review).
@@ -1377,6 +1413,7 @@ pub(crate) async fn handle_chroot_write(
             None => return NotifAction::Errno(libc::EACCES),
         };
         if !ctx.can_write(&link_vp) { return NotifAction::Errno(libc::EACCES); }
+        ctx.mark_dirty(&host_link);
 
         {
             let mut cs = cow_state.lock().await;
@@ -1460,6 +1497,8 @@ pub(crate) async fn handle_chroot_write(
         if !ctx.can_write(&old_vp) || !ctx.can_write(&new_vp) {
             return NotifAction::Errno(libc::EACCES);
         }
+        // N25/L2c: the new name is a new directory entry.
+        ctx.mark_dirty(&new_host);
         // link(2) to a mount point source is refused by real bind mounts
         // (EBUSY); letting the leaf resolve to the host source would create a
         // hard link to the HOST object behind the mount (I1/P5 review).
@@ -1577,6 +1616,7 @@ pub(crate) async fn handle_chroot_write(
             None => return NotifAction::Errno(libc::EACCES),
         };
         if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
+        ctx.mark_dirty(&host_path);
         let length = notif.data.args[1] as i64;
 
         {

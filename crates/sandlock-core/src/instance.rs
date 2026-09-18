@@ -305,6 +305,9 @@ pub struct SandboxInstance {
         Option<Arc<tokio::sync::Mutex<crate::seccomp::state::ResourceState>>>,
     pub(crate) supervisor_processes: Option<Arc<crate::seccomp::state::ProcessIndex>>,
     pub(crate) supervisor_cow: Option<Arc<tokio::sync::Mutex<crate::seccomp::state::CowState>>>,
+    /// N25/L2c: the supervisor's written-directory ledger, shared with the
+    /// parent so the accounting that runs outside the sandbox can drain it.
+    pub(crate) supervisor_dirty: Option<Arc<crate::dirty::DirtyDirs>>,
     pub(crate) supervisor_network: Option<Arc<tokio::sync::Mutex<crate::seccomp::state::NetworkState>>>,
     pub(crate) ctrl_fd: Option<OwnedFd>,
     pub(crate) stdout_pipe: Option<OwnedFd>,
@@ -2397,6 +2400,22 @@ impl SandboxInstance {
     /// `None` — the session has no single "process pid"; each exec child's
     /// pid lives on its [`ExecHandle`]. Never reports the confined
     /// `sandlock-init` pid.
+    /// N25/L2c: take the written-directory ledger
+    /// (see [`crate::dirty::DirtyDirs`]).
+    ///
+    /// `(directories, overflow)`: `overflow` means the sandbox touched more
+    /// directories than the ledger remembers, so the caller must fall back to
+    /// one whole-tree walk rather than trust a list that stopped recording.
+    /// Both empty/`false` on a session that never spawned a supervisor, and
+    /// always empty in the pure shape -- without a chroot there are no path
+    /// notifications to mark from.
+    pub fn drain_dirty_dirs(&self) -> (Vec<std::path::PathBuf>, bool) {
+        match self.supervisor_dirty.as_ref() {
+            Some(dirty) => dirty.drain(),
+            None => (Vec::new(), false),
+        }
+    }
+
     pub fn pid(&self) -> Option<i32> {
         if let Some(session) = self.exec_session.as_ref() {
             // Exec-capable session: report the main workload (child id 0),
