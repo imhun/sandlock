@@ -56,6 +56,17 @@ pub trait OffsetReader {
     fn read_offset_by_path(&self, _pid: i32, _path: &std::path::Path) -> Option<u64> {
         None
     }
+
+    /// The same question asked of the mediator's *own* descriptor for the file.
+    ///
+    /// The fd injection dups the listener's descriptor into the sandbox, so
+    /// both name one open file description and one offset. This copy cannot be
+    /// moved or closed by the sandbox, and reading it is a plain
+    /// `/proc/self/fdinfo/<fd>` -- no pid translation, no permission on
+    /// another process, and no dependence on which number the sandbox kept.
+    fn read_offset_held(&self, _held: &std::os::fd::OwnedFd) -> Option<u64> {
+        None
+    }
 }
 
 /// Reads `/proc/<pid>/fdinfo/<fd>` and parses its `pos:` line.
@@ -148,6 +159,13 @@ impl OffsetReader for ProcOffsetReader {
         }
         best
     }
+
+    fn read_offset_held(&self, held: &std::os::fd::OwnedFd) -> Option<u64> {
+        use std::os::fd::AsRawFd;
+        let fd = held.as_raw_fd();
+        let text = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).ok()?;
+        parse_pos(&text)
+    }
 }
 
 /// Whether a `/proc/<pid>/fd/<n>` target names the same path, allowing for the
@@ -219,10 +237,16 @@ impl AppendWatch {
             // The recorded number first (exact, one file to read). When it is
             // gone, the sandbox moved that descriptor somewhere the mediator
             // cannot know -- `exec 9>>` dups it onto 9 and closes the original
-            // -- so ask by path before giving up on the entry.
+            // -- so ask the mediator's own copy of the same file, which no
+            // sandbox can move, and only then fall back to a path scan.
             let offset = match reader.read_offset(key.0, key.1) {
                 Some(pos) => Some(pos),
-                None => reader.read_offset_by_path(key.0, &entry.path),
+                None => match entry.held.as_ref() {
+                    Some(held) => reader
+                        .read_offset_held(held)
+                        .or_else(|| reader.read_offset_by_path(key.0, &entry.path)),
+                    None => reader.read_offset_by_path(key.0, &entry.path),
+                },
             };
             let Some(offset) = offset else {
                 watch.forget(key.0, key.1);
@@ -271,6 +295,8 @@ mod tests {
         offsets: Mutex<Map<(i32, i32), Option<u64>>>,
         /// `(pid, path) -> offset`, for the descriptors the sandbox moved.
         by_path: Mutex<Map<(i32, String), u64>>,
+        /// `mediator fd -> offset`, for the copy the mediator holds.
+        held: Mutex<Map<i32, u64>>,
     }
 
     impl Fake {
@@ -283,6 +309,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert((pid, path.to_string()), offset);
+        }
+
+        fn set_held(&self, fd: i32, offset: u64) {
+            self.held.lock().unwrap().insert(fd, offset);
         }
     }
 
@@ -298,12 +328,17 @@ mod tests {
                 .get(&(pid, path.to_string_lossy().into_owned()))
                 .copied()
         }
+
+        fn read_offset_held(&self, held: &std::os::fd::OwnedFd) -> Option<u64> {
+            use std::os::fd::AsRawFd;
+            self.held.lock().unwrap().get(&held.as_raw_fd()).copied()
+        }
     }
 
     fn watch_with(entries: &[(i32, i32, &str, u64)]) -> WriteFds {
         let watch = WriteFds::new();
         for (pid, fd, path, baseline) in entries {
-            watch.register(*pid, *fd, std::path::Path::new(path), *baseline);
+            watch.register(*pid, *fd, std::path::Path::new(path), *baseline, None, 0);
         }
         watch
     }
@@ -354,6 +389,33 @@ mod tests {
 
         fake.set_path(7, "/tree/blob.bin", 5 * 1024 * 1024 + 4096);
         assert_eq!(watcher.tick(&watch, &fake).bytes, 4096);
+    }
+
+    #[test]
+    fn the_mediators_own_copy_is_read_when_the_sandbox_moved_its_descriptor() {
+        // The cheap answer to the same question the path scan answers: the
+        // kernel dups the listener's descriptor into the sandbox, so the
+        // mediator holds a reference to the *same* open file description and
+        // can read the offset from `/proc/self/fdinfo` -- no pid translation,
+        // no path scan, and nothing the sandbox can move.
+        let holder = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let held = std::sync::Arc::new(std::os::fd::OwnedFd::from(holder));
+        let held_fd = {
+            use std::os::fd::AsRawFd;
+            held.as_raw_fd()
+        };
+        let watch = WriteFds::new();
+        watch.register(7, 3, std::path::Path::new("/tree/blob.bin"), 0, Some(held), 1024);
+        let fake = Fake::default();
+        fake.set(7, 3, None);
+        // A path scan would find nothing; only the held copy knows.
+        fake.set_held(held_fd, 7 * 1024 * 1024);
+
+        let mut watcher = AppendWatch::new();
+        let sample = watcher.tick(&watch, &fake);
+        assert_eq!(sample.bytes, 7 * 1024 * 1024);
+        assert_eq!(sample.watching, 1);
+        assert_eq!(sample.dropped, 0);
     }
 
     #[test]
@@ -438,7 +500,7 @@ mod tests {
         fake.set(7, 3, None);
         assert_eq!(watcher.tick(&watch, &fake).bytes, 0);
 
-        watch.register(7, 9, std::path::Path::new("/tree/part2"), 0);
+        watch.register(7, 9, std::path::Path::new("/tree/part2"), 0, None, 0);
         fake.set(7, 9, Some(700));
         assert_eq!(watcher.tick(&watch, &fake).bytes, 700);
     }

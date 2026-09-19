@@ -881,6 +881,7 @@ fn inject_watched(
             );
         }
     }
+    let held = srcfd.try_clone().ok().map(std::sync::Arc::new);
     NotifAction::InjectFdSendTracked {
         srcfd,
         newfd_flags,
@@ -897,8 +898,90 @@ fn inject_watched(
                     end as u64
                 }
             };
-            watch.register(host_pid, child_fd, &path, baseline);
+            // `held` is the mediator's own reference to the file it just
+            // injected: the kernel *dups* this descriptor into the sandbox, so
+            // both name one open file description and one offset, and this
+            // copy cannot be moved out from under the watch by a redirection.
+            let cap = grant_file_size_cap(&watch, host_pid, baseline, &path);
+            watch.register(host_pid, child_fd, &path, baseline, held, cap);
         }),
+    }
+}
+
+/// Hand this `open` its share of what is left of the budget, and return the
+/// absolute file size that grants it.
+///
+/// Why at `open`: the ceiling is `RLIMIT_FSIZE`, which is per *process* and
+/// inherited, so the value a process holds is the one its parent had when it
+/// forked. Measured on the cluster, that made "the remaining budget" get
+/// handed out once per file -- a 1024 MiB sandbox tightened to 124 MiB with
+/// 900 MiB already written let both files after it write that same 124 MiB
+/// (900 + 124 + 124 = 1148 MiB at the freeze), because no scan landed between
+/// two files that each took ~275 ms. Deciding here instead bounds the sum by
+/// construction: the pool is the budget minus everything the watch has seen
+/// the sandbox append since that budget arrived, so a second writer sees what
+/// the first one already spent, however fast the files come.
+///
+/// Two properties keep this from cutting legal writes:
+///
+/// * the grant is `baseline + pool` -- the file may fill what is left, not
+///   "what is left" on its own (the same tail rule the tightening applies);
+/// * a process that is *already* writing keeps the largest grant among its
+///   live descriptors, so a later `open` by the same process cannot lower the
+///   ceiling under the file it is still writing. `RLIMIT_FSIZE` cannot
+///   separate two files of one process; this is the closest thing to it.
+fn grant_file_size_cap(
+    watch: &Arc<crate::dirty::WriteFds>,
+    host_pid: i32,
+    baseline: u64,
+    path: &Path,
+) -> u64 {
+    let Some(remaining) = watch.remaining() else {
+        // No budget yet (no round has run): leave the ceiling alone.
+        return baseline;
+    };
+    let floor = 1024 * 1024;
+    let grant = baseline
+        .saturating_add(remaining)
+        .max(floor);
+    let wanted = grant.max(watch.max_cap_for_pid(host_pid));
+    apply_file_size_cap(host_pid, wanted, path);
+    wanted
+}
+
+/// Lower `pid`'s `RLIMIT_FSIZE` to at most `bytes`, if that is a change.
+///
+/// Only ever lowers, like every other ceiling in this design: a stale number
+/// must never be able to *widen* a limit that is already in force.
+fn apply_file_size_cap(pid: i32, bytes: u64, path: &Path) {
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::prlimit(pid, libc::RLIMIT_FSIZE, std::ptr::null(), &mut current) } != 0 {
+        return;
+    }
+    let wanted = libc::rlimit {
+        rlim_cur: current.rlim_cur.min(bytes),
+        rlim_max: current.rlim_max.min(bytes),
+    };
+    if wanted.rlim_cur == current.rlim_cur && wanted.rlim_max == current.rlim_max {
+        return;
+    }
+    if unsafe { libc::prlimit(pid, libc::RLIMIT_FSIZE, &wanted, std::ptr::null_mut()) } != 0 {
+        return;
+    }
+    if std::env::var("SANLOCK_EVENT_TRACE").map(|v| v.trim() == "1").unwrap_or(false) {
+        static GRANTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = GRANTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 12 {
+            eprintln!(
+                "sandlock-supervise: open cap pid={pid} -> {bytes} bytes \
+                 (was {}) path={}",
+                current.rlim_cur,
+                path.display()
+            );
+        }
     }
 }
 

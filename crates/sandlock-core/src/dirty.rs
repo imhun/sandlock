@@ -32,6 +32,7 @@
 
 use std::collections::HashSet;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -157,10 +158,28 @@ pub const MAX_WRITE_FDS: usize = 4096;
 #[derive(Debug, Default)]
 pub struct WriteFds {
     inner: Mutex<HashMap<(i32, i32), WriteFd>>,
+    /// Everything the watch has attributed to writes since this generation
+    /// started, summed incrementally (`observe` adds each step, so a
+    /// descriptor that closes keeps its contribution).
+    ///
+    /// This is how much of the last budget the sandbox has *spent*, which is
+    /// what turns "the remaining budget as of the last round" into "the
+    /// remaining budget now" for an `open` that happens in between.
+    spent: std::sync::atomic::AtomicU64,
+    /// The last budget the worker sent, with the `spent` reading it arrived
+    /// at: `bytes - (spent_now - spent_then)` is what is left *now*.
+    budget: Mutex<Option<Budget>>,
+}
+
+/// One `update_file_size_limit` from the worker, as a baseline.
+#[derive(Debug, Clone, Copy)]
+struct Budget {
+    bytes: u64,
+    spent_at: u64,
 }
 
 /// One watched descriptor: what it names and where it started.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct WriteFd {
     pub path: PathBuf,
     /// The file's size at the instant the mediator opened it (`lseek(SEEK_END)`
@@ -179,12 +198,44 @@ pub struct WriteFd {
     /// bytes a file has already written are part of the worker's "used", so
     /// the ceiling it implies must be added back to them.
     pub observed: u64,
+    /// The mediator's own descriptor for the same open file description.
+    ///
+    /// The kernel's fd injection *dups* the listener's descriptor into the
+    /// sandbox, so both name one `struct file` and therefore one offset. The
+    /// sandbox is free to move its copy -- measured: `exec 9>>file` dups the
+    /// injected descriptor onto 9 and closes the original -- and a reader that
+    /// only knows the sandbox's copy loses the file at that instant. This one
+    /// cannot move, and reading it needs no pid translation and no permission
+    /// on another process's `/proc` entry.
+    pub held: Option<Arc<std::os::fd::OwnedFd>>,
+    /// The absolute file size this descriptor was granted when it was opened
+    /// (`baseline + what was left of the budget then`).
+    ///
+    /// Kept so a later `open` by the same process cannot lower the ceiling of
+    /// a file it is still writing: the process-wide limit is the largest of
+    /// the grants its live descriptors hold.
+    pub cap: u64,
 }
+
+impl PartialEq for WriteFd {
+    /// Everything that decides an entry's *accounting*. The held descriptor is
+    /// the same file by construction, so it is left out of the comparison.
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.baseline == other.baseline
+            && self.observed == other.observed
+            && self.cap == other.cap
+    }
+}
+
+impl Eq for WriteFd {}
 
 impl WriteFds {
     pub fn new() -> Self {
         WriteFds {
             inner: Mutex::new(HashMap::new()),
+            spent: std::sync::atomic::AtomicU64::new(0),
+            budget: Mutex::new(None),
         }
     }
 
@@ -193,7 +244,15 @@ impl WriteFds {
     /// Called from the inject callback, i.e. *after* the kernel has answered
     /// with the child-side descriptor number, so the entry lands before the
     /// sandbox's `open` returns and no write can happen off the books.
-    pub fn register(&self, pid: i32, fd: i32, host_path: &Path, baseline: u64) {
+    pub fn register(
+        &self,
+        pid: i32,
+        fd: i32,
+        host_path: &Path,
+        baseline: u64,
+        held: Option<Arc<std::os::fd::OwnedFd>>,
+        cap: u64,
+    ) {
         let mut inner = self.lock();
         if inner.len() >= MAX_WRITE_FDS && !inner.contains_key(&(pid, fd)) {
             return;
@@ -204,6 +263,8 @@ impl WriteFds {
                 path: host_path.to_path_buf(),
                 baseline,
                 observed: baseline,
+                held,
+                cap,
             },
         );
     }
@@ -214,8 +275,50 @@ impl WriteFds {
         if let Some(entry) = inner.get_mut(&(pid, fd)) {
             // Monotone: a rewind (pwrite) must not shrink what the file is
             // allowed to be, or a tightening could refuse a legal file.
-            entry.observed = entry.observed.max(offset);
+            let next = entry.observed.max(offset);
+            let step = next.saturating_sub(entry.observed);
+            entry.observed = next;
+            self.spent
+                .fetch_add(step, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// Record the budget the worker just sent, with the spend it arrived at.
+    pub fn note_budget(&self, bytes: u64) {
+        let spent_at = self.spent.load(std::sync::atomic::Ordering::Relaxed);
+        *self
+            .budget
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Budget { bytes, spent_at });
+    }
+
+    /// What is left of the last budget, counting everything the watch has seen
+    /// the sandbox append since that budget was computed.
+    ///
+    /// `None` when the worker has not sent a budget yet: an `open` then has no
+    /// number to hand out and leaves the ceiling alone.
+    pub fn remaining(&self) -> Option<u64> {
+        let guard = self
+            .budget
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let budget = (*guard)?;
+        let spent_now = self.spent.load(std::sync::atomic::Ordering::Relaxed);
+        Some(
+            budget
+                .bytes
+                .saturating_sub(spent_now.saturating_sub(budget.spent_at)),
+        )
+    }
+
+    /// The largest file-size grant any of `pid`'s live descriptors holds.
+    pub fn max_cap_for_pid(&self, pid: i32) -> u64 {
+        self.lock()
+            .iter()
+            .filter(|((entry_pid, _fd), _entry)| *entry_pid == pid)
+            .map(|(_key, entry)| entry.cap)
+            .max()
+            .unwrap_or(0)
     }
 
     /// How much `pid`'s watched descriptors have grown since they were opened.
@@ -340,7 +443,7 @@ mod tests {
     #[test]
     fn a_watched_descriptor_keeps_its_path_and_baseline() {
         let watch = WriteFds::new();
-        watch.register(11, 5, Path::new("/tree/blob.bin"), 4096);
+        watch.register(11, 5, Path::new("/tree/blob.bin"), 4096, None, 0);
         let entries = watch.snapshot();
         assert_eq!(entries.len(), 1);
         let (key, entry) = &entries[0];
@@ -352,8 +455,8 @@ mod tests {
     #[test]
     fn forgetting_a_descriptor_removes_it() {
         let watch = WriteFds::new();
-        watch.register(11, 5, Path::new("/tree/a"), 0);
-        watch.register(11, 6, Path::new("/tree/b"), 0);
+        watch.register(11, 5, Path::new("/tree/a"), 0, None, 0);
+        watch.register(11, 6, Path::new("/tree/b"), 0, None, 0);
         watch.forget(11, 5);
         let entries = watch.snapshot();
         assert_eq!(entries.len(), 1);
@@ -365,8 +468,8 @@ mod tests {
         // Same slot, new file: the old baseline must not survive, or growth
         // would be measured against the wrong starting point.
         let watch = WriteFds::new();
-        watch.register(11, 5, Path::new("/tree/first"), 10_000);
-        watch.register(11, 5, Path::new("/tree/second"), 0);
+        watch.register(11, 5, Path::new("/tree/first"), 10_000, None, 0);
+        watch.register(11, 5, Path::new("/tree/second"), 0, None, 0);
         let entries = watch.snapshot();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1.path, PathBuf::from("/tree/second"));
@@ -376,7 +479,7 @@ mod tests {
     #[test]
     fn an_observed_offset_reports_what_a_descriptor_has_grown_by() {
         let watch = WriteFds::new();
-        watch.register(11, 5, Path::new("/tree/f"), 4096);
+        watch.register(11, 5, Path::new("/tree/f"), 4096, None, 0);
         assert_eq!(watch.max_grown_for_pid(11), 0);
         watch.observe(11, 5, 4096 + 900);
         assert_eq!(watch.max_grown_for_pid(11), 900);
@@ -389,7 +492,7 @@ mod tests {
         // A `pwrite` back at offset 0 must not shrink what the file may be:
         // the limit derived from it would then refuse writes that are legal.
         let watch = WriteFds::new();
-        watch.register(11, 5, Path::new("/tree/f"), 0);
+        watch.register(11, 5, Path::new("/tree/f"), 0, None, 0);
         watch.observe(11, 5, 10_000);
         watch.observe(11, 5, 8);
         assert_eq!(watch.max_grown_for_pid(11), 10_000);
@@ -398,8 +501,8 @@ mod tests {
     #[test]
     fn the_allowance_is_the_largest_of_a_processs_descriptors() {
         let watch = WriteFds::new();
-        watch.register(11, 5, Path::new("/tree/a"), 0);
-        watch.register(11, 6, Path::new("/tree/b"), 0);
+        watch.register(11, 5, Path::new("/tree/a"), 0, None, 0);
+        watch.register(11, 6, Path::new("/tree/b"), 0, None, 0);
         watch.observe(11, 5, 700);
         watch.observe(11, 6, 900);
         assert_eq!(watch.max_grown_for_pid(11), 900);
@@ -413,20 +516,66 @@ mod tests {
     }
 
     #[test]
+    fn the_remaining_budget_is_the_last_number_minus_what_was_spent_since() {
+        // N25/B: an `open` between two rounds has to know what the last round
+        // did *not* know yet. `spent` is that, summed as the watch observes.
+        let watch = WriteFds::new();
+        watch.register(11, 5, Path::new("/tree/a.bin"), 0, None, 0);
+        watch.note_budget(1024 * 1024);
+        assert_eq!(watch.remaining(), Some(1024 * 1024));
+
+        watch.observe(11, 5, 600 * 1024);
+        assert_eq!(watch.remaining(), Some(424 * 1024));
+
+        // A descriptor that closes keeps what it spent: the pool is a spend
+        // counter, not a sum over live descriptors.
+        watch.forget(11, 5);
+        assert_eq!(watch.remaining(), Some(424 * 1024));
+
+        watch.register(11, 9, Path::new("/tree/b.bin"), 0, None, 0);
+        watch.observe(11, 9, 424 * 1024);
+        assert_eq!(watch.remaining(), Some(0));
+    }
+
+    #[test]
+    fn a_new_budget_rebaselines_the_spend() {
+        let watch = WriteFds::new();
+        watch.register(11, 5, Path::new("/tree/a.bin"), 0, None, 0);
+        watch.observe(11, 5, 700);
+        watch.note_budget(400);
+        assert_eq!(watch.remaining(), Some(400));
+        watch.observe(11, 5, 900);
+        assert_eq!(watch.remaining(), Some(200));
+    }
+
+    #[test]
+    fn the_largest_grant_of_a_processes_descriptors_wins() {
+        // A later `open` by a process that is still writing must not lower the
+        // ceiling under that file: the process-wide limit is the largest grant
+        // its live descriptors hold.
+        let watch = WriteFds::new();
+        watch.register(11, 5, Path::new("/tree/first.bin"), 0, None, 900 * 1024 * 1024);
+        assert_eq!(watch.max_cap_for_pid(11), 900 * 1024 * 1024);
+        watch.register(11, 9, Path::new("/tree/second.bin"), 0, None, 1024 * 1024);
+        assert_eq!(watch.max_cap_for_pid(11), 900 * 1024 * 1024);
+        assert_eq!(watch.max_cap_for_pid(12), 0);
+    }
+
+    #[test]
     fn the_cap_refuses_new_descriptors_but_keeps_the_ones_it_has() {
         let watch = WriteFds::new();
         for fd in 0..MAX_WRITE_FDS as i32 {
-            watch.register(11, fd, Path::new("/tree/f"), 0);
+            watch.register(11, fd, Path::new("/tree/f"), 0, None, 0);
         }
         assert_eq!(watch.len(), MAX_WRITE_FDS);
-        watch.register(11, MAX_WRITE_FDS as i32, Path::new("/tree/one-too-many"), 0);
+        watch.register(11, MAX_WRITE_FDS as i32, Path::new("/tree/one-too-many"), 0, None, 0);
         assert_eq!(watch.len(), MAX_WRITE_FDS);
         assert!(!watch
             .snapshot()
             .iter()
             .any(|(_, e)| e.path == PathBuf::from("/tree/one-too-many")));
         // An update to a descriptor already watched is still accepted.
-        watch.register(11, 0, Path::new("/tree/f"), 7);
+        watch.register(11, 0, Path::new("/tree/f"), 7, None, 0);
         let first = watch
             .snapshot()
             .into_iter()

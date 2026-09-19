@@ -1593,6 +1593,99 @@ fn test_a_tightening_does_not_cut_off_the_file_that_caused_it() {
 }
 
 #[test]
+fn test_the_remaining_budget_is_handed_out_once_per_open() {
+    // N25/B. The ceiling is per *process* and inherited, so a command that
+    // writes several files handed each new one "what is left" as of the last
+    // tightening: measured on the cluster, a 1024 MiB sandbox tightened to
+    // 124 MiB with 900 MiB written let both files after it write that same
+    // 124 MiB (1148 MiB at the freeze). The pool is now computed at the
+    // `open`, from the mediator's own spend counter, so the second file sees
+    // what the first one already used.
+    isolate_ctl_root();
+    let workdir = std::path::PathBuf::from(format!(
+        "/tmp/sandlock-pool-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&workdir).expect("create pool workdir");
+    let first = workdir.join("first.bin");
+    let second = workdir.join("second.bin");
+    let policy = write_policy(
+        "pool-limit",
+        &instance_policy_chrooted_pid_ns_with_file_size("/tmp", "512M"),
+    );
+    // A long-running writer on `first`, then a fresh process opening `second`
+    // -- the shape `for i in 1 2 3; do dd of=part$i.bin; done` has.
+    let script = format!(
+        "exec 3>>{a}; i=0; while [ $i -lt 40 ]; do \
+         dd if=/dev/zero bs=1M count=1 status=none >&3; i=$((i+1)); sleep 0.05; done; \
+         dd if=/dev/zero of={b} bs=1M count=64 status=none 2>{e}; echo rc=$? > {r}; exec sleep 30",
+        a = first.display(),
+        b = second.display(),
+        e = workdir.join("second.err").display(),
+        r = workdir.join("second.rc").display()
+    );
+    let program = write_policy(
+        "pool-program",
+        &serde_json::json!({ "argv": ["/bin/sh", "-c", script] }).to_string(),
+    );
+    let (mut child, mut worker, _events) =
+        spawn_serve_supervisor_with_events(&policy, &program, &[]);
+
+    let size = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    wait_until(deadline, "the first writer to reach 8 MiB", || {
+        size(&first) >= 8 * 1024 * 1024
+    });
+
+    // "Two MiB left of the budget", told to the slot the way a round does.
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({
+            "v": 1,
+            "verb": "update_file_size_limit",
+            "args": { "bytes": 2 * 1024 * 1024 },
+        }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "tighten: {resp:?}");
+    let at_tighten = size(&first);
+    assert!(at_tighten >= 8 * 1024 * 1024, "sanity: first is {at_tighten}");
+
+    // The second file's `open` happens well after the first file spent the
+    // whole remaining budget, so it is granted the floor and stops there.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        if size(&second) > 0 && size(&first) > at_tighten {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+    dump_child_stderr(&mut child);
+
+    assert_eq!(
+        size(&second),
+        1024 * 1024,
+        "a second file opened after the pool is spent is capped at the floor"
+    );
+    assert!(
+        size(&first) > at_tighten,
+        "the file that caused the spend keeps its own grant ({} -> {})",
+        at_tighten,
+        size(&first)
+    );
+
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "shutdown", "args": {} }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "shutdown: {resp:?}");
+    let _ = child.wait_with_output();
+    let _ = std::fs::remove_file(&policy);
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+#[test]
 fn test_update_file_size_limit_stops_a_running_writer() {
     isolate_ctl_root();
     let workdir = repo_tmp_dir().join(format!("supervise-tighten-{}", std::process::id()));
