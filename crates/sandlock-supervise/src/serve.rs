@@ -149,6 +149,14 @@ struct Generation {
     /// ledger that can lag, and a lag must never be able to *loosen* a limit
     /// that a previous, less stale measurement already imposed.
     applied_file_size_limit: Option<u64>,
+    /// N25: the append publisher, owned by the generation.
+    ///
+    /// It has to outlive this function's locals: the publisher runs for as
+    /// long as the generation does, and dropping it stops the thread. A local
+    /// binding *looked* equivalent and was not -- the thread stopped the
+    /// moment the generation started serving, which the worker can only see as
+    /// its events descriptor closing.
+    appender: Option<Appender>,
     // Declared after `instance` so a dropped Generation drops the instance
     // FIRST (its synchronous kill-and-clean backstop runs while the runtime
     // is still alive); the runtime field drops last and cancels any
@@ -168,6 +176,7 @@ impl Generation {
             rt,
             instance: None,
             applied_file_size_limit: None,
+            appender: None,
         };
         // Launch-first (F2b.3): a generation with a provisioned workload
         // starts it before serving any verb.  A generation without one stays
@@ -936,10 +945,18 @@ pub fn serve_control_fd(
     // when the open-descriptor ledger does. It runs on its own thread so a
     // blocking `wait_child` on the serve thread cannot stall it -- which is
     // exactly when the events matter, since the child is writing.
-    let _appender = events_fd.and_then(|fd| {
-        let watch = generation.instance.as_ref()?.open_write_fds()?;
-        Some(Appender::spawn(fd, watch))
-    });
+    if let Some(fd) = events_fd {
+        let watch = generation
+            .instance
+            .as_ref()
+            .and_then(|instance| instance.open_write_fds())
+            .ok_or_else(|| {
+                "no open-descriptor ledger for this generation: the events \
+                 descriptor cannot be fed"
+                    .to_string()
+            })?;
+        generation.appender = Some(Appender::spawn(fd, watch)?);
+    }
     let outcome = serve_fd_connection(stream, expected_token, &mut generation);
     generation.finish(outcome)
 }

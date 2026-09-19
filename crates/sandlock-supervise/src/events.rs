@@ -61,8 +61,17 @@ impl Appender {
     /// the generation ending, and a thread blocked writing to a worker that
     /// has stopped reading must not be able to hold the process open. It
     /// owns its end of the socketpair, so the fd closes when it exits.
-    pub fn spawn(events_fd: RawFd, watch: Arc<WriteFds>) -> Appender {
+    ///
+    /// Fails when the descriptor cannot be written at all: a slot whose
+    /// channel is dead must say so, because the consumer cannot tell "nothing
+    /// was written" from "the channel was never wired" -- it sees an
+    /// immediately-closed descriptor in both cases, which is how a dead push
+    /// channel stayed invisible on the cluster (§22.5.7).
+    pub fn spawn(events_fd: RawFd, watch: Arc<WriteFds>) -> Result<Appender, String> {
         let interval = interval_from_env();
+        let trace = std::env::var("SANLOCK_EVENT_TRACE")
+            .map(|value| value.trim() == "1")
+            .unwrap_or(false);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let mut stream = unsafe { UnixStream::from_raw_fd(events_fd) };
@@ -72,7 +81,18 @@ impl Appender {
         // here, before anything else in the generation can run.
         unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
 
-        let _ = std::thread::Builder::new()
+        // Prove the channel before the generation starts serving: one greeting
+        // line, so "the worker never saw a byte" is a refusal here rather than
+        // silence later.
+        let hello = serde_json::json!({"v": 1, "event": "hello", "fd": events_fd});
+        let mut greeting = hello.to_string();
+        greeting.push('\n');
+        stream
+            .write_all(greeting.as_bytes())
+            .and_then(|()| stream.flush())
+            .map_err(|e| format!("events descriptor {events_fd} is not writable: {e}"))?;
+
+        std::thread::Builder::new()
             .name("sandlock-events".to_string())
             .spawn(move || {
                 let mut state = AppendWatch::new();
@@ -80,6 +100,22 @@ impl Appender {
                 let mut seq: u64 = 0;
                 while !thread_stop.load(Ordering::Relaxed) {
                     let sample = state.tick(&watch, &reader);
+                    if trace {
+                        // Off by default. The question it answers -- "is the
+                        // watch empty, or are the reads failing?" -- is the
+                        // one the two look identical for from outside, and it
+                        // is what found the namespace-pid bug.
+                        let debug = serde_json::json!({
+                            "v": 1,
+                            "event": "tick",
+                            "watching": sample.watching,
+                            "dropped": sample.dropped,
+                            "bytes": sample.bytes,
+                        });
+                        let mut line = debug.to_string();
+                        line.push('\n');
+                        let _ = stream.write_all(line.as_bytes());
+                    }
                     if sample.bytes > 0 {
                         let event = serde_json::json!({
                             "v": 1,
@@ -91,9 +127,15 @@ impl Appender {
                         });
                         let mut line = event.to_string();
                         line.push('\n');
-                        if stream.write_all(line.as_bytes()).is_err() {
-                            // The worker's end is gone (it closed, or the
-                            // process is exiting): nothing left to tell.
+                        if let Err(e) = stream.write_all(line.as_bytes()) {
+                            // Loud on purpose: a publisher that stops without
+                            // saying so looks exactly like a sandbox that
+                            // stopped writing, and the worker cannot tell the
+                            // two apart -- it just sees the channel close.
+                            eprintln!(
+                                "sandlock-supervise: events publisher stopped: write to \
+                                 the events descriptor failed: {e}"
+                            );
                             return;
                         }
                         let _ = stream.flush();
@@ -101,8 +143,9 @@ impl Appender {
                     }
                     std::thread::sleep(interval);
                 }
-            });
-        Appender { stop }
+            })
+            .map_err(|e| format!("cannot start the events publisher thread: {e}"))?;
+        Ok(Appender { stop })
     }
 }
 

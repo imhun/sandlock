@@ -871,10 +871,15 @@ pub struct NotifPolicy {
     /// PID namespace translation for `Sandbox::pid_ns` sandboxes, used to
     /// render the sandbox's `/proc` view (renumbered to namespace pids).
     /// `None` when the sandbox shares the supervisor's PID namespace (the
-    /// default). Note: `SeccompNotif.pid` is *not* routed through this map —
-    /// the kernel reports it as the pid in the *reader's* namespace
-    /// (`task_pid_vnr`), and the supervisor reads notifications from the
-    /// host namespace, so it is already a host pid.
+    /// default).
+    ///
+    /// `SeccompNotif.pid` **is** routed through this map, and has to be: the
+    /// kernel reports the pid in the *task's own* namespace, not in the
+    /// listener's. Measured on the cluster, a writer the supervisor can read
+    /// as host pid 121 arrived as `7`, and every `/proc/7/fdinfo/…` read
+    /// answered `ENOENT` — which is how the append watch came to sit at
+    /// `watching: 0` for 1515 consecutive ticks with a writer running.
+    /// `handle_chroot_open` translates before recording a write descriptor.
     pub(crate) pid_ns: Option<std::sync::Arc<std::sync::RwLock<crate::procfs::PidNsMap>>>,
 }
 

@@ -1176,6 +1176,7 @@ fn sum_appended_events(events: &std::os::unix::net::UnixStream, window: Duration
     let deadline = Instant::now() + window;
     let mut total = 0u64;
     let mut count = 0usize;
+    let mut greeted = 0usize;
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     let mut peek = events;
@@ -1198,14 +1199,22 @@ fn sum_appended_events(events: &std::os::unix::net::UnixStream, window: Duration
             let value: serde_json::Value = serde_json::from_str(&text)
                 .unwrap_or_else(|e| panic!("event line is not JSON ({e}): {text}"));
             assert_eq!(value["v"], 1, "event protocol version: {value}");
-            assert_eq!(value["event"], "append", "event kind: {value}");
-            let bytes = value["bytes"].as_u64().expect("event carries bytes");
-            if bytes > 0 {
-                total += bytes;
-                count += 1;
+            match value["event"].as_str() {
+                // The greeting proves the channel is wired before any write;
+                // it is the one event that is not about bytes.
+                Some("hello") => greeted += 1,
+                Some("append") => {
+                    let bytes = value["bytes"].as_u64().expect("event carries bytes");
+                    if bytes > 0 {
+                        total += bytes;
+                        count += 1;
+                    }
+                }
+                other => panic!("unexpected event kind {other:?} in {value}"),
             }
         }
     }
+    assert_eq!(greeted, 1, "the channel greets exactly once");
     (total, count)
 }
 
@@ -1262,6 +1271,29 @@ fn instance_policy_chrooted_with_file_size(writable: &str, ceiling: &str) -> Str
         "fs_readable": readable,
         "fs_writable": [writable],
         "max_file_size": ceiling,
+    })
+    .to_string()
+}
+
+/// The chroot shape **with a pid namespace**: the deployment's shape.
+///
+/// It is what the append watch is sensitive to, and the reason this fixture
+/// exists. A `pid_ns` sandbox's notifications carry pids in the sandbox's
+/// *own* namespace -- a task the supervisor can read as host pid 121 arrives
+/// as `7` -- so a watch that registers the notification pid verbatim opens a
+/// path that names a different process, or nothing. Measured on the cluster
+/// that is exactly what happened: `watching: 0` for 1515 consecutive ticks
+/// while a writer was busy, no pushed appends, and a 1024 MiB budget exceeded
+/// by 124 MiB. Without this fixture the whole unit suite passes while the
+/// feature is dead in production.
+fn instance_policy_chrooted_pid_ns(writable: &str) -> String {
+    let mut readable = base_read_paths();
+    readable.push(writable.to_string());
+    serde_json::json!({
+        "chroot": "/",
+        "fs_readable": readable,
+        "fs_writable": [writable],
+        "pid_ns": true,
     })
     .to_string()
 }
@@ -1347,7 +1379,9 @@ fn test_events_fd_reports_a_running_writers_growth() {
     let blob = workdir.join("blob.bin");
     let policy = write_policy(
         "events-append",
-        &instance_policy_chrooted("/tmp"),
+        // `pid_ns` on purpose: this is the test that has to fail when the
+        // watch is handed namespace pids it cannot read (see the fixture).
+        &instance_policy_chrooted_pid_ns("/tmp"),
     );
     // One descriptor, held open across eight 1 MiB appends 150 ms apart:
     // the shape this signal exists for (a writer filling a file), and one

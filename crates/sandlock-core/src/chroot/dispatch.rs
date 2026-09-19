@@ -89,6 +89,15 @@ pub(crate) struct ChrootCtx<'a> {
     /// can read a live size for the files a writer is filling (see
     /// [`crate::append_watch`]). Only the `openat` handler adds to it.
     pub write_fds: &'a Arc<crate::dirty::WriteFds>,
+    /// `pid_ns` translation, for the one handler that has to turn a
+    /// notification pid into a pid this process can open.
+    ///
+    /// A notification carries the pid **in the sandbox's own namespace**:
+    /// measured on the cluster a writer the supervisor sees as host pid 121
+    /// arrived as `7`, so `/proc/<pid>/fdinfo/<fd>` named a different process
+    /// or nothing and the append watch never read a single descriptor. The
+    /// map is the same one the `/proc` view and the teardown sweep use.
+    pub pid_ns: Option<&'a Arc<std::sync::RwLock<crate::procfs::PidNsMap>>>,
 }
 
 impl<'a> ChrootCtx<'a> {
@@ -112,6 +121,7 @@ impl<'a> ChrootCtx<'a> {
             processes,
             dirty,
             write_fds,
+            pid_ns: policy.pid_ns.as_ref(),
         }
     }
 
@@ -839,6 +849,23 @@ fn inject_watched(
     }
     let srcfd_raw = srcfd.as_raw_fd();
     let watch = Arc::clone(ctx.write_fds);
+    // `pid` is the *notification's* pid, i.e. one in the sandbox's own
+    // namespace whenever the policy sets `pid_ns`. Registering it verbatim is
+    // how the watch ended up unable to read a single descriptor -- every
+    // `/proc/<ns pid>/fdinfo/<fd>` answers `ENOENT` from here (see
+    // `crate::append_watch`) -- so the entry is keyed by the host pid, which
+    // is also the pid a tightening addresses.
+    let host_pid = match ctx.pid_ns {
+        Some(map) => map
+            .write()
+            .ok()
+            .and_then(|mut map| map.host_pid(pid))
+            // An untranslatable pid is kept as-is: that is the behaviour the
+            // watch had before this translation existed, and never a reason to
+            // refuse the open itself.
+            .unwrap_or(pid as i32),
+        None => pid as i32,
+    };
     let path = host_path.to_path_buf();
     NotifAction::InjectFdSendTracked {
         srcfd,
@@ -856,7 +883,7 @@ fn inject_watched(
                     end as u64
                 }
             };
-            watch.register(pid as i32, child_fd, &path, baseline);
+            watch.register(host_pid, child_fd, &path, baseline);
         }),
     }
 }
@@ -2837,6 +2864,9 @@ mod mount_ro_tests {
             processes,
             dirty,
             write_fds,
+            // These tests describe the policy halves, not a namespace: with no
+            // map the pid translation is the identity.
+            pid_ns: None,
         }
     }
 

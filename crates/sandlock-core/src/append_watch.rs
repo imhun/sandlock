@@ -50,12 +50,59 @@ pub trait OffsetReader {
 /// for the shapes that matter here -- create-and-fill (`dd`, a download, an
 /// extractor) and append (`>>`, a log) -- it *is* the file's size, and it is
 /// available with no round trip to the server and no wait for the data.
+///
+/// ## Which `/proc`
+///
+/// A `pid_ns` sandbox's notifications carry pids in the sandbox's **own**
+/// namespace: measured on the cluster, the writer was `NSpid: 121 7` and the
+/// mediator was handed `7`, so `/proc/7/fdinfo/…` named a different process
+/// or nothing and every read failed with `ENOENT` while the writer was alive.
+///
+/// Re-rooting does not fix it, which is worth recording because it looks like
+/// it should: the sandbox's own `/proc` is the *pod's* procfs, not a second
+/// view numbered by the sandbox's namespace. Measured on the cluster,
+/// `/proc/<sandbox pid>/root/proc/self` resolves to a pod-level pid and
+/// `/proc/<sandbox pid>/root/proc/<namespace pid>` does not exist at all. The
+/// namespace pid therefore has to be *translated* before anything can be read
+/// (`crate::procfs::PidNsMap`, the same map the `/proc` view and the teardown
+/// sweep already use), and this reader is only ever handed the translated pid.
 pub struct ProcOffsetReader;
 
 impl OffsetReader for ProcOffsetReader {
     fn read_offset(&self, pid: i32, fd: i32) -> Option<u64> {
-        let text = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).ok()?;
-        parse_pos(&text)
+        let path = format!("/proc/{pid}/fdinfo/{fd}");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(read) => read,
+            Err(e) => {
+                // Diagnostic (rate-limited): an unresolvable descriptor is the
+                // difference between "nothing was written" and "we cannot see
+                // what was written", and from outside the two look the same.
+                static MISSES: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let n = MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 6 {
+                    eprintln!(
+                        "sandlock-supervise: events watch cannot read fdinfo: {path}: {e}"
+                    );
+                }
+                return None;
+            }
+        };
+        match parse_pos(&text) {
+            Some(pos) => Some(pos),
+            None => {
+                static NOPOS: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let n = NOPOS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 6 {
+                    eprintln!(
+                        "sandlock-supervise: fdinfo has no pos: {path}: {:?}",
+                        text.lines().take(3).collect::<Vec<_>>()
+                    );
+                }
+                None
+            }
+        }
     }
 }
 

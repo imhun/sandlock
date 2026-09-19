@@ -1397,18 +1397,23 @@ impl SandboxInstance {
         // the tree's remaining falls to 324). The allowance is per *group*
         // because the descriptor that grows is usually the parent's while the
         // writer is its child.
-        let group_grown = self
-            .supervisor_write_fds
-            .as_ref()
-            .map(|watch| watch.max_grown_for_pids(&targets))
-            .unwrap_or(0);
+        //
+        // It is per *task*, not per group, because `RLIMIT_FSIZE` is inherited
+        // and the number handed to a shell is the number every process it
+        // forks afterwards starts with: measured on the cluster,
+        // `for i in 1 2 3; do dd of=part$i.bin count=900; done` in a 1024 MiB
+        // sandbox was tightened to 124 MiB of remaining budget once part1 was
+        // finished, and both remaining files were allowed that same 124 MiB
+        // (900 + 124 + 124 = 1148 MiB at the freeze). A task with no watched
+        // descriptor of its own is therefore capped at what is actually left.
+        let grown = self.grown_by_target(&targets);
 
         let mut report = FileSizeLimitReport {
             considered: targets.len(),
             ..FileSizeLimitReport::default()
         };
         for pid in targets {
-            let allowance = bytes.saturating_add(group_grown);
+            let allowance = bytes.saturating_add(grown.get(&pid).copied().unwrap_or(0));
             let mut current = libc::rlimit {
                 rlim_cur: 0,
                 rlim_max: 0,
@@ -1451,6 +1456,44 @@ impl SandboxInstance {
             report.tightened += 1;
         }
         Ok(report)
+    }
+
+    /// How much each target may have written already, by task.
+    ///
+    /// A task inherits the ceiling of whoever forked it, so the growth that
+    /// belongs to a file has to reach the task that writes it: a descriptor
+    /// opened by a parent and written by a child (`sh -c '… > file'`) is the
+    /// shape a naive per-pid answer cuts short. Only ancestors that are
+    /// themselves being tightened can contribute, which keeps the number
+    /// inside the sandbox's own process tree.
+    fn grown_by_target(&self, targets: &[i32]) -> HashMap<i32, u64> {
+        let mut grown: HashMap<i32, u64> = HashMap::new();
+        for pid in targets {
+            let watched = self
+                .supervisor_write_fds
+                .as_ref()
+                .map(|watch| watch.max_grown_for_pid(*pid))
+                .unwrap_or(0);
+            grown.insert(*pid, watched);
+        }
+        let in_group: HashSet<i32> = targets.iter().copied().collect();
+        let mut result = grown.clone();
+        for pid in targets {
+            let mut best = grown.get(pid).copied().unwrap_or(0);
+            let mut current = *pid;
+            for _ in 0..MAX_ANCESTOR_HOPS {
+                let Some(parent) = parent_pid(current) else {
+                    break;
+                };
+                if parent <= 1 || !in_group.contains(&parent) {
+                    break;
+                }
+                best = best.max(grown.get(&parent).copied().unwrap_or(0));
+                current = parent;
+            }
+            result.insert(*pid, best);
+        }
+        result
     }
 
     /// Resize the pty of an exec child (F3.2): `TIOCSWINSZ` on the host-side
@@ -3012,6 +3055,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parent_pid_agrees_with_getppid() {
+        // The allowance a tightening hands to a task is the remaining budget
+        // plus what *its own* file has already written, and "its own" is
+        // resolved by walking the parent chain -- so the walk has to agree
+        // with the kernel's answer for a process that certainly exists.
+        assert_eq!(
+            parent_pid(std::process::id() as i32),
+            Some(unsafe { libc::getppid() })
+        );
+    }
+
+    #[test]
     fn stray_sweep_target_passthrough_without_pid_ns() {
         // Non-pid-ns sessions announce host pids: the stray is signalled
         // as-is (translation is a no-op).
@@ -3052,6 +3107,21 @@ mod tests {
         );
     }
 }
+/// How far up a parent chain [`SandboxInstance::grown_by_target`] looks.
+const MAX_ANCESTOR_HOPS: usize = 32;
+
+/// The parent of `pid` in this process's own pid namespace, when it is alive.
+///
+/// `comm` is parenthesised and may contain spaces and parens, so the fields
+/// after it are counted from its *last* `)`.
+fn parent_pid(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = stat.rsplit_once(')')?;
+    let mut fields = rest.split_whitespace();
+    let _state = fields.next()?;
+    fields.next()?.parse().ok()
+}
+
 /// Pids whose process group is `pgid`, read from `/proc/<pid>/stat`.
 ///
 /// A per-exec ceiling is inherited at `execve`, so it reaches the processes
