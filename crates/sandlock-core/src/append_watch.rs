@@ -42,6 +42,20 @@ use crate::dirty::WriteFds;
 pub trait OffsetReader {
     /// The descriptor's current offset, or `None` when it no longer exists.
     fn read_offset(&self, pid: i32, fd: i32) -> Option<u64>;
+
+    /// The same question asked by *path*, for the descriptors whose number the
+    /// mediator cannot know any more.
+    ///
+    /// The number it records is the one the kernel handed back from the fd
+    /// injection, and a sandbox is free to move it: measured on the cluster,
+    /// `exec 9>>file` dups the injected descriptor onto 9 and closes the
+    /// original, so the watch's `(pid, fd)` named a closed descriptor within
+    /// milliseconds of being recorded and every entry was dropped on its first
+    /// tick. The path is what survives that (and a reopen), so a reader that
+    /// can answer it keeps the entry alive.
+    fn read_offset_by_path(&self, _pid: i32, _path: &std::path::Path) -> Option<u64> {
+        None
+    }
 }
 
 /// Reads `/proc/<pid>/fdinfo/<fd>` and parses its `pos:` line.
@@ -104,6 +118,49 @@ impl OffsetReader for ProcOffsetReader {
             }
         }
     }
+
+    /// Every descriptor of `pid` that names `path`, by its largest offset.
+    ///
+    /// Used only after the recorded number has failed: the sandbox moved the
+    /// descriptor (a redirection dups it onto the number the shell asked for)
+    /// or reopened the file. Matching on the resolved target keeps it exact --
+    /// the mediator records the *host* path it opened, which is what
+    /// `/proc/<pid>/fd/<n>` resolves to.
+    fn read_offset_by_path(&self, pid: i32, path: &std::path::Path) -> Option<u64> {
+        let dir = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+        let mut best: Option<u64> = None;
+        for entry in dir.flatten() {
+            let Some(fd) = entry.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else {
+                continue;
+            };
+            let Ok(target) = std::fs::read_link(entry.path()) else {
+                continue;
+            };
+            if !same_file(&target, path) {
+                continue;
+            }
+            if let Some(pos) = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}"))
+                .ok()
+                .and_then(|text| parse_pos(&text))
+            {
+                best = Some(best.map_or(pos, |seen: u64| seen.max(pos)));
+            }
+        }
+        best
+    }
+}
+
+/// Whether a `/proc/<pid>/fd/<n>` target names the same path, allowing for the
+/// trailing `" (deleted)"` the kernel appends to an unlinked file.
+fn same_file(target: &std::path::Path, wanted: &std::path::Path) -> bool {
+    if target == wanted {
+        return true;
+    }
+    let text = target.to_string_lossy();
+    match text.strip_suffix(" (deleted)") {
+        Some(trimmed) => std::path::Path::new(trimmed) == wanted,
+        None => false,
+    }
 }
 
 /// Pull `pos:` out of one `fdinfo` document.
@@ -159,7 +216,15 @@ impl AppendWatch {
         let mut before_by_path: HashMap<PathBuf, u64> = HashMap::new();
 
         for (key, entry) in entries {
-            let Some(offset) = reader.read_offset(key.0, key.1) else {
+            // The recorded number first (exact, one file to read). When it is
+            // gone, the sandbox moved that descriptor somewhere the mediator
+            // cannot know -- `exec 9>>` dups it onto 9 and closes the original
+            // -- so ask by path before giving up on the entry.
+            let offset = match reader.read_offset(key.0, key.1) {
+                Some(pos) => Some(pos),
+                None => reader.read_offset_by_path(key.0, &entry.path),
+            };
+            let Some(offset) = offset else {
                 watch.forget(key.0, key.1);
                 result.dropped += 1;
                 continue;
@@ -204,17 +269,34 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         offsets: Mutex<Map<(i32, i32), Option<u64>>>,
+        /// `(pid, path) -> offset`, for the descriptors the sandbox moved.
+        by_path: Mutex<Map<(i32, String), u64>>,
     }
 
     impl Fake {
         fn set(&self, pid: i32, fd: i32, offset: Option<u64>) {
             self.offsets.lock().unwrap().insert((pid, fd), offset);
         }
+
+        fn set_path(&self, pid: i32, path: &str, offset: u64) {
+            self.by_path
+                .lock()
+                .unwrap()
+                .insert((pid, path.to_string()), offset);
+        }
     }
 
     impl OffsetReader for Fake {
         fn read_offset(&self, pid: i32, fd: i32) -> Option<u64> {
             self.offsets.lock().unwrap().get(&(pid, fd)).copied().flatten()
+        }
+
+        fn read_offset_by_path(&self, pid: i32, path: &std::path::Path) -> Option<u64> {
+            self.by_path
+                .lock()
+                .unwrap()
+                .get(&(pid, path.to_string_lossy().into_owned()))
+                .copied()
         }
     }
 
@@ -250,6 +332,28 @@ mod tests {
         assert_eq!(sample.bytes, 900 * 1024 * 1024);
         assert_eq!(sample.watching, 1);
         assert_eq!(sample.dropped, 0);
+    }
+
+    #[test]
+    fn a_descriptor_the_sandbox_moved_is_followed_by_path() {
+        // Measured on the cluster: `exec 9>>file` dups the injected descriptor
+        // onto 9 and closes the original, so the recorded `(pid, fd)` names a
+        // closed descriptor and the entry was dropped on the first tick --
+        // every push from a plain `> file` command was lost that way. The path
+        // is what survives the move, so the same entry keeps counting.
+        let watch = watch_with(&[(7, 3, "/tree/blob.bin", 0)]);
+        let fake = Fake::default();
+        fake.set(7, 3, None);
+        fake.set_path(7, "/tree/blob.bin", 5 * 1024 * 1024);
+        let mut watcher = AppendWatch::new();
+
+        let first = watcher.tick(&watch, &fake);
+        assert_eq!(first.bytes, 5 * 1024 * 1024);
+        assert_eq!(first.watching, 1);
+        assert_eq!(first.dropped, 0);
+
+        fake.set_path(7, "/tree/blob.bin", 5 * 1024 * 1024 + 4096);
+        assert_eq!(watcher.tick(&watch, &fake).bytes, 4096);
     }
 
     #[test]
