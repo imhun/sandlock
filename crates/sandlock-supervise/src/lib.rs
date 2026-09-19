@@ -31,6 +31,7 @@
 
 pub mod policy;
 pub mod serve;
+pub mod events;
 
 /// Route-B hard invariant, pinned at the crate root (fork-plan F2b.3):
 /// supervise never re-maps its mediator (itself) to a new host uid at

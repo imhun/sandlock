@@ -50,6 +50,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::events::Appender;
 use sandlock_core::control::{
     serve_fd_connection, serve_registered_once, write_response_frame, ControlHandler,
     ControlRequest, ControlResponse, ServeOutcome,
@@ -143,6 +144,11 @@ struct Generation {
     policy: Arc<Sandbox>,
     program: Option<ProgramSpec>,
     instance: Option<SandboxInstance>,
+    /// N25: the tightest per-file ceiling this generation has put on its live
+    /// processes. Monotone on purpose -- the worker's numbers come from a
+    /// ledger that can lag, and a lag must never be able to *loosen* a limit
+    /// that a previous, less stale measurement already imposed.
+    applied_file_size_limit: Option<u64>,
     // Declared after `instance` so a dropped Generation drops the instance
     // FIRST (its synchronous kill-and-clean backstop runs while the runtime
     // is still alive); the runtime field drops last and cancels any
@@ -161,6 +167,7 @@ impl Generation {
             program,
             rt,
             instance: None,
+            applied_file_size_limit: None,
         };
         // Launch-first (F2b.3): a generation with a provisioned workload
         // starts it before serving any verb.  A generation without one stays
@@ -482,6 +489,86 @@ impl Generation {
         }))
     }
 
+    /// Serve an `update_file_size_limit` verb (N25): tighten `RLIMIT_FSIZE`
+    /// on every live process of this generation.
+    ///
+    /// The number comes from the worker's disk accounting, which can only
+    /// ever be *behind* the sandbox's writes (see
+    /// `docs/k8s-deployment.md` §22.4). That makes the direction of a stale
+    /// reading the whole design: a stale reading is a *larger* remaining
+    /// budget, so applying it would loosen. Two rules follow, and both are
+    /// enforced here rather than trusted to the caller:
+    ///
+    /// * a value above the instance's own ceiling is refused outright
+    ///   (`max_file_size` from the policy, the same field `exec` validates
+    ///   against);
+    /// * a value at or above what this generation already applied is a no-op,
+    ///   reported as such -- tightening is one-way for the life of a
+    ///   generation, and a new exec is what re-opens the budget.
+    fn handle_update_file_size_limit(
+        &mut self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, Refusal> {
+        let bytes = args
+            .get("bytes")
+            .and_then(|v| v.as_u64())
+            .filter(|b| *b > 0)
+            .ok_or_else(|| {
+                Refusal::refused(
+                    "update_file_size_limit requires a positive `bytes` integer",
+                )
+            })?;
+        // A generation without a file-size ceiling is refused rather than
+        // tightened: the ceiling is what installs the ignored `SIGXFSZ` at
+        // launch (`context.rs` step 13d), and without it a write past the
+        // limit takes the kernel's *default* action and kills the process.
+        // "Your command dies silently" is not a useful enforcement of a
+        // budget, so the caller has to have opted into EFBIG first.
+        let ceiling = self.policy.max_file_size.map(|b| b.0).ok_or_else(|| {
+            Refusal::refused(
+                "update_file_size_limit needs an instance file-size ceiling \
+                 (max_file_size in the policy): the ceiling is what makes a write past \
+                 the limit fail with EFBIG instead of killing the process",
+            )
+        })?;
+        if bytes > ceiling {
+            return Err(Refusal::refused(format!(
+                "update_file_size_limit {bytes} is wider than the instance ceiling \
+                 {ceiling}: a per-exec change may only tighten"
+            )));
+        }
+        if let Some(applied) = self.applied_file_size_limit {
+            if bytes >= applied {
+                return Ok(serde_json::json!({
+                    "applied_bytes": applied,
+                    "tightened": 0,
+                    "considered": 0,
+                    "missed": 0,
+                    "effective": applied,
+                    "noop": true,
+                }));
+            }
+        }
+        let instance = self.instance.as_ref().ok_or_else(|| {
+            Refusal::refused(
+                "generation has no instance: update_file_size_limit requires a \
+                 launched session",
+            )
+        })?;
+        let report = instance
+            .set_file_size_limit(bytes)
+            .map_err(|e| Refusal::from_core("instance set_file_size_limit failed", &e))?;
+        self.applied_file_size_limit = Some(bytes);
+        Ok(serde_json::json!({
+            "applied_bytes": bytes,
+            "tightened": report.tightened,
+            "considered": report.considered,
+            "missed": report.missed,
+            "effective": report.effective,
+            "noop": false,
+        }))
+    }
+
     /// Serve a `kill_child` verb: deliver `signum` to the named child through
     /// its registered pid/pidfd (never an arbitrary-pid verb).
     fn handle_kill_child(
@@ -692,6 +779,14 @@ impl ControlHandler for Generation {
                 let _ = write_response_frame(stream, &resp);
                 ServeOutcome::Continue
             }
+            "update_file_size_limit" => {
+                let resp = match self.handle_update_file_size_limit(&req.args) {
+                    Ok(data) => ok_response(data),
+                    Err(e) => err_response(&e),
+                };
+                let _ = write_response_frame(stream, &resp);
+                ServeOutcome::Continue
+            }
             "run" => {
                 let resp = if !req.args.as_object().map(|o| o.is_empty()).unwrap_or(true) {
                     err_response(&Refusal::refused(
@@ -804,6 +899,7 @@ pub fn probe_userns_self_map() -> bool {
 /// abnormal end (the binary then exits non-zero).
 pub fn serve_control_fd(
     control_fd: RawFd,
+    events_fd: Option<RawFd>,
     policy: Arc<Sandbox>,
     program: Option<ProgramSpec>,
     expected_token: Option<&str>,
@@ -836,6 +932,14 @@ pub fn serve_control_fd(
         ));
     }
     let mut generation = Generation::new(policy, program)?;
+    // N25: the append watch starts once the instance exists, because that is
+    // when the open-descriptor ledger does. It runs on its own thread so a
+    // blocking `wait_child` on the serve thread cannot stall it -- which is
+    // exactly when the events matter, since the child is writing.
+    let _appender = events_fd.and_then(|fd| {
+        let watch = generation.instance.as_ref()?.open_write_fds()?;
+        Some(Appender::spawn(fd, watch))
+    });
     let outcome = serve_fd_connection(stream, expected_token, &mut generation);
     generation.finish(outcome)
 }

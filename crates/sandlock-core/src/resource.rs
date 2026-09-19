@@ -1088,6 +1088,7 @@ mod tests {
             policy_fn: Arc::new(Mutex::new(PolicyFnState::new())),
             chroot: Arc::new(Mutex::new(ChrootState::new())),
             dirty: Arc::new(crate::dirty::DirtyDirs::new()),
+            write_fds: Arc::new(crate::dirty::WriteFds::new()),
             netlink: Arc::new(NetlinkState::new()),
             processes: Arc::new(ProcessIndex::new()),
             policy: Arc::new(fake_policy(argv_safety_required)),

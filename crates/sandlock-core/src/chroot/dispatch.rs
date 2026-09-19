@@ -59,7 +59,9 @@ use crate::chroot::resolve::{
     confine, resolve_existing_in_root, resolve_in_root, resolve_in_root_nofollow,
 };
 use crate::sys::fs::{openat2_in_root, openat2_in_root_with_resolve};
-use crate::seccomp::notif::{decode_open_args, read_child_mem, write_child_mem, NotifAction, NotifPolicy};
+use crate::seccomp::notif::{
+    decode_open_args, read_child_mem, write_child_mem, NotifAction, NotifPolicy, OnInjectSuccess,
+};
 use crate::seccomp::state::{ChrootState, CowState, ProcessIndex};
 use crate::sys::structs::{SeccompNotif, SeccompNotifAddfd, SECCOMP_IOCTL_NOTIF_ADDFD};
 
@@ -83,6 +85,10 @@ pub(crate) struct ChrootCtx<'a> {
     /// Handlers that perform a *write* record the resolved host path's parent
     /// here; nothing else does.
     pub dirty: &'a Arc<crate::dirty::DirtyDirs>,
+    /// N25: descriptors opened for writing, so a consumer outside the sandbox
+    /// can read a live size for the files a writer is filling (see
+    /// [`crate::append_watch`]). Only the `openat` handler adds to it.
+    pub write_fds: &'a Arc<crate::dirty::WriteFds>,
 }
 
 impl<'a> ChrootCtx<'a> {
@@ -94,6 +100,7 @@ impl<'a> ChrootCtx<'a> {
         policy: &'a NotifPolicy,
         processes: &'a Arc<ProcessIndex>,
         dirty: &'a Arc<crate::dirty::DirtyDirs>,
+        write_fds: &'a Arc<crate::dirty::WriteFds>,
     ) -> Self {
         ChrootCtx {
             root: policy.chroot_root.as_ref().expect("chroot handlers are only registered with a chroot root"),
@@ -104,6 +111,7 @@ impl<'a> ChrootCtx<'a> {
             mount_ro: &policy.chroot_mount_ro,
             processes,
             dirty,
+            write_fds,
         }
     }
 
@@ -752,7 +760,9 @@ pub(crate) async fn handle_chroot_open(
                             0
                         };
                         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-                        return NotifAction::InjectFdSend { srcfd: owned, newfd_flags };
+                        return inject_watched(
+                            ctx, notif.pid, &real_path, owned, newfd_flags, is_write,
+                        );
                     }
                     Ok(None) => {
                         // Fall through to openat2_in_root below. This keeps
@@ -798,8 +808,56 @@ pub(crate) async fn handle_chroot_open(
         0
     };
     match open_in_namespace(ctx, notif.pid, &virtual_path, flags as i32, mode, honored) {
-        Ok(srcfd) => NotifAction::InjectFdSend { srcfd, newfd_flags },
+        Ok(srcfd) => inject_watched(
+            ctx, notif.pid, &host_path, srcfd, newfd_flags, is_write,
+        ),
         Err(errno) => NotifAction::Errno(errno),
+    }
+}
+
+/// Inject a freshly opened descriptor, and -- when the open is one the sandbox
+/// may write through -- record `(pid, child fd, path, baseline)` so the append
+/// watch can later read that file's live size (N25).
+///
+/// The record is made from the kernel's ADDFD *reply*, inside the same
+/// response the child's `open` is waiting on (see
+/// [`NotifAction::InjectFdSendTracked`]), so there is no window in which the
+/// sandbox holds a writable descriptor the accounting has not seen: the entry
+/// is in place before the `open` returns. A read-only open is not watched --
+/// its offset says nothing about the file's size, and watching it would only
+/// make the reader do more work.
+fn inject_watched(
+    ctx: &ChrootCtx<'_>,
+    pid: u32,
+    host_path: &Path,
+    srcfd: OwnedFd,
+    newfd_flags: u32,
+    is_write: bool,
+) -> NotifAction {
+    if !is_write {
+        return NotifAction::InjectFdSend { srcfd, newfd_flags };
+    }
+    let srcfd_raw = srcfd.as_raw_fd();
+    let watch = Arc::clone(ctx.write_fds);
+    let path = host_path.to_path_buf();
+    NotifAction::InjectFdSendTracked {
+        srcfd,
+        newfd_flags,
+        on_success: OnInjectSuccess::new(move |child_fd: i32| {
+            let baseline = {
+                let previous = unsafe { libc::lseek(srcfd_raw, 0, libc::SEEK_CUR) };
+                let end = unsafe { libc::lseek(srcfd_raw, 0, libc::SEEK_END) };
+                if previous >= 0 {
+                    unsafe { libc::lseek(srcfd_raw, previous, libc::SEEK_SET) };
+                }
+                if end < 0 {
+                    0
+                } else {
+                    end as u64
+                }
+            };
+            watch.register(pid as i32, child_fd, &path, baseline);
+        }),
     }
 }
 
@@ -2762,6 +2820,13 @@ mod mount_ro_tests {
         denied: &'a [PathBuf],
         processes: &'a Arc<ProcessIndex>,
     ) -> ChrootCtx<'a> {
+        // Leaked on purpose: these tests only read the chroot policy halves,
+        // so the two ledgers exist to satisfy the struct's shape and a
+        // `'static` borrow keeps this helper's signature unchanged.
+        let dirty: &'static Arc<crate::dirty::DirtyDirs> =
+            Box::leak(Box::new(Arc::new(crate::dirty::DirtyDirs::new())));
+        let write_fds: &'static Arc<crate::dirty::WriteFds> =
+            Box::leak(Box::new(Arc::new(crate::dirty::WriteFds::new())));
         ChrootCtx {
             root: Path::new("/rootfs"),
             readable: &[],
@@ -2770,6 +2835,8 @@ mod mount_ro_tests {
             mounts,
             mount_ro,
             processes,
+            dirty,
+            write_fds,
         }
     }
 

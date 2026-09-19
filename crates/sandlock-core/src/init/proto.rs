@@ -366,6 +366,7 @@ mod tests {
             clean_env: false,
             extra_writable: vec![],
             bind_ports: vec![],
+            max_file_size: None,
         };
         let j = serde_json::to_string(&r).unwrap();
         assert!(j.contains("runexec"));

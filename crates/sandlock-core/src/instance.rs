@@ -308,6 +308,10 @@ pub struct SandboxInstance {
     /// N25/L2c: the supervisor's written-directory ledger, shared with the
     /// parent so the accounting that runs outside the sandbox can drain it.
     pub(crate) supervisor_dirty: Option<Arc<crate::dirty::DirtyDirs>>,
+    /// N25: descriptors opened for writing (`crate::dirty::WriteFds`), the
+    /// watch list the append watch reads to report a running writer's growth
+    /// without asking the filesystem.
+    pub(crate) supervisor_write_fds: Option<Arc<crate::dirty::WriteFds>>,
     pub(crate) supervisor_network: Option<Arc<tokio::sync::Mutex<crate::seccomp::state::NetworkState>>>,
     pub(crate) ctrl_fd: Option<OwnedFd>,
     pub(crate) stdout_pipe: Option<OwnedFd>,
@@ -1319,6 +1323,8 @@ impl SandboxInstance {
 
     /// Deliver `signum` to one registered exec child (F3.2/F1.7).
     ///
+    /// (See [`Self::set_file_size_limit`] for the tightening counterpart.)
+    ///
     /// The child token is resolved through the session registry to the
     /// child's pid (its own process group, per F1.7's per-child-group
     /// layout) and its host-side pidfd. Delivery is group-first (the child's
@@ -1342,6 +1348,109 @@ impl SandboxInstance {
         }
         signal_registered_child(child, signum);
         Ok(())
+    }
+
+    /// N25: lower every live child's `RLIMIT_FSIZE` to at most `bytes`.
+    ///
+    /// A per-exec ceiling is applied at `execve` and inherited by whatever
+    /// that command forks, which covers everything a command does *after* it
+    /// starts. It does not cover the case this exists for: the accounting
+    /// outside the sandbox notices, mid-command, that the workspace is nearly
+    /// out of budget, while a writer is part-way through a file. Waiting for
+    /// the sandbox to be frozen bounds that overshoot by however long the
+    /// freeze takes; tightening the running process's own limit bounds it by
+    /// the write itself, in the kernel, with no cooperation from the program.
+    ///
+    /// Properties that matter:
+    ///
+    /// * **Only ever lower.** The new limit is `min(current, bytes)` for both
+    ///   the soft and the hard value, so a stale or mistaken caller cannot
+    ///   widen a limit that is already in force -- passing a larger number is
+    ///   a no-op, not a grant.
+    /// * **The whole group.** `RLIMIT_FSIZE` is per-process, so the sweep
+    ///   walks the process group of every live child (the same unit
+    ///   [`Self::kill_child`] signals), which is what reaches a shell loop's
+    ///   `dd`, not just the shell.
+    /// * **EFBIG, not a death.** The sandbox already has `SIGXFSZ` ignored
+    ///   (set with the exec-time ceiling), so a write past the new limit fails
+    ///   with `EFBIG` -- an error the program handles -- instead of killing
+    ///   it by default action.
+    pub fn set_file_size_limit(
+        &self,
+        bytes: u64,
+    ) -> Result<FileSizeLimitReport, SandlockError> {
+        let session = self.exec_ref()?;
+        let mut targets: Vec<i32> = Vec::new();
+        for child in session.children.values() {
+            if child.status.is_some() {
+                continue;
+            }
+            targets.push(child.pid);
+            targets.extend(pids_in_process_group(child.pid));
+        }
+        targets.sort_unstable();
+        targets.dedup();
+        // The bytes a file has *already* written are part of the usage the
+        // worker's number came from, so they are added back to it: applying
+        // the plain remaining budget would let a file eat its own tail (a
+        // legal 900 MiB file in a 1 GiB budget refused at 324 MiB the moment
+        // the tree's remaining falls to 324). The allowance is per *group*
+        // because the descriptor that grows is usually the parent's while the
+        // writer is its child.
+        let group_grown = self
+            .supervisor_write_fds
+            .as_ref()
+            .map(|watch| watch.max_grown_for_pids(&targets))
+            .unwrap_or(0);
+
+        let mut report = FileSizeLimitReport {
+            considered: targets.len(),
+            ..FileSizeLimitReport::default()
+        };
+        for pid in targets {
+            let allowance = bytes.saturating_add(group_grown);
+            let mut current = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if unsafe {
+                libc::prlimit(
+                    pid,
+                    libc::RLIMIT_FSIZE,
+                    std::ptr::null(),
+                    &mut current,
+                )
+            } != 0
+            {
+                report.missed += 1;
+                continue;
+            }
+            report.effective = Some(match report.effective {
+                Some(seen) => seen.min(current.rlim_cur),
+                None => current.rlim_cur,
+            });
+            let wanted = libc::rlimit {
+                rlim_cur: current.rlim_cur.min(allowance),
+                rlim_max: current.rlim_max.min(allowance),
+            };
+            if wanted.rlim_cur == current.rlim_cur && wanted.rlim_max == current.rlim_max {
+                continue;
+            }
+            if unsafe {
+                libc::prlimit(
+                    pid,
+                    libc::RLIMIT_FSIZE,
+                    &wanted,
+                    std::ptr::null_mut(),
+                )
+            } != 0
+            {
+                report.missed += 1;
+                continue;
+            }
+            report.tightened += 1;
+        }
+        Ok(report)
     }
 
     /// Resize the pty of an exec child (F3.2): `TIOCSWINSZ` on the host-side
@@ -2417,6 +2526,17 @@ impl SandboxInstance {
         }
     }
 
+    /// N25: the descriptors this sandbox has open for writing, as
+    /// `((pid, fd), {path, baseline})`.
+    ///
+    /// `None` means the session has no mediator to ask (a pure-shaped session
+    /// with no chroot, or one that never spawned a supervisor), which is a
+    /// capability answer -- the caller keeps its size-from-the-filesystem
+    /// path rather than reading an empty list as "nothing is being written".
+    pub fn open_write_fds(&self) -> Option<Arc<crate::dirty::WriteFds>> {
+        self.supervisor_write_fds.as_ref().map(Arc::clone)
+    }
+
     pub fn pid(&self) -> Option<i32> {
         if let Some(session) = self.exec_session.as_ref() {
             // Exec-capable session: report the main workload (child id 0),
@@ -2931,4 +3051,55 @@ mod tests {
             "a poisoned map must not fall back to the raw ns pid"
         );
     }
+}
+/// Pids whose process group is `pgid`, read from `/proc/<pid>/stat`.
+///
+/// A per-exec ceiling is inherited at `execve`, so it reaches the processes
+/// that exist then -- and a command that forks its own workers (a shell
+/// loop, a build) reaches them too, because they inherit from it. What
+/// inheritance cannot do is reach a process that is *already running* when
+/// the ceiling has to be tightened, which is exactly the case this sweep is
+/// for: the worker learns the tree is nearly full while a writer is mid-file,
+/// and the writer has to feel it. The child's group is the unit
+/// `kill_child` already uses for the same reason, so the two agree on what
+/// "this command's subtree" means.
+fn pids_in_process_group(pgid: i32) -> Vec<i32> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        // `comm` is parenthesised and may itself contain spaces and parens,
+        // so the fields after it are counted from its *last* ')'.
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let mut fields = rest.split_whitespace();
+        let _state = fields.next();
+        let _ppid = fields.next();
+        if fields.next().and_then(|v| v.parse::<i32>().ok()) == Some(pgid) {
+            out.push(pid);
+        }
+    }
+    out
+}
+
+/// What one [`SandboxInstance::set_file_size_limit`] pass did.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileSizeLimitReport {
+    /// Live processes whose limit was lowered by this pass.
+    pub tightened: usize,
+    /// Processes the pass looked at (the group of every live child).
+    pub considered: usize,
+    /// Processes whose limit could not be read or written (raced exits).
+    pub missed: usize,
+    /// The smallest soft limit in force after the pass, when it saw any.
+    pub effective: Option<u64>,
 }

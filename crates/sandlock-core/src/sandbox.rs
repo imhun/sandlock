@@ -1727,6 +1727,7 @@ impl Sandbox {
                 supervisor_processes: None,
                 supervisor_cow: None,
                 supervisor_dirty: None,
+                supervisor_write_fds: None,
                 supervisor_network: None,
                 ctrl_fd: None,
                 stdout_pipe: pipe,
@@ -1846,6 +1847,7 @@ impl Sandbox {
             supervisor_processes: None,
             supervisor_cow: None,
             supervisor_dirty: None,
+            supervisor_write_fds: None,
             supervisor_network: None,
             ctrl_fd: None,
             stdout_pipe: None,
@@ -3087,6 +3089,10 @@ impl Sandbox {
             // outside the sandbox can drain it -- see `dirty::DirtyDirs`.
             let dirty_state = Arc::new(crate::dirty::DirtyDirs::new());
             self.rt_mut().supervisor_dirty = Some(Arc::clone(&dirty_state));
+            // N25: the open-descriptor watch list, filled by the `openat`
+            // handler and read by the append watch that supervise publishes.
+            let write_fds_state = Arc::new(crate::dirty::WriteFds::new());
+            self.rt_mut().supervisor_write_fds = Some(Arc::clone(&write_fds_state));
 
             let net_state = Arc::new(tokio::sync::Mutex::new(net_state));
             self.rt_mut().supervisor_network = Some(Arc::clone(&net_state));
@@ -3108,6 +3114,7 @@ impl Sandbox {
                 policy_fn: Arc::clone(&policy_fn_state),
                 chroot: Arc::clone(&chroot_state),
                 dirty: Arc::clone(&dirty_state),
+                write_fds: Arc::clone(&write_fds_state),
                 netlink: netlink_state,
                 processes: Arc::clone(&processes),
                 policy: Arc::new(notif_policy),

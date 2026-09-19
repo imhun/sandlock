@@ -965,16 +965,18 @@ fn register_chroot_handlers(
             let cow_state = Arc::clone(&ctx.cow);
             let processes = Arc::clone(&ctx.processes);
             let dirty = Arc::clone(&ctx.dirty);
+            let write_fds = Arc::clone(&ctx.write_fds);
             move |cx: &HandlerCtx| {
                 let notif = cx.notif;
                 let chroot_state = Arc::clone(&chroot_state);
                 let cow_state = Arc::clone(&cow_state);
                 let processes = Arc::clone(&processes);
                 let dirty = Arc::clone(&dirty);
+                let write_fds = Arc::clone(&write_fds);
                 let notif_fd = cx.notif_fd;
                 let policy = Arc::clone(&policy);
                 async move {
-                    let chroot_ctx = ChrootCtx::new(&policy, &processes, &dirty);
+                    let chroot_ctx = ChrootCtx::new(&policy, &processes, &dirty, &write_fds);
                     $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx).await
                 }
             }
@@ -990,16 +992,18 @@ fn register_chroot_handlers(
             let cow_state = Arc::clone(&ctx.cow);
             let processes = Arc::clone(&ctx.processes);
             let dirty = Arc::clone(&ctx.dirty);
+            let write_fds = Arc::clone(&ctx.write_fds);
             move |cx: &HandlerCtx| {
                 let notif = cx.notif;
                 let chroot_state = Arc::clone(&chroot_state);
                 let cow_state = Arc::clone(&cow_state);
                 let processes = Arc::clone(&processes);
                 let dirty = Arc::clone(&dirty);
+                let write_fds = Arc::clone(&write_fds);
                 let notif_fd = cx.notif_fd;
                 let policy = Arc::clone(&policy);
                 async move {
-                    let chroot_ctx = ChrootCtx::new(&policy, &processes, &dirty);
+                    let chroot_ctx = ChrootCtx::new(&policy, &processes, &dirty, &write_fds);
                     $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx).await
                 }
             }
@@ -1080,7 +1084,7 @@ fn register_chroot_handlers(
             let notif_fd = cx.notif_fd;
             let policy = Arc::clone(&policy_for_chown);
             async move {
-                let chroot_ctx = ChrootCtx::new(&policy, &sup.processes, &sup.dirty);
+                let chroot_ctx = ChrootCtx::new(&policy, &sup.processes, &sup.dirty, &sup.write_fds);
                 crate::chroot::dispatch::handle_chroot_legacy_chown(&notif, &sup.chroot, &sup.cow, notif_fd, &chroot_ctx, false).await
             }
         });
@@ -1096,7 +1100,7 @@ fn register_chroot_handlers(
             let notif_fd = cx.notif_fd;
             let policy = Arc::clone(&policy_for_lchown);
             async move {
-                let chroot_ctx = ChrootCtx::new(&policy, &sup.processes, &sup.dirty);
+                let chroot_ctx = ChrootCtx::new(&policy, &sup.processes, &sup.dirty, &sup.write_fds);
                 crate::chroot::dispatch::handle_chroot_legacy_chown(&notif, &sup.chroot, &sup.cow, notif_fd, &chroot_ctx, true).await
             }
         });
@@ -1315,6 +1319,7 @@ mod handler_tests {
             policy_fn: Arc::new(Mutex::new(PolicyFnState::new())),
             chroot: Arc::new(Mutex::new(ChrootState::new())),
             dirty: Arc::new(crate::dirty::DirtyDirs::new()),
+            write_fds: Arc::new(crate::dirty::WriteFds::new()),
             netlink: Arc::new(NetlinkState::new()),
             processes: Arc::new(ProcessIndex::new()),
             policy: Arc::new(NotifPolicy {

@@ -28,6 +28,12 @@ pub struct SupervisorCtx {
     /// Filled by the chroot path handlers (the only component that sees every
     /// write) and drained by whoever does the disk accounting.
     pub dirty: Arc<crate::dirty::DirtyDirs>,
+    /// N25: descriptors this sandbox has open **for writing**, with the size
+    /// each file had when the mediator opened it. Filled by the `openat`
+    /// handler from the kernel's ADDFD reply, and read by the append watch
+    /// (`crate::append_watch`), which can see a running writer's true size
+    /// through those descriptors while a path-based `stat` cannot.
+    pub write_fds: Arc<crate::dirty::WriteFds>,
     /// NETLINK_ROUTE virtualization state.
     pub netlink: Arc<crate::netlink::NetlinkState>,
     /// Per-process registry: pid → PidKey. This anchors unified

@@ -93,6 +93,13 @@ struct Cli {
     #[arg(long = "control-fd", value_name = "N")]
     control_fd: Option<RawFd>,
 
+    /// One-way event descriptor handed over by the launcher (N25): the slot
+    /// pushes unprompted accounting events here (append growth, so far) and
+    /// the worker reads them without touching the request/response channel.
+    /// Optional; without it the slot simply never pushes.
+    #[arg(long = "events-fd", value_name = "N")]
+    events_fd: Option<RawFd>,
+
     /// Serve the fd-handoff control channel until a shutdown verb ends the
     /// generation (single-generation lifecycle).  Without this flag (and
     /// without --serve-path) the binary validates and exits (F2b.1
@@ -239,6 +246,7 @@ fn run(cli: Cli) -> Result<()> {
             check_control_fd(control_fd)?;
             sandlock_supervise::serve::serve_control_fd(
                 control_fd,
+                cli.events_fd,
                 policy,
                 program,
                 cli.token.as_deref(),

@@ -1106,6 +1106,498 @@ fn test_supervise_fd_serve_launches_instance_and_serves_instance_verbs() {
     let _ = std::fs::remove_dir_all(&workdir);
 }
 
+// ---------------------------------------------------------------------------
+// N25: pushed append accounting and the live per-file tightening.
+// ---------------------------------------------------------------------------
+
+/// Spawn a serving supervisor that also holds the one-way events descriptor,
+/// returning the child, the control end, and the events end the test reads.
+fn spawn_serve_supervisor_with_events(
+    policy: &PathBuf,
+    program: &PathBuf,
+    extra_args: &[&str],
+) -> (
+    std::process::Child,
+    std::os::unix::net::UnixStream,
+    std::os::unix::net::UnixStream,
+) {
+    use std::os::unix::process::CommandExt;
+
+    let (worker, server) = std::os::unix::net::UnixStream::pair().expect("control socketpair");
+    let (events_reader, events_writer) =
+        std::os::unix::net::UnixStream::pair().expect("events socketpair");
+    let control_fd = server.as_raw_fd();
+    let events_fd = events_writer.as_raw_fd();
+    let mut cmd = Command::new(bin());
+    cmd.arg("--policy")
+        .arg(policy.to_str().unwrap())
+        .arg("--uid")
+        .arg(euid().to_string())
+        .arg("--control-fd")
+        .arg(control_fd.to_string())
+        .arg("--events-fd")
+        .arg(events_fd.to_string())
+        .arg("--program")
+        .arg(program.to_str().unwrap())
+        .arg("--serve")
+        .args(extra_args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    unsafe {
+        cmd.pre_exec(move || {
+            for fd in [control_fd, events_fd] {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().expect("spawn serve supervise with events");
+    drop(server);
+    drop(events_writer);
+    (child, worker, events_reader)
+}
+
+/// Read NDJSON events for `window`, summing the `append` payloads.
+///
+/// The reader is non-blocking because the publisher only writes when
+/// something grew: "no events" is a legitimate state to observe for a while,
+/// not a read that should block the test.
+fn sum_appended_events(events: &std::os::unix::net::UnixStream, window: Duration) -> (u64, usize) {
+    use std::io::Read;
+    events
+        .set_nonblocking(true)
+        .expect("events reader non-blocking");
+    let deadline = Instant::now() + window;
+    let mut total = 0u64;
+    let mut count = 0usize;
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut peek = events;
+    while Instant::now() < deadline {
+        match peek.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            Err(e) => panic!("reading events: {e}"),
+        }
+        while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = buffer.drain(..=pos).collect();
+            let text = String::from_utf8_lossy(&line[..line.len() - 1]).to_string();
+            if text.trim().is_empty() {
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("event line is not JSON ({e}): {text}"));
+            assert_eq!(value["v"], 1, "event protocol version: {value}");
+            assert_eq!(value["event"], "append", "event kind: {value}");
+            let bytes = value["bytes"].as_u64().expect("event carries bytes");
+            if bytes > 0 {
+                total += bytes;
+                count += 1;
+            }
+        }
+    }
+    (total, count)
+}
+
+/// A policy with a file-size ceiling: the ceiling is what installs the
+/// ignored `SIGXFSZ` that makes a past-the-limit write fail with EFBIG, so a
+/// generation that will be tightened has to start with one.
+fn instance_policy_with_file_size(evidence_dir: &str, ceiling: &str) -> String {
+    let mut readable = base_read_paths();
+    readable.push(evidence_dir.to_string());
+    serde_json::json!({
+        "fs_readable": readable,
+        "fs_writable": [evidence_dir],
+        "max_file_size": ceiling,
+    })
+    .to_string()
+}
+
+/// The same policy, in the **chroot** shape (`chroot: "/"`, so virtual paths
+/// and host paths are the same string but the path handlers are live).
+///
+/// The append watch is fed by the `openat` handler, which only exists in the
+/// chroot shape -- the pure (Landlock-only) shape never traps a path syscall,
+/// so there is nothing to record a descriptor from. That is the same
+/// structural difference the dirty-directory ledger has.
+///
+/// `writable` is a *root* the shape can actually reach: the chroot shape
+/// mediates paths itself, and a nested directory whose ancestors are not in
+/// the readable set is not reachable through them (measured: the same
+/// workload that writes happily to `/tmp` writes nothing at all under a
+/// deeply nested repo path, with its diagnostics going to the M0 child's
+/// `/dev/null`). `/tmp` keeps the test independent of where the repo lives.
+fn instance_policy_chrooted(writable: &str) -> String {
+    let mut readable = base_read_paths();
+    readable.push(writable.to_string());
+    serde_json::json!({
+        "chroot": "/",
+        "fs_readable": readable,
+        "fs_writable": [writable],
+    })
+    .to_string()
+}
+
+/// The chroot shape **with** a file-size ceiling: the deployment's shape.
+///
+/// The two matter together, for different reasons: `chroot` is what makes the
+/// mediator trap `openat` (and therefore see the descriptors a writer holds),
+/// and the ceiling is what installs the ignored `SIGXFSZ` that turns a
+/// past-the-limit write into `EFBIG` instead of a killed process.
+fn instance_policy_chrooted_with_file_size(writable: &str, ceiling: &str) -> String {
+    let mut readable = base_read_paths();
+    readable.push(writable.to_string());
+    serde_json::json!({
+        "chroot": "/",
+        "fs_readable": readable,
+        "fs_writable": [writable],
+        "max_file_size": ceiling,
+    })
+    .to_string()
+}
+
+#[test]
+fn test_dirty_dirs_reports_the_directory_a_write_landed_in() {
+    // The written-directory ledger is what keeps the disk accounting from
+    // re-walking a whole tree, and this is its end-to-end shape over the
+    // control channel: a workload writes into a directory, the worker asks,
+    // and the answer names that directory (the parent of what was written).
+    isolate_ctl_root();
+    let workdir =
+        std::path::PathBuf::from(format!("/tmp/sandlock-dirty-{}", std::process::id()));
+    std::fs::create_dir_all(&workdir).expect("create dirty workdir");
+    let policy = write_policy("dirty-verb", &instance_policy_chrooted("/tmp"));
+    let script = format!(
+        "mkdir -p {0}/sub && printf hi > {0}/sub/blob.bin && exec sleep 30",
+        workdir.display()
+    );
+    let program = write_policy(
+        "dirty-verb-program",
+        &serde_json::json!({ "argv": ["/bin/sh", "-c", script] }).to_string(),
+    );
+    let (child, mut worker, _events) =
+        spawn_serve_supervisor_with_events(&policy, &program, &[]);
+
+    let written = workdir.join("sub").join("blob.bin");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    wait_until(deadline, "the workload to write its file", || written.exists());
+
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "dirty_dirs", "args": {} }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "dirty_dirs: {resp:?}");
+    let dirs: Vec<String> = resp["data"]["dirs"]
+        .as_array()
+        .expect("dirs array")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    let sub = workdir.join("sub").to_string_lossy().into_owned();
+    assert!(
+        dirs.contains(&sub),
+        "the directory the file landed in must be reported; got {dirs:?}"
+    );
+    assert_eq!(resp["data"]["overflow"], serde_json::Value::Bool(false));
+
+    // Draining is a take: the second answer must not repeat what the first
+    // already reported (the consumer re-walks what it is told, once).
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "dirty_dirs", "args": {} }),
+    );
+    let again: Vec<String> = resp["data"]["dirs"]
+        .as_array()
+        .expect("dirs array")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        !again.contains(&sub),
+        "a drain is a take; the second drain repeated {sub}: {again:?}"
+    );
+
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "shutdown", "args": {} }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "shutdown: {resp:?}");
+    let _ = child.wait_with_output();
+    let _ = std::fs::remove_file(&policy);
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+#[test]
+fn test_events_fd_reports_a_running_writers_growth() {
+    isolate_ctl_root();
+    let workdir =
+        std::path::PathBuf::from(format!("/tmp/sandlock-events-{}", std::process::id()));
+    std::fs::create_dir_all(&workdir).expect("create events workdir");
+    let blob = workdir.join("blob.bin");
+    let policy = write_policy(
+        "events-append",
+        &instance_policy_chrooted("/tmp"),
+    );
+    // One descriptor, held open across eight 1 MiB appends 150 ms apart:
+    // the shape this signal exists for (a writer filling a file), and one
+    // where the count must be exact rather than merely non-zero.
+    //
+    // The other shape -- a new `dd` per file, each living a few ms -- is
+    // deliberately *not* what this asserts on: a descriptor that opens,
+    // writes and closes inside one sampling interval is not observed, and
+    // that is by design (the bytes still reach the accounting through the
+    // filesystem walk, just later). See `docs/k8s-deployment.md` §22.5.
+    let script = format!(
+        "exec 3>>{}; i=0; while [ $i -lt 8 ]; do \
+         dd if=/dev/zero bs=1M count=1 status=none >&3; \
+         i=$((i+1)); sleep 0.15; done; exec sleep 30",
+        blob.display()
+    );
+    let program = write_policy(
+        "events-program",
+        &serde_json::json!({ "argv": ["/bin/sh", "-c", script] }).to_string(),
+    );
+
+    let (child, mut worker, events) =
+        spawn_serve_supervisor_with_events(&policy, &program, &[]);
+
+    let (appended, events_seen) = sum_appended_events(&events, Duration::from_secs(10));
+    let written = std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(
+        written,
+        8 * 1024 * 1024,
+        "the workload must have written exactly 8 MiB before the assertions"
+    );
+    assert!(
+        events_seen > 0,
+        "the slot must push at least one append event for a writer"
+    );
+    assert_eq!(
+        appended, written,
+        "a single descriptor held open across the whole write must account for \
+         exactly the bytes appended"
+    );
+
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "shutdown", "args": {} }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "shutdown: {resp:?}");
+    let out = child.wait_with_output().expect("wait events supervise");
+    let _ = std::fs::remove_file(&policy);
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_dir_all(&workdir);
+    assert!(
+        out.status.success(),
+        "the generation must end cleanly; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+
+/// Print whatever the slot has written to stderr so far (test diagnostics).
+///
+/// The slot's stderr is a pipe nobody reads until the process ends, and a
+/// panicking test never gets there -- so a failing assertion would otherwise
+/// hide the one line that explains it.
+fn dump_child_stderr(child: &mut std::process::Child) {
+    use std::io::Read;
+    let Some(err) = child.stderr.as_mut() else {
+        return;
+    };
+    let fd = err.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    let mut buf = vec![0u8; 65536];
+    if let Ok(n) = err.read(&mut buf) {
+        eprintln!("slot stderr so far:\n{}", String::from_utf8_lossy(&buf[..n]));
+    }
+}
+
+#[test]
+fn test_a_tightening_does_not_cut_off_the_file_that_caused_it() {
+    // The number the worker sends is "what is left of the *tree* budget", and
+    // the bytes a file has already written are part of the usage that number
+    // came from. Applying it as-is would let a file eat its own tail: a legal
+    // 900 MiB file in a 1 GiB budget gets refused at 324 MiB the moment the
+    // tree's remaining falls to 324. What the limit has to mean is "this file
+    // may keep growing until the tree reaches its budget", which is
+    // `sent + what this descriptor has grown by`.
+    isolate_ctl_root();
+    let workdir = std::path::PathBuf::from(format!(
+        "/tmp/sandlock-tail-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&workdir).expect("create tail workdir");
+    let blob = workdir.join("tail.bin");
+    let policy = write_policy(
+        "tail-limit",
+        &instance_policy_chrooted_with_file_size("/tmp", "512M"),
+    );
+    let script = format!(
+        "exec 3>>{}; i=0; while [ $i -lt 400 ]; do          dd if=/dev/zero bs=1M count=1 status=none >&3;          i=$((i+1)); sleep 0.06; done",
+        blob.display()
+    );
+    let program = write_policy(
+        "tail-program",
+        &serde_json::json!({ "argv": ["/bin/sh", "-c", script] }).to_string(),
+    );
+    let (mut child, mut worker, _events) =
+        spawn_serve_supervisor_with_events(&policy, &program, &[]);
+
+    let grown_to = |bytes: u64| {
+        std::fs::metadata(&blob).map(|m| m.len() >= bytes).unwrap_or(false)
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    wait_until(deadline, "the writer to reach 8 MiB", || grown_to(8 * 1024 * 1024));
+    let before = std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
+    assert!(before >= 8 * 1024 * 1024, "sanity: the file is at {before}");
+
+    // "Only 6 MiB of tree budget left" -- far less than the file already is.
+    let limit = 6 * 1024 * 1024u64;
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({
+            "v": 1,
+            "verb": "update_file_size_limit",
+            "args": { "bytes": limit },
+        }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "tighten: {resp:?}");
+    assert_eq!(resp["data"]["applied_bytes"], limit, "{resp:?}");
+
+    std::thread::sleep(Duration::from_millis(1500));
+    dump_child_stderr(&mut child);
+    let after = std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
+    assert!(
+        after > before,
+        "the file that caused the drop must not be frozen where it stands \
+         ({before} -> {after})"
+    );
+    assert!(
+        after <= before + limit + 4 * 1024 * 1024,
+        "the remaining budget bounds it: {before} + {limit} (+ slack) >= {after}"
+    );
+
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "shutdown", "args": {} }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "shutdown: {resp:?}");
+    let _ = child.wait_with_output();
+    let _ = std::fs::remove_file(&policy);
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+#[test]
+fn test_update_file_size_limit_stops_a_running_writer() {
+    isolate_ctl_root();
+    let workdir = repo_tmp_dir().join(format!("supervise-tighten-{}", std::process::id()));
+    std::fs::create_dir_all(&workdir).expect("create tighten workdir");
+    let blob = workdir.join("grow.bin");
+    // The ceiling is far above what the test tightens to; it exists so the
+    // sandbox runs with SIGXFSZ ignored (EFBIG, not death).
+    let policy = write_policy(
+        "tighten-limit",
+        &instance_policy_with_file_size(workdir.to_str().expect("workdir utf8"), "256M"),
+    );
+    // A shell loop that appends 1 MiB every 50 ms: the shape the per-exec
+    // ceiling cannot stop once it is under way, because the limit was fixed
+    // at exec time and the loop keeps opening new files.
+    let script = format!(
+        "i=0; while [ $i -lt 400 ]; do \
+         dd if=/dev/zero of={} bs=1M count=1 seek=$i conv=notrunc status=none || exit 7; \
+         i=$((i+1)); sleep 0.05; done",
+        blob.display()
+    );
+    let program = write_policy(
+        "tighten-program",
+        &serde_json::json!({ "argv": ["/bin/sh", "-c", script] }).to_string(),
+    );
+
+    let (child, mut worker, _events) =
+        spawn_serve_supervisor_with_events(&policy, &program, &[]);
+
+    // Wait until the writer is under way, then tighten well below where it
+    // would have got to on its own.
+    let grew = Instant::now() + Duration::from_secs(15);
+    wait_until(grew, "the workload to start writing", || {
+        std::fs::metadata(&blob).map(|m| m.len() >= 2 * 1024 * 1024).unwrap_or(false)
+    });
+    let before = std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
+    let limit = 6 * 1024 * 1024u64;
+
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({
+            "v": 1,
+            "verb": "update_file_size_limit",
+            "args": { "bytes": limit },
+        }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "tighten: {resp:?}");
+    assert_eq!(resp["data"]["applied_bytes"], limit, "{resp:?}");
+    assert!(
+        resp["data"]["tightened"].as_u64().unwrap_or(0) >= 1,
+        "the running group must have been tightened: {resp:?}"
+    );
+
+    // The loop must now fail (EFBIG at `limit`) rather than reach 400 MiB:
+    // wait for the size to stop moving, which is what "the writer can no
+    // longer grow this file" looks like from the outside.
+    let stopped = Instant::now() + Duration::from_secs(20);
+    let mut last = std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
+    let after = loop {
+        std::thread::sleep(Duration::from_millis(400));
+        let now = std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
+        if now == last {
+            break now;
+        }
+        last = now;
+        assert!(
+            Instant::now() < stopped,
+            "the tightened writer never stopped; it reached {now} bytes"
+        );
+    };
+    assert!(
+        after > before,
+        "the writer had to make some progress after the tightening ({before} -> {after})"
+    );
+    assert!(
+        after <= limit + 1024 * 1024,
+        "the file must stop at the tightened limit ({limit}): it reached {after}"
+    );
+
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "shutdown", "args": {} }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "shutdown: {resp:?}");
+    let out = child.wait_with_output().expect("wait tighten supervise");
+    assert!(
+        out.status.success(),
+        "the generation must end cleanly; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_file(&policy);
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
 /// `st_ino` of an open descriptor.  For a unix socket that is the socket
 /// inode, which is what `/proc/<pid>/fd` reports as `socket:[<ino>]`; the
 /// fd-table comparison in the SL-11 case below reads it from the handed-over
