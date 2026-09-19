@@ -32,6 +32,21 @@ use crate::sys::structs::{SeccompNotif, EACCES};
 // PID namespace translation (CLONE_NEWPID)
 // ============================================================
 
+/// How far up a parent chain the PID-namespace fallback looks.
+const MAX_ANCESTOR_HOPS: usize = 64;
+
+/// The parent of `pid`, from `/proc/<pid>/stat` (world-readable, so this works
+/// even where reading a namespace link is refused).
+fn parent_pid_of(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` is parenthesised and may contain spaces and parens, so the fields
+    // after it are counted from its *last* `)`.
+    let (_, rest) = stat.rsplit_once(')')?;
+    let mut fields = rest.split_whitespace();
+    let _state = fields.next()?;
+    fields.next()?.parse().ok()
+}
+
 /// Maps the PID namespace of one sandbox (`Sandbox::pid_ns`) to the host
 /// PID namespace the supervisor lives in.
 ///
@@ -56,6 +71,19 @@ pub(crate) struct PidNsMap {
     /// (e.g. `pid:[4026532444]`). Only processes in this namespace can be
     /// translated.
     ns_inode: Option<String>,
+    /// The sandbox leader's host pid, kept so the identity above can be
+    /// re-read when the first attempt failed.
+    ///
+    /// It is not a formality. The read happens while the leader is *starting*:
+    /// it has just moved into its own user namespace, and a process that has
+    /// done that is no longer dumpable, so a reader that is not privileged in
+    /// that namespace can be refused. The failure is silent (`.ok()`), and an
+    /// empty map is not a local problem: measured on the cluster it hides
+    /// every numeric entry from the sandbox's own `/proc` (`/proc/self`
+    /// included) *and* leaves the append watch unable to translate a single
+    /// notification, which is why the push channel was dead for its whole
+    /// life (§22.5.7). Keeping the pid lets a later refresh recover.
+    leader_host_pid: i32,
     /// ns pid (as reported by seccomp notifications) → host pid.
     map: HashMap<u32, i32>,
 }
@@ -64,12 +92,22 @@ impl PidNsMap {
     /// Create the map for a sandbox whose leader (ns pid 1) has host pid
     /// `leader_host_pid`.
     pub(crate) fn new(leader_host_pid: i32) -> Self {
-        let ns_inode = std::fs::read_link(format!("/proc/{}/ns/pid", leader_host_pid))
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned());
         let mut map = HashMap::new();
         map.insert(1, leader_host_pid);
-        Self { ns_inode, map }
+        let mut myself = Self {
+            leader_host_pid,
+            ns_inode: None,
+            map,
+        };
+        myself.ns_inode = myself.read_ns_inode();
+        myself
+    }
+
+    /// The sandbox's PID namespace inode, from the leader's own `/proc` entry.
+    fn read_ns_inode(&self) -> Option<String> {
+        std::fs::read_link(format!("/proc/{}/ns/pid", self.leader_host_pid))
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
     }
 
     /// Translate a sandbox-namespace pid to its host pid, scanning `/proc`
@@ -104,7 +142,15 @@ impl PidNsMap {
     /// by construction.
     fn refresh(&mut self) {
         let mut fresh = HashMap::new();
-        if self.ns_inode.is_some() {
+        // A reader that was refused once may be allowed a moment later (see
+        // `leader_host_pid`): without this retry the whole map stays empty for
+        // the life of the sandbox, which hides every `/proc/<pid>` entry from
+        // the sandbox itself and leaves the append watch unable to translate
+        // a single notification.
+        if self.ns_inode.is_none() {
+            self.ns_inode = self.read_ns_inode();
+        }
+        {
             if let Ok(dir) = std::fs::read_dir("/proc") {
                 for entry in dir.flatten() {
                     let Ok(host) = entry.file_name().to_string_lossy().parse::<i32>() else {
@@ -144,17 +190,73 @@ impl PidNsMap {
         if let Some(&host) = self.map.get(&1) {
             fresh.insert(1, host);
         }
+        if fresh.is_empty() {
+            // Never silent. An empty map hides every numeric entry from the
+            // sandbox's own `/proc` and leaves the append watch with nothing
+            // to translate, and from outside both look exactly like "the
+            // sandbox has no processes".
+            static EMPTY_LOGS: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let n = EMPTY_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 3 {
+                eprintln!(
+                    "sandlock-supervise: pid-ns map is empty for leader {} \
+                     (namespace inode {})",
+                    self.leader_host_pid,
+                    match self.ns_inode {
+                        Some(ref inode) => inode.as_str(),
+                        None => "unreadable",
+                    }
+                );
+            }
+        }
         self.map = fresh;
     }
 
     /// True when `host` lives in the sandbox's PID namespace.
+    ///
+    /// The namespace inode is the precise answer and is used whenever it is
+    /// known. It is not always known: the leader is read while it is moving
+    /// into its own user namespace (see `leader_host_pid`), and a reader that
+    /// is not privileged there can be refused. The fallback is the sandbox's
+    /// *process tree*, which needs nothing but the world-readable
+    /// `/proc/<pid>/stat`: everything a sandbox runs descends from its leader,
+    /// and a process that changed PID namespace inherits that namespace for
+    /// its descendants. Narrower than the inode (a workload that daemonises
+    /// and reparents is missed), and only used when the exact answer is
+    /// unavailable -- an empty map is not an acceptable alternative, because
+    /// it hides every `/proc` entry from the sandbox itself and leaves the
+    /// append watch with nothing to translate (§22.5.7).
     fn in_sandbox_ns(&self, host: i32) -> bool {
         match self.ns_inode {
             Some(ref inode) => std::fs::read_link(format!("/proc/{}/ns/pid", host))
                 .map(|p| p.to_string_lossy() == inode.as_str())
                 .unwrap_or(false),
-            None => false,
+            None => self.descends_from_leader(host),
         }
+    }
+
+    /// Whether `host`'s parent chain reaches the sandbox leader, from
+    /// `/proc/<pid>/stat` alone. Bounded: sandboxes are shallow, and a cycle
+    /// (or a pid namespace's pid 1) must not become an infinite walk.
+    fn descends_from_leader(&self, host: i32) -> bool {
+        if host == self.leader_host_pid {
+            return true;
+        }
+        let mut current = host;
+        for _ in 0..MAX_ANCESTOR_HOPS {
+            let Some(parent) = parent_pid_of(current) else {
+                return false;
+            };
+            if parent == self.leader_host_pid {
+                return true;
+            }
+            if parent <= 1 {
+                return false;
+            }
+            current = parent;
+        }
+        false
     }
 
     /// The pid of `host` inside its own (innermost) PID namespace: the last

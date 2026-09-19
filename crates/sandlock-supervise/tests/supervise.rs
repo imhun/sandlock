@@ -1298,6 +1298,35 @@ fn instance_policy_chrooted_pid_ns(writable: &str) -> String {
     .to_string()
 }
 
+/// The same, **plus the single-entry user namespace route B always has**: the
+/// real shape.
+///
+/// Naming the slot's own `uid`/`gid` in the policy is what makes the sandbox
+/// run in a user namespace that maps the guest's uid 0 onto that host uid --
+/// route B launches the slot as the leased uid (`--uid 10003`) and passes the
+/// same uid here. That is the difference this fixture exists to pin, and it is
+/// not cosmetic: measured on the cluster the push channel was dead for its
+/// whole life in exactly this shape, while a hand-launched slot *without* it
+/// (the probe's `setpriv` shape) pushed events fine. The leader is
+/// mid-transition when the mediator first reads its PID-namespace identity,
+/// and a refused read there used to leave an empty map -- which silently hides
+/// every numeric entry from the sandbox's own `/proc` (measured: `/proc/self`
+/// does not even exist) and leaves the append watch unable to translate a
+/// single notification.
+fn instance_policy_chrooted_pid_ns_self_userns(writable: &str, uid: u32) -> String {
+    let mut readable = base_read_paths();
+    readable.push(writable.to_string());
+    serde_json::json!({
+        "chroot": "/",
+        "fs_readable": readable,
+        "fs_writable": [writable],
+        "pid_ns": true,
+        "uid": uid,
+        "gid": uid,
+    })
+    .to_string()
+}
+
 #[test]
 fn test_dirty_dirs_reports_the_directory_a_write_landed_in() {
     // The written-directory ledger is what keeps the disk accounting from
@@ -1379,9 +1408,11 @@ fn test_events_fd_reports_a_running_writers_growth() {
     let blob = workdir.join("blob.bin");
     let policy = write_policy(
         "events-append",
-        // `pid_ns` on purpose: this is the test that has to fail when the
-        // watch is handed namespace pids it cannot read (see the fixture).
-        &instance_policy_chrooted_pid_ns("/tmp"),
+        // `pid_ns` + the user namespace on purpose: this is the test that has
+        // to fail when the watch is handed namespace pids it cannot read, or
+        // when the PID-namespace identity is lost to a refused read while the
+        // leader starts (see the fixtures).
+        &instance_policy_chrooted_pid_ns_self_userns("/tmp", euid()),
     );
     // One descriptor, held open across eight 1 MiB appends 150 ms apart:
     // the shape this signal exists for (a writer filling a file), and one
