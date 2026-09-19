@@ -949,10 +949,18 @@ fn grant_file_size_cap(
     wanted
 }
 
-/// Lower `pid`'s `RLIMIT_FSIZE` to at most `bytes`, if that is a change.
+/// Set `pid`'s **soft** `RLIMIT_FSIZE` to `bytes`, if that is a change.
 ///
-/// Only ever lowers, like every other ceiling in this design: a stale number
-/// must never be able to *widen* a limit that is already in force.
+/// The *hard* limit is left alone: that one is the worker's, and it only ever
+/// goes down (`update_file_size_limit`). This is the per-`open` grant, and it
+/// has to be able to *rise* back within that hard limit, because the value it
+/// replaces is inherited by everything the process forks: measured on the
+/// cluster, a shell that opened `/dev/null` for a redirection was granted the
+/// floor (the pool was momentarily empty), and every later `dd` it forked
+/// inherited 1 MiB -- so a legal file that had 324 MiB of budget left stopped
+/// at 256 MiB (`probe_exec_limit.py`, step 1). A grant is a statement about
+/// the budget *now*, so it is applied as a value, bounded by the hard limit
+/// the worker set.
 fn apply_file_size_cap(pid: i32, bytes: u64, path: &Path) {
     let mut current = libc::rlimit {
         rlim_cur: 0,
@@ -962,8 +970,8 @@ fn apply_file_size_cap(pid: i32, bytes: u64, path: &Path) {
         return;
     }
     let wanted = libc::rlimit {
-        rlim_cur: current.rlim_cur.min(bytes),
-        rlim_max: current.rlim_max.min(bytes),
+        rlim_cur: current.rlim_max.min(bytes),
+        rlim_max: current.rlim_max,
     };
     if wanted.rlim_cur == current.rlim_cur && wanted.rlim_max == current.rlim_max {
         return;
