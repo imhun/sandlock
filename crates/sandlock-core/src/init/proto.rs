@@ -252,6 +252,11 @@ pub enum Req {
         /// `extra_writable`: init does not consume them.
         #[serde(default)]
         bind_ports: Vec<u16>,
+        /// N25/C: tighten this child's `RLIMIT_FSIZE` (bytes). Per-exec
+        /// *tightening* only; init applies it in the forked child, before
+        /// execve. `#[serde(default)]` keeps pre-C frames parseable.
+        #[serde(default)]
+        max_file_size: Option<u64>,
     },
     /// Instance-level signal: `sandlock-init` delivers `signum` to every
     /// registered child's process group (group-first killpg + pidfd

@@ -309,6 +309,12 @@ typedef struct {
    */
   const uint16_t *bind_ports;
   uintptr_t bind_ports_count;
+  /**
+   * N25/C: tighten this child's `RLIMIT_FSIZE` to this many bytes. 0 means
+   * "no per-exec change" (the instance ceiling applies). A value the instance
+   * ceiling does not allow is refused as wider-than-ceiling.
+   */
+  uint64_t max_file_size;
 } sandlock_instance_exec_params_t;
 
 /**

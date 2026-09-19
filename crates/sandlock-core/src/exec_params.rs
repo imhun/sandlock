@@ -58,6 +58,20 @@ pub struct ExecParams {
     /// TCP ports this child may bind. Must be a subset of the instance's
     /// `net_allow_bind` ceiling.
     pub bind_ports: Vec<u16>,
+    /// N25/C: tighten `RLIMIT_FSIZE` for this child to this many bytes.
+    ///
+    /// A per-exec *tightening* only: the instance ceiling is the policy's
+    /// `max_file_size` (or "no bound"), and a request above it is refused as
+    /// wider-than-ceiling. Lowering your own limit is always permitted, so
+    /// init applies it in the forked child before execve -- and that is the
+    /// only place it can go: limits are per-process, so applying it in init
+    /// itself would cap every later exec as well.
+    ///
+    /// This is what makes the disk ceiling *dynamic* without a per-write
+    /// mediator: a caller that knows how much of a budget is left can hand
+    /// each command the remaining amount, and a write past it fails with
+    /// EFBIG instead of being noticed afterwards.
+    pub max_file_size: Option<u64>,
 }
 
 impl ExecParams {
@@ -82,6 +96,9 @@ pub(crate) struct ExecCeiling {
     writable_mounts: Vec<PathBuf>,
     bind_allow: BindPorts,
     bind_deny: HashSet<u16>,
+    /// N25/C: the instance's `RLIMIT_FSIZE`, in bytes, or `None` for "no
+    /// bound". A per-exec `max_file_size` may only tighten it.
+    max_file_size: Option<u64>,
 }
 
 impl ExecCeiling {
@@ -100,12 +117,27 @@ impl ExecCeiling {
             writable_mounts,
             bind_allow: policy.net_allow_bind.clone(),
             bind_deny: policy.net_deny_bind.iter().copied().collect(),
+            max_file_size: policy.max_file_size.map(|b| b.0),
         }
     }
 
     /// S9 subset check: refuse any per-exec grant wider than the ceiling.
     /// Single choke point for the in-process and on-behalf exec routes.
     pub(crate) fn validate(&self, params: &ExecParams) -> Result<(), SandlockError> {
+        if let Some(requested) = params.max_file_size {
+            // A *tightening* is always in scope; a zero or above-ceiling
+            // request is not. Zero is refused rather than treated as "unset"
+            // because it would refuse every write the child makes, including
+            // the ones it needs to start.
+            let fits = requested > 0
+                && self
+                    .max_file_size
+                    .map(|ceiling| requested <= ceiling)
+                    .unwrap_or(true);
+            if !fits {
+                return Err(Self::too_wide("max_file_size", requested.to_string()));
+            }
+        }
         for path in &params.extra_writable {
             let value = path.to_string_lossy().to_string();
             if !path.is_absolute() {

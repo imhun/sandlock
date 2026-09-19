@@ -297,6 +297,7 @@ fn spawn(
     cwd: &Option<String>,
     clean_env: bool,
     stdio: Option<[RawFd; 3]>,
+    max_file_size: Option<u64>,
 ) -> i32 {
     // SL-4 belt: the control socket must never survive the workload's execvp.
     // fcntl is async-signal-safe and FD_CLOEXEC is per-fd-table state, so
@@ -351,6 +352,34 @@ fn spawn(
     if unsafe { libc::setpgid(0, 0) } != 0 {
         unsafe {
             libc::_exit(126);
+        }
+    }
+    // N25/C: a per-exec `RLIMIT_FSIZE`, applied **here** — in the forked child,
+    // before execve. Limits are per-process, so applying it in init would cap
+    // init's own later work (and every subsequent exec); applying it in the
+    // child bounds exactly this command's subtree. It is only ever a
+    // tightening of the instance's ceiling (the host refuses anything wider),
+    // and a process may always lower its own limits, so this needs no
+    // capability even though the workload is unprivileged.
+    //
+    // `SIGXFSZ` is ignored first so the write fails with EFBIG rather than
+    // killing the command (see `context.rs`, which sets the same disposition
+    // for the instance's own children; an ignored disposition survives
+    // execve).
+    if let Some(limit) = max_file_size {
+        unsafe {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let rlim = libc::rlimit {
+                rlim_cur: limit,
+                rlim_max: limit,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &rlim) != 0 {
+                // Refusing to start is the fail-closed answer: a command whose
+                // per-exec ceiling could not be applied must not run with a
+                // wider one than the caller asked for. 125 is init's
+                // setup-failure code (the workload never ran).
+                libc::_exit(125);
+            }
         }
     }
     if let (Some(plan), Some(received)) = (plan.as_ref(), stdio) {
@@ -922,7 +951,7 @@ pub fn run_init() {
                                 replies.push(Resp::Err { msg: "main already running".into() });
                                 continue;
                             }
-                            let pid = spawn(&argv, &env, &cwd, false, None);
+                            let pid = spawn(&argv, &env, &cwd, false, None, None);
                             if pid < 0 {
                                 replies.push(Resp::Err { msg: "fork failed".into() });
                                 continue;
@@ -948,6 +977,7 @@ pub fn run_init() {
                             clean_env,
                             extra_writable: _,
                             bind_ports: _,
+                            max_file_size,
                         } => {
                             let exec_fds = &received.fds[frame_fds];
                             if exec_fds.len() != 3 {
@@ -959,7 +989,14 @@ pub fn run_init() {
                                 exec_fds[1].as_raw_fd(),
                                 exec_fds[2].as_raw_fd(),
                             ];
-                            let pid = spawn(&argv, &env, &cwd, clean_env, Some(stdio));
+                            let pid = spawn(
+                                &argv,
+                                &env,
+                                &cwd,
+                                clean_env,
+                                Some(stdio),
+                                max_file_size,
+                            );
                             if pid < 0 {
                                 replies.push(Resp::Err { msg: "fork failed".into() });
                                 continue;

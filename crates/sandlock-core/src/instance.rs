@@ -1052,6 +1052,7 @@ impl SandboxInstance {
                 .map(|p| p.to_string_lossy().to_string())
                 .collect(),
             bind_ports: params.bind_ports.clone(),
+            max_file_size: params.max_file_size,
         };
         // F5.4: a request-deadline failure marks the link Dead; the verb must
         // surface the unified InstanceDead code (not the raw closed-instance

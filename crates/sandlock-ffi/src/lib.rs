@@ -3274,6 +3274,11 @@ pub struct sandlock_instance_exec_params_t {
     /// TCP bind ports (S9: subset of the instance `net_allow_bind` ceiling).
     pub bind_ports: *const u16,
     pub bind_ports_count: usize,
+    /// N25/C: tighten this child's `RLIMIT_FSIZE` to this many bytes. 0 means
+    /// "no per-exec change" (the instance ceiling applies). A value above the
+    /// instance ceiling, or a request when the instance has no ceiling, is
+    /// refused as wider-than-ceiling.
+    pub max_file_size: u64,
 }
 
 impl Default for sandlock_instance_exec_result_t {
@@ -3529,6 +3534,11 @@ unsafe fn exec_params_from_raw(
     }
     for i in 0..p.bind_ports_count {
         out.bind_ports.push(*p.bind_ports.add(i));
+    }
+    // N25/C: 0 is the C spelling of "no per-exec change" -- an explicit zero
+    // would be refused by the ceiling check (it refuses every write).
+    if p.max_file_size > 0 {
+        out.max_file_size = Some(p.max_file_size);
     }
     Ok(out)
 }

@@ -582,6 +582,8 @@ class _SandlockInstanceExecParams(ctypes.Structure):
         ("extra_writable_count", ctypes.c_size_t),
         ("bind_ports", ctypes.POINTER(ctypes.c_uint16)),
         ("bind_ports_count", ctypes.c_size_t),
+        # N25/C: per-exec RLIMIT_FSIZE (bytes); 0 = no per-exec change.
+        ("max_file_size", ctypes.c_uint64),
     ]
 
 

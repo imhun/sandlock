@@ -2022,6 +2022,7 @@ class SandboxInstance:
         clean_env: bool = False,
         extra_writable: Sequence[str | os.PathLike] | None = None,
         bind_ports: Sequence[int] | None = None,
+        max_file_size: int | None = None,
     ) -> "ExecProcess":
         """Run ``cmd`` inside the session and return a self-owned
         :class:`ExecProcess`.
@@ -2043,7 +2044,12 @@ class SandboxInstance:
           subset of the instance's writable ceiling, never an ``fs_deny``'d
           path);
         * ``bind_ports`` — TCP ports this child may bind (must be inside the
-          instance's ``net_allow_bind`` ceiling).
+          instance's ``net_allow_bind`` ceiling);
+        * ``max_file_size`` — tighten this child's ``RLIMIT_FSIZE`` to this
+          many bytes (N25/C). A *tightening* only: a value the instance
+          ceiling does not allow raises :class:`PermissionError`. Bytes past
+          it fail with ``EFBIG`` rather than killing the command, because the
+          instance ignores ``SIGXFSZ``.
 
         Any request wider than the instance-time policy ceiling raises
         :class:`PermissionError` (EPERM) — the ceiling never widens. (The
@@ -2104,6 +2110,14 @@ class SandboxInstance:
             arr = (ctypes.c_uint16 * len(ports))(*ports)
             params.bind_ports = arr
             params.bind_ports_count = len(ports)
+        if max_file_size is not None:
+            value = int(max_file_size)
+            if value <= 0:
+                raise ValueError(
+                    "max_file_size must be greater than 0 bytes: a zero "
+                    "RLIMIT_FSIZE refuses every write the child makes"
+                )
+            params.max_file_size = value
         out = _SandlockInstanceExecResult()
         rc = _lib.sandlock_instance_exec_params(
             self._handle,

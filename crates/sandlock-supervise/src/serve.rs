@@ -549,6 +549,17 @@ fn exec_params_from_args(args: &serde_json::Value) -> Result<ExecParams, String>
             params.bind_ports.push(n);
         }
     }
+    // N25/C: per-exec RLIMIT_FSIZE (bytes). Absent means "no per-exec change";
+    // the ceiling check refuses anything the instance does not allow, so a
+    // malformed or over-wide value is a refusal here, not a wider command.
+    if let Some(value) = args.get("max_file_size") {
+        if !value.is_null() {
+            let bytes = value
+                .as_u64()
+                .ok_or_else(|| "exec max_file_size must be an integer of bytes".to_string())?;
+            params.max_file_size = Some(bytes);
+        }
+    }
     Ok(params)
 }
 
