@@ -1313,6 +1313,27 @@ fn instance_policy_chrooted_pid_ns(writable: &str) -> String {
 /// every numeric entry from the sandbox's own `/proc` (measured: `/proc/self`
 /// does not even exist) and leaves the append watch unable to translate a
 /// single notification.
+/// The chroot shape with **a pid namespace and a file-size ceiling**: what the
+/// deployment runs, for the live tightening.
+///
+/// The ceiling is what installs the ignored `SIGXFSZ` (a write past the limit
+/// is `EFBIG`, not a death), and the pid namespace is what makes the
+/// notification pid something the mediator has to translate before it can read
+/// the descriptor -- so this is the fixture under which "the bytes a file has
+/// already written" has to survive that translation.
+fn instance_policy_chrooted_pid_ns_with_file_size(writable: &str, ceiling: &str) -> String {
+    let mut readable = base_read_paths();
+    readable.push(writable.to_string());
+    serde_json::json!({
+        "chroot": "/",
+        "fs_readable": readable,
+        "fs_writable": [writable],
+        "max_file_size": ceiling,
+        "pid_ns": true,
+    })
+    .to_string()
+}
+
 fn instance_policy_chrooted_pid_ns_self_userns(writable: &str, uid: u32) -> String {
     let mut readable = base_read_paths();
     readable.push(writable.to_string());
@@ -1510,7 +1531,10 @@ fn test_a_tightening_does_not_cut_off_the_file_that_caused_it() {
     let blob = workdir.join("tail.bin");
     let policy = write_policy(
         "tail-limit",
-        &instance_policy_chrooted_with_file_size("/tmp", "512M"),
+        // The deployment's shape: the ceiling *and* the pid namespace. Without
+        // the namespace the watch key is already the host pid, so the
+        // translation this exercises is a no-op and the bug is invisible.
+        &instance_policy_chrooted_pid_ns_with_file_size("/tmp", "512M"),
     );
     let script = format!(
         "exec 3>>{}; i=0; while [ $i -lt 400 ]; do          dd if=/dev/zero bs=1M count=1 status=none >&3;          i=$((i+1)); sleep 0.06; done",

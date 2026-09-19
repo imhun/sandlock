@@ -1412,6 +1412,22 @@ impl SandboxInstance {
             considered: targets.len(),
             ..FileSizeLimitReport::default()
         };
+        if std::env::var("SANLOCK_EVENT_TRACE").map(|v| v.trim() == "1").unwrap_or(false) {
+            static TRACES: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let n = TRACES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 12 {
+                let watch_len = self
+                    .supervisor_write_fds
+                    .as_ref()
+                    .map(|watch| watch.len())
+                    .unwrap_or(usize::MAX);
+                eprintln!(
+                    "sandlock-supervise: tighten targets={targets:?} grown={grown:?} \
+                     bytes={bytes} watch_entries={watch_len}"
+                );
+            }
+        }
         for pid in targets {
             let allowance = bytes.saturating_add(grown.get(&pid).copied().unwrap_or(0));
             let mut current = libc::rlimit {

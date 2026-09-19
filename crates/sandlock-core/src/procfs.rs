@@ -133,6 +133,11 @@ impl PidNsMap {
         self.map.keys().copied().map(|p| p as i32).max()
     }
 
+    /// Whether nothing has been resolved yet (a diagnostic).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     /// Rebuild the map from a full `/proc` scan. Every process whose PID
     /// namespace inode matches the sandbox's is added under its own-namespace
     /// pid (the last `NSpid:` entry), and every thread of a sandbox process

@@ -867,6 +867,20 @@ fn inject_watched(
         None => pid as i32,
     };
     let path = host_path.to_path_buf();
+    if std::env::var("SANLOCK_EVENT_TRACE").map(|v| v.trim() == "1").unwrap_or(false) {
+        static PICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = PICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 12 {
+            eprintln!(
+                "sandlock-supervise: watch pid picked: notif={pid} host={host_pid} \
+                 ns_map={} map_is_empty={}",
+                ctx.pid_ns.is_some(),
+                ctx.pid_ns
+                    .map(|map| map.read().map(|m| m.is_empty()).unwrap_or(true))
+                    .unwrap_or(true),
+            );
+        }
+    }
     NotifAction::InjectFdSendTracked {
         srcfd,
         newfd_flags,
