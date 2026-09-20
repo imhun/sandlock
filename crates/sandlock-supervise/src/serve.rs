@@ -626,8 +626,14 @@ impl Generation {
                 "generation has no instance: update_entry_limit requires a launched session",
             )
         })?;
+        // N31: the same dating the byte anchor gets. Without it a 200-entry
+        // cap let 213 names through on the cluster: the anchor was refreshed
+        // with a walked count from before the last dozen creations, and the
+        // mediator's own counter was reset along with it.
+        let created_at = args.get("created").and_then(|v| v.as_u64());
+        let removed_at = args.get("removed").and_then(|v| v.as_u64());
         let (used, applied_limit) = instance
-            .note_entry_budget(entries, limit)
+            .note_entry_budget(entries, limit, created_at, removed_at)
             .unwrap_or((entries, limit));
         Ok(serde_json::json!({
             "entries": used,
@@ -650,7 +656,17 @@ impl Generation {
             .as_ref()
             .and_then(|instance| instance.write_counters())
             .unwrap_or((0, 0));
-        Ok(serde_json::json!({ "spent": spent, "freed": freed }))
+        let (created, removed) = self
+            .instance
+            .as_ref()
+            .and_then(|instance| instance.entry_counters())
+            .unwrap_or((0, 0));
+        Ok(serde_json::json!({
+            "spent": spent,
+            "freed": freed,
+            "created": created,
+            "removed": removed,
+        }))
     }
 
     fn handle_kill_child(

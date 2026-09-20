@@ -297,9 +297,19 @@ impl WriteFds {
     /// Same shape as the byte budget: the number is an *anchor* taken when the
     /// worker looked, and everything this side watches appear or disappear
     /// after that is added to it. `limit == 0` turns the gate off.
-    pub fn note_entry_budget(&self, entries: u64, limit: u64) {
-        let created_at = self.entries_created.load(std::sync::atomic::Ordering::Relaxed);
-        let removed_at = self.entries_removed.load(std::sync::atomic::Ordering::Relaxed);
+    pub fn note_entry_budget(
+        &self,
+        entries: u64,
+        limit: u64,
+        created_at: Option<u64>,
+        removed_at: Option<u64>,
+    ) {
+        // Same rule as the bytes: a stamp from the future is clamped to what
+        // the counters say now, which is the old arrival-anchored behaviour.
+        let created_now = self.entries_created.load(std::sync::atomic::Ordering::Relaxed);
+        let removed_now = self.entries_removed.load(std::sync::atomic::Ordering::Relaxed);
+        let created_at = created_at.unwrap_or(created_now).min(created_now);
+        let removed_at = removed_at.unwrap_or(removed_now).min(removed_now);
         *self
             .entry_budget
             .lock()
@@ -372,6 +382,20 @@ impl WriteFds {
         (
             self.spent.load(std::sync::atomic::Ordering::Relaxed),
             self.freed.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// The same, for the entry counters (N31).
+    ///
+    /// Both axes need the same treatment: the worker's count of names is a
+    /// walk, so it can be older than the message that carries it -- measured
+    /// on the cluster, a 200-entry cap let **213** names through, because the
+    /// anchor was refreshed with a walked count from before the last dozen
+    /// creations and the mediator's own counter was reset with it.
+    pub fn entry_counters(&self) -> (u64, u64) {
+        (
+            self.entries_created.load(std::sync::atomic::Ordering::Relaxed),
+            self.entries_removed.load(std::sync::atomic::Ordering::Relaxed),
         )
     }
 
@@ -875,10 +899,10 @@ mod tests {
         // switched off.
         assert_eq!(watch.entries_now(), None);
         assert!(!watch.entries_exhausted());
-        watch.note_entry_budget(100, 0);
+        watch.note_entry_budget(100, 0, None, None);
         assert!(!watch.entries_exhausted());
 
-        watch.note_entry_budget(100, 110);
+        watch.note_entry_budget(100, 110, None, None);
         assert_eq!(watch.entries_now(), Some((100, 110)));
         for _ in 0..10 {
             watch.credit_entry_created();
@@ -894,7 +918,7 @@ mod tests {
         assert!(!watch.entries_exhausted());
 
         // The next walk re-anchors, and whatever happened before it is gone.
-        watch.note_entry_budget(50, 110);
+        watch.note_entry_budget(50, 110, None, None);
         assert_eq!(watch.entries_now(), Some((50, 110)));
         assert!(!watch.entries_exhausted());
     }

@@ -1389,10 +1389,23 @@ impl SandboxInstance {
     /// anchor rather than a field on the byte budget.
     /// Returns `(entries now, limit)` after the anchor was applied, for the
     /// caller that wants to report it back.
-    pub fn note_entry_budget(&self, entries: u64, limit: u64) -> Option<(u64, u64)> {
+    pub fn note_entry_budget(
+        &self,
+        entries: u64,
+        limit: u64,
+        created_at: Option<u64>,
+        removed_at: Option<u64>,
+    ) -> Option<(u64, u64)> {
         let watch = self.supervisor_write_fds.as_ref()?;
-        watch.note_entry_budget(entries, limit);
+        watch.note_entry_budget(entries, limit, created_at, removed_at);
         watch.entries_now()
+    }
+
+    /// The entry counters, for dating an entry walk (N31).
+    pub fn entry_counters(&self) -> Option<(u64, u64)> {
+        self.supervisor_write_fds
+            .as_ref()
+            .map(|watch| watch.entry_counters())
     }
 
     /// N25: lower every live child's `RLIMIT_FSIZE` to at most `bytes`.
