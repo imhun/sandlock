@@ -1364,6 +1364,37 @@ impl SandboxInstance {
         }
     }
 
+    /// The same, dated (N25): the counters the worker's walk was taken at.
+    pub fn note_file_size_budget_sampled(
+        &self,
+        bytes: u64,
+        spent_at: Option<u64>,
+        freed_at: Option<u64>,
+    ) {
+        if let Some(watch) = self.supervisor_write_fds.as_ref() {
+            watch.note_budget_sampled(bytes, spent_at, freed_at);
+        }
+    }
+
+    /// The write-watch counters a worker can date its walk with (N25).
+    pub fn write_counters(&self) -> Option<(u64, u64)> {
+        self.supervisor_write_fds.as_ref().map(|watch| watch.counters())
+    }
+
+    /// N31: record the tree's entry count and cap, for the mediator's
+    /// create-entry gate.
+    ///
+    /// The bytes and the entries move independently -- an empty file costs
+    /// nothing, a big file costs one entry -- so this is a second, separate
+    /// anchor rather than a field on the byte budget.
+    /// Returns `(entries now, limit)` after the anchor was applied, for the
+    /// caller that wants to report it back.
+    pub fn note_entry_budget(&self, entries: u64, limit: u64) -> Option<(u64, u64)> {
+        let watch = self.supervisor_write_fds.as_ref()?;
+        watch.note_entry_budget(entries, limit);
+        watch.entries_now()
+    }
+
     /// N25: lower every live child's `RLIMIT_FSIZE` to at most `bytes`.
     ///
     /// A per-exec ceiling is applied at `execve` and inherited by whatever

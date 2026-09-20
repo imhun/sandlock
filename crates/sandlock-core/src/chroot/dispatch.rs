@@ -742,11 +742,12 @@ pub(crate) async fn handle_chroot_open(
     // the sandbox does not), and it is why this is a refusal rather than a
     // freeze. Opening a file that already exists is allowed; writes through it
     // fail at the ceiling instead.
-    if is_write
+    // N31: the byte pool is only half of "may the tree grow?" -- an empty
+    // file costs no bytes at all, so the entry cap has to refuse this too.
+    let creating_entry = is_write
         && (flags as i32 & (libc::O_CREAT | libc::O_TMPFILE)) != 0
-        && ctx.write_fds.is_exhausted()
-        && !host_path.exists()
-    {
+        && !host_path.exists();
+    if creating_entry && (ctx.write_fds.is_exhausted() || ctx.write_fds.entries_exhausted()) {
         return NotifAction::Errno(libc::ENOSPC);
     }
 
@@ -787,7 +788,13 @@ pub(crate) async fn handle_chroot_open(
                         };
                         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
                         return inject_watched(
-                            ctx, notif.pid, &real_path, owned, newfd_flags, is_write,
+                            ctx,
+                            notif.pid,
+                            &real_path,
+                            owned,
+                            newfd_flags,
+                            is_write,
+                            creating_entry,
                         );
                     }
                     Ok(None) => {
@@ -835,7 +842,13 @@ pub(crate) async fn handle_chroot_open(
     };
     match open_in_namespace(ctx, notif.pid, &virtual_path, flags as i32, mode, honored) {
         Ok(srcfd) => inject_watched(
-            ctx, notif.pid, &host_path, srcfd, newfd_flags, is_write,
+            ctx,
+            notif.pid,
+            &host_path,
+            srcfd,
+            newfd_flags,
+            is_write,
+            creating_entry,
         ),
         Err(errno) => NotifAction::Errno(errno),
     }
@@ -859,6 +872,7 @@ fn inject_watched(
     srcfd: OwnedFd,
     newfd_flags: u32,
     is_write: bool,
+    created_entry: bool,
 ) -> NotifAction {
     if !is_write {
         return NotifAction::InjectFdSend { srcfd, newfd_flags };
@@ -920,6 +934,12 @@ fn inject_watched(
             // copy cannot be moved out from under the watch by a redirection.
             let cap = grant_file_size_cap(&watch, host_pid, baseline, &path);
             watch.register(host_pid, child_fd, &path, baseline, held, cap);
+            // N31: the open that got this far is the one that created the
+            // name, so the entry count moves here -- after the kernel said
+            // yes, and on the same path the byte accounting already uses.
+            if created_entry {
+                watch.credit_entry_created();
+            }
         }),
     }
 }
@@ -1666,6 +1686,8 @@ pub(crate) async fn handle_chroot_write(
         );
         if matches!(action, NotifAction::Continue | NotifAction::ReturnValue(_)) {
             ctx.write_fds.credit_freed(freed);
+            // N31: the name is gone, so it comes off the entry count as well.
+            ctx.write_fds.credit_entry_removed();
             raise_caller_file_size_limit(ctx, notif.pid, &host_path);
         }
         return action;
@@ -1680,7 +1702,8 @@ pub(crate) async fn handle_chroot_write(
         // Over budget: a directory is tree growth without a write, and the
         // ceiling cannot reach it. The sandbox keeps running (and keeps being
         // able to delete), which is the point of refusing instead of freezing.
-        if ctx.write_fds.is_exhausted() {
+        // N31: an empty directory costs no bytes, so the entry cap counts too.
+        if ctx.write_fds.is_exhausted() || ctx.write_fds.entries_exhausted() {
             return NotifAction::Errno(libc::ENOSPC);
         }
         ctx.mark_dirty(&host_path);
@@ -1699,7 +1722,11 @@ pub(crate) async fn handle_chroot_write(
                 }
             }
         }
-        return exec_on_host(|p| unsafe { libc::mkdir(p, mode) }, &host_path);
+        let action = exec_on_host(|p| unsafe { libc::mkdir(p, mode) }, &host_path);
+        if matches!(action, NotifAction::Continue | NotifAction::ReturnValue(_)) {
+            ctx.write_fds.credit_entry_created();
+        }
+        return action;
     }
 
     // renameat carries the same (olddirfd, oldpath, newdirfd, newpath) slots
@@ -1778,7 +1805,7 @@ pub(crate) async fn handle_chroot_write(
         if !ctx.can_write(&link_vp) { return NotifAction::Errno(libc::EACCES); }
         // Over budget: a new name is tree growth, which no per-file ceiling
         // can express (see `WriteFds::is_exhausted`).
-        if ctx.write_fds.is_exhausted() {
+        if ctx.write_fds.is_exhausted() || ctx.write_fds.entries_exhausted() {
             return NotifAction::Errno(libc::ENOSPC);
         }
         ctx.mark_dirty(&host_link);
@@ -1799,11 +1826,15 @@ pub(crate) async fn handle_chroot_write(
 
         let c_target = match CString::new(target.as_str()) { Ok(c) => c, Err(_) => return NotifAction::Errno(libc::EINVAL) };
         let c_link = match path_cstr(&host_link, libc::EINVAL) { Ok(c) => c, Err(a) => return a };
-        return if unsafe { libc::symlink(c_target.as_ptr(), c_link.as_ptr()) } < 0 {
+        let action = if unsafe { libc::symlink(c_target.as_ptr(), c_link.as_ptr()) } < 0 {
             NotifAction::Errno(last_errno(libc::EIO))
         } else {
             NotifAction::ReturnValue(0)
         };
+        if matches!(action, NotifAction::Continue | NotifAction::ReturnValue(_)) {
+            ctx.write_fds.credit_entry_created();
+        }
+        return action;
     }
 
     if nr == libc::SYS_linkat {
@@ -1867,7 +1898,7 @@ pub(crate) async fn handle_chroot_write(
         }
         // Over budget: a second name is tree growth (see
         // `WriteFds::is_exhausted`).
-        if ctx.write_fds.is_exhausted() {
+        if ctx.write_fds.is_exhausted() || ctx.write_fds.entries_exhausted() {
             return NotifAction::Errno(libc::ENOSPC);
         }
         // N25/L2c: the new name is a new directory entry.
@@ -1912,11 +1943,15 @@ pub(crate) async fn handle_chroot_write(
         // unknown flags with EINVAL exactly as it would without the sandbox.
         let flags =
             notif.data.args[4] as i32 & !(libc::AT_EMPTY_PATH | libc::AT_SYMLINK_FOLLOW);
-        return if unsafe { libc::linkat(libc::AT_FDCWD, c_old.as_ptr(), libc::AT_FDCWD, c_new.as_ptr(), flags) } < 0 {
+        let action = if unsafe { libc::linkat(libc::AT_FDCWD, c_old.as_ptr(), libc::AT_FDCWD, c_new.as_ptr(), flags) } < 0 {
             NotifAction::Errno(last_errno(libc::EIO))
         } else {
             NotifAction::ReturnValue(0)
         };
+        if matches!(action, NotifAction::Continue | NotifAction::ReturnValue(_)) {
+            ctx.write_fds.credit_entry_created();
+        }
+        return action;
     }
 
     if nr == libc::SYS_fchmodat {

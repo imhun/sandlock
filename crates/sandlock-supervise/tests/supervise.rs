@@ -1657,6 +1657,112 @@ fn test_over_budget_blocks_writes_but_not_deletes() {
 }
 
 #[test]
+fn test_the_entry_cap_refuses_new_names_and_not_deletes() {
+    // N31: the byte budget is blind to a tree that grows by *names*. An empty
+    // file costs zero bytes -- measured on the cluster, 2000 of them left the
+    // platform's number at 0 -- so a sandbox could consume the volume's inodes
+    // without ever touching its budget, and the only gate that covered entry
+    // creation fired when the byte pool was *exactly* zero, which empty
+    // entries never reach. This is that missing gate: the worker walks the
+    // tree and sends the count, the mediator adds what it watches appear.
+    //
+    // Observed from the host: a refused name never appears, a delete still
+    // works, and making room re-opens the gate inside the same command.
+    isolate_ctl_root();
+    let workdir = std::path::PathBuf::from(format!(
+        "/tmp/sandlock-entries-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&workdir).expect("create entry-cap workdir");
+    let first = workdir.join("first.txt");
+    let second = workdir.join("second.txt");
+    let third = workdir.join("third.txt");
+    let fourth = workdir.join("fourth.txt");
+    let policy = write_policy(
+        "entry-cap",
+        &instance_policy_chrooted_pid_ns_with_file_size("/tmp", "512M"),
+    );
+    let script = format!(
+        "echo a > {first}; sleep 6; \
+         echo b > {second}; \
+         echo c > {third} 2>/dev/null; \
+         rm -f {first}; \
+         echo d > {fourth}; \
+         exec sleep 30",
+        first = first.display(),
+        second = second.display(),
+        third = third.display(),
+        fourth = fourth.display(),
+    );
+    let program = write_policy(
+        "entry-cap-program",
+        &serde_json::json!({ "argv": ["/bin/sh", "-c", script] }).to_string(),
+    );
+    let (mut child, mut worker, _events) =
+        spawn_serve_supervisor_with_events(&policy, &program, &[]);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    wait_until(deadline, "the first name to appear", || first.exists());
+
+    // "The walk counted 1 entry and the cap is 2": exactly one more name may
+    // appear, and the tree is otherwise free (no byte pressure at all).
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({
+            "v": 1,
+            "verb": "update_entry_limit",
+            "args": { "entries": 1, "limit": 2 },
+        }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "entry cap: {resp:?}");
+    assert_eq!(resp["data"]["limit"], 2, "the cap is what we sent: {resp:?}");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    wait_until(deadline, "the second name to land", || second.exists());
+    wait_until(deadline, "the delete to land", || !first.exists());
+    // The third name is the one past the cap: refused, and refused with the
+    // error the storage itself would give.
+    assert!(
+        !third.exists(),
+        "a name past the entry cap must not appear"
+    );
+    // The fourth is created *after* a delete in the same command, which is the
+    // whole reason removals are credited: without it the anchor would still
+    // count the name that was just unlinked.
+    wait_until(deadline, "the name after the delete to land", || fourth.exists());
+
+    // Still serving: an entry cap is a refusal, not a freeze.
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "dirty_dirs", "args": {} }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "still serving: {resp:?}");
+
+    // And the anchor moves when the worker walks again: two names exist, the
+    // cap is lifted by sending a limit of zero.
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({
+            "v": 1,
+            "verb": "update_entry_limit",
+            "args": { "entries": 2, "limit": 0 },
+        }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "lift: {resp:?}");
+    assert_eq!(resp["data"]["exhausted"], serde_json::Value::Bool(false), "{resp:?}");
+
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "shutdown", "args": {} }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "shutdown: {resp:?}");
+    let _ = child.wait_with_output();
+    let _ = std::fs::remove_file(&policy);
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+#[test]
 fn test_a_tightening_does_not_cut_off_the_file_that_caused_it() {
     // The number the worker sends is "what is left of the *tree* budget", and
     // the bytes a file has already written are part of the usage that number

@@ -180,6 +180,33 @@ pub struct WriteFds {
     /// the space come back *within the same command*, not on the next
     /// accounting round (§22.5.9).
     freed: std::sync::atomic::AtomicU64,
+    /// Entries the mediator has watched appear and disappear since the anchor.
+    ///
+    /// The byte budget cannot see a tree that grows by *names*: an empty file
+    /// or an empty directory costs zero bytes -- measured on the cluster,
+    /// 2000 empty files left the platform's number at 0 bytes while the
+    /// directory itself was 16384 bytes on NFS and is not counted either
+    /// (§22.5.10, backlog N31). The risk is not capacity but the volume's inodes
+    /// and the cost of walking the tree, and the only gate that used to cover
+    /// entry creation fired when the *byte* pool was exactly zero -- which
+    /// empty entries never spend. These two counters are the mediator's own
+    /// view of that growth; the worker's walked count is the anchor, the same
+    /// split the bytes use.
+    entries_created: std::sync::atomic::AtomicU64,
+    entries_removed: std::sync::atomic::AtomicU64,
+    /// The last entry count and cap the worker sent, with the counters it
+    /// arrived at.
+    entry_budget: Mutex<Option<EntryBudget>>,
+}
+
+/// One `update_entry_limit` from the worker, as a baseline.
+#[derive(Debug, Clone, Copy)]
+struct EntryBudget {
+    entries: u64,
+    created_at: u64,
+    removed_at: u64,
+    /// `0` means "no limit": the knob is off, and nothing is refused.
+    limit: u64,
 }
 
 /// One `update_file_size_limit` from the worker, as a baseline.
@@ -259,11 +286,95 @@ impl WriteFds {
             spent: std::sync::atomic::AtomicU64::new(0),
             budget: Mutex::new(None),
             freed: std::sync::atomic::AtomicU64::new(0),
+            entries_created: std::sync::atomic::AtomicU64::new(0),
+            entries_removed: std::sync::atomic::AtomicU64::new(0),
+            entry_budget: Mutex::new(None),
         }
+    }
+
+    /// Record the entry count and cap the worker just walked (N25/N31).
+    ///
+    /// Same shape as the byte budget: the number is an *anchor* taken when the
+    /// worker looked, and everything this side watches appear or disappear
+    /// after that is added to it. `limit == 0` turns the gate off.
+    pub fn note_entry_budget(&self, entries: u64, limit: u64) {
+        let created_at = self.entries_created.load(std::sync::atomic::Ordering::Relaxed);
+        let removed_at = self.entries_removed.load(std::sync::atomic::Ordering::Relaxed);
+        *self
+            .entry_budget
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(EntryBudget {
+            entries,
+            created_at,
+            removed_at,
+            limit,
+        });
+    }
+
+    /// `(entries now, limit)` as far as this side can tell, or `None` when the
+    /// worker has not sent a count yet.
+    pub fn entries_now(&self) -> Option<(u64, u64)> {
+        let guard = self
+            .entry_budget
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let budget = (*guard)?;
+        let created = self
+            .entries_created
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(budget.created_at);
+        let removed = self
+            .entries_removed
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(budget.removed_at);
+        Some((
+            budget.entries.saturating_add(created).saturating_sub(removed),
+            budget.limit,
+        ))
+    }
+
+    /// Whether the tree has used up the entry cap.
+    ///
+    /// `false` with no count, or with the knob off (`limit == 0`): "not told"
+    /// and "no limit" are both not "no entries left".
+    pub fn entries_exhausted(&self) -> bool {
+        match self.entries_now() {
+            Some((used, limit)) if limit > 0 => used >= limit,
+            _ => false,
+        }
+    }
+
+    /// Record one entry this side watched appear (`O_CREAT`, `mkdir`,
+    /// `symlink`, `link`).
+    pub fn credit_entry_created(&self) {
+        self.entries_created
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record one entry this side watched disappear (`unlink`, `rmdir`).
+    ///
+    /// Deletions have to come off the count for the same reason frees do for
+    /// the bytes: `rm -rf cache && mkdir cache` inside one command must not be
+    /// refused because the anchor still counts the name it just removed.
+    pub fn credit_entry_removed(&self) {
+        self.entries_removed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Record bytes the sandbox just freed (`unlink`, `rmdir`, a shrinking
     /// truncate).
+    ///
+    /// The counters are also what the worker dates its walk with (N25): it
+    /// reads them *before* the walk and sends them back with the budget, so
+    /// the mediator can subtract everything that happened since -- see
+    /// `note_budget_sampled`.
+    pub fn counters(&self) -> (u64, u64) {
+        (
+            self.spent.load(std::sync::atomic::Ordering::Relaxed),
+            self.freed.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     ///
     /// They go straight back into what is left, so the very next `open` in the
     /// same command is judged against the space its own `rm` just returned.
@@ -320,8 +431,32 @@ impl WriteFds {
 
     /// Record the budget the worker just sent, with the spend it arrived at.
     pub fn note_budget(&self, bytes: u64) {
-        let spent_at = self.spent.load(std::sync::atomic::Ordering::Relaxed);
-        let freed_at = self.freed.load(std::sync::atomic::Ordering::Relaxed);
+        self.note_budget_sampled(bytes, None, None);
+    }
+
+    /// The same, with the counters the *sample* was taken at (N25).
+    ///
+    /// The worker's number comes from its own walk, and that walk is a
+    /// maintained ledger: it can be older than the moment its message arrives.
+    /// Anchoring at arrival -- which is what `note_budget` did -- only ever
+    /// subtracts growth that happens *after* delivery, so whatever the walk
+    /// missed before that is handed out as if it were free. Measured on the
+    /// cluster: 700 MiB used, a 324 MiB file, then a second file with no pause
+    /// between the commands, and the second file wrote **48 MiB past the
+    /// budget** (`probe_exec_limit.py` step 1b).
+    ///
+    /// So the sample dates itself: the worker asks for `(spent, freed)` before
+    /// it walks, and the anchor is those values. Everything this side watched
+    /// grow since -- including the part the walk was too early to see -- is
+    /// then subtracted, which is the conservative direction (a sandbox can be
+    /// handed slightly less than the truth, never more).
+    pub fn note_budget_sampled(&self, bytes: u64, spent_at: Option<u64>, freed_at: Option<u64>) {
+        // A stamp from the future is not a thing this side can act on: clamp to
+        // what the counters say now, which is exactly the old behaviour.
+        let spent_now = self.spent.load(std::sync::atomic::Ordering::Relaxed);
+        let freed_now = self.freed.load(std::sync::atomic::Ordering::Relaxed);
+        let spent_at = spent_at.unwrap_or(spent_now).min(spent_now);
+        let freed_at = freed_at.unwrap_or(freed_now).min(freed_now);
         *self
             .budget
             .lock()
@@ -335,6 +470,10 @@ impl WriteFds {
 
     /// What is left of the last budget, counting everything the watch has seen
     /// the sandbox append since that budget was computed.
+    ///
+    /// `budget.bytes` is the worker's walk, and `spent_at`/`freed_at` are the
+    /// counters at the instant that walk was *taken* when the worker dated its
+    /// sample (`note_budget_sampled`) -- otherwise at the instant it arrived.
     ///
     /// `None` when the worker has not sent a budget yet: an `open` then has no
     /// number to hand out and leaves the ceiling alone.
@@ -724,6 +863,40 @@ mod tests {
         watch.register(11, 9, Path::new("/tree/b.bin"), 0, None, 0);
         watch.observe(11, 9, 424 * 1024);
         assert_eq!(watch.remaining(), Some(0));
+    }
+
+    #[test]
+    fn the_entry_budget_counts_the_names_the_mediator_watched() {
+        // N31: the byte pool cannot see a tree that grows by names -- an empty
+        // file costs zero bytes (measured: 2000 of them left the platform's
+        // number at 0). This is the counter that can.
+        let watch = WriteFds::new();
+        // "Not told yet" is not "no entries left", and neither is the knob
+        // switched off.
+        assert_eq!(watch.entries_now(), None);
+        assert!(!watch.entries_exhausted());
+        watch.note_entry_budget(100, 0);
+        assert!(!watch.entries_exhausted());
+
+        watch.note_entry_budget(100, 110);
+        assert_eq!(watch.entries_now(), Some((100, 110)));
+        for _ in 0..10 {
+            watch.credit_entry_created();
+        }
+        assert_eq!(watch.entries_now(), Some((110, 110)));
+        assert!(watch.entries_exhausted());
+
+        // A deletion inside the same command makes room again, exactly the way
+        // a freed byte does for the size budget: `rm -rf cache && mkdir cache`
+        // must not be refused because the anchor still counts the old name.
+        watch.credit_entry_removed();
+        assert_eq!(watch.entries_now(), Some((109, 110)));
+        assert!(!watch.entries_exhausted());
+
+        // The next walk re-anchors, and whatever happened before it is gone.
+        watch.note_entry_budget(50, 110);
+        assert_eq!(watch.entries_now(), Some((50, 110)));
+        assert!(!watch.entries_exhausted());
     }
 
     #[test]

@@ -557,7 +557,13 @@ impl Generation {
         // has to be able to write again. The `RLIMIT_FSIZE` sweep below stays
         // one-way on purpose -- a limit that a stale reading could widen is
         // not a limit.
-        instance.note_file_size_budget(bytes);
+        // N25: the worker dates its walk -- it read `read_write_counters`
+        // before walking -- so the anchor is when the number was *taken*, not
+        // when it arrived. Without the stamps (an older worker) this falls
+        // back to arrival, which is what this verb used to do.
+        let spent_at = args.get("spent").and_then(|v| v.as_u64());
+        let freed_at = args.get("freed").and_then(|v| v.as_u64());
+        instance.note_file_size_budget_sampled(bytes, spent_at, freed_at);
         if let Some(applied) = self.applied_file_size_limit {
             if bytes >= applied {
                 return Ok(serde_json::json!({
@@ -584,8 +590,69 @@ impl Generation {
         }))
     }
 
+    /// Serve an `update_entry_limit` verb (N25/N31): tell the mediator how
+    /// many entries the tree holds and how many it may hold.
+    ///
+    /// The counterpart of `read_write_counters`: the worker takes the counters
+    /// before it walks the tree, and hands them back with the budget, so the
+    /// number it sends stays honest about *when* it was true.
+    ///
+    /// The byte ceiling is a *file size* and the byte pool is a *sum of
+    /// sizes*; neither can see a tree that grows by names, because an empty
+    /// file or an empty directory costs zero bytes (measured: creating 2000
+    /// empty files left the platform's number at 0). This is the missing
+    /// axis: the worker walks the tree and sends what it counted, the
+    /// mediator adds every name it watches appear (and subtracts every one it
+    /// watches disappear), and the four syscalls that create a name refuse
+    /// with `ENOSPC` once the count reaches the cap.
+    ///
+    /// `limit == 0` turns the gate off, which is the default: the knob is a
+    /// runaway backstop, not a policy the platform invents for itself.
+    fn handle_update_entry_limit(
+        &mut self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, Refusal> {
+        let entries = args
+            .get("entries")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                Refusal::refused("update_entry_limit requires an `entries` integer")
+            })?;
+        let limit = args.get("limit").and_then(|v| v.as_u64()).ok_or_else(|| {
+            Refusal::refused("update_entry_limit requires a `limit` integer (0 turns it off)")
+        })?;
+        let instance = self.instance.as_ref().ok_or_else(|| {
+            Refusal::refused(
+                "generation has no instance: update_entry_limit requires a launched session",
+            )
+        })?;
+        let (used, applied_limit) = instance
+            .note_entry_budget(entries, limit)
+            .unwrap_or((entries, limit));
+        Ok(serde_json::json!({
+            "entries": used,
+            "limit": applied_limit,
+            "exhausted": applied_limit > 0 && used >= applied_limit,
+        }))
+    }
+
     /// Serve a `kill_child` verb: deliver `signum` to the named child through
     /// its registered pid/pidfd (never an arbitrary-pid verb).
+    fn handle_read_write_counters(&mut self) -> Result<serde_json::Value, Refusal> {
+        // N25: the two numbers that let a walk date itself. The worker reads
+        // them *before* it measures the tree and sends them back with the
+        // budget, so the mediator subtracts everything it watched grow since
+        // the measurement -- including the bytes the measurement was too
+        // early to see. Without them the anchor is the moment of delivery,
+        // which is how a second file came to write 48 MiB past the budget.
+        let (spent, freed) = self
+            .instance
+            .as_ref()
+            .and_then(|instance| instance.write_counters())
+            .unwrap_or((0, 0));
+        Ok(serde_json::json!({ "spent": spent, "freed": freed }))
+    }
+
     fn handle_kill_child(
         &mut self,
         args: &serde_json::Value,
@@ -796,6 +863,22 @@ impl ControlHandler for Generation {
             }
             "update_file_size_limit" => {
                 let resp = match self.handle_update_file_size_limit(&req.args) {
+                    Ok(data) => ok_response(data),
+                    Err(e) => err_response(&e),
+                };
+                let _ = write_response_frame(stream, &resp);
+                ServeOutcome::Continue
+            }
+            "update_entry_limit" => {
+                let resp = match self.handle_update_entry_limit(&req.args) {
+                    Ok(data) => ok_response(data),
+                    Err(e) => err_response(&e),
+                };
+                let _ = write_response_frame(stream, &resp);
+                ServeOutcome::Continue
+            }
+            "read_write_counters" => {
+                let resp = match self.handle_read_write_counters() {
                     Ok(data) => ok_response(data),
                     Err(e) => err_response(&e),
                 };
