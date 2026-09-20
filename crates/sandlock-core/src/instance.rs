@@ -1496,7 +1496,15 @@ impl SandboxInstance {
             let watched = self
                 .supervisor_write_fds
                 .as_ref()
-                .map(|watch| watch.max_grown_for_pid(*pid))
+                .map(|watch| {
+                    // The worker's "remaining" comes from a number measured
+                    // *now*; the watch's last sample of this file can be an
+                    // interval older, and the difference is exactly what a
+                    // file is short-changed by. Re-read the descriptors the
+                    // mediator holds before answering.
+                    watch.refresh_held(*pid);
+                    watch.max_grown_for_pid(*pid)
+                })
                 .unwrap_or(0);
             grown.insert(*pid, watched);
         }

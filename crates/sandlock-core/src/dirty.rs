@@ -178,6 +178,16 @@ struct Budget {
     spent_at: u64,
 }
 
+/// The offset of a descriptor the mediator holds, from `/proc/self/fdinfo`.
+fn held_offset(held: &std::os::fd::OwnedFd) -> Option<u64> {
+    use std::os::fd::AsRawFd;
+    let fd = held.as_raw_fd();
+    let text = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("pos:"))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
 /// One watched descriptor: what it names and where it started.
 #[derive(Debug, Clone)]
 pub struct WriteFd {
@@ -324,6 +334,37 @@ impl WriteFds {
     /// How much `pid`'s watched descriptors have grown since they were opened.
     pub fn max_grown_for_pid(&self, pid: i32) -> u64 {
         self.max_grown_for_pids(&[pid])
+    }
+
+    /// Read every held descriptor of `pid` *now*, before answering a
+    /// tightening.
+    ///
+    /// The watch samples on its own interval, and a tightening reasons about
+    /// the same instant the worker's number came from: measured on the cluster,
+    /// a file at 113 MiB was handed `bytes + grown` with `grown` still at the
+    /// watch's previous sample (54 MiB), so the cap came out 59 MiB short and a
+    /// legal file stopped at 263 MiB with 324 MiB of budget left
+    /// (`probe_exec_limit.py`, step 1). The held descriptor is always
+    /// readable, so the size at *this* instant is one small read away.
+    ///
+    /// Returns the largest growth seen, for callers that only want the number.
+    pub fn refresh_held(&self, pid: i32) -> u64 {
+        let held: Vec<(i32, i32, Arc<std::os::fd::OwnedFd>)> = self
+            .lock()
+            .iter()
+            .filter(|((entry_pid, _fd), _entry)| *entry_pid == pid)
+            .filter_map(|((entry_pid, fd), entry)| {
+                entry.held.clone().map(|held| (*entry_pid, *fd, held))
+            })
+            .collect();
+        let mut best = 0;
+        for (entry_pid, fd, held) in held {
+            if let Some(offset) = held_offset(&held) {
+                self.observe(entry_pid, fd, offset);
+                best = best.max(offset);
+            }
+        }
+        best
     }
 
     /// The same, for a whole process group (N25).
@@ -513,6 +554,32 @@ mod tests {
         let watch = WriteFds::new();
         watch.observe(11, 5, 1234);
         assert_eq!(watch.max_grown_for_pid(11), 0);
+    }
+
+    #[test]
+    fn refresh_held_reads_the_descriptor_now() {
+        // The watch samples on its own interval, and a tightening reasons
+        // about the instant the worker's number came from: measured on the
+        // cluster, a file at 113 MiB was handed `bytes + grown` with `grown`
+        // still at the previous sample (54 MiB), which stopped a legal file
+        // 59 MiB early. The held descriptor makes the size at *this* instant
+        // one small read away.
+        use std::io::Write;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-tmp");
+        std::fs::create_dir_all(&dir).expect("create test tmp");
+        let path = dir.join(format!("refresh-held-{}.bin", std::process::id()));
+        let mut file = std::fs::File::create(&path).expect("create file");
+        file.write_all(&[0u8; 4096]).expect("write");
+        let held = std::sync::Arc::new(std::os::fd::OwnedFd::from(file));
+
+        let watch = WriteFds::new();
+        watch.register(11, 5, &path, 0, Some(held), 1024);
+        // Nothing has sampled this descriptor yet.
+        assert_eq!(watch.max_grown_for_pid(11), 0);
+        // A tightening asks for the size now.
+        assert_eq!(watch.refresh_held(11), 4096);
+        assert_eq!(watch.max_grown_for_pid(11), 4096);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
