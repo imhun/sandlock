@@ -1004,9 +1004,10 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     // a misleading EMFILE. Before the `entry` match so the in-process
     // entrypoint is capped too.
     if let Some(n) = sandbox.max_open_files {
-        // Lower both the soft and the hard limit. setrlimit/prlimit64 are not
-        // blocked by the seccomp filter, so a soft-only cap would be advisory:
-        // the sandboxed process could raise it straight back to the hard limit.
+        // Lower both the soft and the hard limit. Nothing here mediates
+        // setrlimit/prlimit64 (N25 gates only RLIMIT_FSIZE, and only in the
+        // chroot shape), so a soft-only cap would be advisory: the sandboxed
+        // process could raise it straight back to the hard limit.
         // Raising a hard limit needs CAP_SYS_RESOURCE, so an *unprivileged*
         // sandlock makes this one-way. It is not one-way when sandlock itself
         // runs privileged: nothing here drops CAP_SYS_RESOURCE, so a root child
@@ -1026,11 +1027,15 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
 
     // 13d. Optional: cap the size of any single file (RLIMIT_FSIZE).
     //
-    // Same reasoning as 13c about soft vs hard: a soft-only cap is advisory,
-    // because setrlimit/prlimit64 are not in the seccomp filter and the guest
-    // could raise it back (soft caps are always raisable; only the hard cap
-    // needs CAP_SYS_RESOURCE). Unlike 13c this is deliberately *not* sold as
-    // confinement either: a privileged child can raise the hard cap too.
+        // Same reasoning as 13c about soft vs hard: a soft-only cap is advisory
+        // by the kernel's own rule (soft caps are always raisable; only the hard
+        // cap needs CAP_SYS_RESOURCE). In the chroot shape N25 adds a seccomp
+        // gate that refuses a guest *raising* either value, which is what makes
+        // the platform's moving soft limit authoritative there -- and that gate
+        // is why the live tightening no longer has to move the hard limit, which
+        // is one-way (measured: an unprivileged parent lowers a child's hard
+        // limit and cannot raise it back, EPERM). Without the gate this is still
+        // *not* confinement: a privileged child can raise the hard cap too.
     //
     // SIGXFSZ is set to SIG_IGN first, and that ordering is the whole UX: the
     // kernel's default action for "a write past the limit" is to terminate
