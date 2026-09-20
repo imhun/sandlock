@@ -521,10 +521,9 @@ impl Generation {
         let bytes = args
             .get("bytes")
             .and_then(|v| v.as_u64())
-            .filter(|b| *b > 0)
             .ok_or_else(|| {
                 Refusal::refused(
-                    "update_file_size_limit requires a positive `bytes` integer",
+                    "update_file_size_limit requires a `bytes` integer",
                 )
             })?;
         // A generation without a file-size ceiling is refused rather than

@@ -1514,6 +1514,111 @@ fn dump_child_stderr(child: &mut std::process::Child) {
 }
 
 #[test]
+fn test_over_budget_blocks_writes_but_not_deletes() {
+    // The product semantic for a sandbox that has used its disk: it may not
+    // write any more, and everything else keeps working -- reads, exec, and
+    // above all the deletes that bring it back inside. Freezing it (which is
+    // what the platform used to do on the same measurement) took all of that
+    // away.
+    //
+    // Everything here is observed from the *host* side: a workload inside this
+    // shape has its stdio on /dev/null (an exec-capable session delivers output
+    // per child), and a marker file would be exactly what the zero ceiling
+    // forbids.
+    isolate_ctl_root();
+    let workdir = std::path::PathBuf::from(format!(
+        "/tmp/sandlock-overbudget-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&workdir).expect("create over-budget workdir");
+    let filled = workdir.join("filled.bin");
+    let refused = workdir.join("refused.bin");
+    let refused_dir = workdir.join("refused-dir");
+    let policy = write_policy(
+        "over-budget-limit",
+        &instance_policy_chrooted_pid_ns_with_file_size("/tmp", "512M"),
+    );
+    let script = format!(
+        "exec 3>>{filled}; i=0; while [ $i -lt 40 ]; do \
+         dd if=/dev/zero bs=1M count=1 status=none >&3 || break; i=$((i+1)); sleep 0.05; done; \
+         sleep 6; \
+         dd if=/dev/zero of={refused} bs=1M count=1 status=none 2>/dev/null; \
+         mkdir {refused_dir} 2>/dev/null; \
+         rm -f {filled}; \
+         exec sleep 30",
+        filled = filled.display(),
+        refused = refused.display(),
+        refused_dir = refused_dir.display()
+    );
+    let program = write_policy(
+        "over-budget-program",
+        &serde_json::json!({ "argv": ["/bin/sh", "-c", script] }).to_string(),
+    );
+    let (mut child, mut worker, _events) =
+        spawn_serve_supervisor_with_events(&policy, &program, &[]);
+
+    let size = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    wait_until(deadline, "the writer to reach 4 MiB", || {
+        size(&filled) >= 4 * 1024 * 1024
+    });
+
+    // "The budget is gone": the number the worker sends on the round that sees
+    // the tree at or past its budget.
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({
+            "v": 1,
+            "verb": "update_file_size_limit",
+            "args": { "bytes": 0 },
+        }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "tighten: {resp:?}");
+    assert_eq!(resp["data"]["applied_bytes"], 0, "zero is a value: {resp:?}");
+
+    // A write in flight when the ceiling lands may finish its block; after
+    // that, nothing moves. Two readings a second apart have to agree exactly.
+    std::thread::sleep(Duration::from_millis(800));
+    let settled = size(&filled);
+    std::thread::sleep(Duration::from_millis(1200));
+    assert_eq!(
+        size(&filled),
+        settled,
+        "a write past the budget must fail: the file stopped at {settled} bytes"
+    );
+
+    // The workload's own next steps, from the host's side: a refused entry
+    // never appears, and the delete really happens -- which is only possible if
+    // the sandbox is still running.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    wait_until(deadline, "the workload's delete to land", || {
+        !filled.exists()
+    });
+    assert!(!refused.exists(), "a new file past the budget must be refused");
+    assert!(
+        !refused_dir.exists(),
+        "a new directory past the budget must be refused"
+    );
+
+    // Still alive and serving: over budget is not a freeze.
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "dirty_dirs", "args": {} }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "still serving: {resp:?}");
+
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "shutdown", "args": {} }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "shutdown: {resp:?}");
+    let _ = child.wait_with_output();
+    let _ = std::fs::remove_file(&policy);
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+#[test]
 fn test_a_tightening_does_not_cut_off_the_file_that_caused_it() {
     // The number the worker sends is "what is left of the *tree* budget", and
     // the bytes a file has already written are part of the usage that number
@@ -1651,12 +1756,11 @@ fn test_the_remaining_budget_is_handed_out_once_per_open() {
     assert!(at_tighten >= 8 * 1024 * 1024, "sanity: first is {at_tighten}");
 
     // The second file's `open` happens well after the first file spent the
-    // whole remaining budget, so it is granted the floor and stops there.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while Instant::now() < deadline {
-        if size(&second) > 0 && size(&first) > at_tighten {
-            break;
-        }
+    // whole remaining budget, so its grant is `baseline + 0`: the file is
+    // created (there is no entry-refusal here -- the *budget* is not zero, the
+    // pool simply has nothing left) and every write to it fails.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && size(&first) <= at_tighten {
         std::thread::sleep(Duration::from_millis(250));
     }
     std::thread::sleep(Duration::from_millis(1500));
@@ -1664,8 +1768,8 @@ fn test_the_remaining_budget_is_handed_out_once_per_open() {
 
     assert_eq!(
         size(&second),
-        1024 * 1024,
-        "a second file opened after the pool is spent is capped at the floor"
+        0,
+        "a second file opened after the pool is spent may not grow at all"
     );
     assert!(
         size(&first) > at_tighten,

@@ -734,6 +734,22 @@ pub(crate) async fn handle_chroot_open(
         return NotifAction::Errno(libc::EACCES);
     }
 
+    // N25: over its budget, the sandbox may not *grow* -- and creating a new
+    // entry grows the tree without writing a byte, which is the one shape a
+    // per-file ceiling cannot express (the new file is empty and legal). The
+    // refusal is `ENOSPC`, what the storage would say. Everything else keeps
+    // working, deletes above all: that is the product semantic (writes stop,
+    // the sandbox does not), and it is why this is a refusal rather than a
+    // freeze. Opening a file that already exists is allowed; writes through it
+    // fail at the ceiling instead.
+    if is_write
+        && (flags as i32 & (libc::O_CREAT | libc::O_TMPFILE)) != 0
+        && ctx.write_fds.is_exhausted()
+        && !host_path.exists()
+    {
+        return NotifAction::Errno(libc::ENOSPC);
+    }
+
     // N25/L2c: an open that can change the file's bytes or existence is what
     // makes its directory worth re-walking. The flag set is wider than the
     // access check above: `O_CREAT`/`O_TRUNC`/`O_APPEND` change a file even
@@ -940,10 +956,11 @@ fn grant_file_size_cap(
         // No budget yet (no round has run): leave the ceiling alone.
         return baseline;
     };
-    let floor = 1024 * 1024;
-    let grant = baseline
-        .saturating_add(remaining)
-        .max(floor);
+    // `baseline + remaining`, with no floor: a floor here is exactly the "one
+    // more MiB" that puts a sandbox past its budget, and the product semantic
+    // is that over the limit nothing grows (deleting still works, which is
+    // what a ceiling cannot take away).
+    let grant = baseline.saturating_add(remaining);
     let wanted = grant.max(watch.max_cap_for_pid(host_pid));
     apply_file_size_cap(host_pid, wanted, path);
     wanted
@@ -1510,6 +1527,12 @@ pub(crate) async fn handle_chroot_write(
             Err(a) => return a,
         };
         if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
+        // Over budget: a directory is tree growth without a write, and the
+        // ceiling cannot reach it. The sandbox keeps running (and keeps being
+        // able to delete), which is the point of refusing instead of freezing.
+        if ctx.write_fds.is_exhausted() {
+            return NotifAction::Errno(libc::ENOSPC);
+        }
         ctx.mark_dirty(&host_path);
         let mode = notif.data.args[2] as u32;
 
@@ -1603,6 +1626,11 @@ pub(crate) async fn handle_chroot_write(
             None => return NotifAction::Errno(libc::EACCES),
         };
         if !ctx.can_write(&link_vp) { return NotifAction::Errno(libc::EACCES); }
+        // Over budget: a new name is tree growth, which no per-file ceiling
+        // can express (see `WriteFds::is_exhausted`).
+        if ctx.write_fds.is_exhausted() {
+            return NotifAction::Errno(libc::ENOSPC);
+        }
         ctx.mark_dirty(&host_link);
 
         {
@@ -1686,6 +1714,11 @@ pub(crate) async fn handle_chroot_write(
         // Landlock enforces this already: linking needs REFER on both sides.
         if !ctx.can_write(&old_vp) || !ctx.can_write(&new_vp) {
             return NotifAction::Errno(libc::EACCES);
+        }
+        // Over budget: a second name is tree growth (see
+        // `WriteFds::is_exhausted`).
+        if ctx.write_fds.is_exhausted() {
+            return NotifAction::Errno(libc::ENOSPC);
         }
         // N25/L2c: the new name is a new directory entry.
         ctx.mark_dirty(&new_host);

@@ -321,6 +321,23 @@ impl WriteFds {
         )
     }
 
+    /// Whether the sandbox has spent its whole budget: nothing may grow.
+    ///
+    /// The product semantic is "over the limit means you cannot write, but
+    /// everything else still works" -- a freeze takes the whole sandbox away
+    /// from its owner, including the deletes that would bring it back inside.
+    /// So the enforcement is a *zero ceiling* plus, for the operations a
+    /// ceiling cannot reach, a refusal at the mediator: `RLIMIT_FSIZE = 0`
+    /// stops every write to a regular file, and creating *new* tree entries
+    /// (`O_CREAT`, `mkdir`, `symlink`, `link`) is refused with `ENOSPC`,
+    /// because those grow the tree without writing a byte.
+    ///
+    /// `false` until the worker has sent a budget: "no number yet" is not
+    /// "no space".
+    pub fn is_exhausted(&self) -> bool {
+        self.remaining() == Some(0)
+    }
+
     /// The largest file-size grant any of `pid`'s live descriptors holds.
     pub fn max_cap_for_pid(&self, pid: i32) -> u64 {
         self.lock()

@@ -125,15 +125,15 @@ impl ExecCeiling {
     /// Single choke point for the in-process and on-behalf exec routes.
     pub(crate) fn validate(&self, params: &ExecParams) -> Result<(), SandlockError> {
         if let Some(requested) = params.max_file_size {
-            // A *tightening* is always in scope; a zero or above-ceiling
-            // request is not. Zero is refused rather than treated as "unset"
-            // because it would refuse every write the child makes, including
-            // the ones it needs to start.
-            let fits = requested > 0
-                && self
-                    .max_file_size
-                    .map(|ceiling| requested <= ceiling)
-                    .unwrap_or(true);
+            // A *tightening* is always in scope; an above-ceiling request is
+            // not. Zero is a tightening like any other, and it is the one the
+            // product asks for: a sandbox over its disk budget may not write,
+            // and everything else (reads, deletes, exec) keeps working, so the
+            // owner can get back inside. It is not a freeze.
+            let fits = self
+                .max_file_size
+                .map(|ceiling| requested <= ceiling)
+                .unwrap_or(true);
             if !fits {
                 return Err(Self::too_wide("max_file_size", requested.to_string()));
             }
