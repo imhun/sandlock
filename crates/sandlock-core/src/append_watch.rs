@@ -235,17 +235,30 @@ impl AppendWatch {
 
         for (key, entry) in entries {
             // The recorded number first (exact, one file to read). When it is
-            // gone, the sandbox moved that descriptor somewhere the mediator
-            // cannot know -- `exec 9>>` dups it onto 9 and closes the original
-            // -- so ask the mediator's own copy of the same file, which no
-            // sandbox can move, and only then fall back to a path scan.
-            let offset = match reader.read_offset(key.0, key.1) {
-                Some(pos) => Some(pos),
-                None => match entry.held.as_ref() {
-                    Some(held) => reader
-                        .read_offset_held(held)
-                        .or_else(|| reader.read_offset_by_path(key.0, &entry.path)),
-                    None => reader.read_offset_by_path(key.0, &entry.path),
+            // gone, the sandbox may have *moved* the descriptor since -- the
+            // measured shape is `exec 9>>`, which dups the injected descriptor
+            // onto 9 and closes the original -- so ask the process itself which
+            // of its descriptors still names this file.
+            //
+            // That question decides more than an offset: no descriptor left
+            // means the writer is finished with the file, and the mediator has
+            // to *let go* of its own copy. On this deployment the workspace is
+            // NFS, where an unlinked file that anyone still holds open is kept
+            // as `.nfsXXXX`: measured on the cluster, a deleted 900 MiB file
+            // kept every byte of its space because the mediator held the last
+            // reference, so the accounting never came down and the sandbox
+            // could never write again after making room.
+            let (offset, keep_watching) = match reader.read_offset(key.0, key.1) {
+                Some(pos) => (Some(pos), true),
+                None => match reader.read_offset_by_path(key.0, &entry.path) {
+                    Some(pos) => (Some(pos), true),
+                    None => (
+                        entry
+                            .held
+                            .as_ref()
+                            .and_then(|held| reader.read_offset_held(held)),
+                        false,
+                    ),
                 },
             };
             let Some(offset) = offset else {
@@ -253,6 +266,12 @@ impl AppendWatch {
                 result.dropped += 1;
                 continue;
             };
+            if !keep_watching {
+                // Count the last value the held copy can still see, then drop
+                // the entry (which is what releases the descriptor).
+                watch.forget(key.0, key.1);
+                result.dropped += 1;
+            }
             // Publish where this descriptor is, so a tightening can add back
             // what this file has already written (see `WriteFd::observed`).
             watch.observe(key.0, key.1, offset);
@@ -370,34 +389,37 @@ mod tests {
     }
 
     #[test]
-    fn a_descriptor_the_sandbox_moved_is_followed_by_path() {
-        // Measured on the cluster: `exec 9>>file` dups the injected descriptor
-        // onto 9 and closes the original, so the recorded `(pid, fd)` names a
-        // closed descriptor and the entry was dropped on the first tick --
-        // every push from a plain `> file` command was lost that way. The path
-        // is what survives the move, so the same entry keeps counting.
-        let watch = watch_with(&[(7, 3, "/tree/blob.bin", 0)]);
+    fn a_descriptor_the_sandbox_moved_is_followed_through_the_process() {
+        // The cheap answer to the same question: the kernel dups the
+        // listener's descriptor into the sandbox, so a redirection (`exec
+        // 9>>`) leaves the *file* open under another number. The mediator asks
+        // the process which descriptor still names it -- measured on the
+        // cluster, that is exactly what kept `watching` at 1 while the recorded
+        // number (`/proc/<pid>/fdinfo/5`) was already gone.
+        let holder = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let held = std::sync::Arc::new(std::os::fd::OwnedFd::from(holder));
+        let watch = WriteFds::new();
+        watch.register(7, 3, std::path::Path::new("/tree/blob.bin"), 0, Some(held), 1024);
         let fake = Fake::default();
         fake.set(7, 3, None);
-        fake.set_path(7, "/tree/blob.bin", 5 * 1024 * 1024);
+        fake.set_path(7, "/tree/blob.bin", 7 * 1024 * 1024);
+
         let mut watcher = AppendWatch::new();
-
-        let first = watcher.tick(&watch, &fake);
-        assert_eq!(first.bytes, 5 * 1024 * 1024);
-        assert_eq!(first.watching, 1);
-        assert_eq!(first.dropped, 0);
-
-        fake.set_path(7, "/tree/blob.bin", 5 * 1024 * 1024 + 4096);
-        assert_eq!(watcher.tick(&watch, &fake).bytes, 4096);
+        let sample = watcher.tick(&watch, &fake);
+        assert_eq!(sample.bytes, 7 * 1024 * 1024);
+        assert_eq!(sample.watching, 1);
+        assert_eq!(sample.dropped, 0);
     }
 
     #[test]
-    fn the_mediators_own_copy_is_read_when_the_sandbox_moved_its_descriptor() {
-        // The cheap answer to the same question the path scan answers: the
-        // kernel dups the listener's descriptor into the sandbox, so the
-        // mediator holds a reference to the *same* open file description and
-        // can read the offset from `/proc/self/fdinfo` -- no pid translation,
-        // no path scan, and nothing the sandbox can move.
+    fn a_file_the_sandbox_no_longer_holds_is_counted_then_released() {
+        // Measured on the cluster: a deleted 900 MiB file kept every byte of
+        // its space, because the mediator's own copy was the last descriptor
+        // holding it and NFS keeps an unlinked file open as `.nfsXXXX`. The
+        // accounting therefore never came down and the sandbox could never
+        // write again after making room for itself. When no descriptor in the
+        // sandbox names the file any more, the mediator counts what it can
+        // still see and lets go.
         let holder = std::fs::File::open("/dev/null").expect("open /dev/null");
         let held = std::sync::Arc::new(std::os::fd::OwnedFd::from(holder));
         let held_fd = {
@@ -407,15 +429,15 @@ mod tests {
         let watch = WriteFds::new();
         watch.register(7, 3, std::path::Path::new("/tree/blob.bin"), 0, Some(held), 1024);
         let fake = Fake::default();
-        fake.set(7, 3, None);
-        // A path scan would find nothing; only the held copy knows.
-        fake.set_held(held_fd, 7 * 1024 * 1024);
+        fake.set(7, 3, None); // the recorded descriptor is gone
+        fake.set_held(held_fd, 7 * 1024 * 1024); // ...and the sandbox has none
 
         let mut watcher = AppendWatch::new();
         let sample = watcher.tick(&watch, &fake);
-        assert_eq!(sample.bytes, 7 * 1024 * 1024);
-        assert_eq!(sample.watching, 1);
-        assert_eq!(sample.dropped, 0);
+        assert_eq!(sample.bytes, 7 * 1024 * 1024, "the last bytes still count");
+        assert_eq!(sample.watching, 0);
+        assert_eq!(sample.dropped, 1);
+        assert!(watch.is_empty(), "the mediator let go of the file");
     }
 
     #[test]
