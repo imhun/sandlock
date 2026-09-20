@@ -545,6 +545,19 @@ impl Generation {
                  {ceiling}: a per-exec change may only tighten"
             )));
         }
+        let instance = self.instance.as_ref().ok_or_else(|| {
+            Refusal::refused(
+                "generation has no instance: update_file_size_limit requires a \
+                 launched session",
+            )
+        })?;
+        // The *budget* moves in both directions: it is what the mediator's
+        // `open` grant and its "may the tree grow?" refusals are computed
+        // from, and after a sandbox deletes its way back inside, a new command
+        // has to be able to write again. The `RLIMIT_FSIZE` sweep below stays
+        // one-way on purpose -- a limit that a stale reading could widen is
+        // not a limit.
+        instance.note_file_size_budget(bytes);
         if let Some(applied) = self.applied_file_size_limit {
             if bytes >= applied {
                 return Ok(serde_json::json!({
@@ -557,12 +570,6 @@ impl Generation {
                 }));
             }
         }
-        let instance = self.instance.as_ref().ok_or_else(|| {
-            Refusal::refused(
-                "generation has no instance: update_file_size_limit requires a \
-                 launched session",
-            )
-        })?;
         let report = instance
             .set_file_size_limit(bytes)
             .map_err(|e| Refusal::from_core("instance set_file_size_limit failed", &e))?;

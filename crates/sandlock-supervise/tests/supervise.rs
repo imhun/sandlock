@@ -1607,6 +1607,44 @@ fn test_over_budget_blocks_writes_but_not_deletes() {
     );
     assert_eq!(resp["ok"], serde_json::Value::Bool(true), "still serving: {resp:?}");
 
+    // And with room again, the pool opens: the *budget* this verb carries moves
+    // in both directions, so a deletion reaches the mediator's "may the tree
+    // grow?" refusals. (The workload's own processes keep the ceiling they were
+    // given -- the sweep stays one-way -- so the file appears empty; a *new*
+    // command is what gets a fresh per-exec ceiling.)
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({
+            "v": 1,
+            "verb": "update_file_size_limit",
+            "args": { "bytes": 64 * 1024 * 1024 },
+        }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "refresh: {resp:?}");
+    assert_eq!(resp["data"]["noop"], serde_json::Value::Bool(true), "one-way sweep: {resp:?}");
+    let after_delete = workdir.join("after-delete.bin");
+    let script = format!(
+        "echo hi > {path}; exec sleep 5",
+        path = after_delete.display()
+    );
+    let program = write_policy(
+        "over-budget-after",
+        &serde_json::json!({ "argv": ["/bin/sh", "-c", script] }).to_string(),
+    );
+    let (mut child2, mut worker2, _events2) =
+        spawn_serve_supervisor_with_events(&policy, &program, &[]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    wait_until(deadline, "the post-delete command to run", || {
+        after_delete.exists()
+    });
+    let _ = roundtrip_frame(
+        &mut worker2,
+        &serde_json::json!({ "v": 1, "verb": "shutdown", "args": {} }),
+    );
+    let _ = child2.wait_with_output();
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_file(&after_delete);
+
     let resp = roundtrip_frame(
         &mut worker,
         &serde_json::json!({ "v": 1, "verb": "shutdown", "args": {} }),

@@ -1350,6 +1350,20 @@ impl SandboxInstance {
         Ok(())
     }
 
+    /// N25: hand the worker's latest budget to the write-descriptor ledger.
+    ///
+    /// The number is *fresh* every round -- it is what the mediator's `open`
+    /// grant and its "may the tree grow?" refusals are computed from -- and it
+    /// has to move in **both** directions: after a sandbox deletes its way back
+    /// inside its budget, a new command must be able to write again, and that
+    /// decision happens in the mediator, not in the (deliberately one-way)
+    /// `RLIMIT_FSIZE` sweep below.
+    pub fn note_file_size_budget(&self, bytes: u64) {
+        if let Some(watch) = self.supervisor_write_fds.as_ref() {
+            watch.note_budget(bytes);
+        }
+    }
+
     /// N25: lower every live child's `RLIMIT_FSIZE` to at most `bytes`.
     ///
     /// A per-exec ceiling is applied at `execve` and inherited by whatever
@@ -1407,14 +1421,6 @@ impl SandboxInstance {
         // (900 + 124 + 124 = 1148 MiB at the freeze). A task with no watched
         // descriptor of its own is therefore capped at what is actually left.
         let grown = self.grown_by_target(&targets);
-        // N25/B: hand the number to the watch as the budget the *next* `open`
-        // may allocate from. The mediator adds up everything it has seen the
-        // sandbox append since this landed, so an open between two rounds sees
-        // a fresher remaining than this round did -- which is what stops a
-        // command's next file from inheriting a stale share.
-        if let Some(watch) = self.supervisor_write_fds.as_ref() {
-            watch.note_budget(bytes);
-        }
 
         let mut report = FileSizeLimitReport {
             considered: targets.len(),
