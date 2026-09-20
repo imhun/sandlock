@@ -369,9 +369,29 @@ fn spawn(
     if let Some(limit) = max_file_size {
         unsafe {
             libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            // The **soft** limit is this command's ceiling; the *hard* limit
+            // stays where the instance put it (the sandbox's own budget).
+            //
+            // Why the split: the platform has to be able to move that ceiling
+            // *back up* when the sandbox frees space -- a command that deletes
+            // and then writes has to keep working (§22.5.9) -- and raising the
+            // hard limit of a running process needs CAP_SYS_RESOURCE, which
+            // the platform does not have. Raising the *soft* limit within the
+            // hard one does not, and the guest cannot follow it up because
+            // `setrlimit`/`prlimit64` may only lower `RLIMIT_FSIZE` (see the
+            // gate in `chroot/dispatch.rs`).
+            let mut current = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            let hard = if libc::getrlimit(libc::RLIMIT_FSIZE, &mut current) == 0 {
+                current.rlim_max
+            } else {
+                limit
+            };
             let rlim = libc::rlimit {
-                rlim_cur: limit,
-                rlim_max: limit,
+                rlim_cur: limit.min(hard),
+                rlim_max: hard,
             };
             if libc::setrlimit(libc::RLIMIT_FSIZE, &rlim) != 0 {
                 // Refusing to start is the fail-closed answer: a command whose

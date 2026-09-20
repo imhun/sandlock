@@ -924,6 +924,136 @@ fn inject_watched(
     }
 }
 
+/// Let the process that just freed space use it, in the same command.
+///
+/// The platform moves these limits on its own clock (an accounting round), and
+/// a command that deletes and then writes would otherwise be refused by the
+/// ceiling *it* started with. The mediator knows the freed bytes the moment
+/// they are freed, so it hands them to the caller right here: the soft limit
+/// goes up to `what is left + what this process is already writing`, bounded
+/// by the hard limit the instance set.
+///
+/// This is a *soft* raise, which needs no privilege even for another process;
+/// the guest cannot follow it up on its own, because `setrlimit`/`prlimit64`
+/// may only lower `RLIMIT_FSIZE` (the gate below).
+fn raise_caller_file_size_limit(ctx: &ChrootCtx<'_>, pid: u32, path: &Path) {
+    let Some(remaining) = ctx.write_fds.remaining() else {
+        // No budget yet: nothing to hand out.
+        return;
+    };
+    let host_pid = match ctx.pid_ns {
+        Some(map) => map
+            .write()
+            .ok()
+            .and_then(|mut map| map.host_pid(pid))
+            .unwrap_or(pid as i32),
+        None => pid as i32,
+    };
+    let own_growth = {
+        ctx.write_fds.refresh_held(host_pid);
+        ctx.write_fds.max_grown_for_pid(host_pid)
+    };
+    let wanted = remaining.saturating_add(own_growth);
+    if wanted > 0 {
+        apply_file_size_cap(host_pid, wanted, path);
+    }
+}
+
+/// N25: `setrlimit`/`prlimit64` on `RLIMIT_FSIZE` may only *lower*.
+///
+/// The ceilings are the platform's: the budget at launch (the hard limit, which
+/// a sandbox process cannot raise), the per-exec allowance, and the worker's
+/// live tightening. The soft limit is the moving part -- the platform raises it
+/// back when the sandbox frees space, which is what makes "delete, then write"
+/// work inside one command -- and it can only stay authoritative if the guest
+/// cannot raise it back up to the hard one. That is all this gate does: any
+/// change that would *raise* the soft or the hard limit is refused with
+/// `EPERM`, exactly what the kernel answers when a hard limit is raised without
+/// privilege. Lowering stays allowed, as do all other resources.
+///
+/// The sandbox's own init path is exempt, because it is what applies each
+/// command's per-exec allowance in the fork before `execve`. It is recognisable
+/// by its executable: the supervisor binary lives outside the image the sandbox
+/// can exec, so no workload process shares it.
+pub(crate) async fn handle_file_size_limit(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    ctx: &ChrootCtx<'_>,
+) -> NotifAction {
+    const RLIMIT_FSIZE: i32 = libc::RLIMIT_FSIZE as i32;
+    let nr = notif.data.nr as i64;
+    let (target_ns_pid, resource, request_ptr) = if nr == libc::SYS_setrlimit {
+        (notif.pid, notif.data.args[0] as i32, notif.data.args[1])
+    } else if nr == libc::SYS_prlimit64 {
+        let raw = notif.data.args[0] as i32;
+        // `0` is "the calling process", like the kernel reads it.
+        (if raw == 0 { notif.pid } else { raw as u32 }, notif.data.args[1] as i32, notif.data.args[2])
+    } else {
+        return NotifAction::Continue;
+    };
+    if resource != RLIMIT_FSIZE {
+        return NotifAction::Continue;
+    }
+    // A NULL new-limit pointer is a query: nothing changes.
+    if request_ptr == 0 {
+        return NotifAction::Continue;
+    }
+    let requested = match read_child_mem(
+        notif_fd,
+        notif.id,
+        notif.pid,
+        request_ptr,
+        std::mem::size_of::<libc::rlimit>(),
+    ) {
+        Ok(bytes) if bytes.len() == std::mem::size_of::<libc::rlimit>() => {
+            let mut rlim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    &mut rlim as *mut libc::rlimit as *mut u8,
+                    bytes.len(),
+                )
+            };
+            rlim
+        }
+        _ => return NotifAction::Continue,
+    };
+    let host_pid = match ctx.pid_ns {
+        Some(map) => map
+            .write()
+            .ok()
+            .and_then(|mut map| map.host_pid(target_ns_pid))
+            .unwrap_or(target_ns_pid as i32),
+        None => target_ns_pid as i32,
+    };
+    // The init path: the same executable as this process (the supervisor),
+    // which the sandbox cannot reach inside its own image.
+    if std::fs::read_link(format!("/proc/{host_pid}/exe"))
+        .ok()
+        .zip(std::fs::read_link("/proc/self/exe").ok())
+        .map(|(target, us)| target == us)
+        .unwrap_or(false)
+    {
+        return NotifAction::Continue;
+    }
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::prlimit(host_pid, libc::RLIMIT_FSIZE, std::ptr::null(), &mut current) } != 0 {
+        // Cannot read it (the task is gone, or it is not ours to touch): let
+        // the kernel decide, which is what the guest would get anyway.
+        return NotifAction::Continue;
+    }
+    if requested.rlim_cur > current.rlim_cur || requested.rlim_max > current.rlim_max {
+        return NotifAction::Errno(libc::EPERM);
+    }
+    NotifAction::Continue
+}
+
 /// Hand this `open` its share of what is left of the budget, and return the
 /// absolute file size that grants it.
 ///
@@ -1515,10 +1645,23 @@ pub(crate) async fn handle_chroot_write(
                 }
             }
         }
-        return exec_on_host(
+        // N25: what this removal is worth, measured *before* it happens, so
+        // the space comes back to a command that deletes and then writes
+        // within the same process (`rm -rf cache && mkdir cache && …`). A
+        // directory's own entry is a few KiB at most; the files inside it are
+        // unlinked one by one and credited as they go.
+        let freed = std::fs::symlink_metadata(&host_path)
+            .map(|meta| if is_dir { 0 } else { meta.len() })
+            .unwrap_or(0);
+        let action = exec_on_host(
             |p| if is_dir { unsafe { libc::rmdir(p) } } else { unsafe { libc::unlink(p) } },
             &host_path,
         );
+        if matches!(action, NotifAction::Continue | NotifAction::ReturnValue(_)) {
+            ctx.write_fds.credit_freed(freed);
+            raise_caller_file_size_limit(ctx, notif.pid, &host_path);
+        }
+        return action;
     }
 
     if nr == libc::SYS_mkdirat {

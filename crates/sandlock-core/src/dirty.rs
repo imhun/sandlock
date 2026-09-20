@@ -169,6 +169,17 @@ pub struct WriteFds {
     /// The last budget the worker sent, with the `spent` reading it arrived
     /// at: `bytes - (spent_now - spent_then)` is what is left *now*.
     budget: Mutex<Option<Budget>>,
+    /// Bytes the mediator has watched the sandbox *free* since the generation
+    /// started (an `unlink`, an `rmdir`, a shrinking truncate).
+    ///
+    /// Deleting is how a sandbox gets back inside its budget, and on this
+    /// storage that only becomes true when the last descriptor lets go -- but
+    /// the *decision* that matters is the mediator's own: its "may the tree
+    /// grow?" refusal and the soft limit it hands out are computed from
+    /// `remaining()`, and a command that deletes and then writes has to see
+    /// the space come back *within the same command*, not on the next
+    /// accounting round (§22.5.9).
+    freed: std::sync::atomic::AtomicU64,
 }
 
 /// One `update_file_size_limit` from the worker, as a baseline.
@@ -176,6 +187,7 @@ pub struct WriteFds {
 struct Budget {
     bytes: u64,
     spent_at: u64,
+    freed_at: u64,
 }
 
 /// The offset of a descriptor the mediator holds, from `/proc/self/fdinfo`.
@@ -246,6 +258,19 @@ impl WriteFds {
             inner: Mutex::new(HashMap::new()),
             spent: std::sync::atomic::AtomicU64::new(0),
             budget: Mutex::new(None),
+            freed: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Record bytes the sandbox just freed (`unlink`, `rmdir`, a shrinking
+    /// truncate).
+    ///
+    /// They go straight back into what is left, so the very next `open` in the
+    /// same command is judged against the space its own `rm` just returned.
+    pub fn credit_freed(&self, bytes: u64) {
+        if bytes > 0 {
+            self.freed
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -296,10 +321,16 @@ impl WriteFds {
     /// Record the budget the worker just sent, with the spend it arrived at.
     pub fn note_budget(&self, bytes: u64) {
         let spent_at = self.spent.load(std::sync::atomic::Ordering::Relaxed);
+        let freed_at = self.freed.load(std::sync::atomic::Ordering::Relaxed);
         *self
             .budget
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Budget { bytes, spent_at });
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Budget {
+                bytes,
+                spent_at,
+                freed_at,
+            });
     }
 
     /// What is left of the last budget, counting everything the watch has seen
@@ -314,9 +345,11 @@ impl WriteFds {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let budget = (*guard)?;
         let spent_now = self.spent.load(std::sync::atomic::Ordering::Relaxed);
+        let freed_now = self.freed.load(std::sync::atomic::Ordering::Relaxed);
         Some(
             budget
                 .bytes
+                .saturating_add(freed_now.saturating_sub(budget.freed_at))
                 .saturating_sub(spent_now.saturating_sub(budget.spent_at)),
         )
     }

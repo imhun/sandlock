@@ -1464,9 +1464,16 @@ impl SandboxInstance {
                 Some(seen) => seen.min(current.rlim_cur),
                 None => current.rlim_cur,
             });
+            // The **soft** limit only. The hard limit is the sandbox's own
+            // budget (set at launch) and stays there, because the platform has
+            // to be able to raise the soft one back when the sandbox frees
+            // space -- and raising a *hard* limit of another process needs
+            // CAP_SYS_RESOURCE, which the slot does not have. The guest cannot
+            // raise its own soft limit either: `setrlimit`/`prlimit64` may only
+            // lower `RLIMIT_FSIZE` (the gate in `chroot/dispatch.rs`).
             let wanted = libc::rlimit {
                 rlim_cur: current.rlim_cur.min(allowance),
-                rlim_max: current.rlim_max.min(allowance),
+                rlim_max: current.rlim_max,
             };
             if wanted.rlim_cur == current.rlim_cur && wanted.rlim_max == current.rlim_max {
                 continue;

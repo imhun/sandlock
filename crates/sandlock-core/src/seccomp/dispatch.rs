@@ -1167,6 +1167,30 @@ fn register_chroot_handlers(
         crate::chroot::dispatch::handle_chroot_getcwd));
     table.register(libc::SYS_statfs as i64, chroot_handler!(policy,
         crate::chroot::dispatch::handle_chroot_statfs));
+
+    // N25: `RLIMIT_FSIZE` may only be *lowered* by a sandbox process; the
+    // ceilings belong to the platform (see `file_size_limit_syscalls` and
+    // `handle_file_size_limit`). Registered here, with the other mediated
+    // syscalls, because the gate has to see every call, not just the ones a
+    // policy mentions.
+    for &nr in &crate::seccomp_plan::file_size_limit_syscalls() {
+        let __sup = Arc::clone(ctx);
+        table.register(nr, move |cx: &HandlerCtx| {
+            let notif = cx.notif;
+            let sup = Arc::clone(&__sup);
+            let notif_fd = cx.notif_fd;
+            async move {
+                let chroot_ctx = ChrootCtx::new(
+                    &sup.policy,
+                    &sup.processes,
+                    &sup.dirty,
+                    &sup.write_fds,
+                );
+                crate::chroot::dispatch::handle_file_size_limit(&notif, notif_fd, &chroot_ctx)
+                    .await
+            }
+        });
+    }
     table.register(libc::SYS_utimensat as i64, chroot_handler!(policy,
         crate::chroot::dispatch::handle_chroot_utimensat));
 

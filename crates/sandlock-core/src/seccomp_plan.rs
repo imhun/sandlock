@@ -210,6 +210,29 @@ fn cow_path_syscalls() -> Vec<i64> {
     v
 }
 
+/// The file-size-limit syscalls, mediated so a sandbox process may only
+/// *lower* its `RLIMIT_FSIZE` (N25).
+///
+/// The ceilings this deployment runs on are `RLIMIT_FSIZE` values: the
+/// sandbox's budget at launch (the hard limit, which a sandbox process cannot
+/// raise -- measured in a sandbox, `setrlimit((1<<40, 1<<40))` answers
+/// `ValueError: not allowed to raise maximum limit`), a per-exec allowance, and
+/// the worker's live tightening. The *soft* limit, however, may always be
+/// raised back up to the hard one by the process itself, with no privilege:
+/// that is the kernel's rule and it is enough for a workload to undo a soft
+/// tightening. So the platform moved the hard limit down instead -- which is
+/// one-way, and left a sandbox that made room for itself unable to ever write
+/// again (§22.5.9).
+///
+/// The way out is to keep the hard limit where the launch put it and let only
+/// the platform move the soft one, with these two syscalls gated so the guest
+/// can only lower it. The init path is exempt: it applies each command's
+/// per-exec allowance in the fork before `execve`, and it is identifiable as
+/// the supervisor binary, which lives outside the image the sandbox can exec.
+pub(crate) fn file_size_limit_syscalls() -> Vec<i64> {
+    vec![libc::SYS_setrlimit, libc::SYS_prlimit64]
+}
+
 pub(crate) fn chroot_path_syscalls() -> Vec<i64> {
     let mut v = vec![
         libc::SYS_openat,
@@ -472,6 +495,9 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
     // Chroot path interception
     if features.chroot {
         nrs.extend(&chroot_path_syscalls());
+        // N25: the file-size ceilings are the platform's. A sandbox process may
+        // only *lower* them (see `file_size_limit_syscalls`).
+        nrs.extend(&file_size_limit_syscalls());
     }
 
     // Explicit deny-paths need path-bearing syscalls intercepted.
