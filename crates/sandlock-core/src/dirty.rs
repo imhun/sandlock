@@ -368,6 +368,12 @@ impl WriteFds {
     /// `false` until the worker has sent a budget: "no number yet" is not
     /// "no space".
     pub fn is_exhausted(&self) -> bool {
+        // The descriptors are read *now*: this answers a decision (may this
+        // `open` create a file? may this `mkdir` run?), and a writer that
+        // closed between two watch ticks has bytes the tick has not counted
+        // yet. Deciding on the older number is what let a second file write
+        // past the budget (`flush_held`).
+        self.flush_held();
         self.remaining() == Some(0)
     }
 
@@ -417,7 +423,38 @@ impl WriteFds {
         best
     }
 
-    /// The same, for a whole process group (N25).
+    /// Read *every* held descriptor now, before answering a decision.
+    ///
+    /// The watch samples on its own tick, and a decision made between two
+    /// ticks is otherwise made against a number that is one interval old --
+    /// measured on the cluster, `probe_exec_limit.py` step 1 (700 MiB in the
+    /// tree, a 324 MiB file, then a second file with no pause) let that second
+    /// file write 48 MiB past the budget, because the writer had closed and
+    /// neither the watch nor the worker's ledger had counted its last 48 MiB
+    /// yet. The mediator holds its own descriptor for every file it mediated,
+    /// so the size at *this* instant is one read away, and deciding is exactly
+    /// the moment to ask.
+    ///
+    /// Returns the largest offset seen, for callers that only want the number.
+    pub fn flush_held(&self) -> u64 {
+        let held: Vec<(i32, i32, Arc<std::os::fd::OwnedFd>)> = self
+            .lock()
+            .iter()
+            .filter_map(|((entry_pid, fd), entry)| {
+                entry.held.clone().map(|held| (*entry_pid, *fd, held))
+            })
+            .collect();
+        let mut best = 0;
+        for (entry_pid, fd, held) in held {
+            if let Some(offset) = held_offset(&held) {
+                self.observe(entry_pid, fd, offset);
+                best = best.max(offset);
+            }
+        }
+        best
+    }
+
+    /// How much a whole process group's descriptors have grown (N25).
     ///
     /// The group is the unit the tightening already works in, and for the
     /// same reason: the descriptor that is growing usually belongs to the
@@ -629,6 +666,41 @@ mod tests {
         // A tightening asks for the size now.
         assert_eq!(watch.refresh_held(11), 4096);
         assert_eq!(watch.max_grown_for_pid(11), 4096);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_decision_reads_the_descriptors_before_answering() {
+        // N25: the watch samples on its own tick, and a *decision* made
+        // between two ticks is made against a number that is one interval
+        // old. Measured on the cluster (`probe_exec_limit.py` step 1b): 700
+        // MiB in the tree, a 324 MiB file, then a second file with no pause
+        // -- the second one wrote 48 MiB past the budget, because the writer
+        // had closed and the tick had not counted its last 48 MiB yet. The
+        // mediator holds its own descriptor for every file it mediated, so
+        // answering "may this grow?" means reading them first.
+        use std::io::Write;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-tmp");
+        std::fs::create_dir_all(&dir).expect("create test tmp");
+        let path = dir.join(format!("flush-held-{}.bin", std::process::id()));
+        let mut file = std::fs::File::create(&path).expect("create file");
+        file.write_all(&[0u8; 4096]).expect("write");
+        let held = std::sync::Arc::new(std::os::fd::OwnedFd::from(file));
+
+        let watch = WriteFds::new();
+        watch.register(11, 5, &path, 0, Some(held), 0);
+        // The worker has just reported what the tree held before this write.
+        watch.note_budget(4096);
+        // Nothing has sampled the descriptor yet, so the pool still looks
+        // untouched -- this is the stale answer the decision must not use.
+        assert_eq!(watch.remaining(), Some(4096));
+        // The primitives reads them.
+        assert_eq!(watch.flush_held(), 4096);
+        // And the decision is the caller: "may this `open` create a file?"
+        // had to answer `false` before this change, with the bytes sitting in
+        // the file it was about to let a second writer add to.
+        assert!(watch.is_exhausted());
+        assert_eq!(watch.remaining(), Some(0));
         let _ = std::fs::remove_file(&path);
     }
 

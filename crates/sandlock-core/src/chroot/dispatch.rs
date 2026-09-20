@@ -950,7 +950,10 @@ fn raise_caller_file_size_limit(ctx: &ChrootCtx<'_>, pid: u32, path: &Path) {
         None => pid as i32,
     };
     let own_growth = {
-        ctx.write_fds.refresh_held(host_pid);
+        // Every descriptor, not just this process's: the bytes a *neighbour*
+        // just finished writing are part of what is left, and reading them
+        // here is what keeps the freed bytes from being handed out twice.
+        ctx.write_fds.flush_held();
         ctx.write_fds.max_grown_for_pid(host_pid)
     };
     let wanted = remaining.saturating_add(own_growth);
@@ -1082,6 +1085,10 @@ fn grant_file_size_cap(
     baseline: u64,
     path: &Path,
 ) -> u64 {
+    // What the sandbox's own descriptors say, at this instant: the watch's
+    // tick and the worker's ledger both lag a fast writer, and this decision
+    // is the one that hands a *new* file its ceiling (`flush_held`).
+    watch.flush_held();
     let Some(remaining) = watch.remaining() else {
         // No budget yet (no round has run): leave the ceiling alone.
         return baseline;
