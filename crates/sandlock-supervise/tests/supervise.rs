@@ -143,9 +143,29 @@ fn euid() -> u32 {
 /// Per-process control-root override shared by every supervise test in this
 /// binary (spawned supervise processes inherit it), so instance runtime dirs
 /// and the registered-path registry never collide with another suite's.
+///
+/// Deliberately `/tmp/...`, **not** `<repo>/tmp/...`: the registered-path
+/// transport publishes `<ctl_root>-registry/<fnv1a_hex>.d/control.sock`, and an
+/// AF_UNIX `sun_path` holds 108 bytes *including* the NUL.  A root that carries
+/// the checkout path spends that budget on the caller's directory names --
+/// measured 2026-09-21, a checkout at
+/// `/Users/…/sandlock-e2b/third_party/sandlock` builds a **165-byte** socket
+/// path (and even the canonical `/src` checkout sat only 8 bytes under the
+/// limit, because `repo_tmp_dir()` keeps the literal `/crates/…/../..` hop),
+/// so the slot's `bind` fails with ENAMETOOLONG, the process exits, and the
+/// fixture times out with "timed out waiting for registered socket to appear"
+/// -- a false red that reads exactly like a supervise regression (the trap
+/// `scripts/test-all.sh` warns about for nested worktrees).  Production is not
+/// exposed: `channel_registry_root()` defaults to `/tmp/sandlock-ctl-<uid>`, a
+/// 66-byte socket path.  This override now mirrors that shape, which keeps the
+/// per-process isolation and makes the fixture independent of where the
+/// checkout lives.
 fn isolate_ctl_root() -> PathBuf {
     static SET: std::sync::Once = std::sync::Once::new();
-    let root = repo_tmp_dir().join(format!("supervise-ctl-{}", std::process::id()));
+    let root = PathBuf::from(format!(
+        "/tmp/sandlock-ctl-test-{}",
+        std::process::id()
+    ));
     SET.call_once(|| {
         let _ = std::fs::remove_dir_all(&root);
         std::env::set_var("SANDBOX_CTL_ROOT", &root);

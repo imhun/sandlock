@@ -11,13 +11,19 @@
 #              C档 suite only; must run as root)
 #
 # Path discipline (2026-09-08, measured): run the gate from a checkout mounted at
-# a SHORT path (/src). `supervise.rs`'s path-mode fixtures build their registry
-# socket under `<repo>/tmp/supervise-ctl-<pid>-registry/<hash>.d/control.sock`; the
-# repo tmp path comes from CARGO_MANIFEST_DIR, so running the suites from a nested
-# git worktree (/src/tmp/wt-fixN/...) pushes that socket path past the 108-byte
-# sun_path limit and `test_supervise_path_serve_...` times out — a false red that
-# looks exactly like a real supervise regression. Always confirm against the repo
-# root before believing that failure.
+# a SHORT path (/src). A registered-path fixture builds its registry socket under
+# `<ctl_root>-registry/<hash>.d/control.sock`, and the 108-byte sun_path limit is
+# spent on whatever prefix the fixture's root carries. The non-root `supervise.rs`
+# suite used to root that under `<repo>/tmp` (2026-09-08: nested worktrees like
+# /src/tmp/wt-fixN/ timed out on `test_supervise_path_serve_...`); since
+# 2026-09-21 its override is `/tmp/sandlock-ctl-test-<pid>` (69-byte socket path,
+# mirroring the `/tmp/sandlock-ctl-<uid>` production default) and is
+# path-independent. The root-mode `supervise_root.rs` suite still derives its
+# ctl root from `CARGO_MANIFEST_DIR` (canonicalized, which is why the checkout
+# path there costs ~30 bytes fewer), so a long checkout or a nested worktree can
+# still make that one time out — a false red that looks exactly like a real
+# supervise regression. Always confirm against the repo root before believing
+# that failure.
 #
 # Canonical full-gate procedure (sandlock-dev:latest, repo mounted at /src):
 #   chmod -R a+rwX tmp
