@@ -1567,6 +1567,32 @@ pub(crate) fn rewrite_exec_path_to_fd(
 // Response dispatch
 // ============================================================
 
+/// True when the operator asked for the event trace. Same switch the chroot
+/// mediator uses (`SANLOCK_EVENT_TRACE=1`), read per call because the tests
+/// set it on the process environment at run time.
+fn trace_on() -> bool {
+    std::env::var("SANLOCK_EVENT_TRACE")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Short label for a decision, for the trace only.
+fn action_label(action: &NotifAction) -> &'static str {
+    match action {
+        NotifAction::Continue => "continue",
+        NotifAction::Errno(_) => "errno",
+        NotifAction::InjectFd { .. } => "inject-fd",
+        NotifAction::InjectFdSend { .. } => "inject-fd-send",
+        NotifAction::InjectFdSendTracked { .. } => "inject-fd-send-tracked",
+        NotifAction::InjectFdAt { .. } => "inject-fd-at",
+        NotifAction::ReturnValue(_) => "return-value",
+        NotifAction::Hold => "hold",
+        NotifAction::Defer(_) => "defer",
+        NotifAction::KillGroup { .. } => "kill-group",
+        NotifAction::KillTask { .. } => "kill-task",
+    }
+}
+
 /// Dispatch a `NotifAction` to the appropriate low-level response function.
 fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
     match action {
@@ -1588,12 +1614,29 @@ fn send_response(fd: RawFd, id: u64, action: NotifAction) -> io::Result<()> {
             }
         }
         NotifAction::InjectFdSendTracked { srcfd, newfd_flags, on_success } => {
+            if trace_on() {
+                eprintln!(
+                    "sandlock-supervise: ADDFD-SEND start id={id} srcfd={}",
+                    srcfd.as_raw_fd()
+                );
+            }
             match inject_fd_and_send(fd, id, srcfd.as_raw_fd(), newfd_flags) {
                 Ok(new_fd) => {
+                    if trace_on() {
+                        eprintln!("sandlock-supervise: ADDFD-SEND ok id={id} new_fd={new_fd}");
+                    }
                     (on_success.0)(new_fd);
+                    if trace_on() {
+                        eprintln!("sandlock-supervise: on_success done id={id}");
+                    }
                     Ok(())
                 }
-                Err(_) => send_resp_raw(fd, &inject_failure_resp(id)),
+                Err(e) => {
+                    if trace_on() {
+                        eprintln!("sandlock-supervise: ADDFD-SEND failed id={id}: {e}");
+                    }
+                    send_resp_raw(fd, &inject_failure_resp(id))
+                }
             }
         }
         NotifAction::InjectFdAt { srcfd, targetfd, newfd_flags } => {
@@ -2351,6 +2394,14 @@ async fn handle_notification(
     };
 
     let nr = notif.data.nr as i64;
+    if trace_on() {
+        eprintln!(
+            "sandlock-supervise: notif nr={nr} pid={} id={} -> {}",
+            notif.pid,
+            notif.id,
+            action_label(&action)
+        );
+    }
     let fork_counted = matches!(action, NotifAction::Continue)
         && crate::resource::fork_counted_on_continue(&notif, fd);
 
@@ -2587,6 +2638,9 @@ pub async fn supervisor(
         Arc::clone(&ctx.processes),
         Arc::clone(&ctx.resource),
     ));
+    if trace_on() {
+        eprintln!("sandlock-supervise: notify loop up (fd={fd})");
+    }
 
     // Bounds the number of in-flight deferred handler futures (see
     // `DEFER_MAX_INFLIGHT`). Shared across all notifications this supervisor
@@ -2614,7 +2668,12 @@ pub async fn supervisor(
     'outer: loop {
         let mut ready = match async_fd.readable().await {
             Ok(r) => r,
-            Err(_) => break 'outer,
+            Err(e) => {
+                if trace_on() {
+                    eprintln!("sandlock-supervise: notify readable() failed: {e}");
+                }
+                break 'outer;
+            }
         };
         ready.clear_ready();
         drop(ready);
@@ -2725,6 +2784,9 @@ pub(crate) fn spawn_pid_watcher(
         // pidfd becomes readable when the process exits; we don't
         // read any data, so `readable()` is just an await point.
         let _ = async_fd.readable().await;
+        if trace_on() {
+            eprintln!("sandlock-supervise: pid watcher fired for {key:?}");
+        }
         cleanup_pid(&ctx, key).await;
         // async_fd drops here, closing the pidfd.
     });

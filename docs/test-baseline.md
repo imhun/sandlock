@@ -1,7 +1,13 @@
 # sandlock fork test baseline — Linux 7.0.14-orbstack-00380-ga7e0a2dc9535, Landlock ABI 8, Python 3.11.16
 
-> **2026-09-22 状态（E2B 侧，仍未刷表）**：先把上一版这张注记里的"数字本身不稳定"查清了 ——
-> 三条红的成因互不相同，**都已修**，`core_lib` 现在是一个确定的数：
+> **2026-09-22 状态（E2B 侧；表已按这一轮的门禁绿跑刷新）**：上一版这张注记里的"数字本身不稳定"
+> 查清了 —— 三条红的成因互不相同，**都已修**，而且顺着它挖出了两个把门禁挡住的真问题。现在
+> **四个相位全绿**：默认相位 `core_lib 891 / core_integ 545 / ffi 104 / cli 97 / supervise 51 /
+> supervise_cost 3 / cli_build 0 / python 465`（`--oci-root` 157、`--supervise-root` 4、
+> `--mediation-2uid` 9）；证据是 fork 仓 `tmp/test-all-*.log`（2026-09-22 13:54–14:01）。
+> 下面三格数字因此动过：`core_lib` 848 → 891、`core_integ` 543 → 545、`supervise` 43 → 51。
+>
+> 修的是什么：
 >
 > * `..._flaky.log` 的 **886/2**（`rename_staging_failure_fails_rename_and_rolls_back`、
 >   `write_open_in_unreadable_dir_virtualizes`）**不是负载下的时序，是那次以 root 跑**：这两条用例
@@ -17,22 +23,33 @@
 >   `PTRACE_CONT`）仍然被抓：2/2 红在上述新断言上（`state 't'` + 残留 tracer）。
 > * 修完复量：`cargo test -p sandlock-core --offline --lib` = **888 passed / 0 failed**，root 与非 root
 >   两种形态、以及负载下均一致（4 次独立运行）。表里写的 848 是旧的，**正确的数是 888**。
-> * `core_integ` **仍然跑不完**，所以这张表的**其它数字维持不动**：`test_chroot_magic_fd_symlink_resolves_to_child_fd`
->   在 tip 上**确定性挂住**（单跑、空载、干净夹具、helper 健康；同一 tip 的干净 worktree 同样挂，
->   所以与本轮改动无关）—— 证据与判读见 E2B 仓 `docs/task-backlog.md` N33。跳过它之后整档是
->   `542 passed / 1 failed / 84.31s`（历史：543 passed / 84.14s），那 1 条是
->   `test_restore::test_restore_glibc_vdso_program_resumes`，只在"测试二进制 stdio 是普通文件"时红
->   （管道则绿）——E2B 仓 N34。
+> * `core_integ` 那条挂起**已修**（2026-09-22 同一轮，E2B 仓 N33）：`test_chroot_magic_fd_symlink_
+>   resolves_to_child_fd` 的 magic link 让字节监控登记了子进程自己的 stderr **管道**并保留了自己的
+>   dup，于是 capture 管道在子进程退出后仍不 EOF、`wait()` 永不返回（dup 只在 sandbox drop 时释放，
+>   而 drop 在那次 wait 之后）。现在 `inject_watched` 只监控**有大小**的 open（`holds_a_file_size`），
+>   创建非普通条目时的条目数记账保留；同一条路径还带来一个副作用修正：`/dev/null` 这类重定向不再
+>   进字节监控（它正是"空池瞬间给后续 fork 留下 1 MiB 地板"的来源）。整档现在跑完：
+>   **545 passed / 0 failed / 85.84s**（`core_integ` 那一格已按此更新）。RED 证明：把分类变异成
+>   恒真后，新增的有界用例在 30 s 超时断言上红（`tmp/k0s/sigstop-logs/mutant-bounded.log`）。
+> * 排查用提示（E2B 仓 N34）：这个套件直接跑二进制时要用**管道**接输出。`scripts/test-all.sh` 的
+>   `run()` 早就为此把每条套件 tee 过匿名管道并写明理由；`--nocapture` + 文件重定向会让
+>   `test_restore::test_restore_glibc_vdso_program_resumes` 红（恢复进程重开不了那个普通文件）。
 > * 同一轮还修掉一个会把整个 chroot 家族变成假红的状态坑：共享夹具目录里的残留 rootfs 会让
 >   `build_test_rootfs` 回退 `fs::copy`，而它的目标与共享的 `tests/rootfs-helper` **同 inode** ⇒
 >   打开写入把源截断成 0 字节，之后所有 chroot 用例报 `Exec format error`。`test_chroot.rs` 现在与
 >   `test_instance_chroot.rs` 一样（单调 seq + 先清目录），`build.rs::build_static` 改成编译到同级
 >   临时文件再 `rename` 发布。E2B 仓 `docs/build-test-deploy-pitfalls.md` B12。
+> * 挂起修好后门禁继续往下走，立刻撞到 N25/C 漏下的一处编译错误：`Req::RunExec` 新增的
+>   `max_file_size` 在 `sandlock-oci` 里有 **1 处生产字面量 + 4 处测试字面量**没跟上，而
+> `cli_build`（release 构建门）与 `--oci-root` 相位是唯一会编译那个 crate 的地方 —— 换句话说，
+> N25 之后**从来没有人跑过这道门**。补的是 `None`（OCI 的 exec verb 没有预算旋钮），并让
+> `sandlock-oci::init::req_roundtrip` 断言那个字段的**值**而不只是形状。E2B 仓 pitfalls 的 A6
+> 就是这一族（"新增字段改不全，lane 全绿而 fork 门禁编译不过"），这轮多了一个新形状：
+> 卡住它的不是 `--lib`，而是 release 构建 + oci 相位。
 >
-> 因此：**要先修好 N33（那条挂起），再用一次完整绿跑把表刷到那时的数字**；`core_lib` 这一格现在
-> 就可以写 888。在那之前，定向套件（`cargo test -p sandlock-core --lib`、
-> `-p sandlock-supervise --test supervise`）才是可信证据 —— E2B 侧这一轮的验收就是这么做的
-> （`docs/k8s-deployment.md` §22.5.12、`docs/build-test-deploy-pitfalls.md` §B5–B9/B12）。
+> 也就是说：这一轮既修掉了那三条时序红，也把挡住绿跑的**两个真问题**（magic-link 挂起、oci
+> 缺字段）修掉了，表按绿跑刷新。E2B 侧的验收记录在 `docs/k8s-deployment.md` §22.5.12 与
+> `docs/build-test-deploy-pitfalls.md` §B5–B9/B12。
 
 # Measured 2026-09-04 in sandlock-dev:latest (Debian trixie x86_64, cargo 1.98,
 # python 3.11.16), repo mounted at /src, --privileged; kernel
@@ -83,7 +100,14 @@
 # and core_integ (534 -> 539) move, by the A1/A2 test cases registered below;
 # ffi / cli / supervise / supervise_cost / cli_build / python / oci /
 # supervise_root / mediation_2uid are unchanged.
-core_lib = 888 # 2026-09-22 (the E2B gate-repair round): 848 -> 888, because
+core_lib = 891 # 2026-09-22 (the E2B gate-repair round): 848 -> 891. 888 of
+               # that is the settle-the-timing-reds work below; the last +3 is
+               # `chroot::dispatch::watchable_open_tests` (a regular file has a
+               # size to watch, a pipe does not, a character device does not),
+               # pinning the classification that fixes the core_integ hang:
+               # the wrong direction there is not an assertion but a wedged
+               # run, so it is worth a unit test that can only ever be cheap.
+               # 848 -> 888, because
                # the three reds the previous note recorded are all fixed and
                # the count is now deterministic — measured four times, 888/0
                # every time (uid 65534 and root shapes, plus 60 loaded runs of
@@ -242,7 +266,24 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 543 # pid-ns route-B self-map (2026-09-16): 542 -> 543, +1 in
+core_integ = 545 # 2026-09-22: 543 -> 545, and the suite now *finishes* again.
+                 # +1 is `test_chroot::a_magic_link_write_returns_instead_of_
+                 # pinning_the_capture_pipe`, the bounded copy of the case that
+                 # used to hang; the other +1 is the count the tip had already
+                 # grown to while the suite could not get past that hang (the
+                 # last measured complete run was 2026-09-16's 543). The hang
+                 # itself: a write to the sandbox's own stdio through a magic
+                 # link (`/tmp/errlog` -> `/dev/stderr` -> `/proc/self/fd/2`)
+                 # made the byte watch register the child's stderr *pipe* and
+                 # retain its own duplicate of it, so the capture pipe never
+                 # reached EOF and `wait()` never returned — the duplicate is
+                 # only dropped when the sandbox is dropped, which is after the
+                 # wait it was blocking. `inject_watched` now watches only
+                 # opens that have a size (`holds_a_file_size`), and the entry
+                 # count still credits a created non-regular entry. Evidence:
+                 # E2B `tmp/k0s/sigstop-logs/core_integ-green.log` (545 passed
+                 # in 85.84s), mutant run red in `mutant-bounded.log`.
+                 # pid-ns route-B self-map (2026-09-16): 542 -> 543, +1 in
                  # crates/sandlock-core/tests/integration/test_pid_ns.rs:
                  # `pid_ns_self_map_restores_guest_root` — with pid_ns the
                  # generation's user namespace is created by the *intermediate*
@@ -490,7 +531,14 @@ cli = 97      # B3 (2026-09-11, SL-1 hard delete): 100 -> 97, -3 with the
               # after F0.4 wiring (cli suite includes net_bind_map tests);
               # F5.1 updates the no-supervisor default validation to
               # DEFAULT_MAX_PROCESSES (256), no count change
-supervise = 43 # F19/SL-13 (2026-09-14): 42 -> 43, +1 integration
+supervise = 51 # 2026-09-22 catch-up, not this round's work: the first
+               # complete gate run since the N25 series reported "baseline says
+               # 43 passed, run produced 51". The +8 are the supervise-side
+               # cases that series added and never re-ran this gate for
+               # (`c152d38` +106 lines in tests/supervise.rs for the entry cap /
+               # dated walk / pinned overrun, `9a6f90a` +38, `e4122fa` +22 for
+               # the ctl-override fixture). The number below is that run's.
+               # F19/SL-13 (2026-09-14): 42 -> 43, +1 integration
                # (test_supervise_refusal_carries_the_generation_closed_code:
                # a generation whose M0 main exits collapses to `Exited` and
                # every later verb answers the unified closed-instance prose

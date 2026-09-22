@@ -877,6 +877,30 @@ fn inject_watched(
     if !is_write {
         return NotifAction::InjectFdSend { srcfd, newfd_flags };
     }
+    // A pipe, socket, FIFO or device has no size, so there is nothing for the
+    // byte watch to account for -- and holding a descriptor to one is not
+    // merely useless, it is harmful: the magic-link shape opens the sandbox's
+    // *own* stdio (`/dev/stderr` -> `/proc/self/fd/2`), so the retained copy is
+    // a write end of the pipe the parent is draining. The child exits, the
+    // parent's drain still waits for EOF, and the run never returns: the
+    // mediator's copy is only dropped when the sandbox is dropped, which
+    // happens after the wait it is blocking (2026-09-22,
+    // `test_chroot_magic_fd_symlink_resolves_to_child_fd` hung here; the
+    // bounded regression test next to it in `test_chroot.rs` pins this).
+    if !holds_a_file_size(srcfd.as_raw_fd()) {
+        // The *entry count* is still this side's business when the open created
+        // the name (N25/N31), so the credit stays; only the size watch goes.
+        let watch = Arc::clone(ctx.write_fds);
+        return NotifAction::InjectFdSendTracked {
+            srcfd,
+            newfd_flags,
+            on_success: OnInjectSuccess::new(move |_child_fd: i32| {
+                if created_entry {
+                    watch.credit_entry_created();
+                }
+            }),
+        };
+    }
     let srcfd_raw = srcfd.as_raw_fd();
     let watch = Arc::clone(ctx.write_fds);
     // `pid` is the *notification's* pid, i.e. one in the sandbox's own
@@ -980,6 +1004,23 @@ fn raise_caller_file_size_limit(ctx: &ChrootCtx<'_>, pid: u32, path: &Path) {
     if wanted > 0 {
         apply_file_size_cap(host_pid, wanted, path);
     }
+}
+
+/// Does the open file the mediator just resolved have a *size* to watch?
+///
+/// Only a regular file does. `lseek`/`fdinfo` describe a byte offset into a
+/// size; a pipe, socket, FIFO or character/block device has neither, and the
+/// watch's own release rule ("the held copy's last offset, then let go") has
+/// nothing to read there either. See `inject_watched` for why registering one
+/// anyway wedges a run whose sandbox writes to its own stdio.
+fn holds_a_file_size(fd: RawFd) -> bool {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        // Unreadable type: treat it as "not a size", i.e. do not watch it.
+        // Watching is the risky direction (it retains the descriptor).
+        return false;
+    }
+    st.st_mode & libc::S_IFMT == libc::S_IFREG
 }
 
 /// N25: `setrlimit`/`prlimit64` on `RLIMIT_FSIZE` may only *lower*.
@@ -3122,6 +3163,47 @@ pub(crate) async fn handle_chroot_legacy_chown(
     ]);
     synth.data.nr = libc::SYS_fchownat as i32;
     handle_chroot_write(&synth, chroot_state, cow_state, notif_fd, ctx).await
+}
+
+#[cfg(test)]
+mod watchable_open_tests {
+    use super::holds_a_file_size;
+    use std::os::fd::AsRawFd;
+
+    /// A regular file is the only shape the byte watch can account for, and the
+    /// only one whose retained descriptor cannot wedge somebody else's pipe.
+    /// Pinned here because the *other* direction of this classification fails
+    /// as a hang rather than as an assertion (see `inject_watched`).
+    #[test]
+    fn a_regular_file_has_a_size_to_watch() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = std::fs::File::create(dir.path().join("f")).unwrap();
+        assert!(holds_a_file_size(f.as_raw_fd()));
+    }
+
+    #[test]
+    fn a_pipe_does_not() {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_end, write_end) = (fds[0], fds[1]);
+        assert!(!holds_a_file_size(read_end));
+        assert!(!holds_a_file_size(write_end));
+        unsafe {
+            libc::close(read_end);
+            libc::close(write_end);
+        }
+    }
+
+    #[test]
+    fn nor_does_a_character_device() {
+        // `/dev/null` is the shape a redirection opens, and watching it is how
+        // a momentary empty pool used to hand every later fork a 1 MiB floor.
+        let null = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("/dev/null is openable");
+        assert!(!holds_a_file_size(null.as_raw_fd()));
+    }
 }
 
 #[cfg(test)]

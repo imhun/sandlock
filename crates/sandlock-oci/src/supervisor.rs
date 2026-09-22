@@ -1220,6 +1220,12 @@ async fn handle_exec(
         clean_env: false,
         extra_writable: vec![],
         bind_ports: vec![],
+        // No per-exec ceiling on this path: the OCI exec verb carries no
+        // budget knob, and `None` is "leave the instance's `RLIMIT_FSIZE`
+        // alone", which is what the container lifecycle expects. (N25/C added
+        // the field and missed this literal; nothing compiled
+        // `sandlock-oci` until the release build gate did, on 2026-09-22.)
+        max_file_size: None,
     };
     let started = link.request(&req, &raw).await;
     // init has now dup'd the fds (SCM_RIGHTS); drop the daemon's copies.
@@ -1883,6 +1889,7 @@ mod tests {
             clean_env: false,
             extra_writable: vec![],
             bind_ports: vec![],
+            max_file_size: None,
         };
 
         // Announce CAP + 2 children through the real request/Started path
@@ -1956,6 +1963,7 @@ mod tests {
             clean_env: false,
             extra_writable: vec![],
             bind_ports: vec![],
+            max_file_size: None,
         };
         let announcer = spawn_init_announcer(child, vec![DETACHED]);
         match link.request(&detach_req, &[]).await.expect("request must be answered") {
@@ -1995,6 +2003,7 @@ mod tests {
             clean_env: false,
             extra_writable: vec![],
             bind_ports: vec![],
+            max_file_size: None,
         };
 
         // (a) A forged Exited whose pid matches a FUTURE exec (announced only
@@ -2111,6 +2120,7 @@ mod tests {
             clean_env: false,
             extra_writable: vec![],
             bind_ports: vec![],
+            max_file_size: None,
         };
 
         // (a) One healthy request/Started round-trip announces pid 111, then

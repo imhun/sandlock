@@ -1030,6 +1030,52 @@ async fn test_chroot_magic_fd_symlink_resolves_to_child_fd() {
     cleanup_rootfs(&rootfs);
 }
 
+/// The magic-link write again, but bounded: a regression has to surface as a
+/// red assertion, never as a hang.
+///
+/// The symlink chain lands on the sandbox's own `/proc/self/fd/2`, so the
+/// descriptor the mediator resolves is that child's stderr **pipe** — a
+/// descriptor with no size. The byte watch used to register it anyway *and keep
+/// its own duplicate*, which held the capture pipe's write end open after the
+/// child exited: `run()` then drained a pipe that could never reach EOF and
+/// never returned (2026-09-22 — the unbounded case above hung the whole
+/// `core_integ` suite from this). Every assertion here is reached only if the
+/// run comes back.
+#[tokio::test]
+async fn a_magic_link_write_returns_instead_of_pinning_the_capture_pipe() {
+    let rootfs = build_test_rootfs("magic-fd-bounded");
+    std::os::unix::fs::symlink("/dev/stderr", rootfs.join("tmp/errlog")).unwrap();
+
+    let policy = minimal_exec_policy(&rootfs)
+        .fs_mount("/proc", "/proc")
+        .fs_mount("/dev", "/dev")
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    let run = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        policy.clone().run(&[
+            "rootfs-helper",
+            "write-fd-link",
+            "/tmp/errlog",
+            "BOUNDED_MARKER",
+        ]),
+    )
+    .await
+    .expect("the run must return: a write to the sandbox's own stdio is not a file to watch")
+    .expect("run");
+
+    assert!(run.success(), "stderr: {}", run.stderr_str().unwrap_or(""));
+    assert!(
+        run.stderr_str().unwrap_or("").contains("BOUNDED_MARKER"),
+        "marker must reach the child's stderr through the magic link, stderr: {:?}",
+        run.stderr_str()
+    );
+
+    cleanup_rootfs(&rootfs);
+}
+
 /// echo hello > /tmp/test.txt && cat /tmp/test.txt works, file appears in rootfs/tmp
 #[tokio::test]
 async fn test_chroot_write_file() {

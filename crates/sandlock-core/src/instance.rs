@@ -1804,8 +1804,16 @@ impl SandboxInstance {
         // `spawn_pid_watcher`. Falls back to a blocking `waitpid` only when no
         // pidfd is available (kernel without `pidfd_open`).
         let exit_status = match self.pidfd.take() {
-            Some(pidfd) => wait_child_exit_via_pidfd(pidfd, pid).await,
-            None => wait_child_exit_blocking(pid).await,
+            Some(pidfd) => {
+                crate::sandbox::trace_step("wait_main: awaiting pidfd");
+                let status = wait_child_exit_via_pidfd(pidfd, pid).await;
+                crate::sandbox::trace_step("wait_main: pidfd reported exit");
+                status
+            }
+            None => {
+                crate::sandbox::trace_step("wait_main: no pidfd, blocking waitpid");
+                wait_child_exit_blocking(pid).await
+            }
         };
 
         self.state = RuntimeState::Stopped(exit_status.clone());

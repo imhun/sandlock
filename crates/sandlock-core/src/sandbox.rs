@@ -17,6 +17,19 @@ use crate::protection::{Protection, ProtectionPolicy, ProtectionState, Protectio
 mod builder;
 pub use builder::SandboxBuilder;
 
+/// Step trace for `SANLOCK_EVENT_TRACE=1` — the same switch the chroot mediator
+/// prints under. It exists because a hang in the run path has to be attributed
+/// to a *step* (create / start / wait) rather than guessed at from process
+/// state alone (2026-09-22, the magic-fd case).
+pub(crate) fn trace_step(msg: &str) {
+    if std::env::var("SANLOCK_EVENT_TRACE")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+    {
+        eprintln!("sandlock: {msg}");
+    }
+}
+
 /// Default `max_processes`: the whole-box concurrent-process ceiling for a
 /// sandbox session (fork-plan F5.1 / M3 S1).
 ///
@@ -1533,9 +1546,14 @@ impl Sandbox {
         let pending = sandbox_collect_handlers(handlers, self)?;
         self.ensure_runtime()?;
         self.rt_mut().handlers = pending;
+        trace_step("run: do_create");
         self.do_create(cmd, true).await?;
+        trace_step("run: do_start");
         self.do_start()?;
-        self.wait().await
+        trace_step("run: wait");
+        let result = self.wait().await;
+        trace_step("run: wait returned");
+        result
     }
 
     /// Interactive-stdio counterpart of `run_with_handlers`.

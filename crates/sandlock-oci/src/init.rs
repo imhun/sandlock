@@ -129,10 +129,18 @@ mod tests {
             clean_env: false,
             extra_writable: vec![],
             bind_ports: vec![],
+            max_file_size: Some(4096),
         };
         let j = serde_json::to_string(&r).unwrap();
         assert!(j.contains("runexec"));
-        assert!(matches!(serde_json::from_str::<Req>(&j).unwrap(), Req::RunExec { .. }));
+        // N25/C's per-exec ceiling rides this frame, and a serde round-trip is
+        // the only thing that pins the field's wire name: the OCI supervisor's
+        // own literals were what this crate's compile errors caught on
+        // 2026-09-22, so assert the value, not just the shape.
+        match serde_json::from_str::<Req>(&j).unwrap() {
+            Req::RunExec { max_file_size, .. } => assert_eq!(max_file_size, Some(4096)),
+            other => panic!("expected RunExec, got {other:?}"),
+        }
     }
     #[test]
     fn resp_roundtrip() {
