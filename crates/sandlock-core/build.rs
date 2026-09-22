@@ -142,18 +142,47 @@ fn build_static(src: &Path, bin: &Path, ccs: &[&str], args: &[&str]) -> bool {
             }
         }
     }
+    // Compile to a sibling temp path and publish with a rename, never in
+    // place: the artifact is hard-linked into test fixtures that outlive the
+    // build (they live under `CARGO_TARGET_TMPDIR` = `target-linux/tmp`), and
+    // an in-place rewrite is visible to every one of those links at once. A
+    // failed or interrupted `cc` then leaves a zero-byte artifact behind and
+    // each fixture execs `ENOEXEC` -- measured 2026-09-22, where a leftover
+    // fixture made a test's `fs::copy` fallback truncate the shared
+    // `tests/rootfs-helper` and the whole chroot family went red with
+    // `execvp 'rootfs-helper': Exec format error`. A rename swaps the
+    // directory entry, so an existing link keeps the previous (complete)
+    // inode.
+    let tmp = bin.with_file_name(format!(
+        "{}.tmp-{}",
+        bin.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "artifact".to_string()),
+        std::process::id()
+    ));
     for cc in ccs {
         let ok = Command::new(cc)
             .args(args)
             .arg("-o")
-            .arg(bin)
+            .arg(&tmp)
             .arg(src)
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
         if ok {
-            return true;
+            return match std::fs::rename(&tmp, bin) {
+                Ok(()) => true,
+                Err(e) => {
+                    println!(
+                        "cargo:warning=cannot publish {}: {e}",
+                        bin.display()
+                    );
+                    let _ = std::fs::remove_file(&tmp);
+                    false
+                }
+            };
         }
     }
+    let _ = std::fs::remove_file(&tmp);
     false
 }

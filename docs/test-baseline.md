@@ -1,23 +1,38 @@
 # sandlock fork test baseline — Linux 7.0.14-orbstack-00380-ga7e0a2dc9535, Landlock ABI 8, Python 3.11.16
 
-> **2026-09-22 状态（E2B 侧，未刷表）**：这张表的数字**没有**跟着刷新，因为先量出来的
-> 是"数字本身不稳定"，刷一个数只会把门禁变成偶发红：
+> **2026-09-22 状态（E2B 侧，仍未刷表）**：先把上一版这张注记里的"数字本身不稳定"查清了 ——
+> 三条红的成因互不相同，**都已修**，`core_lib` 现在是一个确定的数：
 >
-> * `core_lib`：三次运行分别是 **888/0**（单容器、无竞争）、**887/1**、**886/2** —— 三次红的
->   用例互不相同（`resource::tests::sigstop_inside_the_fork_tracking_window_ends_as_a_real_stop`、
->   `cow::seccomp::tests::rename_staging_failure_fails_rename_and_rolls_back`、
->   `cow::seccomp::tests::write_open_in_unreadable_dir_virtualizes`），都是时序/权限顺序敏感的那类；
->   证据：`sandlock-e2b/tmp/k0s/fork-core-lib-gate.log`（887/1）与 `fork-core-lib-flaky.log`（886/2）。
->   表里写的 848 早就过期，但"正确的数"在把这几条 flaky 定下来之前不存在。
-> * `core_integ`：在一次测量运行里**挂住**——`test_chroot::test_chroot_magic_fd_symlink_resolves_to_child_fd`
->   之后再无输出（25 分钟，容器被手动停掉），证据 `sandlock-e2b/tmp/k0s/fork-core-integ-hang.log`。
->   在挂住的那次运行里，同一台机器上**同时**跑着两个 sandlock-dev 容器（都挂在同一个
->   `target/` 上、共享 CPU），所以"负载下的时序"是首要嫌疑，但它没有被单独验证过。
+> * `..._flaky.log` 的 **886/2**（`rename_staging_failure_fails_rename_and_rolls_back`、
+>   `write_open_in_unreadable_dir_virtualizes`）**不是负载下的时序，是那次以 root 跑**：这两条用例
+>   的夹具就是 `0o000` 模式位，而 `CAP_DAC_OVERRIDE` 直接读穿它。同文件里的兄弟用例早就写着
+>   `Skipped as root, where CAP_DAC_OVERRIDE makes the directory readable`，这两条漏了。以 root 复现，
+>   断言行号与原日志逐条一致（4823 / 4376）；补上同一守卫后，root 与非 root 两种形态都是 888/0。
+> * `..._gate.log` 的 **887/1**（`sigstop_inside_the_fork_tracking_window_ends_as_a_real_stop`）是**两处**
+>   真问题：① 夹具 `sh -c 'sleep 30'` 并不是"不会 fork 的 caller"——dash 对非内建命令 fork 并留在父位置，
+>   那个 fork 与 SIGSTOP 竞争（负载下 40 次跑出 3 次红，断言 `!created`）；换成本身不 fork 的
+>   `/bin/sleep 30` 后该断言不再红。② 之后暴露的 `State == 'T'` 断言把"窗口关闭"与"内核把 stop 投递给
+>   已脱管任务"当成同一时刻读 —— 负载下读到 `R` + `TracerPid 0`（60 次跑出 4 次红）。改成有界等待
+>   （5 s 轮询）后，**6 个 CPU hog / 8 核下 60+80 次全绿**；变异（把 `DETACH`-with-`SIGSTOP` 换回
+>   `PTRACE_CONT`）仍然被抓：2/2 红在上述新断言上（`state 't'` + 残留 tracer）。
+> * 修完复量：`cargo test -p sandlock-core --offline --lib` = **888 passed / 0 failed**，root 与非 root
+>   两种形态、以及负载下均一致（4 次独立运行）。表里写的 848 是旧的，**正确的数是 888**。
+> * `core_integ` **仍然跑不完**，所以这张表的**其它数字维持不动**：`test_chroot_magic_fd_symlink_resolves_to_child_fd`
+>   在 tip 上**确定性挂住**（单跑、空载、干净夹具、helper 健康；同一 tip 的干净 worktree 同样挂，
+>   所以与本轮改动无关）—— 证据与判读见 E2B 仓 `docs/task-backlog.md` N33。跳过它之后整档是
+>   `542 passed / 1 failed / 84.31s`（历史：543 passed / 84.14s），那 1 条是
+>   `test_restore::test_restore_glibc_vdso_program_resumes`，只在"测试二进制 stdio 是普通文件"时红
+>   （管道则绿）——E2B 仓 N34。
+> * 同一轮还修掉一个会把整个 chroot 家族变成假红的状态坑：共享夹具目录里的残留 rootfs 会让
+>   `build_test_rootfs` 回退 `fs::copy`，而它的目标与共享的 `tests/rootfs-helper` **同 inode** ⇒
+>   打开写入把源截断成 0 字节，之后所有 chroot 用例报 `Exec format error`。`test_chroot.rs` 现在与
+>   `test_instance_chroot.rs` 一样（单调 seq + 先清目录），`build.rs::build_static` 改成编译到同级
+>   临时文件再 `rename` 发布。E2B 仓 `docs/build-test-deploy-pitfalls.md` B12。
 >
-> 因此本轮**不**改动下面的数字：先修那几条时序用例（或给门禁一个"flaky 名单 + 重跑"的正式机制），
-> 再把表刷到那时的数字。在那之前，定向套件（`cargo test -p sandlock-core --lib`、
+> 因此：**要先修好 N33（那条挂起），再用一次完整绿跑把表刷到那时的数字**；`core_lib` 这一格现在
+> 就可以写 888。在那之前，定向套件（`cargo test -p sandlock-core --lib`、
 > `-p sandlock-supervise --test supervise`）才是可信证据 —— E2B 侧这一轮的验收就是这么做的
-> （`docs/k8s-deployment.md` §22.5.12、`docs/build-test-deploy-pitfalls.md` §B5–B9）。
+> （`docs/k8s-deployment.md` §22.5.12、`docs/build-test-deploy-pitfalls.md` §B5–B9/B12）。
 
 # Measured 2026-09-04 in sandlock-dev:latest (Debian trixie x86_64, cargo 1.98,
 # python 3.11.16), repo mounted at /src, --privileged; kernel
@@ -68,7 +83,25 @@
 # and core_integ (534 -> 539) move, by the A1/A2 test cases registered below;
 # ffi / cli / supervise / supervise_cost / cli_build / python / oci /
 # supervise_root / mediation_2uid are unchanged.
-core_lib = 848 # FUP-26 (2026-09-15): 844 -> 848, +4 unit tests in
+core_lib = 888 # 2026-09-22 (the E2B gate-repair round): 848 -> 888, because
+               # the three reds the previous note recorded are all fixed and
+               # the count is now deterministic — measured four times, 888/0
+               # every time (uid 65534 and root shapes, plus 60 loaded runs of
+               # the sigstop case alone). What each red actually was:
+               # two mode-bit cases in `cow/seccomp.rs::tests`
+               # (`rename_staging_failure_fails_rename_and_rolls_back`,
+               # `write_open_in_unreadable_dir_virtualizes`) had lost the
+               # "skipped as root" guard their siblings carry — the 886/2 run
+               # was a root run, not load (reproduced at the same assertion
+               # lines, 4823 / 4376); and
+               # `resource.rs::tests::sigstop_inside_the_fork_tracking_window_
+               # ends_as_a_real_stop` had two real problems: a fixture that
+               # *did* fork (`sh -c 'sleep 30'` — dash forks and stays as the
+               # parent, so the fork raced the SIGSTOP) and a state assertion
+               # that read /proc once, racing the kernel's delivery of the
+               # stop to the detached task. See the note at the top of this
+               # file for the evidence paths and the mutant proof.
+               # FUP-26 (2026-09-15): 844 -> 848, +4 unit tests in
                # `sys/fs.rs::tests` pinning the bounded `EAGAIN` retry of
                # `openat2(RESOLVE_IN_ROOT)` (openat2(2): the kernel could not
                # prove a `..` did not escape — a race, and the caller "may

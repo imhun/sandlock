@@ -4357,7 +4357,17 @@ mod tests {
         // (as with /root under learn's workdir="/"). The write must still
         // virtualize onto an empty upper file instead of erroring out and
         // letting the child hit the real permission wall.
+        //
+        // Skipped as root, where `CAP_DAC_OVERRIDE` reads straight through the
+        // 0o000 fixture: the copy then really copies, and this read as a
+        // regression (2026-09-22, the "886/2" gate run -- see
+        // `docs/test-baseline.md`). Unprivileged is the only shape that tests
+        // anything here.
         use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("skipped: root ignores mode bits");
+            return;
+        }
         let (workdir, storage) = setup_workdir();
         fs::create_dir(workdir.path().join("locked")).unwrap();
         fs::write(workdir.path().join("locked/f"), "x").unwrap();
@@ -4804,7 +4814,15 @@ mod tests {
         // source was whiteouted anyway and the untraversed children were
         // lost at commit. The rename must fail, leave the merged view
         // untouched, and leave no partially staged destination behind.
+        //
+        // Skipped as root, for the same reason as
+        // `write_open_in_unreadable_dir_virtualizes`: the 0o000 fixture is the
+        // whole test, and root is not stopped by it.
         use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::getuid() } == 0 {
+            eprintln!("skipped: root ignores mode bits");
+            return;
+        }
         let (workdir, storage) = setup_workdir();
         let wd = workdir.path().canonicalize().unwrap();
         fs::create_dir(wd.join("d")).unwrap();

@@ -1342,9 +1342,21 @@ mod tests {
     /// tests demand.
     #[test]
     fn sigstop_inside_the_fork_tracking_window_ends_as_a_real_stop() {
-        let mut caller = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg("sleep 30")
+        // The caller must be *unable* to fork while the window is open: a fork
+        // event racing the stop in makes the window legitimately end as
+        // "a child exists", which is a different (also correct) outcome and
+        // not what this test is about.
+        //
+        // `/bin/sh -c 'sleep 30'` is not such a caller. dash forks for a
+        // non-builtin `-c` command and stays alive as the parent (measured in
+        // sandlock-dev on 2026-09-22: `sh -c sleep 30` leaves the sh pid and a
+        // `sleep` child), so the fork races the window: 3 reds in 40 runs at
+        // 5 CPU hogs on 8 CPUs (`tmp/k0s/sigstop-logs/`, E2B checkout), all at
+        // the `!created` assertion below.
+        //
+        // `sleep(1)` is a single exec with no forking path of its own.
+        let mut caller = std::process::Command::new("/bin/sleep")
+            .arg("30")
             .spawn()
             .expect("spawn a caller that will not fork");
         let tid = caller.id() as i32;
@@ -1393,18 +1405,34 @@ mod tests {
              failed-fork watchdog (took {elapsed:?})"
         );
 
-        let status = std::fs::read_to_string(format!("/proc/{tid}/status"))
-            .expect("caller status");
-        let state = status
-            .lines()
-            .find(|line| line.starts_with("State:"))
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|word| word.chars().next());
-        let tracer = status
-            .lines()
-            .find(|line| line.starts_with("TracerPid:"))
-            .and_then(|line| line.split_whitespace().nth(1))
-            .unwrap_or("<missing>");
+        // Two different claims, with two different time bounds. `elapsed`
+        // above bounds the *window*; it says nothing about when the kernel
+        // finishes delivering the stop to the now-untraced task. Reading
+        // /proc once right after the detach therefore races the delivery and
+        // reports `State: R, TracerPid: 0` on a loaded machine (measured
+        // 2026-09-22: 4 reds in 60 runs at 5 CPU hogs on 8 CPUs). The
+        // bounded wait below is what the contract actually is -- a task that
+        // discarded the stop (the `PTRACE_CONT` mutant this test exists for)
+        // keeps running and never reaches `T`, so it is still caught.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut state = None;
+        let mut tracer = String::from("<missing>");
+        loop {
+            let status = std::fs::read_to_string(format!("/proc/{tid}/status"))
+                .expect("caller status");
+            let field = |key: &str| -> Option<&str> {
+                status
+                    .lines()
+                    .find(|line| line.starts_with(key))
+                    .and_then(|line| line.split_whitespace().nth(1))
+            };
+            state = field("State:").and_then(|word| word.chars().next());
+            tracer = field("TracerPid:").unwrap_or("<missing>").to_string();
+            if state == Some('T') || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert_eq!(
             state,
             Some('T'),

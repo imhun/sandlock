@@ -5,6 +5,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
+/// Monotonic suffix for scratch directory names; see `temp_dir`.
+static SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Path to the static rootfs-helper binary (compiled by build.rs).
 fn helper_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -31,10 +34,31 @@ fn temp_dir(name: &str) -> PathBuf {
     // fallback, whose writable fd can be inherited by a concurrent fork+exec in
     // another parallel test and leave the helper briefly open for write, making
     // the eventual execve fail with ETXTBSY (Text file busy).
+    //
+    // The pid alone is NOT enough to name that scratch, for the reason
+    // `test_instance_chroot.rs` records in full: `CARGO_TARGET_TMPDIR` is
+    // `target-linux/tmp`, which survives across container runs while the pid
+    // baked into the name is reused there, and a case that fails (or hangs)
+    // never reaches `cleanup_rootfs`. A leftover rootfs then makes
+    // `build_test_rootfs`'s hard link fail, and its `fs::copy` fallback writes
+    // to a destination that is the SAME INODE as the shared
+    // `tests/rootfs-helper` -- opening it for write truncates the source. The
+    // git-ignored artifact goes to zero bytes and every later chroot case dies
+    // with `execvp 'rootfs-helper': Exec format error` (measured 2026-09-22:
+    // one leftover `magic-fd-link` fixture zeroed the helper and turned the
+    // whole file red). A monotonic suffix plus a clean start removes the
+    // fallback-copy path and the leftover it needs.
     let base = option_env!("CARGO_TARGET_TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    let dir = base.join(format!("sandlock-test-chroot-{}-{}", name, std::process::id()));
+    let seq = SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = base.join(format!(
+        "sandlock-test-chroot-{}-{}-{}",
+        name,
+        std::process::id(),
+        seq
+    ));
+    let _ = fs::remove_dir_all(&dir);
     let _ = fs::create_dir_all(&dir);
     dir
 }
