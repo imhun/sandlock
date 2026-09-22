@@ -77,6 +77,26 @@
   `tests/unit/test_oci_registry.py` 的「chroot 内解析到同一 inode」钉子需要同步调整/删除，
   这正是当初为了绕开本 bug 才加的那两条。
 
+  **前提②已在部署宿主上量过（2026-09-22，E2B 侧）**：把触发机制直接复现 —— 一个
+  `..` 相对符号链接（`lib64/ld.so -> ../lib/real/ld.so`）+ `RESOLVE_IN_ROOT`，同时用
+  4 条线程在**被走的路径下面**反复 rename，然后统计 errno（探针
+  `sandlock-e2b/tmp/k0s/probe_openat2_eagain.py`，一次 40000 次 openat2）：
+
+  | 宿主 | 内核 | EAGAIN / 40000 | 成功 |
+  |---|---|---|---|
+  | `.94`（k0s 控制面节点） | 6.12.0-211.34.1.el10_2.aarch64 | **8107（20%）** | 18398 |
+  | `.140`（worker 节点） | 6.12.0-211.34.1.el10_2.aarch64 | **6855（17%）** | 17511 |
+  | 开发容器（对照） | 7.0.14-orbstack x86_64 | 730 / 20000（3.7%） | 7446 |
+
+  ⇒ **这两个宿主内核确实会返回 EAGAIN**（不是只有开发内核会），所以本仓的 `EAGAIN`
+  有界重试在线上是**真的在被用**；前提①也成立（集群 worker 镜像里的 wheel manifest
+  HEAD = `7b60349c`，含 FUP-26）。**剩下的只有前提③**：那是**产品路径**的竞态 soak
+  （受管 open 连续 97482 次 0 失败、300 条 `exec /bin/echo` 0 次「127 + 空 stderr」、
+  同时内核侧原始 EAGAIN > 0），要在**部署宿主**上跑，而 worker 镜像里没有 cargo ——
+  要么在节点上起 sandlock-dev 类镜像，要么交叉编译出 arm64 的 soak 二进制塞进一次性 pod。
+  在那之前**保留改写**（它的代价只是每沙箱建箱时一次树走查 + "沙箱看到的文件系统与镜像不同"
+  这一点），撤掉的收益不足以承担没有 soak 的风险。
+
 - **FUP-24 `kill --all` 的兜底判据仍是「任何发送错误」而不是「连不上」（f1oci，
   2026-09-14）** — 来源：f1oci 对 oci `test_signal_to_sibling_pid_rejected` flake
   的定真因（见 `docs/CHANGELOG.md` 的 f1oci 两条 + `.superpowers/sdd/task-f1oci-report.md`）。
