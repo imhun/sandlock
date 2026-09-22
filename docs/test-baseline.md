@@ -1,5 +1,24 @@
 # sandlock fork test baseline — Linux 7.0.14-orbstack-00380-ga7e0a2dc9535, Landlock ABI 8, Python 3.11.16
 
+> **2026-09-22 状态（E2B 侧，未刷表）**：这张表的数字**没有**跟着刷新，因为先量出来的
+> 是"数字本身不稳定"，刷一个数只会把门禁变成偶发红：
+>
+> * `core_lib`：三次运行分别是 **888/0**（单容器、无竞争）、**887/1**、**886/2** —— 三次红的
+>   用例互不相同（`resource::tests::sigstop_inside_the_fork_tracking_window_ends_as_a_real_stop`、
+>   `cow::seccomp::tests::rename_staging_failure_fails_rename_and_rolls_back`、
+>   `cow::seccomp::tests::write_open_in_unreadable_dir_virtualizes`），都是时序/权限顺序敏感的那类；
+>   证据：`sandlock-e2b/tmp/k0s/fork-core-lib-gate.log`（887/1）与 `fork-core-lib-flaky.log`（886/2）。
+>   表里写的 848 早就过期，但"正确的数"在把这几条 flaky 定下来之前不存在。
+> * `core_integ`：在一次测量运行里**挂住**——`test_chroot::test_chroot_magic_fd_symlink_resolves_to_child_fd`
+>   之后再无输出（25 分钟，容器被手动停掉），证据 `sandlock-e2b/tmp/k0s/fork-core-integ-hang.log`。
+>   在挂住的那次运行里，同一台机器上**同时**跑着两个 sandlock-dev 容器（都挂在同一个
+>   `target/` 上、共享 CPU），所以"负载下的时序"是首要嫌疑，但它没有被单独验证过。
+>
+> 因此本轮**不**改动下面的数字：先修那几条时序用例（或给门禁一个"flaky 名单 + 重跑"的正式机制），
+> 再把表刷到那时的数字。在那之前，定向套件（`cargo test -p sandlock-core --lib`、
+> `-p sandlock-supervise --test supervise`）才是可信证据 —— E2B 侧这一轮的验收就是这么做的
+> （`docs/k8s-deployment.md` §22.5.12、`docs/build-test-deploy-pitfalls.md` §B5–B9）。
+
 # Measured 2026-09-04 in sandlock-dev:latest (Debian trixie x86_64, cargo 1.98,
 # python 3.11.16), repo mounted at /src, --privileged; kernel
 # 7.0.14-orbstack-00380-ga7e0a2dc9535; Landlock ABI 8 (read via
