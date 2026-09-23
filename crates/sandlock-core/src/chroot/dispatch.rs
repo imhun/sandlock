@@ -427,6 +427,50 @@ fn canon_proc_self(virtual_path: &str, pid: u32) -> String {
 /// the child's real cwd, `/proc/<pid>/cwd` still points wherever exec left
 /// it. That kernel value is the right answer only for a task that has never
 /// moved, which is exactly when nothing is tracked.
+/// The interpreter a `#!` line names, read from the file itself.
+///
+/// The kernel resolves that line by itself, with no notification for this
+/// mediator, so a script's interpreter is the one exec-time path the `openat`
+/// handler never sees. Reading the line here is how the write watch on it can
+/// be released anyway (see [`release_write_watch`]); it is the same trick
+/// `read_pt_interp` uses for an ELF's PT_INTERP.
+///
+/// Only the interpreter *path* matters: a trailing argument
+/// (`#!/usr/bin/env python3`) is an argument, not a path, and the interpreter
+/// it names is itself exec'd through this handler later.
+fn shebang_interpreter(host_path: &Path) -> Option<PathBuf> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(host_path).ok()?;
+    let mut buf = [0u8; 256];
+    let read = file.read(&mut buf).ok()?;
+    let line = &buf[..read];
+    if !line.starts_with(b"#!") {
+        return None;
+    }
+    let rest = &line[2..];
+    let end = rest
+        .iter()
+        .position(|b| *b == b'\n' || *b == b'\r')
+        .unwrap_or(rest.len());
+    let rest = &rest[..end];
+    let start = rest
+        .iter()
+        .position(|b| *b != b' ' && *b != b'\t')
+        .unwrap_or(rest.len());
+    let rest = &rest[start..];
+    let stop = rest
+        .iter()
+        .position(|b| *b == b' ' || *b == b'\t')
+        .unwrap_or(rest.len());
+    let raw = &rest[..stop];
+    // The kernel takes the interpreter verbatim, so anything relative is a
+    // non-starter (`execve` answers ENOENT) and nothing is watched.
+    if raw.is_empty() || raw[0] != b'/' {
+        return None;
+    }
+    Some(PathBuf::from(String::from_utf8_lossy(raw).into_owned()))
+}
+
 /// The host path behind a virtual path, for the exec-watch release below.
 fn exec_host_path(virtual_path: &Path, ctx: &ChrootCtx<'_>) -> Option<PathBuf> {
     if let Some((mount_host, sub)) = ctx.mount_target(virtual_path) {
@@ -448,7 +492,12 @@ fn exec_host_path(virtual_path: &Path, ctx: &ChrootCtx<'_>) -> Option<PathBuf> {
 /// so releasing early costs the accounting nothing and unblocks the exec.
 fn release_write_watch(host_path: &Path, ctx: &ChrootCtx<'_>) {
     for ((pid, fd), entry) in ctx.write_fds.snapshot() {
-        if entry.path != host_path {
+        // Spellings can differ (`/bin/sh` against a resolved `/usr/bin/dash`,
+        // or a mount alias), and a missed comparison is exactly the ETXTBSY
+        // this function exists to avoid -- so compare resolved forms too.
+        if entry.path != host_path && std::fs::canonicalize(&entry.path).ok()
+            != std::fs::canonicalize(host_path).ok()
+        {
             continue;
         }
         if let Some(held) = entry.held.as_ref() {
@@ -1613,6 +1662,26 @@ pub(crate) async fn handle_chroot_exec(
     // loses the descriptor, not the information.
     if let Some(host_path) = exec_host_path(&virtual_path, ctx) {
         release_write_watch(&host_path, ctx);
+        // A script's interpreter is resolved by the kernel, so the watch on it
+        // is released here or not at all -- and "copy a binary in, then point a
+        // script at it" (how a venv's console script starts) is exactly the
+        // shape that would otherwise answer ETXTBSY. Nested interpreters are
+        // followed the way the kernel does it, a bounded number of times.
+        let mut interp_host = shebang_interpreter(&host_path);
+        for _ in 0..4 {
+            let Some(interpreter) = interp_host.take() else {
+                break;
+            };
+            match exec_host_path(&crate::chroot::resolve::confine(
+                &interpreter.to_string_lossy(),
+            ), ctx) {
+                Some(resolved) => {
+                    release_write_watch(&resolved, ctx);
+                    interp_host = shebang_interpreter(&resolved);
+                }
+                None => break,
+            }
+        }
     }
 
     // A child with a real root (crate::realroot) resolves this path itself: the
