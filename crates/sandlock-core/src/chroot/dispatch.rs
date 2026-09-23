@@ -421,95 +421,52 @@ fn canon_proc_self(virtual_path: &str, pid: u32) -> String {
     virtual_path.to_string()
 }
 
+/// Settle and drop every write watch whose sandbox descriptor is already gone.
+///
+/// The mediator keeps its own duplicate of every write descriptor
+/// (`WriteFds::held`) so the accounting can still learn a short-lived writer's
+/// final offset after the sandbox closed its own copy. That duplicate is also
+/// what makes the kernel answer ETXTBSY for a file the sandbox wrote moments
+/// ago -- and an `exec` is where that becomes user-visible: the exec target, a
+/// script's interpreter, and anything else the kernel resolves by itself all
+/// have to be executable *now*.
+///
+/// So an exec settles first: every entry whose sandbox descriptor is gone is
+/// read one last time (the pump's own reading, taken early), marked dirty so
+/// the ledger walk still re-reads the path, and dropped -- which releases the
+/// duplicate. Entries whose writer is still running are left alone on purpose:
+/// there the kernel's refusal is about the sandbox's *own* live descriptor,
+/// which is the rule it is meant to enforce.
+fn settle_closed_writes(ctx: &ChrootCtx<'_>) {
+    use crate::append_watch::OffsetReader;
+    let reader = crate::append_watch::ProcOffsetReader;
+    for ((pid, fd), entry) in ctx.write_fds.snapshot() {
+        if reader.read_offset(pid, fd).is_some() {
+            continue;
+        }
+        // A descriptor that was dup'd to another number is still a writer; the
+        // pump keeps those alive the same way (by path) and so does this.
+        if reader.read_offset_by_path(pid, &entry.path).is_some() {
+            continue;
+        }
+        if let Some(offset) = entry
+            .held
+            .as_ref()
+            .and_then(|held| reader.read_offset_held(held))
+        {
+            ctx.write_fds.observe(pid, fd, offset);
+        }
+        ctx.mark_dirty(&entry.path);
+        ctx.write_fds.forget(pid, fd);
+    }
+}
+
 /// The virtual cwd of the calling task.
 ///
 /// The supervisor's own notion wins: since chdir is serviced without moving
 /// the child's real cwd, `/proc/<pid>/cwd` still points wherever exec left
 /// it. That kernel value is the right answer only for a task that has never
 /// moved, which is exactly when nothing is tracked.
-/// The interpreter a `#!` line names, read from the file itself.
-///
-/// The kernel resolves that line by itself, with no notification for this
-/// mediator, so a script's interpreter is the one exec-time path the `openat`
-/// handler never sees. Reading the line here is how the write watch on it can
-/// be released anyway (see [`release_write_watch`]); it is the same trick
-/// `read_pt_interp` uses for an ELF's PT_INTERP.
-///
-/// Only the interpreter *path* matters: a trailing argument
-/// (`#!/usr/bin/env python3`) is an argument, not a path, and the interpreter
-/// it names is itself exec'd through this handler later.
-fn shebang_interpreter(host_path: &Path) -> Option<PathBuf> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(host_path).ok()?;
-    let mut buf = [0u8; 256];
-    let read = file.read(&mut buf).ok()?;
-    let line = &buf[..read];
-    if !line.starts_with(b"#!") {
-        return None;
-    }
-    let rest = &line[2..];
-    let end = rest
-        .iter()
-        .position(|b| *b == b'\n' || *b == b'\r')
-        .unwrap_or(rest.len());
-    let rest = &rest[..end];
-    let start = rest
-        .iter()
-        .position(|b| *b != b' ' && *b != b'\t')
-        .unwrap_or(rest.len());
-    let rest = &rest[start..];
-    let stop = rest
-        .iter()
-        .position(|b| *b == b' ' || *b == b'\t')
-        .unwrap_or(rest.len());
-    let raw = &rest[..stop];
-    // The kernel takes the interpreter verbatim, so anything relative is a
-    // non-starter (`execve` answers ENOENT) and nothing is watched.
-    if raw.is_empty() || raw[0] != b'/' {
-        return None;
-    }
-    Some(PathBuf::from(String::from_utf8_lossy(raw).into_owned()))
-}
-
-/// The host path behind a virtual path, for the exec-watch release below.
-fn exec_host_path(virtual_path: &Path, ctx: &ChrootCtx<'_>) -> Option<PathBuf> {
-    if let Some((mount_host, sub)) = ctx.mount_target(virtual_path) {
-        let sub = sub.trim_start_matches('/');
-        return Some(if sub.is_empty() {
-            mount_host.to_path_buf()
-        } else {
-            mount_host.join(sub)
-        });
-    }
-    Some(ctx.root.join(virtual_path.strip_prefix("/").unwrap_or(virtual_path)))
-}
-
-/// Settle and then drop every write watch on `host_path`.
-///
-/// Called on the exec path: the watch's `held` descriptor is what makes the
-/// kernel answer ETXTBSY for a file the sandbox wrote moments ago, and the
-/// final size reading here is the same one the append pump would have taken --
-/// so releasing early costs the accounting nothing and unblocks the exec.
-fn release_write_watch(host_path: &Path, ctx: &ChrootCtx<'_>) {
-    for ((pid, fd), entry) in ctx.write_fds.snapshot() {
-        // Spellings can differ (`/bin/sh` against a resolved `/usr/bin/dash`,
-        // or a mount alias), and a missed comparison is exactly the ETXTBSY
-        // this function exists to avoid -- so compare resolved forms too.
-        if entry.path != host_path && std::fs::canonicalize(&entry.path).ok()
-            != std::fs::canonicalize(host_path).ok()
-        {
-            continue;
-        }
-        if let Some(held) = entry.held.as_ref() {
-            let end = unsafe { libc::lseek(held.as_raw_fd(), 0, libc::SEEK_END) };
-            if end >= 0 {
-                ctx.write_fds.observe(pid, fd, end as u64);
-            }
-        }
-        ctx.write_fds.forget(pid, fd);
-    }
-}
-
 fn virtual_cwd_of(notif: &SeccompNotif, ctx: &ChrootCtx<'_>) -> Option<PathBuf> {
     if let Ok(pid) = i32::try_from(notif.pid) {
         if let Some(cwd) = ctx.processes.virtual_cwd(pid) {
@@ -1660,29 +1617,10 @@ pub(crate) async fn handle_chroot_exec(
     // The accounting is settled first -- one final size reading, which is what
     // the pump would have done -- so the bytes are attributed and the watch only
     // loses the descriptor, not the information.
-    if let Some(host_path) = exec_host_path(&virtual_path, ctx) {
-        release_write_watch(&host_path, ctx);
-        // A script's interpreter is resolved by the kernel, so the watch on it
-        // is released here or not at all -- and "copy a binary in, then point a
-        // script at it" (how a venv's console script starts) is exactly the
-        // shape that would otherwise answer ETXTBSY. Nested interpreters are
-        // followed the way the kernel does it, a bounded number of times.
-        let mut interp_host = shebang_interpreter(&host_path);
-        for _ in 0..4 {
-            let Some(interpreter) = interp_host.take() else {
-                break;
-            };
-            match exec_host_path(&crate::chroot::resolve::confine(
-                &interpreter.to_string_lossy(),
-            ), ctx) {
-                Some(resolved) => {
-                    release_write_watch(&resolved, ctx);
-                    interp_host = shebang_interpreter(&resolved);
-                }
-                None => break,
-            }
-        }
-    }
+    // One settle per exec, before the kernel is asked to run anything: it
+    // covers the exec target, a script's interpreter (which the kernel resolves
+    // on its own) and any other file this sandbox has already finished writing.
+    settle_closed_writes(ctx);
 
     // A child with a real root (crate::realroot) resolves this path itself: the
     // image tree *is* its root, and the mounts are its own. Hand the syscall
