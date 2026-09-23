@@ -174,3 +174,109 @@ async fn test_restore_glibc_vdso_program_resumes() {
         strays.len(),
     );
 }
+
+/// The real root must not break checkpoint/restore (N35 follow-up, 2026-09-23).
+///
+/// `restore_interactive` re-creates the sandbox from the *policy*, so the
+/// checkpoint's host-recorded paths -- the exe mapping and every fd the plan
+/// reopens -- have to be translated into the tree the restored child will run
+/// in. With `real_root` that tree is the rootfs itself: the kernel resolves
+/// paths inside it and the mediator no longer rewrites them, so anything the
+/// restore path needs has to exist there (including the restore stub's own
+/// binary, which the chroot shape reaches through the mediator).
+///
+/// Same counter proof as the vDSO test: checkpoint a `clock-loop`, kill the
+/// original, write a sentinel, restore into a fresh sandbox and require the
+/// counter to advance past the checkpoint's baseline.
+#[tokio::test]
+async fn test_restore_resumes_inside_a_real_root() {
+    if cfg!(not(any(target_arch = "x86_64", target_arch = "riscv64"))) {
+        eprintln!("skipping: the restore engine is x86_64/riscv64 only");
+        return;
+    }
+
+    let helper = helper_binary();
+    let tmp = std::env::temp_dir().join(format!("sandlock-realroot-{}", std::process::id()));
+    let rootfs = tmp.join("rootfs");
+    let data = tmp.join("data");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
+    std::fs::create_dir_all(rootfs.join("work")).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let inside = rootfs.join("usr/bin/rootfs-helper");
+    std::fs::copy(&helper, &inside).expect("install the helper inside the rootfs");
+
+    let counter = data.join("clock.cnt");
+    let counter_s = counter.to_str().unwrap().to_string();
+
+    // The policy an image-rootfs sandbox carries: the rootfs as the real root,
+    // the image's own directories readable, one workspace mount writable.
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .real_root(true)
+        .fs_read("/usr")
+        .fs_mount("/work", &data)
+        .fs_write("/work")
+        .cwd("/work")
+        .build()
+        .expect("real-root policy builds");
+
+    let mut sb = policy.clone().with_name("realroot-src");
+    sb.spawn_interactive(&["/usr/bin/rootfs-helper", "clock-loop", "/work/clock.cnt"])
+        .await
+        .expect("the real-root sandbox starts the counter");
+
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let cp = sb.checkpoint().await.expect("checkpoint a real-root sandbox");
+
+    let read_counter = |path: &str| -> Option<u64> {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+    let baseline = read_counter(&counter_s).expect("counter file should exist with a value");
+    assert!(baseline > 2, "counter should have advanced, got {baseline}");
+
+    sb.kill().unwrap();
+    let _ = sb.wait().await;
+    std::fs::write(&counter, b"0\n").unwrap();
+
+    let mut sb2 = policy.clone().with_name("realroot-dst");
+    // Both root shapes must refuse, immediately and by name. The stub is a host
+    // build artifact exec'd by its host path, and a chroot root -- emulated or
+    // real -- resolves the workload's paths inside the rootfs, so the attempt
+    // otherwise ends in the measured 10 s READY timeout over a process that
+    // exited 127 ("execvp '<target>/restore-stub': No such file or directory").
+    for (label, mut candidate) in [
+        ("real root", policy.clone().with_name("realroot-dst")),
+        ("emulated root", {
+            let mut emulated = policy.clone();
+            emulated.real_root = false;
+            emulated.with_name("emulated-dst")
+        }),
+    ] {
+        let started = std::time::Instant::now();
+        let refusal = candidate.restore_interactive(&cp).await.map(|_| ());
+        let elapsed = started.elapsed();
+        let text = match &refusal {
+            Ok(()) => String::new(),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            refusal.is_err(),
+            "restoring into a {label} must be refused, not attempted"
+        );
+        assert!(
+            text.contains("restore stub") && text.contains("chroot root"),
+            "the refusal has to name the stub and the root shape ({label}): {text}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the refusal must be immediate, not a READY timeout ({label}): took {elapsed:?}"
+        );
+    }
+
+    // The positive control is the chroot-free test next door
+    // (`test_restore_glibc_vdso_program_resumes`): same engine, no root, resumes.
+    let _ = std::fs::remove_dir_all(&tmp);
+}

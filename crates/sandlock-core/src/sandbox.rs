@@ -1337,6 +1337,34 @@ impl Sandbox {
         // without a chroot, leaving paths untranslated.
         let chroot_root = crate::chroot::resolve::resolve_chroot_root(self.chroot.as_deref())?;
         let mounts = crate::chroot::resolve::resolve_chroot_mounts(&self.fs_mount);
+        // A chroot root -- emulated or real -- resolves the workload's paths
+        // inside the rootfs, while the stub is a host build artifact that this
+        // method execs by its host path (`resume::stub_path`). It can never be
+        // reached there, and the failure is otherwise a 10 s READY timeout over
+        // a process nobody can see. Measured 2026-09-23 on both shapes:
+        // `execvp '/src/target/.../restore-stub': No such file or directory`,
+        // then "restore stub never signalled READY within 10000ms: exited with
+        // restore-stub code 127". Chroot-free policies do work
+        // (test_restore_glibc_vdso_program_resumes). Refuse up front instead,
+        // naming the reason and the way out; E2B never calls this
+        // (docs/chroot-workspace-exec.md §9.7.9) and its production shape is a
+        // chroot root, so this is a documented gap, not a regression.
+        if let Some(root) = chroot_root.as_ref() {
+            let stub_host = stub.canonicalize().unwrap_or_else(|_| stub.clone());
+            if !stub_host.starts_with(root) {
+                return Err(SandboxRuntimeError::Child(format!(
+                    "checkpoint restore cannot run with a chroot root (emulated or real, \
+                     real_root={}): the restore stub lives on the host ({}), and the \
+                     sandbox's own root is {} -- the stub has to be reachable inside that \
+                     root (a policy mount carrying it, or a chroot-free restore target) \
+                     before this can work",
+                    self.real_root,
+                    stub_host.display(),
+                    root.display(),
+                ))
+                .into());
+            }
+        }
         let plan = restore_blob::plan(cp, chroot_root.as_deref(), &mounts)
             .map_err(SandboxRuntimeError::Child)?;
 
