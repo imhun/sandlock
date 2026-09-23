@@ -285,6 +285,14 @@ pub struct SandboxBuilder {
     pub pid_ns: bool,
 
     /// Build a real root for the image-rootfs shape (see `Sandbox::real_root`).
+    ///
+    /// A CLI flag like `--pid-ns` (and, like it, forwarded by the CLI's
+    /// `apply_flattened_bool_flags`). Without an `arg(...)` here clap derives a
+    /// *positional* bool, which its own debug assertions reject at parse time:
+    /// measured 2026-09-23, the whole `sandlock` binary panicked with
+    /// "Argument 'real_root' is positional and it must take a value but action
+    /// is SetTrue" as soon as the field was added.
+    #[cfg_attr(feature = "cli", arg(long = "real-root"))]
     pub real_root: bool,
 
     /// Self-map the confining process's own host uid to **in-namespace uid 0**

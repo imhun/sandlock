@@ -478,6 +478,12 @@ fn apply_flattened_bool_flags(
     if pb.pid_ns {
         builder = builder.pid_ns(true);
     }
+    // N35: the real root is a policy knob like `--pid-ns`, and it has to be
+    // forwarded the same way -- a flag that parses but never reaches the
+    // builder would look like "the sandbox ignored --real-root".
+    if pb.real_root {
+        builder = builder.real_root(true);
+    }
     if pb.port_remap {
         builder = builder.port_remap(true);
     }
@@ -1225,6 +1231,37 @@ mod net_bind_map_tests {
         assert!(
             !default_policy.pid_ns,
             "the default shared-PID-namespace shape must stay the default"
+        );
+    }
+
+    /// N35: `--real-root` must parse at all -- clap rejected the field while it
+    /// had no `arg(...)` (a positional `bool` trips its debug asserts, so every
+    /// `sandlock` invocation panicked) -- and must reach the runtime policy
+    /// instead of being accepted and ignored.
+    #[test]
+    fn test_real_root_flag_reaches_runtime_policy() {
+        let cli = Cli::try_parse_from(["sandlock", "run", "--real-root", "--", "true"])
+            .expect("--real-root must parse");
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        let policy = apply_flattened_bool_flags(Sandbox::builder(), &args.sandbox_builder)
+            .build()
+            .expect("policy must build");
+        assert!(policy.real_root, "--real-root must reach the runtime policy");
+
+        let default = Cli::try_parse_from(["sandlock", "run", "--", "true"])
+            .expect("run without --real-root must parse");
+        let Command::Run(default_args) = default.command else {
+            panic!("expected the run subcommand");
+        };
+        let default_policy =
+            apply_flattened_bool_flags(Sandbox::builder(), &default_args.sandbox_builder)
+                .build()
+                .expect("default policy must build");
+        assert!(
+            !default_policy.real_root,
+            "the emulated root must stay the default"
         );
     }
 }

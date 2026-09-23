@@ -136,10 +136,10 @@ pub const POLICY_FIELDS: &[&str] = &[
     "on_error",
     "on_exit",
     "pid_ns",
-    "real_root",
     "port_mappings",
     "port_remap",
     "random_seed",
+    "real_root",
     "time_start",
     "uid",
     "workdir",
@@ -1415,6 +1415,13 @@ pub fn example_policy_json(secret_path: &Path) -> String {
         "gpu_devices": [0],
         "port_remap": false,
         "pid_ns": true,
+        // N35: the image-rootfs shape builds a real root instead of emulating
+        // one. It belongs in this example for the same reason every other
+        // manifest field does: `example_policy_json_covers_every_manifest_field`
+        // and `full_field_policy_roundtrips` fail the moment the wire grows a
+        // field the example does not carry (measured: these three tests were
+        // red from the realroot commit until this line existed).
+        "real_root": true,
         "net_isolation": true,
         "fd_inject_connect": true,
         "port_mappings": {"50005": 8080},

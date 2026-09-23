@@ -115,7 +115,15 @@
 # and core_integ (534 -> 539) move, by the A1/A2 test cases registered below;
 # ffi / cli / supervise / supervise_cost / cli_build / python / oci /
 # supervise_root / mediation_2uid are unchanged.
-core_lib = 891 # 2026-09-22 (the E2B gate-repair round): 848 -> 891. 888 of
+core_lib = 897 # 2026-09-23: 891 -> 897, and the +6 is the N35 fork work that
+               # landed after the last refresh, not a new unit test surface:
+               # `44c40f3` (landlock: a mount's host source gets the rights its
+               # mount point declares) added 4 in `landlock.rs`, and `86630ea`
+               # (realroot: the image-rootfs shape builds a real root) added 2.
+               # Measured: the canonical non-root run reports 897/0, and the
+               # diff that landed today (`f1fecba`, `43cc62a`, `9246d09`) adds
+               # no `#[test]`/`#[tokio::test]` in src at all.
+               # 2026-09-22 (the E2B gate-repair round): 848 -> 891. 888 of
                # that is the settle-the-timing-reds work below; the last +3 is
                # `chroot::dispatch::watchable_open_tests` (a regular file has a
                # size to watch, a pipe does not, a character device does not),
@@ -542,7 +550,17 @@ ffi = 104 # B3 (2026-09-11, SL-1 hard delete): 106 -> 104 — the whole
          # compiles the regenerated sandlock.h against the cdylib (still 1);
          # header regeneration also picks up pre-existing drift at HEAD
          # (missing sandlock_sandbox_builder_notify_rate_limit declaration).
-cli = 97      # B3 (2026-09-11, SL-1 hard delete): 100 -> 97, -3 with the
+cli = 98      # 2026-09-23: 97 -> 98, +1
+              # `net_bind_map_tests::test_real_root_flag_reaches_runtime_policy`.
+              # The N35 realroot work added `SandboxBuilder::real_root` without
+              # an `arg(...)`/`clap(skip)` attribute, so clap derived a
+              # *positional* bool and its debug assertions aborted every
+              # `sandlock` invocation -- "Argument 'real_root' is positional and
+              # it must take a value but action is SetTrue", measured in this
+              # suite (3 tests red, suite aborted). The field is now the
+              # `--real-root` flag (like `--pid-ns`) and the CLI forwards it
+              # through `apply_flattened_bool_flags`, which the new test pins.
+              # B3 (2026-09-11, SL-1 hard delete): 100 -> 97, -3 with the
               # `--mediation-run-as` flag: tests/cli_test.rs (-2:
               # test_mediation_run_as_flag_accepted_and_runs,
               # test_mediation_run_as_rejects_unknown_value_at_parse) and
