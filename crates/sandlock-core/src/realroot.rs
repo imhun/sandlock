@@ -123,13 +123,24 @@ fn trace_path() -> String {
 fn write_trace(line: &str) {
     use std::io::Write;
     let slot = TRACE.get_or_init(|| {
-        std::sync::Mutex::new(
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(trace_path())
-                .ok(),
-        )
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(trace_path())
+            .ok();
+        if let Some(handle) = file.as_ref() {
+            // Close-on-exec, explicitly. Measured 2026-09-23: the descriptor
+            // was inherited by the workload (`/proc/<pid>/fd` showed the trace
+            // file), which hands the sandbox a write handle into the worker's
+            // filesystem -- exactly the kind of cross-boundary handle this
+            // module exists to avoid. A *failed* exec never applies the flag,
+            // which is the one case the post-exec failure breadcrumb needs it.
+            unsafe {
+                use std::os::fd::AsRawFd;
+                libc::fcntl(handle.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+        }
+        std::sync::Mutex::new(file)
     });
     if let Ok(mut guard) = slot.lock() {
         if let Some(file) = guard.as_mut() {
