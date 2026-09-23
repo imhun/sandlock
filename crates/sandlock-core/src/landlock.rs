@@ -189,6 +189,36 @@ fn add_path_rule(ruleset_fd: &OwnedFd, path: &Path, access: u64) -> Result<(), C
     Ok(())
 }
 
+/// Rights to grant a mount's host source, derived from what the policy
+/// declares for the mount *point* (the sandbox-side spelling).
+///
+/// `None` means "this mount is not part of the policy's path grants, so it
+/// gets no rule" -- the fail-closed default for anything the policy never
+/// mentioned. A read-only mount never yields the write mask even when the
+/// mount point is declared writable: the read-only declaration wins.
+fn path_rule_rights(policy: &Sandbox, virtual_path: &Path, write_mask: u64) -> Option<u64> {
+    let read_only = policy
+        .fs_mount_ro
+        .iter()
+        .any(|ro| virtual_path.starts_with(ro));
+    let writable = !read_only
+        && policy
+            .fs_writable
+            .iter()
+            .any(|w| virtual_path.starts_with(w));
+    if writable {
+        return Some(write_mask);
+    }
+    let readable = policy
+        .fs_readable
+        .iter()
+        .any(|r| virtual_path.starts_with(r));
+    if readable {
+        return Some(READ_ACCESS);
+    }
+    None
+}
+
 /// Add a Landlock network port rule to `ruleset_fd`.
 fn add_net_rule(ruleset_fd: &OwnedFd, port: u16, access: u64) -> Result<(), ConfinementError> {
     let attr = LandlockNetPortAttr {
@@ -502,6 +532,36 @@ pub(crate) fn build_ruleset(
         add_path_rule(&ruleset_fd, rule_path, READ_ACCESS).map_err(|e| {
             SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
         })?;
+    }
+
+    // Chroot mode: a mount's *source* is a host path, and (with no kernel-side
+    // bind mounts) it is the object the sandbox actually touches -- the
+    // mediator opens the host side on the child's behalf, and the kernel
+    // resolves through the source's own hierarchy whenever it resolves a path
+    // itself (an exec'd file's inode, a `#!` interpreter). Landlock matches on
+    // that hierarchy, so a rule on the *translated* mount point governs
+    // nothing: the mount point inside the rootfs is an empty stub.
+    //
+    // So the source gets exactly the rights the policy declares for its mount
+    // point -- no more. This is the same reasoning that pushes the COW upper
+    // dir into `fs_readable` ("binaries created inside the workdir live in the
+    // upper dir, and Landlock checks EXECUTE on the file's real path at execve
+    // time"): without it, a binary the sandbox writes into its own workspace is
+    // refused with EACCES (measured 2026-09-23: a static ELF, and any `#!`
+    // interpreter living on the host side).
+    if chroot_root.is_some() {
+        for (virtual_path, host_source) in &policy.fs_mount {
+            let rights = match path_rule_rights(policy, virtual_path, fs_write_mask) {
+                Some(rights) => rights,
+                None => continue,
+            };
+            if !host_source.exists() {
+                continue;
+            }
+            add_path_rule(&ruleset_fd, host_source, rights).map_err(|e| {
+                SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
+            })?;
+        }
     }
 
     // GPU device paths (when gpu_devices is set)
@@ -902,5 +962,96 @@ mod mask_contract_tests {
         let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
         assert_eq!(mask, 0, "net_deny + bind-all leaves no handled net access");
         assert!(wildcard, "net_deny must still set the wildcard flag");
+    }
+}
+
+#[cfg(test)]
+mod mount_source_rights_tests {
+    use super::*;
+    use crate::Sandbox;
+
+    const WRITE_MASK: u64 = 0xDEAD_BEEF;
+
+    fn sandbox() -> Sandbox {
+        Sandbox::builder()
+            .fs_write("/workspace")
+            .fs_write("/home/user")
+            .fs_read("/usr")
+            .fs_mount("/workspace", "/host/ws")
+            .fs_mount("/home/user", "/host/ws")
+            .fs_mount("/mnt/data", "/host/volume")
+            .fs_mount("/dev/null", "/dev/null")
+            .fs_mount_ro("/etc/resolv.conf", "/host/resolv.conf")
+            .build()
+            .expect("the fixture sandbox builds")
+    }
+
+    #[test]
+    fn writable_mount_point_grants_the_write_mask_to_its_source() {
+        // The whole point of the rule: the object the sandbox touches for
+        // /workspace is the host source, so that is where the rule has to go.
+        let sb = sandbox();
+        assert_eq!(
+            path_rule_rights(&sb, Path::new("/workspace"), WRITE_MASK),
+            Some(WRITE_MASK),
+            "a writable mount point must grant its source the write mask",
+        );
+        assert_eq!(
+            path_rule_rights(&sb, Path::new("/home/user"), WRITE_MASK),
+            Some(WRITE_MASK),
+            "the /home/user alias of the same source is writable too",
+        );
+    }
+
+    #[test]
+    fn mount_point_outside_every_grant_gets_no_rule() {
+        // Fail-closed: a mount the policy never mentioned must not be granted
+        // just because it is a mount.
+        let sb = sandbox();
+        assert_eq!(
+            path_rule_rights(&sb, Path::new("/mnt/data"), WRITE_MASK),
+            None,
+            "an undeclared mount point must not be granted",
+        );
+    }
+
+    #[test]
+    fn readable_only_mount_point_gets_execute_and_read_but_not_the_write_mask() {
+        let sb = Sandbox::builder()
+            .fs_read("/")
+            .fs_mount("/dev/null", "/dev/null")
+            .build()
+            .expect("the fixture sandbox builds");
+        assert_eq!(
+            path_rule_rights(&sb, Path::new("/dev/null"), WRITE_MASK),
+            Some(READ_ACCESS),
+            "a readable-only mount point must be read+execute, never write",
+        );
+    }
+
+    #[test]
+    fn read_only_mount_point_never_takes_the_write_mask() {
+        // Both declarations present: the read-only one wins.
+        let sb = Sandbox::builder()
+            .fs_write("/etc")
+            .fs_mount_ro("/etc/resolv.conf", "/host/resolv.conf")
+            .build()
+            .expect("the fixture sandbox builds");
+        assert_eq!(
+            path_rule_rights(&sb, Path::new("/etc/resolv.conf"), WRITE_MASK),
+            None,
+            "a read-only mount is not readable by declaration here, so no rule",
+        );
+        let sb = Sandbox::builder()
+            .fs_write("/etc")
+            .fs_read("/")
+            .fs_mount_ro("/etc/resolv.conf", "/host/resolv.conf")
+            .build()
+            .expect("the fixture sandbox builds");
+        assert_eq!(
+            path_rule_rights(&sb, Path::new("/etc/resolv.conf"), WRITE_MASK),
+            Some(READ_ACCESS),
+            "a read-only mount falls back to read+execute even under a writable prefix",
+        );
     }
 }
