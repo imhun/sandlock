@@ -64,6 +64,21 @@
 #      container — plus mediation_2uid (`--mediation-2uid`) and the release
 #      supervise_cost label inside the non-root phase.
 #
+# Invocation matters for `core_integ` (measured 2026-09-23, E2B N35 follow-up):
+# it is a non-root, single-threaded suite, and running it as root with the
+# default parallelism reports **8 failures** that are not defects:
+# test_control::test_socketpair_channel_rejects_third_party,
+# test_instance_lifecycle::test_shutdown_without_wait_closes_pidfd_and_http_acl,
+# the five test_net_isolate::test_net_isolation_inbound_mapping_* cases (plain,
+# _mcp_roundtrip, _poll_, _under_chroot_epoll_, _under_chroot_mcp_roundtrip) and
+# test_transaction::test_txn_merge_failure_preserves_the_unmerged_change_set.
+# Re-run as root *alone* only 4 of those 8 still fail (the other 4 are
+# order-dependent), and all 8 pass in the canonical shape — the same class as
+# the root-mode `0o000`-fixture reds recorded below: `CAP_DAC_OVERRIDE` and the
+# shared container netns change what the fixtures observe. Canonical =
+# `cargo test -p sandlock-core --offline --test integration -- --test-threads=1`
+# as uid 65534 with CARGO_HOME/HOME pinned by scripts/test-all.sh.
+#
 # Final fork-plan full-gate re-verification (F9, 2026-09-05): every label below
 # re-run green at the F9 tip in sandlock-dev:latest (--privileged, repo mounted
 # at /src) — logs tmp/sdd/f9-gate-nonroot.log / f9-oci-root.log /
@@ -266,7 +281,24 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 545 # 2026-09-22: 543 -> 545, and the suite now *finishes* again.
+core_integ = 546 # 2026-09-23: 545 -> 546, +1 in
+                 # crates/sandlock-core/tests/integration/test_restore.rs:
+                 # `test_restore_resumes_inside_a_real_root` — checkpoint/restore
+                 # cannot work with any chroot root (emulated or real): the
+                 # restore stub is a host build artifact exec'd by its host
+                 # path, and a chroot root resolves the workload's paths inside
+                 # the rootfs, so the attempt ends in a 10 s READY timeout over
+                 # a process that exited 127 ("execvp '…/restore-stub': No such
+                 # file or directory"). The call now refuses up front and names
+                 # the stub, the root and the way out; the test pins both root
+                 # shapes refusing in < 2 s, and shapes the policy the route-B
+                 # way (`user(euid)` + `userns_self_map`) so it also runs in the
+                 # non-root phase — without that the child cannot
+                 # unshare(CLONE_NEWNS) and the real root dies at step one.
+                 # `test_restore_glibc_vdso_program_resumes` (chroot-free) stays
+                 # the positive control. Evidence: 545 -> 546 passed / 0 failed
+                 # in the canonical non-root shape, 2026-09-23.
+                 # 2026-09-22: 543 -> 545, and the suite now *finishes* again.
                  # +1 is `test_chroot::a_magic_link_write_returns_instead_of_
                  # pinning_the_capture_pipe`, the bounded copy of the case that
                  # used to hang; the other +1 is the count the tip had already

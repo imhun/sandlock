@@ -210,16 +210,25 @@ async fn test_restore_resumes_inside_a_real_root() {
     let counter_s = counter.to_str().unwrap().to_string();
 
     // The policy an image-rootfs sandbox carries: the rootfs as the real root,
-    // the image's own directories readable, one workspace mount writable.
-    let policy = Sandbox::builder()
+    // the image's own directories readable, one workspace mount writable, and
+    // the sandbox's identity requested -- `user(euid)` + `userns_self_map` is
+    // the route-B shape (`sandlock-supervise` probes exactly this), and it is
+    // what gives the child its own user namespace with CAP_SYS_ADMIN in it. A
+    // non-root caller without it cannot `unshare(CLONE_NEWNS)` and the real root
+    // dies at the first step (measured: "unshare(CLONE_NEWNS): Operation not
+    // permitted" as uid 65534).
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    let mut builder = Sandbox::builder()
         .chroot(&rootfs)
         .real_root(true)
+        .user(euid, egid)
         .fs_read("/usr")
         .fs_mount("/work", &data)
         .fs_write("/work")
-        .cwd("/work")
-        .build()
-        .expect("real-root policy builds");
+        .cwd("/work");
+    builder.userns_self_map = true;
+    let policy = builder.build().expect("real-root policy builds");
 
     let mut sb = policy.clone().with_name("realroot-src");
     sb.spawn_interactive(&["/usr/bin/rootfs-helper", "clock-loop", "/work/clock.cnt"])
