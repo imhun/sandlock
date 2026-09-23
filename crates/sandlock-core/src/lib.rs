@@ -28,6 +28,7 @@ pub(crate) mod freeze;
 pub mod netlink;
 pub(crate) mod procfs;
 pub(crate) mod port_remap;
+pub(crate) mod realroot;
 pub mod pipeline;
 pub mod transaction;
 pub mod policy_fn;

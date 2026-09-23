@@ -541,6 +541,23 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_pid_ns(
     Box::into_raw(Box::new(builder.pid_ns(v)))
 }
 
+/// Build a real root for the image-rootfs shape: mount namespace, the
+/// policy's `fs_mount` entries, `pivot_root` (see `Sandbox::real_root`).
+///
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_real_root(
+    b: *mut SandboxBuilder,
+    v: bool,
+) -> *mut SandboxBuilder {
+    if b.is_null() {
+        return b;
+    }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.real_root(v)))
+}
+
 /// Run the sandbox in its own network namespace (`CLONE_NEWNET` after the
 /// user namespace): only loopback, brought up from inside the sandbox's
 /// userns. Defaults to `false` (shared network namespace). Independent of

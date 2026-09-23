@@ -192,6 +192,7 @@ _b_net_allow_bind = _builder_fn("sandlock_sandbox_builder_net_allow_bind", ctype
 _b_net_deny_bind = _builder_fn("sandlock_sandbox_builder_net_deny_bind", ctypes.c_char_p)
 _b_port_remap = _builder_fn("sandlock_sandbox_builder_port_remap", ctypes.c_bool)
 _b_pid_ns = _builder_fn("sandlock_sandbox_builder_pid_ns", ctypes.c_bool)
+_b_real_root = _builder_fn("sandlock_sandbox_builder_real_root", ctypes.c_bool)
 _b_net_isolation = _builder_fn("sandlock_sandbox_builder_net_isolation", ctypes.c_bool)
 _b_fd_inject_connect = _builder_fn(
     "sandlock_sandbox_builder_fd_inject_connect", ctypes.c_bool
@@ -1349,6 +1350,9 @@ class _NativePolicy:
         "port_remap",
         "pid_ns", "net_isolation", "fd_inject_connect", "port_mappings",
         "net_bind_inject",
+        # Real root: mount namespace + the policy's mounts + pivot_root,
+        # wired below with its own setter (see the fork's `Sandbox::real_root`).
+        "real_root",
         "http_allow", "http_deny", "http_ports", "http_ca", "http_key",
         "http_inject_ca", "http_ca_out", "http_inject", "host_mask",
         "egress_proxy", "uid", "gid",
@@ -1491,6 +1495,8 @@ class _NativePolicy:
 
         if policy.pid_ns:
             b = _b_pid_ns(b, True)
+        if policy.real_root:
+            b = _b_real_root(b, True)
         if policy.net_isolation:
             b = _b_net_isolation(b, True)
         if policy.fd_inject_connect:

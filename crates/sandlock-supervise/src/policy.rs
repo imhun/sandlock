@@ -136,6 +136,7 @@ pub const POLICY_FIELDS: &[&str] = &[
     "on_error",
     "on_exit",
     "pid_ns",
+    "real_root",
     "port_mappings",
     "port_remap",
     "random_seed",
@@ -189,6 +190,11 @@ pub struct SupervisePolicy {
     pub gpu_devices: Option<Vec<u32>>,
     pub port_remap: bool,
     pub pid_ns: bool,
+    /// Build a real root instead of emulating one (see `Sandbox::real_root`).
+    /// The slot does the mounts itself, as the sandbox's uid, and then gives up
+    /// `CAP_SYS_ADMIN` before the workload starts.
+    #[serde(default)]
+    pub real_root: bool,
     pub net_isolation: bool,
     pub fd_inject_connect: bool,
     /// S2.5 bind injection: mapped ports are answered by replacing the
@@ -557,6 +563,9 @@ fn apply(parsed: &ParsedPolicy) -> Result<SandboxBuilder, String> {
     }
     if prov.contains("pid_ns") && p.pid_ns {
         b = b.pid_ns(true);
+    }
+    if prov.contains("real_root") && p.real_root {
+        b = b.real_root(true);
     }
     if prov.contains("net_isolation") && p.net_isolation {
         b = b.net_isolation(true);
@@ -1201,6 +1210,9 @@ fn verify(sandbox: &Sandbox, parsed: &ParsedPolicy) -> Result<(), String> {
     }
     if prov.contains("pid_ns") {
         check!("pid_ns", &p.pid_ns, &sandbox.pid_ns);
+    }
+    if prov.contains("real_root") {
+        check!("real_root", &p.real_root, &sandbox.real_root);
     }
     if prov.contains("net_isolation") {
         check!("net_isolation", &p.net_isolation, &sandbox.net_isolation);

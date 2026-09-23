@@ -679,6 +679,19 @@ pub struct Sandbox {
     #[serde(default)]
     pub pid_ns: bool,
 
+    /// Build a *real* root for the image-rootfs shape: a mount namespace owned
+    /// by the sandbox's user namespace, the rootfs as its root, the policy's
+    /// `fs_mount` entries bound inside it, and `pivot_root` into it (see
+    /// `crate::realroot`). Turned on by a caller that has a `chroot` root and
+    /// wants the kernel, not the mediator, to resolve paths -- which is what
+    /// makes `#!` scripts and static binaries work (E2B N35). Requires
+    /// `CAP_SYS_ADMIN` in the sandbox's user namespace, which is the sandbox's
+    /// own; the capability is dropped before the workload starts, and the
+    /// container the sandbox runs in must admit the mount-family syscalls.
+    /// Defaults to `false`.
+    #[serde(default)]
+    pub real_root: bool,
+
     /// Self-map the supervisor's own host uid to in-namespace uid 0 (see
     /// `SandboxBuilder::userns_self_map`): how a route-B slot restores
     /// "root inside the sandbox, host uid outside". Honoured by both writers
@@ -825,6 +838,7 @@ impl Clone for Sandbox {
             net_isolation: self.net_isolation,
             no_supervisor: self.no_supervisor,
             pid_ns: self.pid_ns,
+            real_root: self.real_root,
             userns_self_map: self.userns_self_map,
             control_socket: self.control_socket,
             user: self.user,

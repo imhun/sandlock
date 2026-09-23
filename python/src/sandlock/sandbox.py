@@ -439,6 +439,22 @@ class Sandbox:
     and renumbered to the sandbox's own processes.  Defaults to ``False``
     (shared host PID namespace)."""
 
+    real_root: bool = False
+    """Build a real root instead of emulating one: a mount namespace owned by
+    the sandbox's user namespace, the :attr:`chroot` root as its root, every
+    :attr:`fs_mount` entry bound inside it, and ``pivot_root`` into it.  Only
+    meaningful together with :attr:`chroot`.
+
+    Why it exists: the emulated root makes the *mediator* resolve paths, so
+    anything the *kernel* resolves on its own -- a ``#!`` interpreter, a static
+    binary -- is looked up in the host namespace and refused.  With this on,
+    those resolve inside the sandbox's own tree.
+
+    Two requirements, both checked at spawn: the sandbox needs
+    ``CAP_SYS_ADMIN`` in its own user namespace (which it has; the capability is
+    dropped again before the workload starts), and the container it runs in
+    must not block the mount-family syscalls.  Defaults to ``False``."""
+
     net_isolation: bool = False
     """Run the sandbox in its own network namespace (``CLONE_NEWNET`` after
     the user namespace): only loopback, brought up from inside the sandbox's

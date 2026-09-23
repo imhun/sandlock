@@ -333,6 +333,44 @@ impl ChrootCtx<'_> {
     fn host_to_virtual(&self, host_path: &Path) -> Option<PathBuf> {
         crate::chroot::resolve::host_to_virtual(self.root, self.mounts, host_path)
     }
+
+    /// Whether the task has the rootfs as its own root, i.e. whether it was
+    /// pivoted into it (`crate::realroot`). Such a task reports self-relative
+    /// paths (`/proc/<pid>/cwd`, `/proc/<pid>/fd/N`, `/proc/<pid>/exe`) in its
+    /// own namespace, where the rootfs *is* `/`.
+    fn child_is_pivoted(&self, pid: u32) -> bool {
+        // Compared by *inode*, not by the path `/proc/<pid>/root` renders to:
+        // that link is rendered in the target's own root, so a pivoted sandbox
+        // reports "/" -- exactly what a sandbox that never left the host root
+        // reports too, which makes the string useless as a discriminator.
+        // (Measured 2026-09-23: the string form silently sent the exec path back
+        // through the injected-fd route, and `/proc/self/fd/N` does not resolve
+        // inside a real root -- the exec failed with ENOENT.)
+        use std::os::unix::fs::MetadataExt;
+        let child_root = match std::fs::metadata(format!("/proc/{}/root", pid)) {
+            Ok(meta) => meta,
+            Err(_) => return false,
+        };
+        let confining_root = match std::fs::metadata(self.root) {
+            Ok(meta) => meta,
+            Err(_) => return false,
+        };
+        child_root.dev() == confining_root.dev() && child_root.ino() == confining_root.ino()
+    }
+
+    /// Translate a path the kernel reported *about the child* into the
+    /// sandbox's virtual spelling.
+    ///
+    /// A pivoted child's reports are already virtual -- they are relative to
+    /// the rootfs -- so they must not be put through the host-to-virtual
+    /// mapping, which would look them up under the rootfs and find nothing.
+    /// Everything else goes through the mapping exactly as before.
+    fn reported_to_virtual(&self, pid: u32, path: &Path) -> Option<PathBuf> {
+        if self.child_is_pivoted(pid) {
+            return Some(path.to_path_buf());
+        }
+        self.host_to_virtual(path)
+    }
 }
 
 // ============================================================
@@ -389,6 +427,40 @@ fn canon_proc_self(virtual_path: &str, pid: u32) -> String {
 /// the child's real cwd, `/proc/<pid>/cwd` still points wherever exec left
 /// it. That kernel value is the right answer only for a task that has never
 /// moved, which is exactly when nothing is tracked.
+/// The host path behind a virtual path, for the exec-watch release below.
+fn exec_host_path(virtual_path: &Path, ctx: &ChrootCtx<'_>) -> Option<PathBuf> {
+    if let Some((mount_host, sub)) = ctx.mount_target(virtual_path) {
+        let sub = sub.trim_start_matches('/');
+        return Some(if sub.is_empty() {
+            mount_host.to_path_buf()
+        } else {
+            mount_host.join(sub)
+        });
+    }
+    Some(ctx.root.join(virtual_path.strip_prefix("/").unwrap_or(virtual_path)))
+}
+
+/// Settle and then drop every write watch on `host_path`.
+///
+/// Called on the exec path: the watch's `held` descriptor is what makes the
+/// kernel answer ETXTBSY for a file the sandbox wrote moments ago, and the
+/// final size reading here is the same one the append pump would have taken --
+/// so releasing early costs the accounting nothing and unblocks the exec.
+fn release_write_watch(host_path: &Path, ctx: &ChrootCtx<'_>) {
+    for ((pid, fd), entry) in ctx.write_fds.snapshot() {
+        if entry.path != host_path {
+            continue;
+        }
+        if let Some(held) = entry.held.as_ref() {
+            let end = unsafe { libc::lseek(held.as_raw_fd(), 0, libc::SEEK_END) };
+            if end >= 0 {
+                ctx.write_fds.observe(pid, fd, end as u64);
+            }
+        }
+        ctx.write_fds.forget(pid, fd);
+    }
+}
+
 fn virtual_cwd_of(notif: &SeccompNotif, ctx: &ChrootCtx<'_>) -> Option<PathBuf> {
     if let Ok(pid) = i32::try_from(notif.pid) {
         if let Some(cwd) = ctx.processes.virtual_cwd(pid) {
@@ -396,7 +468,7 @@ fn virtual_cwd_of(notif: &SeccompNotif, ctx: &ChrootCtx<'_>) -> Option<PathBuf> 
         }
     }
     let host_cwd = std::fs::read_link(format!("/proc/{}/cwd", notif.pid)).ok()?;
-    ctx.host_to_virtual(&host_cwd)
+    ctx.reported_to_virtual(notif.pid, &host_cwd)
 }
 
 /// Record the calling task's new virtual cwd.
@@ -529,7 +601,7 @@ fn build_virtual_path(
             virtual_cwd_of(notif, ctx)?
         } else {
             let base_host = std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd)).ok()?;
-            ctx.host_to_virtual(&base_host)?
+            ctx.reported_to_virtual(notif.pid, &base_host)?
         };
         let combined = base_virtual.join(path);
         combined.to_string_lossy().to_string()
@@ -1512,7 +1584,7 @@ pub(crate) async fn handle_chroot_exec(
             libc::AT_FDCWD => virtual_cwd_of(notif, ctx),
             _ => std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd))
                 .ok()
-                .and_then(|host| ctx.host_to_virtual(&host)),
+                .and_then(|host| ctx.reported_to_virtual(notif.pid, &host)),
         };
         match base {
             Some(base) => base.join(&rel_path).to_string_lossy().to_string(),
@@ -1523,6 +1595,41 @@ pub(crate) async fn handle_chroot_exec(
     let virtual_path = crate::chroot::resolve::confine(&full_path);
     if !ctx.can_read(&virtual_path) {
         return NotifAction::Errno(libc::EACCES);
+    }
+
+    // Settle and release any write watch on the file the kernel is about to
+    // exec.
+    //
+    // The mediator keeps its own duplicate of a write descriptor while it
+    // watches the file grow (`WriteFds::held`), and `deny_write_access` refuses
+    // to exec a file that *anyone* still holds open for writing -- so a command
+    // that writes a script or binary and immediately runs it fails with
+    // ETXTBSY until the append-watch pump forgets the entry, one interval
+    // (~100 ms) later. Measured 2026-09-23 (E2B N35): with the image root made
+    // real, this was the *only* thing left failing "install it, then run it".
+    //
+    // The accounting is settled first -- one final size reading, which is what
+    // the pump would have done -- so the bytes are attributed and the watch only
+    // loses the descriptor, not the information.
+    if let Some(host_path) = exec_host_path(&virtual_path, ctx) {
+        release_write_watch(&host_path, ctx);
+    }
+
+    // A child with a real root (crate::realroot) resolves this path itself: the
+    // image tree *is* its root, and the mounts are its own. Hand the syscall
+    // back to the kernel instead of injecting an fd -- which is not merely
+    // cheaper, it is the only correct thing here, because the rewrite below
+    // points the child at `/proc/self/fd/N` and the new root has no real
+    // procfs (the /proc the sandbox sees is synthesized by this mediator, and
+    // the kernel cannot resolve a path through it). It also means the
+    // interpreter is the image's own, resolved by the kernel inside the root,
+    // which is what this shape exists for.
+    if ctx.child_is_pivoted(notif.pid) {
+        // Record the virtual exe for /proc/self/exe, exactly as the injected
+        // path does, then let the kernel run the exec.
+        let mut cs = chroot_state.lock().await;
+        cs.chroot_exe = Some(virtual_path.clone());
+        return NotifAction::Continue;
     }
 
     // Open the binary directly via openat2(RESOLVE_IN_ROOT). Single atomic
@@ -2298,7 +2405,7 @@ pub(crate) async fn handle_chroot_readlink(
                 .or_else(|| {
                     std::fs::read_link(format!("/proc/{}/cwd", pid))
                         .ok()
-                        .and_then(|host| ctx.host_to_virtual(&host))
+                        .and_then(|host| ctx.reported_to_virtual(pid as u32, &host))
                 })
                 .unwrap_or_else(|| PathBuf::from("/"));
             return write_target(cwd.to_string_lossy().as_bytes());
@@ -2319,7 +2426,7 @@ pub(crate) async fn handle_chroot_readlink(
         if !target.is_absolute() {
             return write_target(target.to_string_lossy().as_bytes());
         }
-        let named = match ctx.host_to_virtual(&target) {
+        let named = match ctx.reported_to_virtual(pid as u32, &target) {
             Some(virtual_target) => virtual_target.to_string_lossy().into_owned(),
             None => unnameable_fd_name(&link),
         };
@@ -2337,7 +2444,7 @@ pub(crate) async fn handle_chroot_readlink(
         drop(cs);
         // Fallback: strip chroot prefix from /proc/{pid}/exe
         if let Ok(real_exe) = std::fs::read_link(format!("/proc/{}/exe", notif.pid)) {
-            let virtual_exe = ctx.host_to_virtual(&real_exe).unwrap_or(real_exe);
+            let virtual_exe = ctx.reported_to_virtual(notif.pid, &real_exe).unwrap_or(real_exe);
             let s = virtual_exe.to_string_lossy();
             return write_target(s.as_bytes());
         }
@@ -2658,6 +2765,16 @@ pub(crate) async fn handle_chroot_chdir(
     // (the kernel re-read the path we wrote) and a force-write through
     // /proc/<pid>/mem that permanently corrupted a .rodata path literal.
     set_virtual_cwd(notif, ctx, confined);
+    // A child with a real root (crate::realroot) has to have the kernel move its
+    // cwd too: the resolutions the mediator never sees -- its `execve` of a
+    // relative path above all -- read the task's own `fs_struct`, not this
+    // bookkeeping. The emulated shape cannot do that (the recorded path is
+    // virtual while the kernel's view is the host's, and rewriting the buffer
+    // does not fit the short ones -- issue #178); inside a real root the guest's
+    // spelling is already the right one, so the kernel can just run the syscall.
+    if ctx.child_is_pivoted(notif.pid) {
+        return NotifAction::Continue;
+    }
     NotifAction::ReturnValue(0)
 }
 
@@ -2682,7 +2799,7 @@ pub(crate) async fn handle_chroot_fchdir(
     // Only follow a target that is really a directory: anything else fails
     // the kernel's fchdir, and recording it would desync the tracked cwd.
     if let Some(host) = target.filter(|t| t.is_dir()) {
-        if let Some(virtual_cwd) = ctx.host_to_virtual(&host) {
+        if let Some(virtual_cwd) = ctx.reported_to_virtual(notif.pid, &host) {
             set_virtual_cwd(notif, ctx, virtual_cwd);
         }
     }

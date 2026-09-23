@@ -284,6 +284,9 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "pid-ns"))]
     pub pid_ns: bool,
 
+    /// Build a real root for the image-rootfs shape (see `Sandbox::real_root`).
+    pub real_root: bool,
+
     /// Self-map the confining process's own host uid to **in-namespace uid 0**
     /// (`0 -> euid`), so the workload is root inside its user namespace and
     /// its host uid outside -- the rootless-container pattern.
@@ -413,6 +416,7 @@ impl Default for SandboxBuilder {
             net_isolation: false,
             no_supervisor: false,
             pid_ns: false,
+            real_root: false,
             userns_self_map: false,
             control_socket: true,
             user: None,
@@ -489,6 +493,7 @@ impl Clone for SandboxBuilder {
             net_isolation: self.net_isolation,
             no_supervisor: self.no_supervisor,
             pid_ns: self.pid_ns,
+            real_root: self.real_root,
             userns_self_map: self.userns_self_map,
             control_socket: self.control_socket,
             user: self.user,
@@ -1008,6 +1013,15 @@ impl SandboxBuilder {
         self
     }
 
+    /// Build a real root for the image-rootfs shape: a mount namespace owned by
+    /// the sandbox's user namespace, the `chroot` root as its root, the
+    /// policy's `fs_mount` entries bound inside it, and `pivot_root` into it.
+    /// See `Sandbox::real_root` for what it is for and what it needs.
+    pub fn real_root(mut self, v: bool) -> Self {
+        self.real_root = v;
+        self
+    }
+
     /// Enable or disable the per-sandbox control socket. Defaults to `true`.
     /// When `false`, no runtime dir, pid file, or control-socket task is
     /// created — `sandlock ps` and `sandlock inspect` will not see this
@@ -1394,6 +1408,7 @@ impl SandboxBuilder {
             net_isolation: self.net_isolation,
             no_supervisor: self.no_supervisor,
             pid_ns: self.pid_ns,
+            real_root: self.real_root,
             userns_self_map: self.userns_self_map,
             control_socket: self.control_socket,
             user: self.user,

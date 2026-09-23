@@ -500,7 +500,13 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     macro_rules! fail {
         ($msg:expr) => {{
             let err = std::io::Error::last_os_error();
-            let _ = write!(std::io::stderr(), "sandlock child: {}: {}\n", $msg, err);
+            let line = format!("sandlock child: {}: {}", $msg, err);
+            let _ = write!(std::io::stderr(), "{}\n", line);
+            // The slot shapes have no reader on this child's stderr while it is
+            // still being set up, so the same line also lands in the real-root
+            // trace file (see `crate::realroot`), which is how a setup failure
+            // stops being invisible.
+            crate::realroot::record_failure(&line);
             unsafe { libc::_exit(127) };
         }};
     }
@@ -656,7 +662,20 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     // directories traversable.  Enforcement is deferred to step 8b below,
     // after the remap (fork-plan F10).
     let mut prebuilt_ruleset: Option<std::os::fd::OwnedFd> = None;
-    if privileged_remap {
+    // Two reasons to build the ruleset here, before the steps below:
+    //
+    //  * `privileged_remap`: the rule paths are chroot-translated *host* paths
+    //    under a rootfs the holder can still traverse; after the remap this
+    //    child no longer can (fork-plan F10);
+    //  * `real_root`: the ruleset is built from those same host paths, and once
+    //    the sandbox has pivoted into the rootfs they no longer resolve at all.
+    //    The mounts the pivot installs are covered anyway: every mount *source*
+    //    carries a rule of its own (`landlock::path_rule_rights`), and a source
+    //    is the same inode the mount exposes.
+    //
+    // Enforcement stays where it always was (8b), which is also the point of no
+    // return for both arms.
+    if privileged_remap || sandbox.real_root {
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
             fail!("prctl(PR_SET_NO_NEW_PRIVS)");
         }
@@ -857,6 +876,47 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         }
     }
 
+    // 7c. Real root (opt-in): the kernel, not the mediator, resolves paths.
+    //
+    // Placement is the whole point. It has to be *after* the user namespace
+    // above -- that namespace owns the mount namespace created here, and
+    // CAP_SYS_ADMIN inside it is what authorises every mount and the
+    // pivot_root -- and *before* Landlock and seccomp, so the workload inherits
+    // a process that has already been sealed: the mediator's own filter refuses
+    // mount/umount2/pivot_root/chroot to it, and the capability below is gone
+    // as well. Nothing between here and the exec runs code the guest supplies.
+    if sandbox.real_root {
+        let Some(ref chroot_root) = sandbox.chroot else {
+            fail!("real_root requires a chroot root (the image rootfs)");
+        };
+        crate::realroot::note("real_root: begin");
+        let mounts = crate::chroot::resolve::resolve_chroot_mounts(&sandbox.fs_mount);
+        if let Err(e) = crate::realroot::real_root(chroot_root, &mounts) {
+            fail!(format!("real root: {}", e));
+        }
+        crate::realroot::note("real_root: pivoted");
+        // Step 6's chdir aimed at the *host* path of the configured cwd, which
+        // for a mount point is the empty stub behind the bind mount. Re-enter
+        // it now that the mounts are real, with the spelling the policy uses
+        // for a sandboxed path (envd maps the workspace cwd to /home/user).
+        let guest_cwd = sandbox
+            .cwd
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        if let Err(e) = crate::realroot::enter_guest_cwd(&guest_cwd) {
+            fail!(format!("chdir to the sandbox cwd: {}", e));
+        }
+        crate::realroot::note("real_root: cwd");
+        // One seal the container's own profile cannot provide, and the reason
+        // the profile can be loosened at all: after this the sandbox has no
+        // CAP_SYS_ADMIN, so a mount-family syscall fails at the capability
+        // check even if a future profile admits it.
+        if let Err(e) = crate::realroot::drop_cap_sys_admin() {
+            fail!(format!("drop CAP_SYS_ADMIN: {}", e));
+        }
+        crate::realroot::note("real_root: caps dropped");
+    }
+
     // 8b. Enforce Landlock (IRREVERSIBLE).
     //
     // Privileged-remap arm: the ruleset was built pre-remap (step 7); apply
@@ -870,6 +930,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         if let Err(e) = crate::landlock::restrict_ruleset(&ruleset) {
             fail!(format!("landlock: {}", e));
         }
+        crate::realroot::note("landlock restricted");
     } else {
         // 7b. NO_NEW_PRIVS (required for Landlock/seccomp without CAP_SYS_ADMIN)
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
@@ -883,6 +944,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     // 9. Assemble and install seccomp filter (IRREVERSIBLE)
     let handler_syscalls: Vec<i64> = extra_syscalls.iter().map(|&nr| nr as i64).collect();
     let resolved = ResolvedSandbox::from_sandbox(sandbox, sandbox_name, &handler_syscalls);
+    crate::realroot::note("step9: resolved");
     let args = arg_filters_resolved(&resolved);
     let mut keep_fd: i32 = -1;
 
@@ -926,6 +988,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
             Ok(f) => f,
             Err(e) => fail!(format!("seccomp assemble: {}", e)),
         };
+        crate::realroot::note("step9: assembled");
         let notif_fd = match bpf::install_filter(&filter) {
             Ok(fd) => fd,
             Err(e) => {
@@ -964,6 +1027,12 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     let mut fds_to_keep: Vec<RawFd> = keep_fds.to_vec();
     if keep_fd >= 0 {
         fds_to_keep.push(keep_fd);
+    }
+    // The real-root trace (when one is configured) is how a setup or exec
+    // failure becomes visible at all in the slot shapes; closing it here would
+    // silence exactly the failures it exists to report.
+    if let Some(fd) = crate::realroot::trace_fd() {
+        fds_to_keep.push(fd);
     }
     close_fds_above(2, &fds_to_keep);
 

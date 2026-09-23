@@ -460,9 +460,15 @@ fn spawn(
         let orig = first.as_bytes_with_nul();
         let mut exec_path = vec![0u8; libc::PATH_MAX as usize];
         exec_path[..orig.len()].copy_from_slice(orig);
+        crate::realroot::note(&format!("exec {}", cargv[0].to_string_lossy()));
         unsafe {
             libc::execvp(exec_path.as_ptr() as *const libc::c_char, ptrs.as_ptr());
         }
+        crate::realroot::record_failure(&format!(
+            "execvp({:?}) failed (errno {})",
+            cargv[0].to_string_lossy(),
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        ));
         // FUP-26: `execvp` only returns on failure, and the reserved 127 alone
         // is not a diagnosis -- in a lane log it reads as "the command died
         // and said nothing". `ENOENT` stays silent on purpose (it is the
@@ -486,6 +492,7 @@ fn spawn(
 /// Write a child-side setup error to fd 2 and `_exit(125)`. Runs in the
 /// post-fork child; glibc's heap is fork-safe in this single-threaded loop.
 fn child_fail(msg: &str) -> ! {
+    crate::realroot::record_failure(msg.trim_end());
     unsafe {
         libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
         libc::_exit(125);
