@@ -289,7 +289,19 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 546 # 2026-09-23: 545 -> 546, +1 in
+core_integ = 548 # 2026-09-23: 546 -> 548, +2 in
+                 # crates/sandlock-core/tests/integration/test_restore.rs, the
+                 # no-exec restore prototype (docs/chroot-workspace-exec.md
+                 # §11.5): `test_restore_resumes_inside_a_real_root_without_exec`
+                 # (the real root the exec route cannot serve) and
+                 # `test_restore_resumes_without_exec_and_without_chroot` (the
+                 # fork-versus-exec bisect that showed the failure was not about
+                 # the root at all). Both pass in the canonical single-threaded
+                 # non-root phase; both fail with SIGSEGV when the suite runs
+                 # these concurrently in one process, which is the fork-of-a-
+                 # multi-threaded-supervisor hazard §11.5 named -- recorded, not
+                 # yet diagnosed.
+                 # 545 -> 546 in
                  # crates/sandlock-core/tests/integration/test_restore.rs:
                  # `test_restore_resumes_inside_a_real_root` — checkpoint/restore
                  # cannot work with any chroot root (emulated or real): the

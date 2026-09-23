@@ -4,6 +4,7 @@ use crate::sandbox::Sandbox;
 
 pub(crate) mod capture;
 mod image;
+pub(crate) mod noexec;
 pub(crate) mod restore_blob;
 pub(crate) mod resume;
 

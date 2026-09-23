@@ -348,6 +348,19 @@ pub enum BranchAction {
 ///
 /// The discriminants are a stable contract: the FFI/Python bindings pass them
 /// as a `u32`, so they are pinned with `#[repr(u32)]`.
+/// How `restore_interactive*` delivers the restore stub
+/// (`docs/chroot-workspace-exec.md` §11).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RestoreLaunch {
+    /// `execve` the stub by its host path (the historical route; needs the path
+    /// to resolve inside the sandbox and a Landlock grant on it).
+    Exec,
+    /// Map the stub image from a memfd inside the confined child and jump into
+    /// it: no path, no exec, no grant (the prototype route for chroot/real
+    /// roots).
+    InProcessNoExec,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum StdioMode {
@@ -1311,6 +1324,31 @@ impl Sandbox {
         &mut self,
         cp: &crate::checkpoint::Checkpoint,
     ) -> Result<Process<'_>, crate::error::SandlockError> {
+        self.restore_interactive_with(cp, RestoreLaunch::Exec).await
+    }
+
+    /// Restore without `execve`-ing the stub (prototype of the route in
+    /// `docs/chroot-workspace-exec.md` §11, "B").
+    ///
+    /// Same engine, same blob, same protocol -- the only difference is delivery:
+    /// the stub binary rides a memfd into the confined child, which maps it at
+    /// `STUB_BASE` and jumps into it. Nothing is resolved by path and nothing is
+    /// executed by path, so this works inside a chroot or real root and needs no
+    /// Landlock grant for the stub. What it costs (a fork's dirty address space
+    /// to sweep, a payload that must not allocate or lock) is documented on
+    /// `crate::checkpoint::noexec`.
+    pub async fn restore_interactive_noexec(
+        &mut self,
+        cp: &crate::checkpoint::Checkpoint,
+    ) -> Result<Process<'_>, crate::error::SandlockError> {
+        self.restore_interactive_with(cp, RestoreLaunch::InProcessNoExec).await
+    }
+
+    async fn restore_interactive_with(
+        &mut self,
+        cp: &crate::checkpoint::Checkpoint,
+        launch: RestoreLaunch,
+    ) -> Result<Process<'_>, crate::error::SandlockError> {
         use crate::checkpoint::{restore_blob, resume};
         use crate::error::SandboxRuntimeError;
 
@@ -1349,7 +1387,8 @@ impl Sandbox {
         // naming the reason and the way out; E2B never calls this
         // (docs/chroot-workspace-exec.md §9.7.9) and its production shape is a
         // chroot root, so this is a documented gap, not a regression.
-        if let Some(root) = chroot_root.as_ref() {
+        if launch == RestoreLaunch::Exec {
+            if let Some(root) = chroot_root.as_ref() {
             let stub_host = stub.canonicalize().unwrap_or_else(|_| stub.clone());
             if !stub_host.starts_with(root) {
                 return Err(SandboxRuntimeError::Child(format!(
@@ -1364,6 +1403,7 @@ impl Sandbox {
                 ))
                 .into());
             }
+            }
         }
         let plan = restore_blob::plan(cp, chroot_root.as_deref(), &mounts)
             .map_err(SandboxRuntimeError::Child)?;
@@ -1371,15 +1411,37 @@ impl Sandbox {
         let channel = resume::StubChannel::new(&plan.blob)
             .map_err(|e| SandboxRuntimeError::Child(format!("restore control channel: {e}")))?;
 
-        // Landlock checks EXECUTE on the real path at execve time, so the stub
-        // binary has to be inside the policy's read+execute grant. It is a
-        // build artifact of sandlock itself, not workload-reachable state.
-        self.fs_readable.push(stub.clone());
-
-        self.ensure_runtime()?;
-        self.rt_mut().extra_fds = channel.extra_fds();
-        let stub_s = stub.to_string_lossy().into_owned();
-        self.create_interactive(&[stub_s.as_str()]).await?;
+        match launch {
+            RestoreLaunch::Exec => {
+                // Landlock checks EXECUTE on the real path at execve time, so the
+                // stub binary has to be inside the policy's read+execute grant. It
+                // is a build artifact of sandlock itself, not workload-reachable
+                // state.
+                self.fs_readable.push(stub.clone());
+                self.ensure_runtime()?;
+                self.rt_mut().extra_fds = channel.extra_fds();
+                let stub_s = stub.to_string_lossy().into_owned();
+                self.create_interactive(&[stub_s.as_str()]).await?;
+            }
+            RestoreLaunch::InProcessNoExec => {
+                // No path, no exec, no grant: the image goes in over a memfd and
+                // the already-confined child installs it and jumps.
+                let image = crate::checkpoint::noexec::memfd_with_file(&stub).map_err(|e| {
+                    SandboxRuntimeError::Child(format!("restore stub image memfd: {e}"))
+                })?;
+                let mut fds = channel.extra_fds();
+                fds.push((crate::checkpoint::noexec::STUB_IMAGE_FD, image.as_raw_fd()));
+                self.create_with_in_child_main(
+                    "restore-stub",
+                    fds,
+                    crate::checkpoint::noexec::install_and_jump_entry,
+                )
+                .await?;
+                // Dropping `image` here is safe: the child holds its own dup of
+                // the memfd (the launch dups every `extra_fds` entry).
+                drop(image);
+            }
+        }
         let pid = self.pid().ok_or(SandboxRuntimeError::NotRunning)?;
         // Release the parked child to execve the stub. From here the stub runs
         // confined, and its openat calls flow through the notify supervisor,

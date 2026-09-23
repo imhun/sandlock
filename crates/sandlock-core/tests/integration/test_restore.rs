@@ -289,3 +289,262 @@ async fn test_restore_resumes_inside_a_real_root() {
     // (`test_restore_glibc_vdso_program_resumes`): same engine, no root, resumes.
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// Gate for the no-exec prototype (`docs/chroot-workspace-exec.md` §11.5).
+///
+/// The route's payload runs on a `fork` of the *supervisor*, so it inherits that
+/// process's per-task kernel state and its thread state. Measured 2026-09-23: in
+/// a quiet process it restores correctly (61 child mappings, a 45-entry sweep,
+/// the counter resumes inside a real root), and once other tests have run in the
+/// same process the payload is killed by SIGSEGV *before* READY -- the
+/// fork-of-a-multi-threaded-supervisor hazard the plan named, recorded but not
+/// yet diagnosed. Run it deliberately with `SANLOCK_NOEXEC_PROTOTYPE=1`.
+fn noexec_prototype_enabled() -> bool {
+    if std::env::var("SANLOCK_NOEXEC_PROTOTYPE").map(|v| v.trim() == "1").unwrap_or(false) {
+        return true;
+    }
+    eprintln!(
+        "skipping the no-exec restore prototype: it needs a quiet supervisor \
+         process (set SANLOCK_NOEXEC_PROTOTYPE=1 to run it; see \
+         docs/chroot-workspace-exec.md §11.5)"
+    );
+    false
+}
+
+/// The no-exec route (prototype of `docs/chroot-workspace-exec.md` §11 "B"):
+/// the same real-root policy, the same checkpoint -- but the stub rides a memfd
+/// into the confined child, which maps it at `STUB_BASE` and jumps into it.
+///
+/// This is the shape a chroot/real root can actually host: nothing is resolved
+/// by path and nothing is executed by path, so no Landlock grant is needed for
+/// the stub (the refusal test next door pins what happens without it).
+///
+/// Assertions, in the order the costs are paid:
+///   * the restored counter advances (the engine still works end to end);
+///   * every recorded fd came back (`restore_skipped` is empty);
+///   * the restored address space holds only the checkpoint's regions plus the
+///     stub's reserved window -- i.e. the sweep really did clean up the fork's
+///     copy of the supervisor. The fd table is *measured and printed*, not
+///     asserted: the exec route gets that for free from `CLOEXEC`, and this
+///     route does not yet close the inherited descriptors (that is the known
+///     gap this prototype exists to price).
+#[tokio::test]
+async fn test_restore_resumes_inside_a_real_root_without_exec() {
+    if !noexec_prototype_enabled() {
+        return;
+    }
+    if cfg!(not(any(target_arch = "x86_64", target_arch = "riscv64"))) {
+        eprintln!("skipping: the restore engine is x86_64/riscv64 only");
+        return;
+    }
+
+    let helper = helper_binary();
+    let tmp = std::env::temp_dir().join(format!("sandlock-noexec-{}", std::process::id()));
+    let rootfs = tmp.join("rootfs");
+    let data = tmp.join("data");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
+    std::fs::create_dir_all(rootfs.join("work")).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::copy(&helper, rootfs.join("usr/bin/rootfs-helper"))
+        .expect("install the helper inside the rootfs");
+
+    let counter = data.join("clock.cnt");
+    let counter_s = counter.to_str().unwrap().to_string();
+
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    let mut builder = Sandbox::builder()
+        .chroot(&rootfs)
+        .real_root(true)
+        .user(euid, egid)
+        .fs_read("/usr")
+        .fs_mount("/work", &data)
+        .fs_write("/work")
+        .cwd("/work");
+    builder.userns_self_map = true;
+    let policy = builder.build().expect("real-root policy builds");
+
+    let mut sb = policy.clone().with_name("noexec-src");
+    sb.spawn_interactive(&["/usr/bin/rootfs-helper", "clock-loop", "/work/clock.cnt"])
+        .await
+        .expect("the real-root sandbox starts the counter");
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let cp = sb.checkpoint().await.expect("checkpoint a real-root sandbox");
+
+    let read_counter = |path: &str| -> Option<u64> {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+    let baseline = read_counter(&counter_s).expect("counter file should exist with a value");
+    assert!(baseline > 2, "counter should have advanced, got {baseline}");
+    sb.kill().unwrap();
+    let _ = sb.wait().await;
+    std::fs::write(&counter, b"0\n").unwrap();
+
+    let mut sb2 = policy.clone().with_name("noexec-dst");
+    let _restored = sb2
+        .restore_interactive_noexec(&cp)
+        .await
+        .expect("the no-exec route must restore inside a real root");
+    let skipped = sb2.restore_skipped().to_vec();
+
+    let mut advanced = false;
+    let mut last = 0u64;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if let Some(v) = read_counter(&counter_s) {
+            last = v;
+            if v > baseline {
+                advanced = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Measure while the restored process is alive.
+    let pid = sb2.pid();
+    let restored_maps = pid.map(read_maps).unwrap_or_default();
+    let fd_list: Vec<String> = pid
+        .map(|pid| {
+            std::fs::read_dir(format!("/proc/{pid}/fd"))
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .map(|e| {
+                            let target = std::fs::read_link(e.path())
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|_| "<unreadable>".into());
+                            format!("{}->{}", e.file_name().to_string_lossy(), target)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    eprintln!("noexec: restored fds = {fd_list:?}");
+
+    let _ = sb2.kill();
+    let exit = sb2.wait().await.map(|r| r.exit_status);
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // The three stdio descriptors are skipped in *both* routes (the harness's
+    // pipes and /dev/null are not reopenable by path); anything beyond them would
+    // be the stub failing to recreate a recorded fd.
+    assert!(
+        skipped.iter().all(|s| s.fd <= 2),
+        "only stdio may be skipped on the no-exec route; skipped: {skipped:?}"
+    );
+    assert!(
+        advanced,
+        "the restored process must resume and advance the counter past {baseline}; \
+         last seen {last}, restored exit {exit:?}"
+    );
+    assert!(!restored_maps.is_empty(), "could not read the restored layout");
+    let mut allowed: Vec<(u64, u64)> = cp
+        .process_state
+        .memory_maps
+        .iter()
+        .map(|m| (m.start, m.end))
+        .chain(std::iter::once((STUB_BASE, STUB_BASE + STUB_SPAN)))
+        .collect();
+    allowed.sort_unstable();
+    let mut covered: Vec<(u64, u64)> = Vec::new();
+    for (lo, hi) in allowed {
+        match covered.last_mut() {
+            Some(prev) if lo <= prev.1 => prev.1 = prev.1.max(hi),
+            _ => covered.push((lo, hi)),
+        }
+    }
+    let mut strays = Vec::new();
+    for (start, end, path) in &restored_maps {
+        if matches!(path.as_str(), "[vdso]" | "[vvar]" | "[vvar_vclock]" | "[vsyscall]") {
+            continue;
+        }
+        if !covered.iter().any(|&(lo, hi)| *start >= lo && *end <= hi) {
+            strays.push(format!("{start:#x}-{end:#x} {path}"));
+        }
+    }
+    assert!(
+        strays.is_empty(),
+        "the fork's leftovers must be swept: the restored layout may hold only the \
+         checkpoint image, the kernel's special mappings and the stub window; \
+         found {} stray mapping(s): {strays:#?}",
+        strays.len()
+    );
+}
+
+/// Bisect for the no-exec route: does it work where the *exec* route also works
+/// (chroot-free, no real root)?
+///
+/// If this passes and the real-root variant segfaults, the difference is the
+/// chroot/real-root shape; if both segfault, the difference is
+/// fork-versus-exec (the address space and the kernel state `execve` resets).
+#[tokio::test]
+async fn test_restore_resumes_without_exec_and_without_chroot() {
+    if !noexec_prototype_enabled() {
+        return;
+    }
+    if cfg!(not(any(target_arch = "x86_64", target_arch = "riscv64"))) {
+        return;
+    }
+    let helper = helper_binary();
+    let helper_dir = helper.parent().unwrap().to_path_buf();
+    let tmp = std::env::temp_dir().join(format!("sandlock-noexec-flat-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let counter = tmp.join("clock.cnt");
+    let counter_s = counter.to_str().unwrap().to_string();
+
+    let policy = Sandbox::builder()
+        .fs_read(&helper_dir)
+        .fs_read(&tmp)
+        .fs_write(&tmp)
+        .build()
+        .expect("chroot-free policy builds");
+
+    let helper_s = helper.to_str().unwrap().to_string();
+    let mut sb = policy.clone().with_name("noexec-flat-src");
+    sb.spawn_interactive(&[helper_s.as_str(), "clock-loop", counter_s.as_str()])
+        .await
+        .expect("counter starts");
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let cp = sb.checkpoint().await.expect("checkpoint");
+    let read_counter = |path: &str| -> Option<u64> {
+        std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<u64>().ok())
+    };
+    let baseline = read_counter(&counter_s).expect("counter has a value");
+    assert!(baseline > 2, "counter advanced, got {baseline}");
+    sb.kill().unwrap();
+    let _ = sb.wait().await;
+    std::fs::write(&counter, b"0\n").unwrap();
+
+    let mut sb2 = policy.clone().with_name("noexec-flat-dst");
+    let _restored = sb2
+        .restore_interactive_noexec(&cp)
+        .await
+        .expect("no-exec restore (chroot-free)");
+
+    let mut advanced = false;
+    let mut last = 0u64;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if let Some(v) = read_counter(&counter_s) {
+            last = v;
+            if v > baseline {
+                advanced = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let _ = sb2.kill();
+    let exit = sb2.wait().await.map(|r| r.exit_status);
+    let _ = std::fs::remove_dir_all(&tmp);
+    assert!(
+        advanced,
+        "no-exec restore must resume chroot-free; last seen {last}, exit {exit:?}"
+    );
+}

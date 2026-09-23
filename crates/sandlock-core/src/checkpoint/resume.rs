@@ -272,6 +272,17 @@ pub(crate) fn finish_restore(
     crate::checkpoint::restore_blob::verify_special_mappings(&current, &plan.maps)
         .map_err(|e| child_err(format!("restore vdso relocation: {e}")))?;
     let sweep = crate::checkpoint::restore_blob::plan_sweep(&current, &plan.maps);
+    // Measurement hook for the no-exec prototype (`docs/chroot-workspace-exec.md`
+    // §11.5): the sweep list is the fork's leftovers minus the image, so its size
+    // is the clearest number for what that route costs versus an exec'd stub
+    // (where `current` is two mappings).
+    if std::env::var("SANLOCK_RESTORE_TRACE").map(|v| v.trim() == "1").unwrap_or(false) {
+        eprintln!(
+            "sandlock-restore: child mappings={} sweep entries={}",
+            current.len(),
+            sweep.len()
+        );
+    }
     if sweep.len() > MAX_SWEEP_ENTRIES {
         return Err(child_err(format!(
             "restore sweep list has {} entries, more than the stub accepts ({MAX_SWEEP_ENTRIES})",
