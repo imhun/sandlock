@@ -341,6 +341,17 @@ async fn test_exec_through_a_dotdot_relative_symlink_resolves() {
 /// Deterministic form: a symlink loop is `ELOOP` (40) at every attempt, on
 /// every kernel version, for every uid -- the kernel's answer must reach the
 /// child's stderr instead of being rewritten into "not found".
+///
+/// Measured 2026-09-23 (root-mode gate, `--privileged`): this test was the
+/// regression reporter for a two-read errno bug -- `sandlock-init` read errno
+/// again *after* `realroot::record_failure()` had tried to open the trace file,
+/// so a denied open of `/tmp/sandlock-real-root-error` (the default path, and
+/// the sandbox's ruleset grants no write to `/tmp`) replaced the exec's ELOOP
+/// with the open's EACCES: `assert_eq` saw `errno 13` where the loop demands
+/// `errno 40`. The shape matters: with `SANLOCK_REALROOT_TRACE` set, `note()`
+/// opens the trace file just before `execvp` and the second read is never
+/// reached, which is why the e2b lane (it sets that variable) hid this from
+/// its own contract tests.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_exec_failure_names_the_kernel_errno_instead_of_exiting_127_silently() {
     let base = temp_dir("exec-errno");

@@ -464,10 +464,19 @@ fn spawn(
         unsafe {
             libc::execvp(exec_path.as_ptr() as *const libc::c_char, ptrs.as_ptr());
         }
+        // Read `errno` *here*, before anything else runs. `record_failure`
+        // below opens the trace file, and if that open fails it overwrites the
+        // errno `execvp` just set -- which is how a plain ENOENT ("no such
+        // binary") turned into a diagnostic line naming the trace file's EACCES
+        // (13) that the binary had nothing to do with. The e2b contract caught
+        // it: "missing binary -> 127 with no output" held only when the trace
+        // was enabled, because `note` above opens the file first and leaves the
+        // errno alone afterwards. One read, one meaning.
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         crate::realroot::record_failure(&format!(
             "execvp({:?}) failed (errno {})",
             cargv[0].to_string_lossy(),
-            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+            errno
         ));
         // FUP-26: `execvp` only returns on failure, and the reserved 127 alone
         // is not a diagnosis -- in a lane log it reads as "the command died
@@ -478,7 +487,6 @@ fn spawn(
         // the one line that names it -- 13 a DAC refusal, 40 a symlink loop,
         // 11/35 the *retryable* `EAGAIN` openat2(RESOLVE_IN_ROOT) reports for
         // a `..` it could not prove stayed inside the root.
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         if errno != libc::ENOENT {
             exec_fail(&format!(
                 "sandlock-init: exec {argv0:?} failed (errno {errno})\n",
