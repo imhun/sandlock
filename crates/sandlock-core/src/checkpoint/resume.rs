@@ -412,7 +412,7 @@ mod tests {
     /// it. If the two ever drift apart, a restore silently maps a checkpoint
     /// region over the running stub instead of being refused.
     #[test]
-    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
     fn stub_links_at_the_reserved_base() {
         use crate::checkpoint::restore_blob::{STUB_BASE, STUB_SPAN};
 
@@ -725,5 +725,203 @@ mod tests {
              {st:#x} (payload exits with write()'s return value), /proc syscall {stalled_in}",
         );
         assert_eq!(got[0], SENTINEL, "the restored program ran from its checkpoint pc");
+    }
+
+    /// End-to-end proof for aarch64: the same protocol as the two tests above,
+    /// with aarch64 machine code, a 34-slot register file (x0-x30, sp, pc,
+    /// pstate) and -- the part the other architectures have nowhere to put --
+    /// the thread pointer and the FP control words.
+    ///
+    /// The payload reads `TPIDR_EL0`, `FPSR` and `FPCR` back out and hands them
+    /// to the supervisor, so the assertions are the exact values the checkpoint
+    /// recorded rather than a sentinel byte:
+    ///
+    ///   * `TPIDR_EL0` proves the `msr` in the stub's step 9. It cannot come
+    ///     from anywhere else -- no register in the frame holds it, and the
+    ///     stub is a -nostdlib binary whose own value is zero;
+    ///   * `FPSR`/`FPCR` prove the sigcontext's `fpsimd_context` record was
+    ///     accepted *and parsed at the offsets restore_blob framed it to*: the
+    ///     zero-valued tail of that record would leave both words clear.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn restore_stub_reconstructs_a_synthetic_image() {
+        use crate::checkpoint::{Checkpoint, MemoryMap, MemorySegment, ProcessState};
+        use crate::checkpoint::restore_blob;
+
+        const CODE: u64 = 0x4500_0000_0000;
+        const STACK: u64 = 0x4500_0001_0000;
+        const OUT_FD: i32 = 10; // sentinel pipe write end, inherited by the child
+        const TP: u64 = 0x0000_ffff_8888_1000; // the checkpoint's TPIDR_EL0
+        const FPSR: u32 = 0x0000_0010;         // IXC
+        // RMode = 0b11 (round toward zero), FPCR bits [23:22]. Both words have to
+        // be non-zero and distinct so that reading them back proves the framed
+        // record is parsed field by field -- an off-by-one-field framing would
+        // hand back fpcr's slot for fpsr and vice versa. RMode rather than an
+        // exception-enable bit (FPCR[0:5]) because not every implementation
+        // keeps the whole of that run: the CPU this lane emulates accepts [0:2]
+        // and silently drops [3:5], and a dropped bit would make the assertion
+        // measure the CPU model rather than the frame.
+        const FPCR: u32 = 0x00C0_0000;
+        const PAGE: u64 = 0x1000;
+
+        let stub = stub_path();
+        if !stub.exists() {
+            eprintln!("skip: restore-stub not built ({})", stub.display());
+            return;
+        }
+
+        // aarch64 payload. It records {tpidr_el0, fpsr, fpcr} into STACK+0x800
+        // (read/write -- the code page is r-x by then) and writes those 16 bytes
+        // to OUT_FD, exiting with write's return value:
+        //
+        //   mrs  x1, tpidr_el0
+        //   movz x2, #0x0800; movk x2, #0x0001, lsl #16; movk x2, #0x4500, lsl #32
+        //   str  x1, [x2]
+        //   mrs  x3, fpsr;  str w3, [x2, #8]
+        //   mrs  x3, fpcr;  str w3, [x2, #12]
+        //   mov  x0, #OUT_FD; mov x1, x2; mov x2, #16; mov x8, #__NR_write
+        //   svc  #0
+        //   mov  x8, #__NR_exit
+        //   svc  #0
+        let mut code_page = vec![0u8; PAGE as usize];
+        {
+            let c = &mut code_page;
+            let mut w = 0usize;
+            let mut put = |bytes: &[u8]| { c[w..w + bytes.len()].copy_from_slice(bytes); w += bytes.len(); };
+            for word in [
+                0xd53bd041u32, // mrs  x1, tpidr_el0
+                0xd2810002,    // movz x2, #0x0800
+                0xf2a00022,    // movk x2, #0x0001, lsl #16
+                0xf2c8a002,    // movk x2, #0x4500, lsl #32
+                0xf9000041,    // str  x1, [x2]
+                0xd53b4423,    // mrs  x3, fpsr
+                0xb9000843,    // str  w3, [x2, #8]
+                0xd53b4403,    // mrs  x3, fpcr
+                0xb9000c43,    // str  w3, [x2, #12]
+                0xd2800140,    // mov  x0, #10 (OUT_FD)
+                0xaa0203e1,    // mov  x1, x2
+                0xd2800202,    // mov  x2, #16
+                0xd2800808,    // mov  x8, #64 (__NR_write)
+                0xd4000001,    // svc  #0
+                0xd2800ba8,    // mov  x8, #93 (__NR_exit)
+                0xd4000001,    // svc  #0
+            ] {
+                put(&word.to_le_bytes());
+            }
+        }
+
+        // aarch64 user_pt_regs: x0-x30, sp, pc, pstate.
+        let mut regs = vec![0u64; 34];
+        regs[31] = STACK + 0xF00; // sp
+        regs[32] = CODE;          // pc
+        regs[33] = 0x1000;        // pstate: EL0t + SSBS, as the kernel reports it
+
+        // The code page is r-x in the checkpoint, so the stub has to map it
+        // writable for the fill and mprotect it back before handing control over.
+        let cp = Checkpoint {
+            name: String::new(),
+            policy: crate::Sandbox::builder().build().unwrap(),
+            process_state: ProcessState {
+                pid: 0,
+                cwd: "/".into(),
+                exe: String::new(),
+                regs,
+                // A capture on this architecture always has both, and plan()
+                // refuses a frame that cannot carry them: the kernel rejects a
+                // frame whose record walk finds no `fpsimd_context` (EINVAL),
+                // and nothing but this field can supply `TPIDR_EL0`.
+                fpregs: {
+                    let mut fp = vec![0u8; 528];
+                    fp[512..516].copy_from_slice(&FPSR.to_le_bytes());
+                    fp[516..520].copy_from_slice(&FPCR.to_le_bytes());
+                    fp
+                },
+                tls: Some(TP),
+                memory_maps: vec![
+                    MemoryMap { start: CODE, end: CODE + PAGE, perms: "r-xp".into(), offset: 0, path: None },
+                    MemoryMap { start: STACK, end: STACK + PAGE, perms: "rw-p".into(), offset: 0, path: None },
+                ],
+                memory_data: vec![
+                    MemorySegment { start: CODE, data: code_page },
+                    MemorySegment { start: STACK, data: vec![0u8; PAGE as usize] },
+                ],
+            },
+            fd_table: Vec::new(),
+            cow_snapshot: None,
+            app_state: None,
+        };
+
+        let plan = restore_blob::plan(&cp, None, &[]).expect("plan");
+        let channel = StubChannel::new(&plan.blob).expect("channel");
+
+        let stub_path = std::ffi::CString::new(stub.to_str().unwrap()).unwrap();
+
+        let mut pipefd = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(pipefd.as_mut_ptr()) }, 0);
+        let pipe_r = relocate_above(pipefd[0], OUT_FD + 1).expect("relocate pipe read end");
+        let pipe_w = relocate_above(pipefd[1], OUT_FD + 1).expect("relocate pipe write end");
+        let (pipe_r, pipe_w) = (pipe_r.into_raw_fd(), pipe_w.into_raw_fd());
+
+        let (ctrl, ready, go) =
+            (channel.ctrl.as_raw_fd(), channel.ready.as_raw_fd(), channel.go_r.as_raw_fd());
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork");
+        if child == 0 {
+            unsafe {
+                libc::dup2(ctrl, CTRL_FD);
+                libc::dup2(ready, READY_FD);
+                libc::dup2(go, GO_FD);
+                libc::dup2(pipe_w, OUT_FD);
+                let argv = [stub_path.as_ptr(), std::ptr::null()];
+                let envp = [std::ptr::null()];
+                libc::execve(stub_path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                libc::_exit(127);
+            }
+        }
+        unsafe { libc::close(pipe_w) };
+
+        let restored = finish_restore(child, &channel, &plan);
+
+        let mut got = [0u8; 16];
+        let mut n = 0usize;
+        if restored.is_ok() && wait_readable(pipe_r, 5000).unwrap_or(false) {
+            let mut done = 0usize;
+            while done < got.len() {
+                let r = unsafe {
+                    libc::read(pipe_r, got[done..].as_mut_ptr() as *mut libc::c_void, got.len() - done)
+                };
+                if r <= 0 { break; }
+                done += r as usize;
+            }
+            n = done;
+        }
+        let stalled_in = std::fs::read_to_string(format!("/proc/{child}/syscall"))
+            .unwrap_or_else(|e| e.to_string());
+        unsafe { libc::kill(child, libc::SIGKILL) };
+        let mut st = 0i32;
+        unsafe { libc::waitpid(child, &mut st, 0) };
+        unsafe { libc::close(pipe_r) };
+
+        restored.expect("finish_restore");
+        assert_eq!(
+            n, 16,
+            "restored code must hand back tpidr_el0+fpsr+fpcr; child exit status \
+             {st:#x} (the payload exits with write()'s return value), /proc syscall {stalled_in}",
+        );
+        assert_eq!(
+            u64::from_le_bytes(got[0..8].try_into().unwrap()),
+            TP,
+            "the restored thread's TPIDR_EL0 is the checkpoint's",
+        );
+        assert_eq!(
+            u32::from_le_bytes(got[8..12].try_into().unwrap()),
+            FPSR,
+            "fpsr came back out of the frame's fpsimd_context record",
+        );
+        assert_eq!(
+            u32::from_le_bytes(got[12..16].try_into().unwrap()),
+            FPCR,
+            "fpcr came back out of the frame's fpsimd_context record",
+        );
     }
 }

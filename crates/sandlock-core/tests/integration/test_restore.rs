@@ -16,12 +16,12 @@ fn helper_binary() -> PathBuf {
 /// The address range the restore-stub's own image is linked into. Must match
 /// `checkpoint::restore_blob::STUB_BASE`/`STUB_SPAN`, which is crate-private;
 /// `stub_links_at_the_reserved_base` guards the constant against the binary.
-/// x86_64 uses 3 TiB; riscv64 uses 192 GiB (below Sv39 ceiling).
-#[cfg(target_arch = "x86_64")]
+/// x86_64 and aarch64 use 3 TiB; riscv64 uses 192 GiB (below Sv39 ceiling).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const STUB_BASE: u64 = 0x300_0000_0000;
 #[cfg(target_arch = "riscv64")]
 const STUB_BASE: u64 = 0x30_0000_0000;
-#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
 const STUB_BASE: u64 = 0;
 const STUB_SPAN: u64 = 0x40_0000;
 
@@ -60,8 +60,12 @@ fn read_maps(pid: i32) -> Vec<(u64, u64, String)> {
 /// stack and heap stayed mapped and reachable.
 #[tokio::test]
 async fn test_restore_glibc_vdso_program_resumes() {
-    if cfg!(not(any(target_arch = "x86_64", target_arch = "riscv64"))) {
-        eprintln!("skipping: the restore engine is x86_64/riscv64 only");
+    if cfg!(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))) {
+        eprintln!("skipping: the restore engine is x86_64/aarch64/riscv64 only");
         return;
     }
 
@@ -186,7 +190,11 @@ async fn test_restore_glibc_vdso_program_resumes() {
 /// (docs/chroot-workspace-exec.md §11).
 #[tokio::test]
 async fn test_restore_resumes_inside_a_chroot_root() {
-    if cfg!(not(any(target_arch = "x86_64", target_arch = "riscv64"))) {
+    if cfg!(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))) {
         return;
     }
     let helper = helper_binary();
@@ -350,7 +358,7 @@ async fn test_restore_resumes_inside_a_real_root_without_exec() {
         return;
     }
     if cfg!(not(any(target_arch = "x86_64", target_arch = "riscv64"))) {
-        eprintln!("skipping: the restore engine is x86_64/riscv64 only");
+        eprintln!("skipping: the no-exec prototype jumps into the stub with an arch-specific asm");
         return;
     }
 

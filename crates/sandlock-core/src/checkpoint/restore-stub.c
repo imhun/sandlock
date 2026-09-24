@@ -1,5 +1,5 @@
 /*
- * restore-stub: freestanding self-restore stub (x86_64, riscv64).
+ * restore-stub: freestanding self-restore stub (x86_64, aarch64, riscv64).
  *
  * This is a core component of the checkpoint restore engine, not a test
  * fixture: the supervisor execs this stub into a fresh, fully-sandboxed process
@@ -21,8 +21,9 @@
  *   6. mprotect the anonymous regions down to their checkpointed protections;
  *   7. unmap the leftovers of its own startup that the image did not overwrite;
  *   8. reopen the fd table at its saved numbers and offsets;
- *   9. (x86_64) restore fs_base/gs_base via arch_prctl; (riscv64) tp is carried
- *      in the signal frame gregs, so nothing to do;
+ *   9. (x86_64) restore fs_base/gs_base via arch_prctl; (aarch64) write
+ *      TPIDR_EL0 with `msr`; (riscv64) tp is carried in the signal frame gregs,
+ *      so nothing to do;
  *  10. rt_sigreturn into the checkpoint's register context.
  *
  * Two address-space hazards drive the layout, and both are why this file avoids
@@ -47,10 +48,11 @@
  *
  * Built with: cc -static -nostdlib -no-pie -O2 -Wl,-Ttext-segment=STUB_BASE
  *
- * Exit codes (all _exit): 2 blob read, 3 bad magic/version/size, 4 map region,
- * 5 open region file, 6 ready write, 7 go read, 8 mprotect, 9 vdso mremap,
- * 10 fd reopen, 12 sweep entry overlapping the stub's own image, 13 arch_prctl
- * (x86_64 only). rt_sigreturn does not return; if it does, exit 11.
+ * Exit codes (all _exit): 2 blob read, 3 bad magic/version/size (including a
+ * blob that disagrees with this architecture about what a frame needs), 4 map
+ * region, 5 open region file, 6 ready write, 7 go read, 8 mprotect, 9 vdso
+ * mremap, 10 fd reopen, 12 sweep entry overlapping the stub's own image,
+ * 13 arch_prctl (x86_64 only). rt_sigreturn does not return; if it does, exit 11.
  */
 #define CTRL_FD 3
 #define READY_FD 4
@@ -80,6 +82,23 @@
 #define SYS_openat 56
 #define SYS_rt_sigreturn 139
 /* No SYS_arch_prctl on riscv64 — tp is in the signal frame gregs. */
+#elif defined(__aarch64__)
+/* aarch64's numbers are the generic 64-bit ones, like riscv64's, but the syscall
+ * register is x8 and the arguments are x0-x5. There is no arch_prctl here
+ * either: the thread pointer is a system register (TPIDR_EL0), written with
+ * `msr` in step 9. */
+#define SYS_read 63
+#define SYS_write 64
+#define SYS_close 57
+#define SYS_lseek 62
+#define SYS_mmap 222
+#define SYS_mprotect 226
+#define SYS_munmap 215
+#define SYS_mremap 216
+#define SYS_dup3 24
+#define SYS_exit 93
+#define SYS_openat 56
+#define SYS_rt_sigreturn 139
 #elif __x86_64__
 #define SYS_read 0
 #define SYS_write 1
@@ -121,11 +140,16 @@
 #define CTRL_MAX (1 << 20)
 /* Upper bound on a signal-frame FP image. x86_64: AMX-sized xstate plus
  * magic2. riscv64: 516 bytes, the last safe byte before sc_extdesc.reserved;
- * the kernel union __riscv_fp_state is 528 bytes. */
+ * the kernel union __riscv_fp_state is 528 bytes. aarch64: exactly one
+ * `struct fpsimd_context` (16-byte header + 528 bytes of state), which is also
+ * the whole FP state a restorable thread can have (live SVE is refused at
+ * capture). */
 #if defined(__x86_64__)
 #define FP_MAX 16384
 #elif defined(__riscv) && __riscv_xlen == 64
 #define FP_MAX 516
+#elif defined(__aarch64__)
+#define FP_MAX 528
 #endif
 #define STACK_SIZE 65536
 /* Leftover mappings the supervisor may ask the stub to unmap. A freshly
@@ -154,6 +178,20 @@ static i64 sc6(long n, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
         : "rcx", "r11", "memory");
     return r;
 }
+#elif defined(__aarch64__)
+static i64 sc6(long n, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
+    register i64 nr __asm__("x8") = n;
+    register u64 r0 __asm__("x0") = a;
+    register u64 r1 __asm__("x1") = b;
+    register u64 r2 __asm__("x2") = c;
+    register u64 r3 __asm__("x3") = d;
+    register u64 r4 __asm__("x4") = e;
+    register u64 r5 __asm__("x5") = f;
+    __asm__ volatile("svc #0" : "+r"(r0)
+        : "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5), "r"(nr)
+        : "memory");
+    return (i64)r0; /* negative errno, like riscv64's a0 */
+}
 #elif defined(__riscv) && __riscv_xlen == 64
 static i64 sc6(long n, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
     register long nr __asm__("a7") = n;
@@ -179,21 +217,34 @@ static void die(int code) { SC1(SYS_exit, code); for(;;){} }
 
 /* -nostdlib leaves no libc, but the compiler may still lower a struct copy or
  * an initializing loop into a call to one of these, so define them here.
- * These bodies depend on -fno-tree-loop-distribute-patterns (see build.rs):
- * loop-idiom recognition otherwise rewrites each loop into a call to the very
- * function it is compiling, and the stub spins forever inside memset. */
+ *
+ * Both bodies are booby-trapped by construction. Loop-idiom recognition sees a
+ * store loop and rewrites it into a call to the function being compiled --
+ * GCC via -ftree-loop-distribute-patterns, LLVM via its LoopIdiom pass -- which
+ * makes memset call itself and the stub die on its own stack, all the way to
+ * the frame it is trying to build. Two defences, because the two compilers
+ * differ: build.rs passes -fno-tree-loop-distribute-patterns when the compiler
+ * is GNU C (clang rejects that flag outright, and the wheel builder's aarch64
+ * cross toolchain is zig), and the empty asm below is a side effect that makes
+ * every compiler's idiom recognizer give up on the loop. */
 void *memset(void *d, int c, unsigned long n) {
     unsigned char *p = d;
-    while (n--) *p++ = (unsigned char)c;
+    while (n--) {
+        *p++ = (unsigned char)c;
+        __asm__ volatile("" ::: "memory");
+    }
     return d;
 }
 void *memcpy(void *d, const void *s, unsigned long n) {
     unsigned char *p = d; const unsigned char *q = s;
-    while (n--) *p++ = *q++;
+    while (n--) {
+        *p++ = *q++;
+        __asm__ volatile("" ::: "memory");
+    }
     return d;
 }
 
-/* Blob layout mirror (little-endian; both x86_64 and riscv64 are LE, so native
+/* Blob layout mirror (little-endian; every supported target is LE, so native
  * struct reads work). Must match checkpoint/restore_blob.rs byte for byte. */
 struct blob_header {
     u32 magic, version, n_regions, n_fds;
@@ -201,7 +252,13 @@ struct blob_header {
     u64 fpstate_off;
     u64 strings_off; u32 strings_len, n_vdso;
     u64 vdso_off;
+    /* The thread pointer, for the architecture that keeps it outside the
+     * register file (aarch64's TPIDR_EL0). Rust refuses a plan whose image has
+     * none, so `has_tls` is 0 only on x86_64/riscv64, where the register file
+     * already carries it and `tls` stays 0. */
+    u64 tls; u32 has_tls, _p0;
 };
+_Static_assert(sizeof(struct blob_header) == 80, "header layout must match restore_blob.rs");
 struct blob_region {
     u64 start, end; u32 prot; unsigned char src, _p0[3]; u64 file_off;
     u32 path_off, _p1;
@@ -210,7 +267,7 @@ struct blob_fd { u32 fd, flags; u64 offset; u32 path_off, _p0; };
 struct blob_vdso { i64 delta; u64 len; u64 target; };
 
 #define BLOB_MAGIC 0x534c5242u
-#define BLOB_VERSION 2u
+#define BLOB_VERSION 3u
 #define SRC_ANON 0
 #define SRC_FILE 1
 
@@ -283,6 +340,70 @@ struct rt_sf {
     struct uctx uc;
 };
 
+#elif defined(__aarch64__)
+
+/* aarch64: rt_sigreturn reads `struct rt_sigframe` at sp -- a 128-byte
+ * `struct siginfo` followed by `struct ucontext` -- and the frame's
+ * `uc_mcontext` is a `struct sigcontext` at uc+0xB0 (measured on the target
+ * kernel as frame+0x130). The sigcontext is the whole register file, a
+ * `fault_address` that rt_sigreturn ignores, and 4 KiB of reserved space.
+ *
+ * There is no FP pointer to set the way x86_64 has: rt_sigreturn *walks*
+ * __reserved looking for `_aarch64_ctx` records and stops at the first zero
+ * magic word. The 0x210-byte `fpsimd_context` that restore_blob.rs framed goes
+ * in there verbatim at +0 (docs/arm-cr-s0-evidence.md §1).
+ *
+ * Two things the x86_64 stub does not have to think about:
+ *   - the register file in the blob is ptrace order, which here *is* frame
+ *     order (x0-x30, sp, pc, pstate), so it is one memcpy;
+ *   - the thread pointer is in neither the register file nor the frame, so
+ *     step 9 has to write it with `msr tpidr_el0`.
+ */
+struct sigctx {
+    u64 fault_address;   /* 0x00: ignored by rt_sigreturn */
+    u64 regs[31];        /* 0x08: x0-x30 */
+    u64 sp;              /* 0x100 */
+    u64 pc;              /* 0x108 */
+    u64 pstate;          /* 0x110 */
+    u8 __reserved[4096] __attribute__((aligned(16))); /* 0x120: the record list */
+};
+
+struct uctx {
+    u64 uc_flags;      /* 0x00 */
+    u64 uc_link;       /* 0x08 */
+    u64 ss_sp;         /* 0x10 */
+    u32 ss_flags;      /* 0x18 */
+    u32 _pad;          /* 0x1C */
+    u64 ss_size;       /* 0x20 */
+    u64 uc_sigmask;    /* 0x28 */
+    u8  __unused[128]; /* 0x30 .. 0xA8, padded to 0xB0 */
+    struct sigctx mc;  /* 0xB0 */
+};
+
+/* rt_sigframe: struct siginfo (zeroed, 128 bytes) + ucontext. */
+struct rt_sf {
+    u8 info[128];
+    struct uctx uc;
+};
+
+/* The measured offsets are load-bearing: the kernel parses the frame by them,
+ * and a wrong one is a silent EINVAL (or, worse, a resumed program with the
+ * wrong registers). Pin them at compile time so a struct edit cannot drift. */
+_Static_assert(__builtin_offsetof(struct uctx, mc) == 0xB0,
+               "sigcontext must land at uc+0xB0 (measured)");
+_Static_assert(__builtin_offsetof(struct sigctx, regs) == 0x08,
+               "regs[0] must land at sc+0x08 (measured)");
+_Static_assert(__builtin_offsetof(struct sigctx, sp) == 0x100,
+               "sp must land at sc+0x100 (measured)");
+_Static_assert(__builtin_offsetof(struct sigctx, pc) == 0x108,
+               "pc must land at sc+0x108 (measured)");
+_Static_assert(__builtin_offsetof(struct sigctx, pstate) == 0x110,
+               "pstate must land at sc+0x110 (measured)");
+_Static_assert(__builtin_offsetof(struct sigctx, __reserved) == 0x120,
+               "the FP record list must land at sc+0x120 (measured)");
+_Static_assert(FP_MAX <= sizeof((struct sigctx){0}.__reserved),
+               "FP_MAX must not exceed the sigcontext's reserved area");
+
 #endif
 
 /* These all live in .bss at STUB_BASE, out of reach of any MAP_FIXED region.
@@ -315,6 +436,16 @@ static void move_special(const struct blob_vdso *v, u64 vdso_base) {
                 MREMAP_MAYMOVE | MREMAP_FIXED, v->target, 0);
     if ((u64)r != v->target) die(9);
 }
+
+#ifdef __aarch64__
+/* Write the thread pointer. TPIDR_EL0 is a system register: it is in neither
+ * the general register file (so the frame cannot carry it) nor any ptrace
+ * regset the restore path uses, which is why the checkpoint records it and the
+ * blob hands it over here. */
+static void set_thread_pointer(u64 tp) {
+    __asm__ volatile("msr tpidr_el0, %0" :: "r"(tp) : "memory");
+}
+#endif
 
 /* `used`: the only reference is the module-level asm `call _start_c`, which the
  * optimizer cannot see, so without this -O2 would eliminate the function. */
@@ -450,8 +581,9 @@ static void _start_c(u64 *sp) {
         i64 fd = SC4(SYS_openat, AT_FDCWD, strings + f->path_off, f->flags, 0);
         if (fd < 0) die(10);
         if ((u32)fd != f->fd) {
-#if defined(__riscv) && __riscv_xlen == 64
-            /* riscv64 has no SYS_dup2 — use dup3 with flags=0. */
+#if (defined(__riscv) && __riscv_xlen == 64) || defined(__aarch64__)
+            /* Neither riscv64 nor aarch64 has SYS_dup2 — use dup3 with
+             * flags=0. */
             if (SC3(SYS_dup3, fd, f->fd, 0) != (i64)f->fd) die(10);
 #else
             if (SC2(SYS_dup2, fd, f->fd) != (i64)f->fd) die(10);
@@ -473,6 +605,16 @@ static void _start_c(u64 *sp) {
      * ordinary user programs; set it only when the checkpoint recorded one. */
     if (SC2(SYS_arch_prctl, ARCH_SET_FS, gp[UR_FS_BASE]) != 0) die(13);
     if (gp[UR_GS_BASE] && SC2(SYS_arch_prctl, ARCH_SET_GS, gp[UR_GS_BASE]) != 0) die(13);
+#elif defined(__aarch64__)
+    /* 9. Restore the thread pointer, which on this architecture is a system
+     * register rather than part of the register file or the frame. Without it
+     * the resumed program inherits this stub's TPIDR_EL0 -- zero, since a
+     * -nostdlib binary never sets one -- and every glibc function dies on entry
+     * reading its stack-protector canary through %tpidr_el0. Rust refuses a plan
+     * whose checkpoint has no thread pointer, so a blob without one here means
+     * the two sides disagree about the version. */
+    if (!h->has_tls) die(3);
+    set_thread_pointer(h->tls);
 #endif
 
     /* 10. Build the rt_sigframe on our private stack and rt_sigreturn into the
@@ -517,6 +659,36 @@ static void _start_c(u64 *sp) {
         : "r"(&uc), "r"(rax)
         : "memory");
 
+#elif defined(__aarch64__)
+    /* aarch64: build a struct rt_sigframe on the stack. The register file is
+     * already in frame order (ptrace order == user_pt_regs order == the
+     * sigcontext's layout), so it is one memcpy covering regs[31], sp, pc and
+     * pstate, all of them contiguous after `fault_address`. */
+    struct rt_sf sf;
+    memset(&sf, 0, sizeof sf);
+    /* The kernel refuses a frame with no FPSIMD record at all -- signal.c's
+     * do_rt_sigreturn returns -EINVAL when the record walk found none -- and a
+     * checkpoint with no FP bytes cannot be framed into one, so restore_blob's
+     * plan() refuses that combination before the stub ever sees it. A length
+     * other than the record this stub expects therefore means the Rust and C
+     * sides disagree about the layout. */
+    if (h->fpstate_len != FP_MAX) die(3);
+    u32 nregs = h->regs_len / 8;
+    if (nregs > 34) nregs = 34;
+    memcpy(&sf.uc.mc.regs[0], gp, (u64)nregs * sizeof(u64));
+    memcpy(sf.uc.mc.__reserved, ctrl_buf + h->fpstate_off, h->fpstate_len);
+
+    /* Set sp = &sf, then svc rt_sigreturn. The syscall number lives in x8 on
+     * this architecture and the frame restores the checkpoint's registers, so
+     * it has to be set here rather than falling out of the argument registers. */
+    register u64 x8 __asm__("x8") = SYS_rt_sigreturn;
+    __asm__ volatile(
+        "mov sp, %0\n\t"
+        "svc #0\n\t"
+        :
+        : "r"(&sf), "r"(x8)
+        : "memory");
+
 #elif defined(__riscv) && __riscv_xlen == 64
     /* riscv64: build a struct rt_sigframe on the stack. gp[] order is 1:1 with
      * sc_regs (both ptrace order), so copy the register file directly.
@@ -559,6 +731,22 @@ __asm__(
     "   and $-16, %rsp\n"
     "   call _start_c\n"
     "   hlt\n"
+);
+#elif defined(__aarch64__)
+/* aarch64: the kernel enters at _start with sp = the initial stack, which is
+ * where auxv lives. Pass it in x0 (the first argument), then switch to the
+ * private .bss stack: the checkpoint's [stack] region is mapped over the
+ * address the kernel picked for ours. `ldr x1, =stub_stack` is a literal-pool
+ * load, which is exactly right for the -no-pie ET_EXEC the stub is linked as. */
+__asm__(
+    ".global _start\n"
+    "_start:\n"
+    "   mov x0, sp\n"
+    "   ldr x1, =stub_stack\n"
+    "   add x1, x1, #" STR(STACK_SIZE) "\n"
+    "   and sp, x1, #-16\n"
+    "   bl _start_c\n"
+    "   brk #0\n"
 );
 #elif defined(__riscv) && __riscv_xlen == 64
 /* riscv64: a0 = sp (first argument), switch to stub_stack, align, call. */
