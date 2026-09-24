@@ -115,6 +115,36 @@ pub(crate) const MEDIATED_PATH_SYSCALLS: &[&str] = &[
     "lchown",
 ];
 
+/// The mediated rows whose *existence* is per-ABI, each with the
+/// [`crate::arch`] helper `chroot_path_syscalls()` reaches it through.
+///
+/// The names above are the union across the ABIs Sandlock targets; this table
+/// says which of them an individual ABI may not have at all. On x86_64 every
+/// helper resolves; on the generic-ABI arches (aarch64, riscv64) the legacy
+/// pre-`*at` forms answer `None` and the ABI has no such syscall, while
+/// `renameat` survives on aarch64 and not on riscv64. The pair is checked
+/// against the name resolver in
+/// [`tests::every_ledger_name_resolves_on_this_arch`], so a row that drifts
+/// out of the plan or is spelled wrong fails on the ABI it belongs to.
+pub(crate) const MEDIATED_PATH_SYSCALLS_PER_ABI: &[(&str, fn() -> Option<i64>)] = &[
+    ("open", crate::arch::sys_open),
+    ("stat", crate::arch::sys_stat),
+    ("lstat", crate::arch::sys_lstat),
+    ("access", crate::arch::sys_access),
+    ("readlink", crate::arch::sys_readlink),
+    ("getdents", crate::arch::sys_getdents),
+    ("unlink", crate::arch::sys_unlink),
+    ("rmdir", crate::arch::sys_rmdir),
+    ("mkdir", crate::arch::sys_mkdir),
+    ("rename", crate::arch::sys_rename),
+    ("renameat", crate::arch::sys_renameat),
+    ("symlink", crate::arch::sys_symlink),
+    ("link", crate::arch::sys_link),
+    ("chmod", crate::arch::sys_chmod),
+    ("chown", crate::arch::sys_chown),
+    ("lchown", crate::arch::sys_lchown),
+];
+
 /// Syscalls that name a filesystem object and are **not** mediated.
 ///
 /// Every one of these either has a gate the sandbox cannot pass, or is an open
@@ -250,6 +280,17 @@ pub(crate) const UNMEDIATED_PATH_TAKING: &[(&str, Disposition)] = &[
     // recorded here because it is the reason this ledger exists.
     ("chroot", Disposition::Blocked),
 ];
+
+/// Unmediated rows the generic-ABI architectures (aarch64, riscv64) do not
+/// have at all: the pre-`*at` legacy forms plus `uselib` (x86-only). The table
+/// above is the union across the ABIs Sandlock targets, so what each of these
+/// rows records is an x86_64 statement; on an ABI that has no such syscall
+/// there is nothing for the kernel to resolve a path through.
+/// [`tests::every_ledger_name_resolves_on_this_arch`] requires every row
+/// *outside* this list to resolve on the architecture under test, so a typo in
+/// the ledger still fails -- on the ABI that does have the syscall.
+pub(crate) const UNMEDIATED_PATH_TAKING_ABI_SPECIFIC: &[&str] =
+    &["creat", "mknod", "utime", "utimes", "futimesat", "uselib"];
 
 /// What confines a path-taking syscall in the **pure** (no-chroot) shape.
 ///
@@ -432,6 +473,19 @@ pub(crate) const NON_PATH_SYSCALLS: &[&str] = &[
     "futex_waitv", "set_mempolicy_home_node", "cachestat", "map_shadow_stack",
     "futex_wake", "futex_wait", "futex_requeue", "lsm_get_self_attr",
     "lsm_set_self_attr", "lsm_list_modules", "mseal",
+    // The 32-bit time64 group. The `syscalls` crate's aarch64 table carries
+    // these at 403..422, where the kernel implements nothing (they exist for
+    // 32-bit ABIs, which have the 2038 problem for `struct timespec`); none of
+    // them takes a path, in either spelling. Classified here so the totality
+    // check reads the same on aarch64 as it does on x86_64 instead of
+    // reporting the crate's leftovers as "new syscalls".
+    "clock_gettime64", "clock_settime64", "clock_adjtime64", "clock_getres_time64",
+    "clock_nanosleep_time64", "timer_gettime64", "timer_settime64",
+    "timerfd_gettime64", "timerfd_settime64", "utimensat_time64",
+    "pselect6_time64", "ppoll_time64", "io_pgetevents_time64",
+    "recvmmsg_time64", "mq_timedsend_time64", "mq_timedreceive_time64",
+    "semtimedop_time64", "rt_sigtimedwait_time64", "futex_time64",
+    "sched_rr_get_interval_time64",
 ];
 
 #[cfg(test)]
@@ -458,29 +512,74 @@ mod tests {
     /// member added to the plan without a ledger row (or removed from the plan
     /// while the ledger still claims mediation) is exactly the drift that let
     /// `chroot` through.
+    ///
+    /// Compared as *numbers*, because that is what the plan actually is: the
+    /// ledger is the union across ABIs (see
+    /// [`MEDIATED_PATH_SYSCALLS_PER_ABI`]) and a name has to go through the
+    /// same alias table the engine uses to land on this ABI's number. On
+    /// aarch64 the legacy non-`*at` rows resolve to nothing and drop out, while
+    /// `newfstatat` resolves to the number the plan calls 79.
     #[test]
     fn mediated_set_matches_the_ledger() {
-        let mediated = mediated_names();
-        let ledger: BTreeSet<String> =
-            MEDIATED_PATH_SYSCALLS.iter().map(|s| s.to_string()).collect();
+        let mediated: BTreeSet<u32> =
+            chroot_path_syscalls().into_iter().map(|n| n as u32).collect();
+        let ledger: BTreeSet<u32> = MEDIATED_PATH_SYSCALLS
+            .iter()
+            .filter_map(|name| syscall_name_to_nr(name))
+            .collect();
         assert_eq!(
             mediated, ledger,
-            "chroot_path_syscalls() and MEDIATED_PATH_SYSCALLS disagree"
+            "chroot_path_syscalls() and MEDIATED_PATH_SYSCALLS disagree on this ABI"
         );
     }
 
+    /// Every ledger row is either a syscall this ABI has, or a documented
+    /// per-ABI row whose arch helper agrees that this ABI has none. The two
+    /// halves are cross-checked against each other, so a typo in either the
+    /// ledger or the per-ABI table fails here instead of shrinking the plan
+    /// silently.
     #[test]
     fn every_ledger_name_resolves_on_this_arch() {
         for name in MEDIATED_PATH_SYSCALLS {
+            if syscall_name_to_nr(name).is_some() {
+                continue;
+            }
+            let helper = MEDIATED_PATH_SYSCALLS_PER_ABI
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| {
+                    panic!("mediated ledger name {name} does not resolve on this architecture")
+                })
+                .1;
             assert!(
-                syscall_name_to_nr(name).is_some(),
-                "mediated ledger name {name} does not resolve on this architecture"
+                helper().is_none(),
+                "{name} is listed as ABI-specific, but the arch helper resolved it"
+            );
+        }
+        for (name, helper) in MEDIATED_PATH_SYSCALLS_PER_ABI {
+            assert!(
+                MEDIATED_PATH_SYSCALLS.contains(name),
+                "per-ABI row {name} is missing from MEDIATED_PATH_SYSCALLS"
+            );
+            assert_eq!(
+                helper().map(|n| n as u32),
+                syscall_name_to_nr(name),
+                "arch helper and name resolver disagree about {name}"
             );
         }
         for (name, _) in UNMEDIATED_PATH_TAKING {
+            if syscall_name_to_nr(name).is_some() {
+                continue;
+            }
             assert!(
-                syscall_name_to_nr(name).is_some(),
+                UNMEDIATED_PATH_TAKING_ABI_SPECIFIC.contains(name),
                 "path-surface entry {name} does not resolve on this architecture"
+            );
+        }
+        for name in UNMEDIATED_PATH_TAKING_ABI_SPECIFIC {
+            assert!(
+                UNMEDIATED_PATH_TAKING.iter().any(|(n, _)| n == name),
+                "{name} is listed as ABI-specific but is not in UNMEDIATED_PATH_TAKING"
             );
         }
     }
