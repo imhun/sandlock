@@ -37,14 +37,48 @@ use super::inbound::socket_ino;
 /// `struct pollfd` on every sandlock target: `{ int fd; short events;
 /// short revents; }` — 8 bytes on LP64.
 const POLLFD_SIZE: usize = 8;
-/// `struct epoll_event` is `__attribute__((packed))` in the kernel ABI:
-/// `{ uint32_t events; uint64_t data; }` — 12 bytes on every arch (no
-/// padding; `data` starts at offset 4).
-const EPOLL_EVENT_SIZE: usize = 12;
+/// `struct epoll_event` is `{ uint32_t events; uint64_t data; }`, and its
+/// *layout* is per-ABI: libc marks the struct `repr(packed)` on x86_64 (and
+/// 32-bit x86), so it is 12 bytes with `data` at offset 4 there, while every
+/// other LP64 ABI keeps the natural alignment — 16 bytes, `data` at offset 8
+/// (measured with a C probe on both: x86_64 12/4, aarch64 16/8). The child's
+/// array is read and written through these two numbers, so a hardcoded 12/4
+/// reads the wrong half of every record on aarch64 and writes back records
+/// the kernel reads as garbage. Both come from libc's own definition, which
+/// is where the packed/natural distinction lives.
+const EPOLL_EVENT_SIZE: usize = std::mem::size_of::<libc::epoll_event>();
+/// Offset of the trailing `data` field inside one [`EPOLL_EVENT_SIZE`] record.
+const EPOLL_EVENT_DATA_OFFSET: usize = std::mem::offset_of!(libc::epoll_event, u64);
 /// Supervisor-side poll slice: bounds how long a newly queued host connection
 /// waits before the synthesized wakeup, and how quickly a cancelled wait
 /// (child died) terminates.
 const POLL_SLICE_MS: i32 = 20;
+
+/// Decode one `struct epoll_event` from the child's memory. `bytes` is exactly
+/// [`EPOLL_EVENT_SIZE`] long; the padding a non-`x86_64` ABI leaves between
+/// `events` and `data` is skipped rather than interpreted.
+fn parse_epoll_event(bytes: &[u8]) -> (u32, u64) {
+    let events = u32::from_ne_bytes(bytes[0..4].try_into().unwrap());
+    let data = u64::from_ne_bytes(
+        bytes[EPOLL_EVENT_DATA_OFFSET..EPOLL_EVENT_DATA_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    );
+    (events, data)
+}
+
+/// Encode `(data, events)` pairs into the array layout the child reads back
+/// from `epoll_wait`.
+fn encode_epoll_events(ready: &[(u64, u32)]) -> Vec<u8> {
+    let mut buf = vec![0u8; ready.len() * EPOLL_EVENT_SIZE];
+    for (i, (data, events)) in ready.iter().enumerate() {
+        let off = i * EPOLL_EVENT_SIZE;
+        buf[off..off + 4].copy_from_slice(&events.to_ne_bytes());
+        buf[off + EPOLL_EVENT_DATA_OFFSET..off + EPOLL_EVENT_DATA_OFFSET + 8]
+            .copy_from_slice(&data.to_ne_bytes());
+    }
+    buf
+}
 
 /// One epoll registration tracked for a sandbox epoll fd (E7.1).
 #[derive(Clone, Copy, Debug)]
@@ -311,8 +345,7 @@ pub(crate) async fn handle_epoll_ctl(
                 Ok(b) if b.len() == EPOLL_EVENT_SIZE => b,
                 _ => return NotifAction::Continue, // kernel returns EFAULT
             };
-            let events = u32::from_ne_bytes(raw[0..4].try_into().unwrap());
-            let data = u64::from_ne_bytes(raw[4..12].try_into().unwrap());
+            let (events, data) = parse_epoll_event(&raw);
             let mapped_ino = mapped_listener_ino(notif.pid, fd, ctx).await;
             let mut ns = ctx.network.lock().await;
             ns.epoll_registrations
@@ -533,11 +566,8 @@ async fn run_epoll_wait(
                 }
             }
             if !ready.is_empty() {
-                let mut buf = Vec::with_capacity(ready.len().min(maxevents as usize) * EPOLL_EVENT_SIZE);
-                for (data, events) in ready.iter().take(maxevents as usize) {
-                    buf.extend_from_slice(&events.to_ne_bytes());
-                    buf.extend_from_slice(&data.to_ne_bytes());
-                }
+                let buf =
+                    encode_epoll_events(&ready[..ready.len().min(maxevents as usize)]);
                 if write_child_mem(notif_fd, id, pid, events_ptr, &buf).is_err() {
                     return NotifAction::Errno(libc::EFAULT);
                 }
@@ -593,8 +623,60 @@ mod tests {
     #[test]
     fn pollfd_and_epoll_event_layouts_match_lp64() {
         assert_eq!(POLLFD_SIZE, std::mem::size_of::<libc::pollfd>());
-        // The kernel ABI packs epoll_event (no padding; data at offset 4).
         assert_eq!(EPOLL_EVENT_SIZE, std::mem::size_of::<libc::epoll_event>());
-        assert_eq!(EPOLL_EVENT_SIZE, 12);
+        assert_eq!(EPOLL_EVENT_DATA_OFFSET, EPOLL_EVENT_SIZE - 8);
+        // Spelled out per ABI so a change in libc's definitions cannot move
+        // the record silently: x86_64's kernel ABI is the packed one.
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!((EPOLL_EVENT_SIZE, EPOLL_EVENT_DATA_OFFSET), (12, 4));
+        } else {
+            assert_eq!((EPOLL_EVENT_SIZE, EPOLL_EVENT_DATA_OFFSET), (16, 8));
+        }
+    }
+
+    /// The child hands the supervisor a `struct epoll_event` and reads back an
+    /// array of them, so both directions have to be in *the ABI's* layout, not
+    /// in x86_64's. The record below is built from `libc::epoll_event` itself,
+    /// which is where the packed/natural distinction lives, so this asserts
+    /// against the syscall ABI rather than against a number this file picked.
+    ///
+    /// Only the two *fields* are compared. A non-x86_64 ABI leaves four bytes
+    /// of padding between them, and that padding is not part of the ABI: the
+    /// kernel copies a `struct epoll_event` whose padding holds whatever its
+    /// stack did, and no reader may depend on it.
+    #[test]
+    fn epoll_event_records_round_trip_in_the_arch_layout() {
+        let mut child: libc::epoll_event = unsafe { std::mem::zeroed() };
+        child.events = libc::EPOLLIN as u32 | libc::EPOLLOUT as u32;
+        child.u64 = 0x0f0e_0d0c_0b0a_0908;
+        // Copied out first: `libc::epoll_event` is `repr(packed)` on x86_64,
+        // and `assert_eq!` borrows its arguments (E0793 on a packed field).
+        let child_events: u32 = child.events;
+        let child_data: u64 = child.u64;
+
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&child as *const libc::epoll_event).cast::<u8>(),
+                std::mem::size_of::<libc::epoll_event>(),
+            )
+        };
+        let (events, data) = parse_epoll_event(bytes);
+        assert_eq!(events, child_events);
+        assert_eq!(data, child_data);
+
+        let encoded = encode_epoll_events(&[(data, events)]);
+        assert_eq!(encoded.len(), EPOLL_EVENT_SIZE);
+        let mut decoded: libc::epoll_event = unsafe { std::mem::zeroed() };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                encoded.as_ptr(),
+                (&mut decoded as *mut libc::epoll_event).cast::<u8>(),
+                EPOLL_EVENT_SIZE,
+            );
+        }
+        let decoded_events: u32 = decoded.events;
+        let decoded_data: u64 = decoded.u64;
+        assert_eq!(decoded_events, child_events);
+        assert_eq!(decoded_data, child_data);
     }
 }
