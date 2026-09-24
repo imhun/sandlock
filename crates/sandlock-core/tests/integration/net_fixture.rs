@@ -103,10 +103,25 @@ impl Drop for WorkerLocalHost {
 
 /// The first `198.18.0.x <host>` line in `/etc/hosts`, if any.
 fn existing_mapping(host: &str) -> Option<Ipv4Addr> {
-    let hosts = std::fs::read_to_string("/etc/hosts").ok()?;
+    mapping_in(&std::fs::read_to_string("/etc/hosts").ok()?, host)
+}
+
+/// The `host` -> address mapping in an `/etc/hosts` body, if any.
+///
+/// Every line that does not carry at least two whitespace-separated fields is
+/// *skipped*. It used to end the scan instead (`it.next()?` returned `None`
+/// from the whole function), and a stock Ubuntu `/etc/hosts` has a blank line
+/// right after `127.0.0.1 localhost` -- measured on the aarch64 lane
+/// (2026-09-24): the pre-seeded entry was present and parseable, yet the
+/// fixture still reported "no pre-seeded /etc/hosts entry" and fell back to
+/// the privileged path, where a non-root run then dies on `ip addr add` with
+/// EPERM.
+fn mapping_in(hosts: &str, host: &str) -> Option<Ipv4Addr> {
     for line in hosts.lines() {
         let mut it = line.split_whitespace();
-        let (addr, name) = (it.next()?, it.next()?);
+        let (Some(addr), Some(name)) = (it.next(), it.next()) else {
+            continue;
+        };
         if name == host {
             if let Ok(ip) = addr.parse::<Ipv4Addr>() {
                 return Some(ip);
@@ -130,4 +145,48 @@ pub fn net_admin_available() -> bool {
             .status();
     }
     ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mapping_in;
+    use std::net::Ipv4Addr;
+
+    /// The stock Ubuntu `/etc/hosts`: a blank line right after the localhost
+    /// entry (and a comment block), then the pre-seeded benchmarking-range
+    /// mappings the container entrypoint appends.
+    const UBUNTU_STYLE: &str = "\
+127.0.0.1 localhost
+
+# The following lines are desirable for IPv6 capable hosts
+::1     ip6-localhost ip6-loopback
+fe00::0 ip6-localnet
+198.18.0.99 conn.example.com
+198.18.0.100 api.egress.test
+";
+
+    #[test]
+    fn mapping_rides_over_blank_lines() {
+        assert_eq!(
+            mapping_in(UBUNTU_STYLE, "conn.example.com"),
+            Some(Ipv4Addr::new(198, 18, 0, 99))
+        );
+        assert_eq!(
+            mapping_in(UBUNTU_STYLE, "api.egress.test"),
+            Some(Ipv4Addr::new(198, 18, 0, 100))
+        );
+    }
+
+    #[test]
+    fn mapping_ignores_a_host_that_is_not_there() {
+        assert_eq!(mapping_in(UBUNTU_STYLE, "other.example.com"), None);
+    }
+
+    #[test]
+    fn mapping_ignores_an_unparsable_address() {
+        assert_eq!(
+            mapping_in("not-an-ip  conn.example.com\n", "conn.example.com"),
+            None
+        );
+    }
 }
