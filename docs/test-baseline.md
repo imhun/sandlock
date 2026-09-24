@@ -302,7 +302,18 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 548 # 2026-09-23: 546 -> 548, +2 in
+core_integ = 551 # 2026-09-24: 548 -> 551, and all +3 are the aarch64 lane's
+                 # own find, not a new integration surface: `net_fixture.rs`
+                 # gained three unit cases for the pre-seeded `/etc/hosts`
+                 # scan (`mapping_rides_over_blank_lines`,
+                 # `mapping_ignores_a_host_that_is_not_there`,
+                 # `mapping_ignores_an_unparsable_address`) together with the
+                 # fix that made them necessary -- a blank line used to end the
+                 # scan, so on a stock Ubuntu `/etc/hosts` the fixture never
+                 # saw the entry the container entrypoint had seeded. The
+                 # canonical non-root run reports 551/0 (`tmp/x86-core-integ-
+                 # final.log`, 85.4s, through the gate's own subshell+pipe).
+                 # 2026-09-23: 546 -> 548, +2 in
                  # crates/sandlock-core/tests/integration/test_restore.rs, the
                  # no-exec restore prototype (docs/chroot-workspace-exec.md
                  # §11.5): `test_restore_resumes_inside_a_real_root_without_exec`
@@ -927,18 +938,63 @@ arm64_core_lib = 904   # 2026-09-24, first full run: 899/4 -> 904/0. The four
                        # wrong half of every intercepted epoll record), the rest
                        # were the `path_surface` ledger comparing x86_64 *names*
                        # on an ABI that has no `open`/`stat`/... at all.
-arm64_core_integ = 506 # OPEN on this lane: 506 passed / 42 failed, and the 42
-                       # are one family, not a spread -- `net_fixture`-based
-                       # tests (http_acl, net_isolate, network injection,
-                       # named unix sockets, wildcard_shared). First one
-                       # reproduced directly: the sandbox connects to a
-                       # listener the test bound on the host loopback and gets
-                       # `Connection refused`, and the fixture gate says why --
-                       # "run the test container entrypoint (root prep) so the
-                       # unprivileged fixtures exist" (the container entrypoint
-                       # seeds /etc/hosts and the 198.18.0.0/15 addresses; the
-                       # Lima lane does not). So the number below is *not* a
-                       # regression baseline yet: the lane needs that prep step
-                       # (or the tests need to be run the way the container
-                       # lane runs them) before core_integ can be called green
-                       # on arm64.
+arm64_core_integ = 551 # 2026-09-24: 551 passed / 0 failed, i.e. the *same*
+                       # entire suite as x86_64 at this tip (551/0, 85.4s), on a
+                       # real 6.14 kernel under qemu TCG (718s). The first round
+                       # of this lane was 506/42 and **not one of the 42 was an
+                       # aarch64 defect**: they were five lane artifacts, one
+                       # test coupled to a libc's wording, and one flake. What
+                       # each actually was, because two of them cost the most:
+                       #
+                       # * 17 -- the ACL/egress fixtures exec a python that
+                       #   honours `http_proxy`, and Lima forwards the host's:
+                       #   the sandboxed workload dialled the *host* proxy
+                       #   instead of the address under test and the sandbox
+                       #   denied it. `test_http_acl::test_http_allow_get` came
+                       #   back "urlopen error [Errno 111] Connection refused"
+                       #   and strace showed the run's one and only connect()
+                       #   going to the proxy. The lane now unsets the proxy
+                       #   vars for every `run`.
+                       # * 17 -- `test_control::*` spawns the `sandlock` CLI via
+                       #   the CARGO_BIN_EXE path cargo baked in, and the lane
+                       #   had never cross-built or copied that binary ("spawn
+                       #   sandlock: NotFound"). It is part of `sync` now.
+                       # * 5 -- the named-unix-socket gate family (connect,
+                       #   sendto, sendmsg, sendmmsg, symlink escape) answered
+                       #   "CONNECTED"/"SENT" where the contract is EACCES. Not
+                       #   an aarch64 bug: those tests keep their socket in
+                       #   CARGO_TARGET_TMPDIR, and the lane's target root was
+                       #   `/tmp/target-aarch64` -- *inside* the `fs_write
+                       #   ("/tmp")` grant every one of those policies makes, so
+                       #   the gate found the path writable by design and let it
+                       #   through. The cross-build target root is now
+                       #   `/var/tmp/aarch64-target`, which is 1777 like /tmp
+                       #   but outside every grant.
+                       # * 1 -- `test_chroot_hardlink_into_a_branch_is_refused`
+                       #   asserted glibc's `strerror(EXDEV)`. The lane builds
+                       #   `tests/rootfs-helper` statically with zigcc, which is
+                       #   musl-only, and musl says "Cross-device link". The
+                       #   assertion now matches the phrase, not the libc.
+                       # * 1 -- `test_policy_fn::test_instance_exec_after_
+                       #   threaded_peer_succeeds` execs `/usr/local/bin/
+                       #   python3` (the lane image's layout); Ubuntu's is
+                       #   /usr/bin/python3, so the helper exited 127 and the
+                       #   test died on "threaded helper never reported ready".
+                       #   The prep now plants that symlink.
+                       # * 1 -- `test_transaction::test_txn_timeout_bounds_the_
+                       #   stage_phase_not_the_commit` was a one-off under load;
+                       #   it has not reproduced.
+                       #
+                       # The fixture fix the lane did land (a blank `/etc/hosts`
+                       # line ending the pre-seeded scan) is in the fork, with
+                       # the three unit cases that count in `core_integ` above.
+                       # Two lane-side findings are worth keeping in mind for
+                       # any arm64 rerun: `sync` must unlink an artifact before
+                       # scp (the guest's sshd refuses to open over an existing
+                       # one: "dest open ... Failure"), and the wildcard family
+                       # still needs the entrypoint's `ip_unprivileged_port_
+                       # start=0` on the *shared*-netns path -- measured, the
+                       # same `test_egress` case passes in 1.9s with it and
+                       # wedges past 130s without it. The deployed E2B shape sets
+                       # E2B_ENABLE_NET_ISOLATION=true, where the gateway binds
+                       # inside the sandbox netns and the sysctl is not in play.
