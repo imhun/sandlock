@@ -192,6 +192,12 @@ S1 起需要在 **aarch64 的真内核上跑 fork 自己的测试**：QEMU 用�
    还有一条与“绿的真假”有关：`stub_path()` 是编译期烘焙的绝对路径，路径不存在时那三条 stub 用例
    会**静默 skip**（只 `eprintln!` 然后 `return`）。跑完必须确认输出里没有 `skip:` —— 第一轮真内核
    的“46/46”就是这么来的假绿。
+
+   以及一条**传输层**的坑（S5 实测，代价是一次假 RED）：`/lima-repo` 这个 9p 挂载在宿主**原地重写**
+   一个文件后仍把**旧内容**给 guest —— 在宿主 `printf > f` 把文件从 6 字节改成 29 字节，guest 侧
+   `cat` 仍然是旧的 6 字节、`stat` 还是旧 mtime，等 12 秒也一样（新建的路径倒是立刻可见）。于是
+   **rsync 的快速检查判定"没变"，什么都不复制**，lane 会拿着上一次的二进制跑出"结果"来。所以
+   `lima-vm.sh sync` 现在把源码用 `tar` 流过 ssh、把产物用 `limactl copy` 送进去；9p 只留作随手看。
 3. **推到节点运行（备选）**：`tmp/k0s/tools.sh node-put <bin> <host> <path>`，然后在节点上（root）跑
    `--test-threads=1` 的子集/全量。节点侧只需要一个可写目录（S1 用 `/opt/arm-lane`）；**不需要**
    在节点上装 rust/cargo，也不要把源码推上去编译。

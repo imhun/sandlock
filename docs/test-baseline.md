@@ -115,7 +115,20 @@
 # and core_integ (534 -> 539) move, by the A1/A2 test cases registered below;
 # ffi / cli / supervise / supervise_cost / cli_build / python / oci /
 # supervise_root / mediation_2uid are unchanged.
-core_lib = 897 # 2026-09-23: 891 -> 897, and the +6 is the N35 fork work that
+core_lib = 902 # 2026-09-24: 897 -> 902, and all +5 are the aarch64 C/R port
+               # (S3), not a new unit-test surface: `restore_blob.rs` gained
+               # three (a checkpoint with no FP bytes is refused; the blob
+               # header carries the thread pointer; and it says when there is
+               # none), `resume.rs` gained the synthetic-image restore -- the
+               # first test that runs the stub itself and reads TPIDR_EL0 /
+               # FPSR / FPCR back out of the restored frame -- and
+               # `network/readiness.rs` gained the epoll record round-trip that
+               # pinned a real aarch64 bug: `struct epoll_event` is 12 bytes
+               # with `data` at offset 4 on x86_64 (packed) but 16/8 on every
+               # other LP64 ABI, and the supervisor had 12/4 hardcoded, so on
+               # aarch64 it read the wrong half of every record it intercepted.
+               # Measured: the canonical non-root run reports 902/0.
+               # 2026-09-23: 891 -> 897, and the +6 is the N35 fork work that
                # landed after the last refresh, not a new unit test surface:
                # `44c40f3` (landlock: a mount's host source gets the rights its
                # mount point declares) added 4 in `landlock.rs`, and `86630ea`
@@ -893,3 +906,39 @@ python = 465  # F19/SL-13 (2026-09-14): 464 -> 465, +1 in
               # test_exec_pty_returns_master_and_resize).
               # F3.2/3.3 review follow-up (drop contract): 445 -> 446, +1
               # (test_dropped_exec_process_is_reaped_on_del).
+
+# ---------------------------------------------------------------------------
+# arm64 lane (2026-09-24): the S5 lane is a local Lima qemu VM (Ubuntu 24.04,
+# kernel 6.14.0-37-generic, 6 vCPU, host = amd64 Darwin). No test binary leaves
+# this machine; the aarch64 binaries are cross-built here with the wheel
+# builder's zig toolchain (`CC_aarch64_unknown_linux_gnu=zigcc`) and copied
+# into the guest over ssh (`tmp/arm-lane/lima-vm.sh`, and see
+# `docs/arm-cr-s0-evidence.md` §7 for the four constraints + the 9p staleness
+# trap that makes rsync-through-9p silently run the previous build).
+#
+# Shape: uid 501 (non-root), cwd = the mirrored source on the guest's own
+# filesystem, `--test-threads=1` for core_integ and 4 for core_lib.
+arm64_core_lib = 904   # 2026-09-24, first full run: 899/4 -> 904/0. The four
+                       # first-round reds were all per-ABI tables; one was a
+                       # real bug (`network/readiness.rs` had `struct
+                       # epoll_event` hardcoded at 12 bytes with `data` at
+                       # offset 4 -- x86_64's packed ABI -- while every other
+                       # LP64 ABI is 16/8, so on aarch64 the supervisor read the
+                       # wrong half of every intercepted epoll record), the rest
+                       # were the `path_surface` ledger comparing x86_64 *names*
+                       # on an ABI that has no `open`/`stat`/... at all.
+arm64_core_integ = 506 # OPEN on this lane: 506 passed / 42 failed, and the 42
+                       # are one family, not a spread -- `net_fixture`-based
+                       # tests (http_acl, net_isolate, network injection,
+                       # named unix sockets, wildcard_shared). First one
+                       # reproduced directly: the sandbox connects to a
+                       # listener the test bound on the host loopback and gets
+                       # `Connection refused`, and the fixture gate says why --
+                       # "run the test container entrypoint (root prep) so the
+                       # unprivileged fixtures exist" (the container entrypoint
+                       # seeds /etc/hosts and the 198.18.0.0/15 addresses; the
+                       # Lima lane does not). So the number below is *not* a
+                       # regression baseline yet: the lane needs that prep step
+                       # (or the tests need to be run the way the container
+                       # lane runs them) before core_integ can be called green
+                       # on arm64.
