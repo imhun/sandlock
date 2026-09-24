@@ -457,6 +457,21 @@ pub struct Sandbox {
     // Filesystem access
     pub fs_writable: Vec<PathBuf>,
     pub fs_readable: Vec<PathBuf>,
+    /// Host-side paths granted to the sandbox *as host paths*, bypassing the
+    /// chroot translation `fs_readable` goes through (`landlock::build_ruleset`
+    /// prefixes those with the rootfs and drops the ones that are not inside
+    /// it). The only user is the checkpoint restore path: the restore stub is a
+    /// build artifact on the host, a chroot root cannot name it (measured:
+    /// `execvp` ENOENT, then a 10 s READY timeout), so it is delivered by
+    /// descriptor and this grants that one file `EXECUTE|READ_FILE` -- Landlock
+    /// judges a file by its real path whether or not the fd named it
+    /// (`docs/chroot-workspace-exec.md` §11).
+    ///
+    /// `serde(skip)`: it is set in-process right before a restore launches, and
+    /// skipping keeps the serialized policy layout (checkpoint images, the
+    /// supervise wire) unchanged.
+    #[serde(skip)]
+    pub fs_readable_host: Vec<PathBuf>,
     pub fs_denied: Vec<PathBuf>,
 
     // Extra syscall filtering on top of Sandlock's default blocklist.
@@ -794,6 +809,7 @@ impl Clone for Sandbox {
         Self {
             fs_writable: self.fs_writable.clone(),
             fs_readable: self.fs_readable.clone(),
+            fs_readable_host: self.fs_readable_host.clone(),
             fs_denied: self.fs_denied.clone(),
             extra_deny_syscalls: self.extra_deny_syscalls.clone(),
             extra_allow_syscalls: self.extra_allow_syscalls.clone(),
@@ -1230,6 +1246,22 @@ impl Sandbox {
         self.do_create(cmd, false).await
     }
 
+    /// `create_interactive`, but the child `execveat`s an already-open
+    /// descriptor instead of resolving `cmd[0]` through its path space.
+    ///
+    /// `cmd` still supplies the process name and `argv[0]`. Used by checkpoint
+    /// restore, whose stub is a host build artifact that a chroot root cannot
+    /// name (`docs/chroot-workspace-exec.md` §11).
+    pub async fn create_interactive_exec_fd(
+        &mut self,
+        cmd: &[&str],
+        exec_fd: std::os::unix::io::RawFd,
+    ) -> Result<(), crate::error::SandlockError> {
+        self.ensure_runtime()?;
+        self.rt_mut().exec_fd = Some(exec_fd);
+        self.do_create(cmd, false).await
+    }
+
     /// Release a previously `create()`d child to `execve` the configured
     /// command. Returns immediately; use `wait()` to collect the exit
     /// status when the child finishes.
@@ -1387,24 +1419,6 @@ impl Sandbox {
         // naming the reason and the way out; E2B never calls this
         // (docs/chroot-workspace-exec.md §9.7.9) and its production shape is a
         // chroot root, so this is a documented gap, not a regression.
-        if launch == RestoreLaunch::Exec {
-            if let Some(root) = chroot_root.as_ref() {
-            let stub_host = stub.canonicalize().unwrap_or_else(|_| stub.clone());
-            if !stub_host.starts_with(root) {
-                return Err(SandboxRuntimeError::Child(format!(
-                    "checkpoint restore cannot run with a chroot root (emulated or real, \
-                     real_root={}): the restore stub lives on the host ({}), and the \
-                     sandbox's own root is {} -- the stub has to be reachable inside that \
-                     root (a policy mount carrying it, or a chroot-free restore target) \
-                     before this can work",
-                    self.real_root,
-                    stub_host.display(),
-                    root.display(),
-                ))
-                .into());
-            }
-            }
-        }
         let plan = restore_blob::plan(cp, chroot_root.as_deref(), &mounts)
             .map_err(SandboxRuntimeError::Child)?;
 
@@ -1413,15 +1427,33 @@ impl Sandbox {
 
         match launch {
             RestoreLaunch::Exec => {
-                // Landlock checks EXECUTE on the real path at execve time, so the
-                // stub binary has to be inside the policy's read+execute grant. It
-                // is a build artifact of sandlock itself, not workload-reachable
-                // state.
-                self.fs_readable.push(stub.clone());
+                // The stub is delivered by descriptor (`execveat(AT_EMPTY_PATH)`)
+                // and the ruleset grants that one host file EXECUTE|READ_FILE --
+                // Landlock judges a file by its real path whether or not an fd
+                // named it (measured; docs/chroot-workspace-exec.md §11.6.1).
+                // This is what makes a chroot root work: nothing resolves the
+                // stub through the sandbox's path space, so neither the rootfs
+                // nor the mediator has to carry it.
+                let stub_path = stub.canonicalize().unwrap_or_else(|_| stub.clone());
+                use std::os::unix::fs::OpenOptionsExt;
+                let stub_fd = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+                    .open(&stub_path)
+                    .map_err(|e| {
+                        SandboxRuntimeError::Child(format!(
+                            "open the restore stub {}: {e}",
+                            stub_path.display()
+                        ))
+                    })?;
+                self.fs_readable_host = vec![stub_path];
                 self.ensure_runtime()?;
-                self.rt_mut().extra_fds = channel.extra_fds();
+                let mut fds = channel.extra_fds();
+                fds.push((resume::STUB_EXEC_FD, stub_fd.as_raw_fd()));
+                self.rt_mut().extra_fds = fds;
                 let stub_s = stub.to_string_lossy().into_owned();
-                self.create_interactive(&[stub_s.as_str()]).await?;
+                self.create_interactive_exec_fd(&[stub_s.as_str()], resume::STUB_EXEC_FD)
+                    .await?;
             }
             RestoreLaunch::InProcessNoExec => {
                 // No path, no exec, no grant: the image goes in over a memfd and
@@ -1855,6 +1887,7 @@ impl Sandbox {
                 stdout_pipe: pipe,
                 io_overrides: None,
                 extra_fds: Vec::new(),
+                exec_fd: None,
                 http_acl_handle: None,
                 dns_gateway_handle: None,
                 dns_gateway_addr: None,
@@ -1975,6 +2008,7 @@ impl Sandbox {
             stdout_pipe: None,
             io_overrides: None,
             extra_fds: Vec::new(),
+            exec_fd: None,
             http_acl_handle: None,
             dns_gateway_handle: None,
             dns_gateway_addr: None,
@@ -2635,8 +2669,15 @@ impl Sandbox {
             // stub's CTRL/READY/GO fds) take the dup2 branch below, and
             // targets 0/1/2 always stay inheritable stdio.
             let control_entry = self.in_child_main.is_some();
+            // The exec-fd delivery descriptor is needed *up to* the child's
+            // `execveat` and must not survive it: measured 2026-09-23, without
+            // this the stub image stayed open as fd 6 in the restored program.
+            // The channel's fds (CTRL/READY/GO) are the opposite case -- the
+            // stub reads them after its exec -- so they keep the inheritable
+            // dup2.
+            let exec_fd_target = self.rt().exec_fd;
             for &(target_fd, source_fd) in &extra_fds_copy {
-                if control_entry && target_fd >= 3 {
+                if (control_entry || Some(target_fd) == exec_fd_target) && target_fd >= 3 {
                     unsafe { libc::dup3(source_fd, target_fd, libc::O_CLOEXEC) };
                 } else {
                     unsafe { libc::dup2(source_fd, target_fd) };
@@ -2689,9 +2730,12 @@ impl Sandbox {
             let sandbox_name = self.rt().name.clone();
             // In-process entrypoint (OCI PID-1) names the process from cmd[0];
             // otherwise execve the command.
-            let entry = match self.in_child_main {
-                Some(run) => context::ChildEntry::InProcess { name: c_cmd[0].as_c_str(), run },
-                None => context::ChildEntry::Exec(&c_cmd),
+            let entry = match (self.in_child_main, self.rt().exec_fd) {
+                (Some(run), _) => {
+                    context::ChildEntry::InProcess { name: c_cmd[0].as_c_str(), run }
+                }
+                (None, Some(fd)) => context::ChildEntry::ExecFd { fd, argv: &c_cmd },
+                (None, None) => context::ChildEntry::Exec(&c_cmd),
             };
             // In a PID namespace the confined process's real parent (the
             // intermediate) lives outside the namespace, so the kernel

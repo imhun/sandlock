@@ -348,6 +348,11 @@ pub(crate) fn current_supplementary_groups() -> Vec<u32> {
 pub(crate) enum ChildEntry<'a> {
     /// `execve` this command (the normal path). argv[0] becomes the process name.
     Exec(&'a [CString]),
+    /// `execveat(fd, "", argv, envp, AT_EMPTY_PATH)`: the program is named by a
+    /// descriptor, so nothing about it is resolved through the sandbox's path
+    /// space. Used by checkpoint restore, whose stub is a host build artifact a
+    /// chroot root cannot name (`docs/chroot-workspace-exec.md` §11).
+    ExecFd { fd: RawFd, argv: &'a [CString] },
     /// Run this function in-process, with the process named `name`. Used for the
     /// OCI in-sandbox PID-1: the child is a fork of the supervisor so the code is
     /// already mapped, nothing is exec'd, and Landlock has no execve to
@@ -1138,6 +1143,39 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
             set_proc_name(name);
             run();
             unsafe { libc::_exit(0) };
+        }
+        ChildEntry::ExecFd { fd, argv } => {
+            // Same SIGPIPE reset the execve path does below (the Rust runtime
+            // ignores it process-wide, and an ignored disposition survives
+            // execve).
+            unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+            let argv_ptrs: Vec<*const libc::c_char> = argv
+                .iter()
+                .map(|s| s.as_ptr())
+                .chain(std::iter::once(std::ptr::null()))
+                .collect();
+            const AT_EMPTY_PATH: libc::c_int = 0x1000;
+            unsafe {
+                // `libc` does not export `environ`; glibc's global is the same
+                // pointer `execvp` would have used, and it already carries the
+                // policy environment applied earlier in this child.
+                unsafe extern "C" {
+                    static environ: *const *const libc::c_char;
+                }
+                libc::syscall(
+                    libc::SYS_execveat,
+                    fd,
+                    c"".as_ptr(),
+                    argv_ptrs.as_ptr(),
+                    environ,
+                    AT_EMPTY_PATH,
+                )
+            };
+            fail!(format!(
+                "execveat(fd {} -> '{}')",
+                fd,
+                argv.first().map(|a| a.to_string_lossy().into_owned()).unwrap_or_default()
+            ));
         }
         ChildEntry::Exec(cmd) => cmd,
     };

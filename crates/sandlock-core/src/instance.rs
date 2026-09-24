@@ -317,6 +317,10 @@ pub struct SandboxInstance {
     pub(crate) stdout_pipe: Option<OwnedFd>,
     pub(crate) io_overrides: Option<(Option<i32>, Option<i32>, Option<i32>)>,
     pub(crate) extra_fds: Vec<(i32, i32)>,
+    /// When set, the confined child `execveat`s this descriptor instead of
+    /// resolving `cmd[0]` through its path space (checkpoint restore; see
+    /// `context::ChildEntry::ExecFd` and docs/chroot-workspace-exec.md §11).
+    pub(crate) exec_fd: Option<RawFd>,
     pub(crate) http_acl_handle: Option<crate::transparent_proxy::HttpAclProxyHandle>,
     pub(crate) dns_gateway_handle: Option<JoinHandle<()>>,
     /// The sandbox's DNS gateway address — a per-sandbox loopback address

@@ -534,6 +534,22 @@ pub(crate) fn build_ruleset(
         })?;
     }
 
+    // Host-path grants (`fs_readable_host`). Every `fs_readable` entry above is
+    // translated *into* the rootfs when a chroot is active, and the ones that do
+    // not exist there are dropped -- which is precisely what happens to a host
+    // build artifact such as the restore stub. These entries are granted as the
+    // host paths they are; `add_path_rule` narrows a non-directory to
+    // `EXECUTE|READ_FILE` (the measured minimum for exec'ing a binary the
+    // sandbox reaches by descriptor: docs/chroot-workspace-exec.md §11.6.1).
+    for path in &policy.fs_readable_host {
+        if !path.exists() {
+            continue;
+        }
+        add_path_rule(&ruleset_fd, path, READ_ACCESS).map_err(|e| {
+            SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
+        })?;
+    }
+
     // Chroot mode: a mount's *source* is a host path, and (with no kernel-side
     // bind mounts) it is the object the sandbox actually touches -- the
     // mediator opens the host side on the child's behalf, and the kernel

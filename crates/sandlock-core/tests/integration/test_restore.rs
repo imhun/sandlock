@@ -175,120 +175,136 @@ async fn test_restore_glibc_vdso_program_resumes() {
     );
 }
 
-/// The real root must not break checkpoint/restore (N35 follow-up, 2026-09-23).
+/// The A route: the stub is delivered by descriptor (`execveat(AT_EMPTY_PATH)`)
+/// and the ruleset grants that one *host* file `EXECUTE|READ_FILE`.
 ///
-/// `restore_interactive` re-creates the sandbox from the *policy*, so the
-/// checkpoint's host-recorded paths -- the exe mapping and every fd the plan
-/// reopens -- have to be translated into the tree the restored child will run
-/// in. With `real_root` that tree is the rootfs itself: the kernel resolves
-/// paths inside it and the mediator no longer rewrites them, so anything the
-/// restore path needs has to exist there (including the restore stub's own
-/// binary, which the chroot shape reaches through the mediator).
-///
-/// Same counter proof as the vDSO test: checkpoint a `clock-loop`, kill the
-/// original, write a sentinel, restore into a fresh sandbox and require the
-/// counter to advance past the checkpoint's baseline.
+/// Both chroot shapes are exercised, because each used to fail for its own
+/// reason: the emulated root could not resolve the stub's host path through the
+/// mediator (and the mediator refused the fd-named exec outright), and the real
+/// root could not resolve it in the kernel either. With the fd delivery neither
+/// has to: the file is named by a descriptor, and Landlock judges its real path
+/// (docs/chroot-workspace-exec.md §11).
 #[tokio::test]
-async fn test_restore_resumes_inside_a_real_root() {
+async fn test_restore_resumes_inside_a_chroot_root() {
     if cfg!(not(any(target_arch = "x86_64", target_arch = "riscv64"))) {
-        eprintln!("skipping: the restore engine is x86_64/riscv64 only");
         return;
     }
-
     let helper = helper_binary();
-    let tmp = std::env::temp_dir().join(format!("sandlock-realroot-{}", std::process::id()));
-    let rootfs = tmp.join("rootfs");
-    let data = tmp.join("data");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
-    std::fs::create_dir_all(rootfs.join("work")).unwrap();
-    std::fs::create_dir_all(&data).unwrap();
-    let inside = rootfs.join("usr/bin/rootfs-helper");
-    std::fs::copy(&helper, &inside).expect("install the helper inside the rootfs");
+    for (label, real_root) in [("emulated chroot", false), ("real root", true)] {
+        let tmp = std::env::temp_dir().join(format!(
+            "sandlock-chroot-restore-{}-{real_root}",
+            std::process::id()
+        ));
+        let rootfs = tmp.join("rootfs");
+        let data = tmp.join("data");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
+        std::fs::create_dir_all(rootfs.join("work")).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::copy(&helper, rootfs.join("usr/bin/rootfs-helper"))
+            .expect("install the helper inside the rootfs");
 
-    let counter = data.join("clock.cnt");
-    let counter_s = counter.to_str().unwrap().to_string();
+        let counter = data.join("clock.cnt");
+        let counter_s = counter.to_str().unwrap().to_string();
+        let euid = unsafe { libc::geteuid() };
+        let egid = unsafe { libc::getegid() };
+        let mut builder = Sandbox::builder()
+            .chroot(&rootfs)
+            .real_root(real_root)
+            .user(euid, egid)
+            .fs_read("/usr")
+            .fs_mount("/work", &data)
+            .fs_write("/work")
+            .cwd("/work");
+        builder.userns_self_map = true;
+        let policy = builder.build().expect("chroot policy builds");
 
-    // The policy an image-rootfs sandbox carries: the rootfs as the real root,
-    // the image's own directories readable, one workspace mount writable, and
-    // the sandbox's identity requested -- `user(euid)` + `userns_self_map` is
-    // the route-B shape (`sandlock-supervise` probes exactly this), and it is
-    // what gives the child its own user namespace with CAP_SYS_ADMIN in it. A
-    // non-root caller without it cannot `unshare(CLONE_NEWNS)` and the real root
-    // dies at the first step (measured: "unshare(CLONE_NEWNS): Operation not
-    // permitted" as uid 65534).
-    let euid = unsafe { libc::geteuid() };
-    let egid = unsafe { libc::getegid() };
-    let mut builder = Sandbox::builder()
-        .chroot(&rootfs)
-        .real_root(true)
-        .user(euid, egid)
-        .fs_read("/usr")
-        .fs_mount("/work", &data)
-        .fs_write("/work")
-        .cwd("/work");
-    builder.userns_self_map = true;
-    let policy = builder.build().expect("real-root policy builds");
+        let mut sb = policy.clone().with_name("chroot-src");
+        sb.spawn_interactive(&["/usr/bin/rootfs-helper", "clock-loop", "/work/clock.cnt"])
+            .await
+            .unwrap_or_else(|e| panic!("{label}: the counter starts: {e}"));
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let cp = sb.checkpoint().await.expect("checkpoint");
 
-    let mut sb = policy.clone().with_name("realroot-src");
-    sb.spawn_interactive(&["/usr/bin/rootfs-helper", "clock-loop", "/work/clock.cnt"])
-        .await
-        .expect("the real-root sandbox starts the counter");
-
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    let cp = sb.checkpoint().await.expect("checkpoint a real-root sandbox");
-
-    let read_counter = |path: &str| -> Option<u64> {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-    };
-    let baseline = read_counter(&counter_s).expect("counter file should exist with a value");
-    assert!(baseline > 2, "counter should have advanced, got {baseline}");
-
-    sb.kill().unwrap();
-    let _ = sb.wait().await;
-    std::fs::write(&counter, b"0\n").unwrap();
-
-    let mut sb2 = policy.clone().with_name("realroot-dst");
-    // Both root shapes must refuse, immediately and by name. The stub is a host
-    // build artifact exec'd by its host path, and a chroot root -- emulated or
-    // real -- resolves the workload's paths inside the rootfs, so the attempt
-    // otherwise ends in the measured 10 s READY timeout over a process that
-    // exited 127 ("execvp '<target>/restore-stub': No such file or directory").
-    for (label, mut candidate) in [
-        ("real root", policy.clone().with_name("realroot-dst")),
-        ("emulated root", {
-            let mut emulated = policy.clone();
-            emulated.real_root = false;
-            emulated.with_name("emulated-dst")
-        }),
-    ] {
-        let started = std::time::Instant::now();
-        let refusal = candidate.restore_interactive(&cp).await.map(|_| ());
-        let elapsed = started.elapsed();
-        let text = match &refusal {
-            Ok(()) => String::new(),
-            Err(e) => e.to_string(),
+        let read_counter = |path: &str| -> Option<u64> {
+            std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<u64>().ok())
         };
-        assert!(
-            refusal.is_err(),
-            "restoring into a {label} must be refused, not attempted"
-        );
-        assert!(
-            text.contains("restore stub") && text.contains("chroot root"),
-            "the refusal has to name the stub and the root shape ({label}): {text}"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "the refusal must be immediate, not a READY timeout ({label}): took {elapsed:?}"
-        );
-    }
+        let baseline = read_counter(&counter_s).expect("counter has a value");
+        assert!(baseline > 2, "{label}: counter advanced, got {baseline}");
+        sb.kill().unwrap();
+        let _ = sb.wait().await;
+        std::fs::write(&counter, b"0\n").unwrap();
 
-    // The positive control is the chroot-free test next door
-    // (`test_restore_glibc_vdso_program_resumes`): same engine, no root, resumes.
-    let _ = std::fs::remove_dir_all(&tmp);
+        let mut sb2 = policy.clone().with_name("chroot-dst");
+        let _restored = sb2
+            .restore_interactive(&cp)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: restore must work with a chroot root: {e}"));
+        let skipped = sb2.restore_skipped().to_vec();
+
+        let mut advanced = false;
+        let mut last = 0u64;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if let Some(v) = read_counter(&counter_s) {
+                last = v;
+                if v > baseline {
+                    advanced = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let pid = sb2.pid();
+        let fds: Vec<String> = pid
+            .map(|pid| {
+                std::fs::read_dir(format!("/proc/{pid}/fd"))
+                    .map(|entries| {
+                        entries
+                            .filter_map(|e| e.ok())
+                            .map(|e| {
+                                format!(
+                                    "{}->{}",
+                                    e.file_name().to_string_lossy(),
+                                    std::fs::read_link(e.path())
+                                        .map(|p| p.display().to_string())
+                                        .unwrap_or_else(|_| "<unreadable>".into())
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        eprintln!("{label}: restored fds = {fds:?}");
+        let _ = sb2.kill();
+        let exit = sb2.wait().await.map(|r| r.exit_status);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            skipped.iter().all(|s| s.fd <= 2),
+            "{label}: only stdio may be skipped; skipped: {skipped:?}"
+        );
+        assert!(
+            advanced,
+            "{label}: the restored process must advance the counter past {baseline}; \
+             last seen {last}, exit {exit:?}"
+        );
+        // No platform descriptor may survive into the restored program: the
+        // delivery fd of the stub (CLOEXEC), the stub's channel fds and the
+        // supervisor's own state are all scaffolding. Measured before the
+        // CLOEXEC on the delivery fd: `6->…/restore-stub` in both shapes.
+        for fd in &fds {
+            assert!(
+                !fd.contains("restore-stub")
+                    && !fd.contains("seccomp notify")
+                    && !fd.contains("memfd"),
+                "{label}: a platform descriptor leaked into the restored program: {fd}"
+            );
+        }
+    }
 }
+
 
 /// Gate for the no-exec prototype (`docs/chroot-workspace-exec.md` §11.5).
 ///

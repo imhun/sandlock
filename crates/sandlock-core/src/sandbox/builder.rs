@@ -1353,6 +1353,7 @@ impl SandboxBuilder {
         Ok(Sandbox {
             fs_writable: self.fs_writable,
             fs_readable: self.fs_readable,
+            fs_readable_host: Vec::new(),
             fs_denied: self.fs_denied,
             extra_deny_syscalls: self.extra_deny_syscalls,
             extra_allow_syscalls: self.extra_allow_syscalls,

@@ -26,6 +26,13 @@ use crate::error::{SandboxRuntimeError, SandlockError};
 /// How long to wait for the stub to finish laying out the address space.
 const READY_TIMEOUT_MS: i32 = 10_000;
 
+/// Fixed child descriptor carrying the *stub binary itself*, next to the
+/// CTRL/READY/GO convention above. The supervisor opens the stub (a host build
+/// artifact) and the child `execveat`s it with `AT_EMPTY_PATH`, so no chroot root
+/// or mediator has to resolve that host path
+/// (`docs/chroot-workspace-exec.md` §11).
+pub(crate) const STUB_EXEC_FD: RawFd = 6;
+
 /// The stub reads the sweep table into a fixed buffer (`MAX_SWEEP` in
 /// `restore-stub.c`); keep the supervisor's side of that contract explicit
 /// rather than overrunning it. A freshly `execve`'d stub has only its own image

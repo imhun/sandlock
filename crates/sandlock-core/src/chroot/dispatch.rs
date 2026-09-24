@@ -1582,6 +1582,21 @@ pub(crate) async fn handle_chroot_exec(
         None => return NotifAction::Continue,
     };
 
+    // `execveat(fd, "", argv, envp, AT_EMPTY_PATH)` names no path at all -- the
+    // descriptor *is* the program. There is nothing for the mediator to
+    // translate, and the kernel plus Landlock still judge the file itself
+    // (measured: the ruleset must grant the file's real path, docs §11.6.1).
+    // Without this branch the empty path falls through to the dirfd translation
+    // below, where a non-`AT_FDCWD` dirfd is read as a directory fd, fails to
+    // translate and the whole call is refused with EACCES. The checkpoint
+    // restore stub arrives exactly this way (docs §11).
+    if nr == libc::SYS_execveat
+        && (notif.data.args[4] & libc::AT_EMPTY_PATH as u64) != 0
+        && rel_path.is_empty()
+    {
+        return NotifAction::Continue;
+    }
+
     // Build the full virtual path from dirfd + relative path.
     let full_path = if Path::new(&rel_path).is_absolute() {
         rel_path
