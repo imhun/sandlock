@@ -141,6 +141,34 @@ fn ptrace_getregset_bytes(pid: i32, set: libc::c_int, max: usize) -> io::Result<
     Ok(buf)
 }
 
+/// The thread pointer, where the architecture keeps one outside the register
+/// file. aarch64's `TPIDR_EL0` is a system register: neither the signal frame
+/// the restore stub builds nor `NT_PRSTATUS` carries it (measured: a poisoned
+/// `TPIDR_EL0` leaves no trace in the frame), so capture goes through
+/// `PTRACE_GETREGSET(NT_ARM_TLS)` -- the restore side writes the same value back
+/// with the same regset. x86_64 carries TLS in `fs_base`/`gs_base` (inside the
+/// captured register state) and riscv64 in a general register, so there is
+/// nothing extra to read and this returns `None`.
+pub(crate) fn ptrace_get_tls(pid: i32) -> io::Result<Option<u64>> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        const NT_ARM_TLS: libc::c_int = 0x401;
+        let raw = ptrace_getregset_bytes(pid, NT_ARM_TLS, 8)?;
+        if raw.len() != 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("NT_ARM_TLS returned {} bytes, expected 8", raw.len()),
+            ));
+        }
+        Ok(Some(u64::from_le_bytes(raw.try_into().unwrap())))
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = pid;
+        Ok(None)
+    }
+}
+
 fn ptrace_getfpregs(pid: i32) -> io::Result<Vec<u8>> {
     // NT_PRFPREG = 2; NT_X86_XSTATE = 0x202.
     //
@@ -427,18 +455,27 @@ pub(crate) fn capture(pid: i32, policy: &Sandbox) -> Result<Checkpoint, Sandlock
             .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Child(e)))?;
         // FP state is best-effort: an image without it still restores.
         let fpregs = ptrace_getfpregs(pid).unwrap_or_default();
+        // TLS is not best-effort on the architecture that keeps it in a system
+        // register: a restored thread with a stale `TPIDR_EL0` faults on its
+        // first TLS access, so a capture that cannot read it must fail here.
+        let tls = ptrace_get_tls(pid).map_err(|e| {
+            SandlockError::Runtime(SandboxRuntimeError::Child(format!(
+                "ptrace get TLS: {}",
+                e
+            )))
+        })?;
         let maps =
             parse_proc_maps(pid).map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
         let memory_data = capture_memory(pid, &maps)?;
         let fd_table = capture_fd_table(pid)
             .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
-        Ok::<_, SandlockError>((regs, fpregs, maps, memory_data, fd_table))
+        Ok::<_, SandlockError>((regs, fpregs, tls, maps, memory_data, fd_table))
     })();
 
     let detached = ptrace_detach(pid);
     // Surface a capture failure first: it is the reason the caller is here, and
     // a detach error on top of it is noise.
-    let (regs, fpregs, maps, memory_data, fd_table) = captured?;
+    let (regs, fpregs, tls, maps, memory_data, fd_table) = captured?;
     detached.map_err(|e| {
         SandlockError::Runtime(SandboxRuntimeError::Child(format!("ptrace detach: {}", e)))
     })?;
@@ -460,6 +497,7 @@ pub(crate) fn capture(pid: i32, policy: &Sandbox) -> Result<Checkpoint, Sandlock
             exe,
             regs,
             fpregs,
+            tls,
             memory_maps: maps,
             memory_data,
         },
@@ -751,5 +789,142 @@ mod tests {
         assert_eq!(loaded.fd_table.len(), cp.fd_table.len(), "fd count roundtrip");
         assert_eq!(loaded.process_state.pid, cp.process_state.pid, "pid roundtrip");
         assert!(!loaded.process_state.exe.is_empty(), "exe path captured");
+        assert_eq!(loaded.process_state.tls, cp.process_state.tls, "tls roundtrip");
+        #[cfg(target_arch = "aarch64")]
+        assert!(
+            cp.process_state.tls.is_some(),
+            "aarch64 capture must record TPIDR_EL0: no signal frame carries it"
+        );
+    }
+
+    /// aarch64 carries the syscall number in `x8`, and that slot is what
+    /// `rearm_restartable_syscall` writes back before re-issuing an
+    /// `-ERESTART*` syscall. Pin it against a real stop: the child asks for a
+    /// group stop from inside `kill(2)`, and the parent reads the register file
+    /// of that stopped-in-syscall thread.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn aarch64_stop_inside_a_syscall_keeps_the_number_in_x8() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                if libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) < 0 {
+                    libc::_exit(90);
+                }
+                libc::kill(libc::getpid(), libc::SIGSTOP);
+                libc::_exit(91);
+            }
+        }
+
+        let mut status: i32 = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid, "wait for the stop");
+        assert!(libc::WIFSTOPPED(status), "child should be stopped, got {status:#x}");
+
+        let regs = ptrace_getregs(pid).expect("aarch64 register capture");
+        unsafe {
+            libc::ptrace(libc::PTRACE_DETACH, pid, 0, 0);
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, &mut status, 0);
+        }
+
+        assert_eq!(regs.len(), 34, "user_pt_regs is x0-x30, sp, pc, pstate");
+        assert_eq!(
+            regs[8], libc::SYS_kill as u64,
+            "x8 must still hold the syscall number at the stop -- rearm writes it back"
+        );
+        assert_ne!(regs[31], 0, "sp is regs[31] on aarch64");
+        assert_ne!(regs[32], 0, "pc is regs[32] on aarch64");
+        assert_eq!(regs[33] & 0xf, 0, "pstate must be EL0t (SPSR mode bits clear)");
+    }
+
+    /// aarch64 keeps the thread pointer in TPIDR_EL0, which neither a signal
+    /// frame nor the register file carries (docs/arm-cr-s0-evidence.md §2), so
+    /// capture has to read it through `NT_ARM_TLS` or a restored thread comes
+    /// back pointing at someone else's TLS. On the other two architectures the
+    /// thread pointer lives in the register file (x86_64 `fs_base`) and this
+    /// field stays empty.
+    #[test]
+    fn capture_records_the_thread_pointer_where_the_arch_keeps_one() {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let (rd, wr) = (fds[0], fds[1]);
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::close(rd);
+                let mut tp: u64 = 0;
+                #[cfg(target_arch = "aarch64")]
+                core::arch::asm!("mrs {}, tpidr_el0", out(reg) tp);
+                if libc::write(wr, &tp as *const u64 as *const libc::c_void, 8) != 8 {
+                    libc::_exit(92);
+                }
+                if libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) < 0 {
+                    libc::_exit(93);
+                }
+                libc::kill(libc::getpid(), libc::SIGSTOP);
+                libc::_exit(94);
+            }
+        }
+
+        unsafe { libc::close(wr) };
+        let mut reported: u64 = 0;
+        let n = unsafe {
+            libc::read(rd, &mut reported as *mut u64 as *mut libc::c_void, 8)
+        };
+        assert_eq!(n, 8, "child must publish its own thread pointer");
+        unsafe { libc::close(rd) };
+
+        let mut status: i32 = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid, "wait for the stop");
+        assert!(libc::WIFSTOPPED(status), "child should be stopped, got {status:#x}");
+
+        let captured = ptrace_get_tls(pid).expect("thread-pointer capture");
+        unsafe {
+            libc::ptrace(libc::PTRACE_DETACH, pid, 0, 0);
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, &mut status, 0);
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_ne!(reported, 0, "a fresh glibc thread has a non-zero TPIDR_EL0");
+            assert_eq!(
+                captured, Some(reported),
+                "capture must report the thread pointer the process itself sees"
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            assert_eq!(
+                captured, None,
+                "only aarch64 keeps TLS in a ptrace regset; the others carry it in the register file"
+            );
+        }
+    }
+
+    /// The aarch64 FP capture is the kernel's raw `user_fpsimd_state` (528 ==
+    /// 0x210 bytes: fpsr, fpcr, 32 x 16-byte vector registers) -- the record
+    /// the signal frame also frames at `sigcontext + 0x120`.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn aarch64_fp_capture_is_one_fpsimd_record() {
+        let mut child = Command::new("sleep").arg("30").spawn().expect("spawn sleep child");
+        let pid = child.id() as i32;
+
+        let res = (|| -> io::Result<Vec<u8>> {
+            ptrace_seize(pid)?;
+            let fp = ptrace_getfpregs(pid)?;
+            ptrace_detach(pid)?;
+            Ok(fp)
+        })();
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let fp = res.expect("fp capture should succeed on aarch64");
+        assert_eq!(fp.len(), 528, "NT_PRFPREG on aarch64 is user_fpsimd_state (0x210)");
     }
 }

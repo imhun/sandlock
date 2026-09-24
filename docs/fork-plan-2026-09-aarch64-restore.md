@@ -142,3 +142,28 @@ E2B 侧的 arm64 镜像与 wheel 腿（`deploy/scripts/build-sandlock-wheels.sh`
 **如果 S0a 或 S0b 不成立**（例如目标内核把 `TPIDR_EL0` 陷入、或手工帧无法 `rt_sigreturn`），
 本计划在 S0 就停下并重新评估（那时可选：放弃 aarch64 的 C/R，或改用"不做进程态恢复"的
 冻结/replay 路线——见 E2B 仓 `docs/chroot-workspace-exec.md` §11.4 的 F/G 两类）。
+
+---
+
+## S1 状态（2026-09-24，已落地）
+
+capture 侧的 aarch64 分支已按 S0 的实测落地并双向绿：
+
+* `capture.rs`：新增 `ptrace_get_tls()`（aarch64 走 `PTRACE_GETREGSET(NT_ARM_TLS)`，其它架构
+  `None`），`capture()` 里 **fail-closed**（TLS 读不到就失败，而不是给一个会崩的镜像）；
+  寄存器/FP 沿用已有分支（34×u64；`NT_PRFPREG` 528 字节裸 fpsimd）。
+* `mod.rs`：`ProcessState` 增加 `tls: Option<u64>`。
+* `image.rs`：`IMAGE_VERSION` 2 → 3，新增 `process/threads/tls.bin`；**aarch64 上缺该字段的 v3
+  镜像直接拒绝**（不是当成 None），其它架构保持"没有就是 None"。
+* 测试（先 RED 后 GREEN）：`aarch64_stop_inside_a_syscall_keeps_the_number_in_x8`
+  （x8=129 在停机时仍是 syscall 号 + sp/pc/pstate 语义）、
+  `capture_records_the_thread_pointer_where_the_arch_keeps_one`（与子进程自己 `mrs` 的值逐位相等；
+  非 aarch64 断言为 `None`）、`aarch64_fp_capture_is_one_fpsimd_record`（528 = 0x210）、
+  `image_version_covers_the_thread_pointer`，并把 tls 加进既有的 save/load 往返断言。
+
+**证据**：RED = 交叉编译报 `no field tls on type ProcessState` ×3 + `cannot find function
+ptrace_get_tls`；GREEN = aarch64 上 `checkpoint::` 子集 **32 passed / 0 failed**（x86_64 同子集
+**40 passed / 0 failed**，两种架构各自独立通过）。
+
+**aarch64 lane 的搭法**（S2/S3/S5 复用，细节与坑见 `docs/arm-cr-s0-evidence.md` §7）：本地用
+fork 自带的 zig builder 镜像交叉编译，产物推到目标节点跑——**不在节点上装工具链、不在节点上编译**。

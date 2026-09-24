@@ -876,6 +876,7 @@ mod tests {
                 exe: "/x".into(),
                 regs: (0..27u64).collect(), // recognizable
                 fpregs: Vec::new(),
+                tls: None,
                 memory_maps: maps,
                 memory_data: data,
             },

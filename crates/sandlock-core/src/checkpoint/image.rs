@@ -18,7 +18,9 @@ use crate::sandbox::Sandbox;
 //       ├── fds.json         # file descriptor table
 //       ├── memory_map.json  # FULL region metadata (every mapping)
 //       ├── threads/
-//       │   └── 0.bin        # raw register bytes (main thread)
+//       │   ├── 0.bin        # raw register bytes (main thread)
+//       │   ├── tls.bin      # the thread pointer, on arches that keep it
+//       │   │                # outside the register file (aarch64 TPIDR_EL0)
 //       └── memory/
 //           └── <start_hex>.bin  # captured bytes for a region, keyed by its
 //                                # start address (only regions with data)
@@ -28,7 +30,7 @@ use crate::sandbox::Sandbox;
 // text) that were never captured into `memory/`. Each `memory/<start_hex>.bin`
 // is re-associated with its map entry by matching start address.
 
-const IMAGE_VERSION: u32 = 2;
+const IMAGE_VERSION: u32 = 3;
 
 fn io_err(e: impl std::fmt::Display) -> SandlockError {
     SandlockError::Runtime(SandboxRuntimeError::Child(e.to_string()))
@@ -175,6 +177,12 @@ impl Checkpoint {
         // process/threads/fpregs.bin -- FPU/extended register state
         std::fs::write(threads_dir.join("fpregs.bin"), &self.process_state.fpregs)
             .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
+        // process/threads/tls.bin -- the thread pointer, written only where the
+        // architecture keeps one outside the register file (see ProcessState).
+        if let Some(tls) = self.process_state.tls {
+            std::fs::write(threads_dir.join("tls.bin"), tls.to_le_bytes())
+                .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
+        }
 
         // process/memory/<start_hex>.bin -- captured segment bytes, keyed by
         // start address so load can re-associate each blob with its (full) map
@@ -255,6 +263,30 @@ impl Checkpoint {
             .collect();
         // Read FP/extended registers; tolerate absence defensively.
         let fpregs = std::fs::read(threads_dir.join("fpregs.bin")).unwrap_or_default();
+        // The thread pointer: absent is normal on the architectures that carry
+        // it in the register file, but on aarch64 it is load-bearing, so a v3
+        // image that lacks it is a broken image rather than an old one.
+        let tls_path = threads_dir.join("tls.bin");
+        let tls = if tls_path.exists() {
+            let raw = std::fs::read(&tls_path)
+                .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Io(e)))?;
+            if raw.len() != 8 {
+                return Err(SandlockError::Runtime(SandboxRuntimeError::Child(format!(
+                    "thread pointer file is {} bytes, expected 8",
+                    raw.len()
+                ))));
+            }
+            Some(u64::from_le_bytes(raw.try_into().unwrap()))
+        } else if cfg!(target_arch = "aarch64") {
+            return Err(SandlockError::Runtime(SandboxRuntimeError::Child(
+                "aarch64 checkpoint image has no thread pointer: this architecture keeps \
+                 TPIDR_EL0 outside the register file, so restore would leave the thread \
+                 pointing at the previous process's TLS"
+                    .into(),
+            )));
+        } else {
+            None
+        };
 
         // process/memory/<start_hex>.bin -- captured segments only, matched to
         // their map entry by start address. Maps without a blob (file-backed
@@ -283,6 +315,7 @@ impl Checkpoint {
                 exe: info.exe,
                 regs,
                 fpregs,
+                tls,
                 memory_maps,
                 memory_data,
             },
@@ -296,6 +329,14 @@ impl Checkpoint {
 #[cfg(test)]
 mod tests {
     use super::Checkpoint;
+
+    /// S1: the image gained the thread pointer (`process/threads/tls.bin`), so
+    /// the version had to move -- an image written before that would otherwise
+    /// be read back with the field silently missing.
+    #[test]
+    fn image_version_covers_the_thread_pointer() {
+        assert_eq!(super::IMAGE_VERSION, 3, "bump the image version when it gains a field");
+    }
 
     #[test]
     fn image_rejects_wrong_version() {

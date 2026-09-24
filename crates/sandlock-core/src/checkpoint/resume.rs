@@ -510,6 +510,7 @@ mod tests {
                 exe: String::new(),
                 regs,
                 fpregs: Vec::new(),
+                tls: None,
                 memory_maps: vec![
                     MemoryMap { start: CODE, end: CODE + PAGE, perms: "r-xp".into(), offset: 0, path: None },
                     MemoryMap { start: STACK, end: STACK + PAGE, perms: "rw-p".into(), offset: 0, path: None },
@@ -658,6 +659,7 @@ mod tests {
                 exe: String::new(),
                 regs,
                 fpregs: Vec::new(),
+                tls: None,
                 memory_maps: vec![
                     MemoryMap { start: CODE, end: CODE + PAGE, perms: "r-xp".into(), offset: 0, path: None },
                     MemoryMap { start: STACK, end: STACK + PAGE, perms: "rw-p".into(), offset: 0, path: None },

@@ -121,3 +121,40 @@ S1–S3 可以按本页定下的常量动手。两处需要按实测修正计划
 * arm64 上 `mm->context.vdso` 在 `mremap` 之后是否被内核更新（D 存活说明信号路径没受影响；
   若将来出现"恢复后一收信号就崩"，第一个查这里）。
 * SVE 实做（按 §5.6 判据先 fail-closed，再按工作负载需求放开）。
+
+## 7. aarch64 lane 的搭法（本地交叉编译 + 目标节点运行）
+
+S1 起需要在 **aarch64 上跑 fork 自己的测试**，而线上节点的内核才是唯一可信的环境（QEMU 用户态
+会把 ptrace/regset 变成模拟器语义，S0 的所有结论在它下面都不成立）。可用的组合是：
+
+1. **本地（Mac，amd64 docker）交叉编译**：用 fork 自带的 wheel-builder recipe 先建一个 builder 镜像
+   （manylinux_2_34 + rustup + `aarch64` target + zig 交叉链接器）：
+
+   ```sh
+   docker buildx build --builder multiarch --platform linux/amd64 \
+     --build-arg BASE_IMAGE=quay.io/pypa/manylinux_2_34_x86_64 \
+     --target build -t sandlock-zig-builder:local \
+     -f python/wheel-builder/Dockerfile --load .
+   ```
+
+   然后用它编 aarch64 测试二进制（`-e ZIG_TARGET=aarch64-linux-gnu.2.34`）。
+   **坑（实测）**：镜像里的 cargo config 把 *两个* target 的 linker 都指向 `zigcc`，而 `zigcc`
+   只读一个全局 `ZIG_TARGET`，于是宿主的 build script / proc macro 会被当成 aarch64 链接而失败
+   （`libcompiler_builtins ... is incompatible with aarch64linux`）。解法是把**宿主的 linker 钉回
+   系统 `cc`**：
+
+   ```sh
+   CARGO_TARGET_DIR=/tmp/target-aarch64 \
+   ZIG_TARGET=aarch64-linux-gnu.2.34 \
+   CC_aarch64_unknown_linux_gnu=zigcc CC_x86_64_unknown_linux_gnu=cc \
+   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc \
+   cargo test --target aarch64-unknown-linux-gnu -p sandlock-core --lib --no-run
+   ```
+
+   产物在 `$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/debug/deps/`，是 aarch64 ELF（glibc 2.34 基线，
+   节点上能直接跑）。
+2. **推到节点运行**：`tmp/k0s/tools.sh node-put <bin> <host> <path>`，然后在节点上（root）跑
+   `--test-threads=1` 的子集/全量。
+
+节点侧只需要一个可写目录（本轮用 `/opt/arm-lane`）；**不需要**在节点上装 rust/cargo，也不需要
+把源码推上去编译——S1 期间节点上临时装的 `cargo`/`rust` rpm 可以撤掉。

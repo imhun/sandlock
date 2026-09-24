@@ -34,6 +34,14 @@ pub struct ProcessState {
     pub exe: String,
     pub regs: Vec<u64>,
     pub fpregs: Vec<u8>,
+    /// The thread pointer, on an architecture that keeps it *outside* the
+    /// register file. aarch64 stores it in the `TPIDR_EL0` system register,
+    /// which no signal frame and no register-file read returns
+    /// (`docs/arm-cr-s0-evidence.md` §2), so capture reads
+    /// `PTRACE_GETREGSET(NT_ARM_TLS)` and restore writes it back the same way.
+    /// x86_64 keeps TLS in `fs_base` (part of `regs`) and riscv64 in a general
+    /// register, so both leave this `None`.
+    pub tls: Option<u64>,
     pub memory_maps: Vec<MemoryMap>,
     pub memory_data: Vec<MemorySegment>,
 }
