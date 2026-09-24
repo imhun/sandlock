@@ -131,10 +131,11 @@ S1–S3 可以按本页定下的常量动手。两处需要按实测修正计划
   若将来出现"恢复后一收信号就崩"，第一个查这里）。
 * SVE 实做（按 §5.6 判据先 fail-closed，再按工作负载需求放开）。
 
-## 7. aarch64 lane 的搭法（本地交叉编译 + 目标节点运行）
+## 7. aarch64 lane 的搭法（本地交叉编译 + 真内核运行）
 
-S1 起需要在 **aarch64 上跑 fork 自己的测试**，而线上节点的内核才是唯一可信的环境（QEMU 用户态
-会把 ptrace/regset 变成模拟器语义，S0 的所有结论在它下面都不成立）。可用的组合是：
+S1 起需要在 **aarch64 的真内核上跑 fork 自己的测试**：QEMU 用户态会把 ptrace/regset 变成模拟器
+语义（`ptrace`/`process_vm_writev` 直接 ENOSYS），S0 的所有结论在它下面都不成立。两个可用的执行
+环境——**本地 Lima VM**（S3 起主用）和**目标节点**——吃的是同一份本地交叉编出的二进制：
 
 1. **本地（Mac，amd64 docker）交叉编译**：用 fork 自带的 wheel-builder recipe 先建一个 builder 镜像
    （manylinux_2_34 + rustup + `aarch64` target + zig 交叉链接器）：
@@ -162,8 +163,35 @@ S1 起需要在 **aarch64 上跑 fork 自己的测试**，而线上节点的内�
 
    产物在 `$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/debug/deps/`，是 aarch64 ELF（glibc 2.34 基线，
    节点上能直接跑）。
-2. **推到节点运行**：`tmp/k0s/tools.sh node-put <bin> <host> <path>`，然后在节点上（root）跑
-   `--test-threads=1` 的子集/全量。
+2. **本地真内核 VM（S3 起主用）**：Lima + qemu，在宿主（Darwin/amd64）上跑一台 aarch64 虚拟机，
+   把上面那份二进制放进去运行。实例定义 `tmp/arm-vm/sandlock-arm.yaml`、驱动脚本
+   `tmp/arm-lane/lima-vm.sh`（`sync` / `run` / `shell` / `start` / `stop`）都在主仓：
 
-节点侧只需要一个可写目录（本轮用 `/opt/arm-lane`）；**不需要**在节点上装 rust/cargo，也不需要
-把源码推上去编译——S1 期间节点上临时装的 `cargo`/`rust` rpm 可以撤掉。
+   ```sh
+   limactl create --name sandlock-arm --tty=false tmp/arm-vm/sandlock-arm.yaml
+   limactl start  sandlock-arm --tty=false
+   tmp/arm-lane/lima-vm.sh sync
+   tmp/arm-lane/lima-vm.sh run '/tmp/target-aarch64/aarch64-unknown-linux-gnu/debug/deps/\
+       integration-* test_restore:: --test-threads=1'
+   ```
+
+   四条实测约束，改配置前先读：
+
+   * **不要写 `networks:`**。`lima: shared` 需要 `socket_vmnet`，装它要 sudo 密码；默认的 user-mode
+     网络加上 Lima 自己的 ssh 端口转发足够（这台 VM 不对外提供服务）。
+   * **guest 内核要 ≥ 6.10**。Ubuntu 24.04 自带的 6.8 只有 Landlock ABI v4，而引擎的策略要求
+     `FsIoctlDev`（ABI v5），于是所有带策略的用例在起沙箱时就失败。装上
+     `linux-image-6.14.0-37-generic` 之后 Landlock 报 v6。
+   * **工作区必须是 guest 本机文件系统，9p 只能当传输**。实测：在 9p 挂载上
+     `landlock_add_rule` 返回 0、`landlock_restrict_self` 返回 0，但随后 `execve` 该目录下的文件
+     一律 **EACCES**（最小复现：同一段三十行代码，目录换成 guest 本机路径就成功）。所以 lane 的
+     形状是「`/lima-repo` = 宿主仓库只读 9p 传输；运行根镜像到 guest 本机」，细节在脚本头注释。
+   * **`/tmp` 重启会被清**。`/tmp/target-aarch64` 这类编译期烘焙的绝对路径每次重启都要重建，
+     `sync` 会做这件事。
+
+   还有一条与“绿的真假”有关：`stub_path()` 是编译期烘焙的绝对路径，路径不存在时那三条 stub 用例
+   会**静默 skip**（只 `eprintln!` 然后 `return`）。跑完必须确认输出里没有 `skip:` —— 第一轮真内核
+   的“46/46”就是这么来的假绿。
+3. **推到节点运行（备选）**：`tmp/k0s/tools.sh node-put <bin> <host> <path>`，然后在节点上（root）跑
+   `--test-threads=1` 的子集/全量。节点侧只需要一个可写目录（S1 用 `/opt/arm-lane`）；**不需要**
+   在节点上装 rust/cargo，也不要把源码推上去编译。

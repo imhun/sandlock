@@ -256,3 +256,77 @@ ENOSYS）。于是：
 * 需要**真内核**的（capture 的 `PTRACE_*`、stub 的 `rt_sigreturn`/`mremap`、`process_vm_writev`
   填页、`--oci-root` 的 C/R 往返）在 qemu-user 下**既跑不动也不可信**：S0 的 ABI 结论、S1 的绿、
   以及 S3/S5 的动态验收都属于这一类。
+
+---
+
+## S3 状态（2026-09-24，已落地）
+
+stub 的 aarch64 分支落地，并在**本地真内核**上第一次跑通完整恢复。
+
+* `restore-stub.c` 新增 `__aarch64__` 分支：
+  * syscall 号走通用 64 位表（`read 63 / write 64 / close 57 / lseek 62 / mmap 222 / mprotect 226 /
+    munmap 215 / mremap 216 / dup3 24 / exit 93 / openat 56 / rt_sigreturn 139`），**没有
+    `arch_prctl`**，dup 改用 `dup3`；`sc6()` 是 `x8` + `x0..x5` + `svc #0`。
+  * `_start`：`mov x0, sp`（auxv 在初始栈上）→ `ldr x1, =stub_stack` + `add` + `and sp, x1, #-16`
+    → `bl _start_c`。切 `.bss` 私有栈的理由与 x86_64 相同：checkpoint 的 `[stack]` 会 MAP_FIXED
+    到内核给的那块地址上。
+  * 步骤 10：栈上建 `struct rt_sf`，`memcpy(&sf.uc.mc.regs[0], gp, nregs*8)`——ptrace 顺序**就是**
+    帧顺序，一次拷贝盖住 `regs[31]/sp/pc/pstate`；FP 记录整段写进 `__reserved`；`mov sp, %0;
+    svc #0`（`x8 = 139`）。帧偏移按 S0 表 1 钉死并加 `_Static_assert`（`mc@0xB0`、`regs@0x08`、
+    `sp@0x100`、`pc@0x108`、`pstate@0x110`、`__reserved@0x120`）。
+  * 步骤 9：`msr tpidr_el0`——`TPIDR_EL0` 既不在寄存器文件里也不在帧里，只能这样写回。
+  * `memset`/`memcpy` 的循环体各加一条空 asm 屏障：LLVM 的 LoopIdiom 会把 store 循环改写成对
+    “正在编译的那个函数”自己的调用（zig/clang 走的正是这条路），屏障让它放弃；GCC 那侧保留
+    `-fno-tree-loop-distribute-patterns`。
+* `restore_blob.rs`：`BLOB_VERSION` 2→3、`HEADER_LEN` 64→80，header 末尾补 `tls/has_tls`；
+  aarch64 两条 fail-closed —— FP 不是 528 字节（含“0 字节”）就拒，`tls` 缺失就拒。
+* `build.rs`：`is_restore_arch` 含 aarch64（缺 stub 由 warning 变**致命**）；`arch_of()` 只在
+  跨架构时才让 `CC_<target>` 优先；链接地址按工具链分派 —— GCC 用 `-Wl,-Ttext-segment=`，
+  zig/clang 拒绝该选项、改用 `-Wl,--image-base=`（实测），aarch64 不加 `-mcmodel=large`
+  （只有 x86_64 需要）。
+* `resume.rs` / `sandbox.rs` / `tests/integration/test_restore.rs`：架构门都补上 aarch64
+  （`STUB_BASE` 用 3 TiB）；noexec 那两个原型仍留在 x86_64/riscv64，用例里会自述原因。
+
+### 真内核 lane（本轮新建）
+
+本地起了一个 **Lima qemu VM**（Ubuntu 24.04 + 6.14 内核，宿主是 amd64 Darwin），把宿主交叉编出的
+aarch64 二进制放进去跑：**真内核、真 ptrace、真 `rt_sigreturn`**，不再是 qemu-user。搭法、驱动脚本
+`tmp/arm-lane/lima-vm.sh` 与两条踩到的约束写在 `docs/arm-cr-s0-evidence.md` §7。
+
+### 本轮抓到并修掉的两个 RED
+
+S3 的代码在 qemu-user 下**跑不到**（`ptrace`/`process_vm_writev` 直接 ENOSYS），所以它的“绿”一直是
+空心的。真内核上第一轮是 **45 passed / 1 failed**，暴露两处：
+
+1. **测试自己写错了机器码**（`resume.rs` 的 aarch64 合成镜像用例）：手工编的
+   `movk x2, #0x4500, lsl #48` 想构造 `STACK + 0x800`，而 `STACK = 0x4500_0001_0000` 需要
+   `lsl #32`。payload 于是往 `0x4500_0000_0001_0800` 写，落在映射之外：
+   `--- SIGSEGV {si_code=SEGV_MAPERR, si_addr=0x4500000000010800} ---`。能一眼定位是因为
+   `rt_sigreturn` **本身已经成功**（strace 里 `rt_sigreturn({mask=[]}) = 0`，随后 pc 落在 `CODE`）
+   ⇒ 帧、寄存器、`svc` 全对，错的只是载荷的地址常量。
+2. **FPCR 的 bit5 在模拟出的 CPU 上根本不可写**：用例原本断言 `FPCR = 0x20`（bit5，IDE），实测写
+   `0x20` 读回 `0`，而 `0xc00000`/`0x1000000` 正常往返；再用 `1.0 + 2⁻⁶⁰` 的舍入行为把 RMode 钉在
+   `FPCR[23:22]`。断言改用 `RMode = 0b11`（`0x00C0_0000`）：断言一个该实现丢掉的位，等于在测
+   CPU 模型而不是测帧，而 RMode 是每个 aarch64 实现都必须实现的字段。
+
+### 证据（全部本地真内核，2026-09-24）
+
+* **RED**：真内核 `checkpoint::` 子集 **45 passed / 1 failed**（上面第 1 条）。
+* **GREEN（aarch64，真内核）**：`checkpoint::` 子集 **46 passed / 0 failed / 0 skipped**。
+  关键一条是 `resume::tests::restore_stub_reconstructs_a_synthetic_image` 这次真的执行了 stub：
+  payload 从恢复出来的帧里读回 `TPIDR_EL0 = 0x0000ffff88881000`、`FPSR = 0x10`、
+  `FPCR = 0x00c00000`，三个值逐位相等。qemu-user 下同一用例是
+  `finish_restore: process_vm_writev ... os error 38`。
+* **GREEN（aarch64，真内核，端到端）**：`integration::test_restore::` **4 passed / 0 failed**：
+  * `test_restore_glibc_vdso_program_resumes`：静态 `clock-loop` 被 checkpoint、原进程被杀、在
+    **新沙箱**里恢复并继续推进磁盘计数器 ⇒ 恢复后的每一次 `clock_gettime`（vDSO 调用）都成功，
+    且地址空间干净。
+  * `test_restore_resumes_inside_a_chroot_root`：emulated chroot 与 real root 两种形态都过。
+  * 另两条 noexec 原型按架构自述跳过（`the no-exec prototype jumps into the stub with an
+    arch-specific asm`），与 §11.5/§11.6 的隔离一致。
+* **GREEN（x86_64 回归）**：`cargo test -p sandlock-core --lib checkpoint::` → **42 passed / 0 failed**。
+
+“0 skipped” 是刻意查的：`stub_path()` 是编译期烘焙的绝对路径，路径不存在时那三条 stub 用例会
+**静默 `return`**。第一轮真内核跑出来的“46/46”是假的——直到把构建产物放到脚本记录的那个路径上，
+那个 SIGSEGV 才露出来。真内核 lane 的同步脚本因此把构建产物**复制进 guest 本机磁盘**，而不是就地
+通过 9p 使用（原因见 §7）。
