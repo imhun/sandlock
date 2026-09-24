@@ -998,3 +998,47 @@ arm64_core_integ = 551 # 2026-09-24: 551 passed / 0 failed, i.e. the *same*
                        # wedges past 130s without it. The deployed E2B shape sets
                        # E2B_ENABLE_NET_ISOLATION=true, where the gateway binds
                        # inside the sandbox netns and the sysctl is not in play.
+
+# The rest of the arm64 table: the same five labels the x86_64 gate reports,
+# each measured in the same shape `scripts/test-all.sh` uses (the phase runner
+# sums the per-binary "test result: ok. N passed" lines exactly like the
+# script does). Every one equals the x86_64 baseline at this tip.
+arm64_ffi = 104          # uid 501. Same as x86_64. Three of the ten binaries
+                         # only run at all once the lane transports the
+                         # cross-built `libsandlock_ffi.so` (the C smoke tests
+                         # link it; the ctypes binding loads it) and once
+                         # `c_smoke`'s `cargo build -p sandlock-ffi --lib` can
+                         # be pointed at a shim that refuses to pass unless that
+                         # artifact is newer than every source it came from --
+                         # the guest has no toolchain, and the path baked in at
+                         # build time (`/root/.rustup/.../x86_64.../cargo`) is
+                         # not even reachable as an unprivileged uid (EACCES
+                         # through a 0700 /root, not ENOENT).
+arm64_supervise = 51     # uid 501. Same as x86_64. Two cases needed fixing
+                         # for the lane rather than for the product: both
+                         # assumed the workload progresses inside a fixed
+                         # wall-clock window, and on qemu TCG it does not --
+                         # the events case read as "the channel never greeted"
+                         # and the tightening case broke out of its stop loop
+                         # on the first equal sample (2097152 -> 2097152), which
+                         # on this lane means "has not written its next 1 MiB
+                         # yet", not "cannot write any more". Both now wait for
+                         # the bytes/state that made the assertion true, with a
+                         # quiet deadline as the backstop.
+arm64_oci = 157          # root phase (`--oci-root`). Same as x86_64. Carries
+                         # the C/R round-trip through the OCI supervisor.
+arm64_supervise_root = 4 # root phase (`--supervise-root`). Same as x86_64.
+                         # Two lane-shaped reds stood in the way, neither an
+                         # isolation defect: the shared ctl root was created by
+                         # the root test process and then chmod-ed by the
+                         # sandbox uid (which has no CAP_FOWNER) -- the root is
+                         # now chown-ed to the uid that uses it, as the real
+                         # per-user root is; and the policy denied `chmod`,
+                         # which does not exist in the generic syscall table
+                         # (aarch64 lowers chmod(2) to fchmodat), so the fork
+                         # refused the rule by name.
+arm64_mediation_2uid = 9 # root phase (`--mediation-2uid`). Same as x86_64.
+                         # The CLI and the cdylib are found through
+                         # <manifest>/../../target, which on this lane is the
+                         # cross-build output rather than the container's
+                         # target root.

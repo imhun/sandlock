@@ -330,3 +330,96 @@ S3 的代码在 qemu-user 下**跑不到**（`ptrace`/`process_vm_writev` 直接
 **静默 `return`**。第一轮真内核跑出来的“46/46”是假的——直到把构建产物放到脚本记录的那个路径上，
 那个 SIGSEGV 才露出来。真内核 lane 的同步脚本因此把构建产物**复制进 guest 本机磁盘**，而不是就地
 通过 9p 使用（原因见 §7）。
+
+## S4 状态（2026-09-24，已落地）
+
+门槛与构建：`build.rs::is_restore_arch` 含 aarch64（**aarch64 上缺 stub 从 warning 变致命**），
+`sandbox.rs` / `resume.rs` / `tests/integration/test_restore.rs` 的架构门放行 aarch64，链接地址按
+工具链分派（GCC `-Wl,-Ttext-segment=`；zig/clang 拒绝该选项、用 `-Wl,--image-base=`）。
+
+* **RED（改前，主仓 `tmp/arm-lane/s4-red-old-buildrs-full.log`）**：把 C 编译器从构建环境里拿掉
+  （`CC_aarch64_unknown_linux_gnu=/nonexistent/cc`），aarch64 构建**照样成功**，只在日志里留一句
+  `warning: sandlock-core@0.9.0-beta: failed to compile restore-stub: no working C compiler
+  (install cc/gcc); checkpoint restore is unavailable` —— 出的是一个 `stub_path()` 指向不存在
+  文件的包，C/R 在运行期才失败。
+* **GREEN（改后，`tmp/arm-lane/s4-missing-stub-aarch64.log`）**：同一条命令变成**致命**
+  （`error occurred in cc-rs: failed to find tool "/nonexistent/cc"`，`build failed`）。
+* **GREEN（stub 放回，`tmp/arm-lane/s4-green-restored.log`）**：6.19s 构建成功（`Finished dev
+  profile`）。
+* **GREEN（x86_64 回归）**：四种门禁相位与 `checkpoint::` 子集未动，证据见 S3 状态。
+
+## S5 状态（2026-09-24，已落地）
+
+lane 与验收：**没有用 arm64 容器**（`sandlock-dev` 与 `e2b-sandlock-test` 至今都是 amd64，
+`docker image inspect` 实测），而是本地 **Lima qemu VM**（Ubuntu 24.04 + 6.14 内核、6 vCPU、宿主
+amd64 Darwin）：宿主用 wheel builder 的 zig 工具链交叉编译 aarch64 二进制，产物**复制进 guest
+本机文件系统**后直接跑（不是 9p 就地跑，原因见 §7 / `docs/arm-cr-s0-evidence.md` §7）。
+**一个测试二进制都没有离开这台机器。**
+
+五条相位在 arm64 上**逐条等于 x86_64 基线**（驱动脚本 `tmp/arm-lane/phase-run.sh`，与
+`scripts/test-all.sh` 同口径：按 dep-info 找到每个 target 的二进制、把每条
+`test result: ok. N passed` 求和）：
+
+| 相位 | arm64 | x86_64 | 形态 |
+|---|---|---|---|
+| ffi（含 C ABI 往返） | **104** | 104 | uid 501 |
+| supervise | **51** | 51 | uid 501 |
+| oci（`--oci-root`，含 C/R 往返） | **157** | 157 | root |
+| supervise_root | **4** | 4 | root |
+| mediation_2uid | **9** | 9 | root |
+
+`core_lib` 904 / `core_integ` 551 见 `docs/test-baseline.md` 的 arm64 段（本轮未变）。
+
+### 五个要改 lane 才知道的坑（都不是 aarch64 产品缺陷）
+
+1. **`/src` 必须是 bind mount，不能是符号链接**。根相位会对自己的 tmp 根做 canonicalize，
+   符号链接把路径还原成 `<mirror>/third_party/sandlock/tmp/...`，注册控制套接字随后撞
+   `path must be shorter than SUN_LEN`（108 字节）——x86_64 容器把仓挂在 `/workspace`，
+   路径短得多，所以这条只在 lane 上出现。`lima-vm.sh sync` 与 `phase-run.sh` 都改成
+   `mount --bind`（幂等）。
+2. **共享 ctl root 要 chown 给用它的 uid**。根相位以 root 建目录再 `chmod 0777`，
+   而沙箱跑在 uid 65533（无 `CAP_FOWNER`），`setup_runtime_dir` 又把根收紧到 0700 ⇒ 非属主
+   `chmod` 得 EPERM，报成 "control socket setup failed ... Operation not permitted"。真实
+   的 per-user 控制根本来就属于它的 uid，测试现在照做（`chown_dir`）。
+3. **`chmod` 在 generic syscall 表里不存在**。aarch64 的 `chmod(2)` 由 libc 落到
+   `fchmodat`，策略里点名 `chmod` 会被 fork 按"这个内核没有这个号"拒掉
+   （`unknown syscall or group name(s): chmod`）。用例按架构选名字（`CHMOD_DENY`）。
+4. **C ABI 套件会 shell 出去重新构建 cdylib**（为了不链到过期产物），而 guest 里没有工具链，
+   构建期烘焙的 `CARGO` 路径（`/root/.rustup/.../x86_64.../bin/cargo`）在非特权 uid 下连
+   `EACCES` 都不是 `ENOENT`（0700 的 `/root`）。新增 `SANLOCK_CARGO` 覆盖，lane 用它指到一个
+   **校验式 shim**：只有 `libsandlock_ffi.so` 比它所有的源都新才通过——换成"过期就红"，
+   而不是"没法重建就跳过"。sync 也随之补传 `libsandlock_ffi.so`。
+5. **两条用例假定"固定墙钟窗口里工作负载会推进"**，QEMU/TCG 下不成立：events 用例读成
+   "通道从没 greet 过"（旧代码是 10s 平窗），tightening 用例在第一个等值采样上就判"写不动了"
+   （`2097152 -> 2097152`，其实只是下一个 1 MiB 的 `dd` 还没落盘）。两条都改成**等那个使断言
+   成立的事实**（字节数 / 已越过打紧点），再留一个静默截止兜底；events 还补了失败时 dump
+   子进程 stderr，因为"通道空"和"supervisor 没起来"从外面看是一样的。
+   附带一条：`RunAs(uid, uid)` 在 euid != egid 的机器上是**重映射**（本 lane 是 501/1000），
+   未特权 supervisor 必须拒；"以自己的身份跑"的策略得写 `gid: egid()`。
+
+### 另一条：E2B 侧的真 bug（不是 lane）
+
+`tests/security` 的两态里，`E2B_REAL_ROOT=1` 在 arm64 上有 12 个用例全红在建箱前，报
+"this worker cannot build a sandbox root: pivot_root (the profile must admit it): No such
+process"。根因不在 fork，而在主仓 worker 的 `_REAL_ROOT_PROBE`：它把 `pivot_root(2)` 的号
+**写死成 x86_64 的 155**，而 aarch64 用 generic 表（`pivot_root` = 41，155 = `sched_getattr`），
+于是探针**从来没问过内核 pivot_root**，却把别人的 errno 报成了 seccomp 档的问题 —— 线上是
+aarch64，这个开关在那之前不可能被打开。已在主仓修（按架构派发 + 未知架构 fail closed），
+并加了一条只在 generic 表架构上真的会红的单元钉（拿掉修复即 ESRCH 红，实测）。
+详见主仓 `docs/build-test-deploy-pitfalls.md` B13。
+
+**E2B 侧 `tests/security` 两态（arm64 lane，`E2B_REQUIRE_SECCOMP_FILTER=0`）**：
+
+| 形态 | arm64 | 同轮 x86_64（同镜像/同 seccomp 档） |
+|---|---|---|
+| `E2B_REAL_ROOT=0`（模拟根） | 35 passed / 9 skipped / 4 xfailed | 43 passed / 1 skipped / 4 xfailed |
+| `E2B_REAL_ROOT=1`（真根） | 38 passed / 9 skipped / 1 xfailed | 46 passed / 1 skipped / 1 xfailed |
+
+arm64 多出的 8 条 skip 全是 lane 能力（guest 里没有 docker 守护进程/socket/CLI：5 条
+"docker is required for template build tests"、1 条 "no base image configured"、2 条 E5.1），
+不是形态差异：两边的 passed + xfailed 逐态相等（39 / 47），而真根比模拟根多出的 3 条通过正是
+N35 的那三条 shebang/binfmt 用例 —— 它们在没有真根时走**运行期** `pytest.xfail()`，真根下走到
+断言并通过，所以 xfailed 从 4 降到 1。
+
+日志（全部在宿主 `tmp/arm-lane/`）：`s5-arm-security-realroot{0,1}.log`、
+`s5-x86-security-realroot{0,1}.log`（x86 用 `tmp/arm-lane/x86-security.sh` 取，见 pitfalls B4）。
