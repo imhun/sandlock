@@ -249,6 +249,11 @@ pub(crate) fn install_and_jump() -> ! {
         ];
         std::ptr::copy_nonoverlapping(words.as_ptr(), sp, words.len());
 
+        // The jump is the only architecture-specific part: the payload runs on
+        // the stack it just built and never returns. Same engine support as the
+        // restore itself (x86_64/riscv64); other targets keep the crate
+        // building (the wheels ship aarch64 too) and exit instead.
+        #[cfg(target_arch = "x86_64")]
         core::arch::asm!(
             "mov rdi, {sp}",
             "mov rsp, rdi",
@@ -257,5 +262,17 @@ pub(crate) fn install_and_jump() -> ! {
             entry = in(reg) entry,
             options(noreturn)
         );
+        #[cfg(target_arch = "riscv64")]
+        core::arch::asm!(
+            "mv sp, {sp}",
+            "jr {entry}",
+            sp = in(reg) sp as u64,
+            entry = in(reg) entry,
+            options(noreturn)
+        );
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+        {
+            libc::_exit(95);
+        }
     }
 }
