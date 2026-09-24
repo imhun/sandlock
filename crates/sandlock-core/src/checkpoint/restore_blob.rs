@@ -44,12 +44,17 @@ const SRC_FILE: u8 = 1;
 /// hits against any static `ET_EXEC` workload).
 ///
 /// x86_64 uses 3 TiB, far above any ordinary user address space.  riscv64 must
-/// stay below the Sv39 ceiling of 256 GiB.
-#[cfg(target_arch = "x86_64")]
+/// stay below the Sv39 ceiling of 256 GiB.  aarch64 also uses 3 TiB: the target
+/// kernel has a 48-bit user VA (measured), 3 TiB is mmap-able there, and it sits
+/// clear of both `mmap_base` (~128 TiB) and the stack (~256 TiB), so a checkpoint
+/// taken on aarch64 can reuse x86_64's value -- which keeps one constant for two
+/// architectures instead of a third number nobody measured
+/// (docs/arm-cr-s0-evidence.md §3).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) const STUB_BASE: u64 = 0x300_0000_0000;
 #[cfg(target_arch = "riscv64")]
 pub(crate) const STUB_BASE: u64 = 0x30_0000_0000;
-#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
 pub(crate) const STUB_BASE: u64 = 0;
 pub(crate) const STUB_SPAN: u64 = 0x40_0000;
 
@@ -357,7 +362,7 @@ fn to_child_path(
 /// -ERESTARTSYS / -ERESTARTNOINTR / -ERESTARTNOHAND / -ERESTART_RESTARTBLOCK.
 /// -515 (ENOIOCTLCMD) is NOT a restart code and must not be matched.
 #[cfg_attr(
-    not(any(target_arch = "x86_64", target_arch = "riscv64")),
+    not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")),
     allow(dead_code)
 )]
 fn is_restart_sentinel(v: i64) -> bool {
@@ -424,6 +429,63 @@ fn rearm_restartable_syscall(regs: &mut [u64]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Return the restart sentinel an aarch64 register file holds in `x0`, if any.
+///
+/// aarch64's `x0` is both the first syscall argument and the return value, so an
+/// aborted restartable syscall whose fixup had *not* run would leave the
+/// sentinel where the argument belongs. Measured on the target kernel the fixup
+/// has always already run by the time a ptrace stop is reported (see
+/// `rearm_restartable_syscall`), so this is a guard against the ordering
+/// changing, not a routine path.
+#[cfg(target_arch = "aarch64")]
+fn restart_sentinel_in_x0(regs: &[u64]) -> Option<i64> {
+    let x0 = *regs.first()? as i64;
+    if is_restart_sentinel(x0) { Some(x0) } else { None }
+}
+
+/// Refuse an aarch64 register file whose `x0` holds a restart sentinel, with the
+/// shared error text; both capture and restore reject through here.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn reject_restart_sentinel(regs: &[u64]) -> Result<(), String> {
+    match restart_sentinel_in_x0(regs) {
+        Some(sentinel) => Err(format!(
+            "checkpoint captured an interrupted restartable syscall \
+             (x0 = {sentinel}); aarch64 keeps the original first argument in \
+             `orig_x0`, which ptrace does not expose, and the kernel is expected \
+             to have rewound this stop onto the `svc` already -- so this register \
+             file is not the shape this engine can restore; retry the checkpoint \
+             while the workload is not blocked in a syscall"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// aarch64 re-arm: the kernel has already done it, so doing anything here would
+/// be the bug.
+///
+/// Measured on the target kernel (`spikes/arm-s0/s0e-restart.c`, two aarch64
+/// hosts): at a `PTRACE_SEIZE` + `PTRACE_INTERRUPT` stop inside a restartable
+/// syscall, the register file is already in the "re-execute the svc" shape --
+/// `pc` sits *exactly* on the `svc` instruction, `x0` holds the original first
+/// argument again, and `x8` still carries the original syscall number. That held
+/// for both restart flavours: -ERESTARTNOHAND (`read` on an empty pipe, whose
+/// `restart_block` is not involved) and -ERESTART_RESTARTBLOCK (`nanosleep`,
+/// where the kernel only swaps in `__NR_restart_syscall` *after* the stop, on
+/// the way out). Resuming the tracee re-executes the syscall, which is exactly
+/// what a restore has to reproduce.
+///
+/// So the x86_64 fixup would be actively wrong here: rewinding `pc` by 4 would
+/// land on the second half of the `svc` and execute garbage, and reloading `x0`
+/// is impossible anyway (`orig_x0` is not in `user_pt_regs`). aarch64 also keeps
+/// the original syscall number in `x8` across the abort, so -- unlike x86_64 --
+/// an -ERESTART_RESTARTBLOCK stop restores by re-running the *original* syscall
+/// with its full timeout, which is the same approximation x86_64 documents,
+/// reached without an `orig_rax` reload.
+#[cfg(target_arch = "aarch64")]
+fn rearm_restartable_syscall(regs: &mut [u64]) -> Result<(), String> {
+    reject_restart_sentinel(regs)
 }
 
 /// riscv64 re-arm is deliberately not implemented (see `restart_sentinel_in_a0`):
@@ -518,12 +580,50 @@ fn build_fpstate_image(fpregs: &[u8]) -> Vec<u8> {
     fpregs.to_vec()
 }
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+/// Build the FP image for the aarch64 signal frame.
+///
+/// aarch64 does not have x86_64's "pointer to a free-standing FP image" slot:
+/// `rt_sigreturn` walks the sigcontext's `__reserved` area looking for
+/// `_aarch64_ctx` records and stops at the first zero magic word. The FP record
+/// is `struct fpsimd_context` -- `{magic, size}` header, then fpsr, fpcr, then
+/// vregs[32] -- while ptrace hands the same 528 bytes back as the kernel's
+/// `user_fpsimd_state` (vregs first, fpsr/fpcr/reserved last). Framing is
+/// therefore a *reordering* plus dropping the two kernel-reserved words, and the
+/// stub copies the result into the reserved area verbatim (the zeroed tail of
+/// the ucontext already terminates the record list). Constants measured on the
+/// target kernel: magic 0x46508001, size 0x210, fpsr at +8, fpcr at +12, v0 at
+/// +16 (docs/arm-cr-s0-evidence.md §1).
+#[cfg(target_arch = "aarch64")]
+fn build_fpstate_image(fpregs: &[u8]) -> Vec<u8> {
+    const FPSIMD_MAGIC: u32 = 0x4650_8001;
+    const FPSIMD_SIZE: u32 = 0x210;
+    /// `sizeof(struct user_fpsimd_state)`: vregs[32], fpsr, fpcr, reserved[2].
+    const STATE_LEN: usize = 0x210;
+    const VREGS_LEN: usize = 32 * 16;
+    const FPSR_OFF: usize = VREGS_LEN;
+    const FPCR_OFF: usize = VREGS_LEN + 4;
+
+    // plan() refuses any other size before calling here; returning nothing is
+    // the safe answer for a caller that got past that gate.
+    if fpregs.len() != STATE_LEN {
+        return Vec::new();
+    }
+
+    let mut img = Vec::with_capacity(FPSIMD_SIZE as usize);
+    img.extend_from_slice(&FPSIMD_MAGIC.to_le_bytes());
+    img.extend_from_slice(&FPSIMD_SIZE.to_le_bytes());
+    img.extend_from_slice(&fpregs[FPSR_OFF..FPSR_OFF + 4]);
+    img.extend_from_slice(&fpregs[FPCR_OFF..FPCR_OFF + 4]);
+    img.extend_from_slice(&fpregs[..VREGS_LEN]);
+    img
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
 fn build_fpstate_image(_fpregs: &[u8]) -> Vec<u8> {
     Vec::new()
 }
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
 fn rearm_restartable_syscall(_regs: &mut [u64]) -> Result<(), String> {
     Ok(())
 }
@@ -583,6 +683,19 @@ pub(crate) fn plan(
 
     let mut regs = ps.regs.clone();
     rearm_restartable_syscall(&mut regs)?;
+    // aarch64 has no degraded FP form to fall back to: the stub writes this
+    // record into the signal frame verbatim, so a capture that is not the
+    // kernel's 528-byte `user_fpsimd_state` would either be refused by the
+    // kernel at rt_sigreturn or silently drop vectors. Fail closed instead.
+    #[cfg(target_arch = "aarch64")]
+    if !matches!(ps.fpregs.len(), 0 | 528) {
+        return Err(format!(
+            "checkpoint carries {} bytes of aarch64 FP state, expected the kernel's \
+             528-byte user_fpsimd_state; refusing to build a signal frame the \
+             kernel would reject",
+            ps.fpregs.len(),
+        ));
+    }
     let fpstate = build_fpstate_image(&ps.fpregs);
 
     let mut strings = StringTable::default();
@@ -801,7 +914,7 @@ mod tests {
         assert!(verify_special_mappings(&current, &cp).is_ok());
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
     #[test]
     fn sweep_removes_a_leftover_stack_but_spares_the_image_and_the_stub() {
         // The layout the stub is in at READY: the checkpoint's regions, the
@@ -948,7 +1061,7 @@ mod tests {
         let strings_len = u32::from_le_bytes(blob[48..52].try_into().unwrap()) as usize;
         assert_eq!(&blob[strings_off..strings_off + strings_len], b"/bin/app\0");
     }
-    #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64"))]
     #[test]
     fn plan_rejects_a_checkpoint_overlapping_the_stub_window() {
         let cp = tiny_checkpoint(
@@ -1061,5 +1174,115 @@ mod tests {
     #[test]
     fn fpstate_image_empty_when_nothing_was_captured() {
         assert!(build_fpstate_image(&[]).is_empty());
+    }
+
+    /// aarch64 does not point the kernel at a free-standing FP buffer the way
+    /// x86_64 does: `rt_sigreturn` walks the sigcontext's `__reserved` area
+    /// looking for `_aarch64_ctx` records, and the FP record is
+    /// `{magic, size, fpsr, fpcr, vregs[32]}` (measured on the target kernel:
+    /// magic 0x46508001, size 0x210 -- docs/arm-cr-s0-evidence.md §1). ptrace
+    /// hands the same 528 bytes back in the kernel's `user_fpsimd_state` order
+    /// instead: vregs first, fpsr/fpcr/reserved last. Framing is therefore a
+    /// *reordering*, and every offset below is the one the kernel parses -- get
+    /// one wrong and the frame is rejected (EINVAL at rt_sigreturn) or the
+    /// program resumes with the wrong vectors.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn aarch64_fpstate_image_is_a_fpsimd_record_not_a_kernel_fpsimd_state() {
+        const FPSIMD_MAGIC: u32 = 0x4650_8001;
+        const FPSIMD_SIZE: u32 = 0x210;
+
+        // Capture order: vregs[32] (one byte per 16-byte lane is enough to
+        // identify each), then fpsr, fpcr, and two kernel-reserved words.
+        let mut capture = vec![0u8; 528];
+        for (i, lane) in capture[..512].chunks_mut(16).enumerate() {
+            lane.fill(i as u8);
+        }
+        capture[512..516].copy_from_slice(&0x0000_0010u32.to_le_bytes()); // fpsr
+        capture[516..520].copy_from_slice(&0x0000_0020u32.to_le_bytes()); // fpcr
+        capture[520..528].fill(0xFF); // reserved: must not be forwarded
+
+        let img = build_fpstate_image(&capture);
+
+        assert_eq!(img.len(), FPSIMD_SIZE as usize, "sizeof(struct fpsimd_context)");
+        assert_eq!(u32::from_le_bytes(img[0..4].try_into().unwrap()), FPSIMD_MAGIC);
+        assert_eq!(u32::from_le_bytes(img[4..8].try_into().unwrap()), FPSIMD_SIZE);
+        assert_eq!(u32::from_le_bytes(img[8..12].try_into().unwrap()), 0x10, "fpsr at +8");
+        assert_eq!(u32::from_le_bytes(img[12..16].try_into().unwrap()), 0x20, "fpcr at +12");
+        assert_eq!(img[16..32], capture[0..16], "v0 is the first lane after fpcr");
+        assert_eq!(img[16 + 15 * 16..16 + 16 * 16], capture[15 * 16..16 * 16], "v15");
+        assert_eq!(img[16 + 31 * 16..16 + 32 * 16], capture[31 * 16..32 * 16], "v31");
+    }
+
+    /// aarch64's `x0` is both the first syscall argument and the return value.
+    /// The target kernel rewinds `pc` onto the `svc` and restores `x0` from
+    /// `orig_x0` *before* the ptrace stop (measured: pc - svc == 0 and x0 is the
+    /// original fd for both -ERESTARTNOHAND and -ERESTART_RESTARTBLOCK, with
+    /// `x8` still carrying the original syscall number -- see s0e-restart.c), so
+    /// a checkpoint of a blocked syscall is already in the "re-execute the svc"
+    /// shape and needs no fixup. What it must not do is resume a *sentinel*
+    /// through: `orig_x0` is not in the ptrace-exposed `user_pt_regs`, so once a
+    /// sentinel is visible the original argument is gone and the only safe
+    /// answer is to refuse the checkpoint.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn aarch64_rearm_leaves_a_fixed_up_syscall_alone() {
+        // x0..x30, sp, pc, pstate.
+        let mut regs = vec![0u64; 34];
+        const X0: usize = 0;
+        const PC: usize = 32;
+        regs[X0] = 3; // the original first argument, restored by the kernel
+        regs[8] = 63; // __NR_read, still in the syscall-number register
+        regs[PC] = 0x400e_58; // at the svc
+
+        rearm_restartable_syscall(&mut regs).expect("a fixed-up stop passes through");
+
+        assert_eq!(regs[X0], 3, "the first argument is not rewritten");
+        assert_eq!(regs[8], 63, "the syscall number is not rewritten");
+        assert_eq!(regs[PC], 0x400e_58, "pc is not rewound: the kernel already did");
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn aarch64_rearm_rejects_a_restart_sentinel_left_in_x0() {
+        for sentinel in [-512i64, -513, -514, -516] {
+            let mut regs = vec![0u64; 34];
+            regs[0] = sentinel as u64;
+            regs[32] = 0x400e_58;
+
+            let err = rearm_restartable_syscall(&mut regs)
+                .expect_err("an un-fixed-up restart must be refused");
+            assert!(
+                err.contains("restartable") && err.contains(&sentinel.to_string()),
+                "names the cause and the sentinel: {err}",
+            );
+        }
+
+        // -515 (ENOIOCTLCMD) is not a restart code: a program is free to hold it
+        // in x0, and refusing such a checkpoint would be a false positive.
+        let mut regs = vec![0u64; 34];
+        regs[0] = (-515i64) as u64;
+        rearm_restartable_syscall(&mut regs).expect("-515 is not a restart sentinel");
+    }
+
+    /// The stub writes the FP record straight into the sigcontext's reserved
+    /// area, so a capture that is not the kernel's 528-byte
+    /// `user_fpsimd_state` cannot be framed. x86_64 has a documented degraded
+    /// fallback (legacy fxsave); aarch64 has no partial form -- a wrong-sized
+    /// record is either rejected by the kernel or silently drops vectors -- so
+    /// the plan fails closed instead.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn aarch64_a_fp_capture_of_the_wrong_size_is_refused() {
+        let mut cp = tiny_checkpoint(Vec::new(), Vec::new());
+        cp.process_state.fpregs = vec![0u8; 512]; // one 16-byte lane short
+        let err = plan(&cp, None, &[]).expect_err("512 bytes is not a fpsimd state");
+        assert!(
+            err.contains("512") && err.contains("528"),
+            "says what it got and what it wanted: {err}",
+        );
+
+        cp.process_state.fpregs = vec![0u8; 528];
+        assert!(plan(&cp, None, &[]).is_ok(), "the measured size is accepted");
     }
 }

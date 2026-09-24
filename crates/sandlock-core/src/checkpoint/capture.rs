@@ -169,6 +169,98 @@ pub(crate) fn ptrace_get_tls(pid: i32) -> io::Result<Option<u64>> {
     }
 }
 
+/// Refuse a checkpoint whose thread has live SVE registers.
+///
+/// Every aarch64 kernel built with SVE exposes `NT_ARM_SVE` for *every* thread,
+/// and that regset always has content, so "non-empty" cannot be the test:
+/// measured on the target, an ordinary glibc process reports
+/// `size=544, vl=16 bytes, max_vl=16, flags=0`. What matters is the format the
+/// kernel is handing back. `arch/arm64/include/uapi/asm/ptrace.h` defines
+/// `SVE_PT_REGS_FPSIMD == 0` ("SVE registers are not live; the payload is a
+/// struct user_fpsimd_state") -- and 16 header bytes plus a 528-byte fpsimd
+/// state is exactly the 544 measured -- and `SVE_PT_REGS_SVE == 1` ("SVE
+/// registers are live"). In the FPSIMD form the fpsimd record *is* the whole
+/// vector state, which is what the restore stub rebuilds, so the guard is that
+/// one bit and nothing else.
+///
+/// Two tempting-but-wrong criteria, both rejected: "the regset has content"
+/// (true for every thread, so it would refuse everything), and "vl > 128 bits"
+/// (`vl` is the thread's vector length, which defaults to the system-wide
+/// default of 64 bytes, or the hardware maximum when that is smaller -- so a
+/// 256-bit Graviton3 would refuse every ordinary process while its state was
+/// perfectly restorable). Measurement: docs/arm-cr-s0-evidence.md §5.6 (which
+/// this corrects). Meaning of the flag: `Documentation/arch/arm64/sve.rst`,
+/// "SVE registers are not live (GETREGSET)".
+///
+/// A kernel without SVE support answers `EINVAL`, which means "no SVE state",
+/// not a failure.
+#[cfg(target_arch = "aarch64")]
+fn reject_aarch64_sve(pid: i32) -> Result<(), String> {
+    const NT_ARM_SVE: libc::c_int = 0x405;
+
+    let raw = match ptrace_getregset_bytes(pid, NT_ARM_SVE, 4096) {
+        Ok(raw) => raw,
+        Err(_) => return Ok(()),
+    };
+    let (vl, max_vl, flags) = parse_user_sve_header(&raw)?;
+    match sve_refusal(vl, max_vl, flags) {
+        Some(reason) => Err(reason),
+        None => Ok(()),
+    }
+}
+
+/// The whole decision -- accept, or the exact reason -- so both answers,
+/// message included, can be driven from a synthetic header.
+#[cfg(target_arch = "aarch64")]
+fn sve_refusal(vl: u16, max_vl: u16, flags: u16) -> Option<String> {
+    if sve_registers_are_restorable(flags) {
+        return None;
+    }
+    Some(format!(
+        "checkpoint captured a thread with live SVE registers (vl = {vl} bytes, \
+         max_vl = {max_vl}, flags = {flags:#x}); the restore stub rebuilds only the \
+         fpsimd record, so the restored thread would resume with the upper halves of \
+         its vectors dropped; retry with SVE out of use, or wait for SVE support",
+    ))
+}
+
+/// Split `struct user_sve_header` into the three fields the decision reads.
+///
+/// Kept apart from the regset read so both answers can be driven from a
+/// synthetic header: the decision is the part that has to be right, and the one
+/// byte-order slip here would silently mis-read `flags`.
+#[cfg(target_arch = "aarch64")]
+fn parse_user_sve_header(raw: &[u8]) -> Result<(u16, u16, u16), String> {
+    /// `struct user_sve_header`: 2 x u32, then 3 x u16 and a reserved u16.
+    const HEADER_LEN: usize = 16;
+    if raw.len() < HEADER_LEN {
+        return Err(format!(
+            "NT_ARM_SVE returned {} bytes, expected at least the {HEADER_LEN}-byte \
+             user_sve_header",
+            raw.len(),
+        ));
+    }
+    // struct user_sve_header { u32 size; u32 max_size; u16 vl; u16 max_vl;
+    //                          u16 flags; u16 __reserved; }
+    Ok((
+        u16::from_le_bytes([raw[8], raw[9]]),
+        u16::from_le_bytes([raw[10], raw[11]]),
+        u16::from_le_bytes([raw[12], raw[13]]),
+    ))
+}
+
+/// The one bit that says the kernel is handing back SVE-format registers rather
+/// than an fpsimd state. Split out so tests can drive both answers without SVE
+/// hardware (the target node's maximum vector length is 128 bits, so it cannot
+/// produce the SVE form at all).
+#[cfg(target_arch = "aarch64")]
+fn sve_registers_are_restorable(flags: u16) -> bool {
+    /// `SVE_PT_REGS_MASK`, `SVE_PT_REGS_SVE`, `SVE_PT_REGS_FPSIMD` (0).
+    const SVE_PT_REGS_MASK: u16 = 1;
+    const SVE_PT_REGS_SVE: u16 = 1;
+    flags & SVE_PT_REGS_MASK != SVE_PT_REGS_SVE
+}
+
 fn ptrace_getfpregs(pid: i32) -> io::Result<Vec<u8>> {
     // NT_PRFPREG = 2; NT_X86_XSTATE = 0x202.
     //
@@ -446,12 +538,18 @@ pub(crate) fn capture(pid: i32, policy: &Sandbox) -> Result<Checkpoint, Sandlock
         let regs = ptrace_getregs(pid).map_err(|e| {
             SandlockError::Runtime(SandboxRuntimeError::Child(format!("ptrace getregs: {}", e)))
         })?;
-        // riscv64 cannot re-arm an interrupted restartable syscall at restore
-        // time (`orig_a0` is not ptrace-exposed), so refuse the checkpoint now
-        // while the tell-tale sentinel is still in `a0`. This saves the memory
-        // dump and surfaces the error at the actionable moment.
-        #[cfg(target_arch = "riscv64")]
+        // riscv64 and aarch64 cannot re-arm an interrupted restartable syscall
+        // at restore time (neither `orig_a0` nor `orig_x0` is exposed through
+        // ptrace), so refuse the checkpoint now, while the tell-tale sentinel is
+        // still in the return register. This saves the memory dump and surfaces
+        // the error at the actionable moment.
+        #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
         super::restore_blob::reject_restart_sentinel(&regs)
+            .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Child(e)))?;
+        // aarch64's SVE is the same shape of refusal one regset over: a thread
+        // with live SVE registers would resume with its vectors truncated.
+        #[cfg(target_arch = "aarch64")]
+        reject_aarch64_sve(pid)
             .map_err(|e| SandlockError::Runtime(SandboxRuntimeError::Child(e)))?;
         // FP state is best-effort: an image without it still restores.
         let fpregs = ptrace_getfpregs(pid).unwrap_or_default();
@@ -926,5 +1024,68 @@ mod tests {
 
         let fp = res.expect("fp capture should succeed on aarch64");
         assert_eq!(fp.len(), 528, "NT_PRFPREG on aarch64 is user_fpsimd_state (0x210)");
+    }
+
+    /// The SVE guard's decision, driven from synthetic headers: the target node's
+    /// maximum vector length is 128 bits, so it cannot produce the SVE form at
+    /// all, and the local lane's qemu answers ENOSYS to ptrace.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn aarch64_sve_guard_reads_the_format_flag_not_the_vector_length() {
+        assert!(sve_registers_are_restorable(0), "SVE_PT_REGS_FPSIMD, the measured form");
+        assert!(!sve_registers_are_restorable(1), "SVE_PT_REGS_SVE");
+        // Flags carry more than the format: SVE_PT_VL_INHERIT (2) and
+        // SVE_PT_VL_ONEXEC (4) are not format bits and must not trip the guard.
+        assert!(sve_registers_are_restorable(2), "SVE_PT_VL_INHERIT");
+        assert!(sve_registers_are_restorable(4), "SVE_PT_VL_ONEXEC");
+        assert!(!sve_registers_are_restorable(3), "the SVE form with a VL flag is still SVE");
+    }
+
+    /// Field offsets and byte order of `struct user_sve_header`, against the
+    /// header the target kernel really returns for a plain glibc process
+    /// (`size=544, max_size=592, vl=16, max_vl=16, flags=0`, S0 §2), plus the
+    /// 256-bit case that the naive "vl > 128 bits" criterion would have refused
+    /// on every ordinary Graviton3 process.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn aarch64_sve_header_parses_a_measured_header_field_by_field() {
+        let header = |vl: u16, max_vl: u16, flags: u16| {
+            let mut raw = vec![0u8; 544];
+            raw[0..4].copy_from_slice(&544u32.to_le_bytes());
+            raw[4..8].copy_from_slice(&592u32.to_le_bytes());
+            raw[8..10].copy_from_slice(&vl.to_le_bytes());
+            raw[10..12].copy_from_slice(&max_vl.to_le_bytes());
+            raw[12..14].copy_from_slice(&flags.to_le_bytes());
+            raw
+        };
+
+        assert_eq!(
+            parse_user_sve_header(&header(16, 16, 0)).unwrap(),
+            (16, 16, 0),
+            "the target kernel's header for a non-SVE process",
+        );
+        assert_eq!(parse_user_sve_header(&header(32, 32, 0)).unwrap(), (32, 32, 0));
+        assert_eq!(parse_user_sve_header(&header(64, 64, 1)).unwrap(), (64, 64, 1));
+        assert_eq!(sve_refusal(32, 32, 0), None, "a wider VL is not the SVE form");
+        assert_eq!(
+            sve_refusal(64, 64, 1),
+            Some(
+                "checkpoint captured a thread with live SVE registers (vl = 64 bytes, \
+                 max_vl = 64, flags = 0x1); the restore stub rebuilds only the fpsimd \
+                 record, so the restored thread would resume with the upper halves of its \
+                 vectors dropped; retry with SVE out of use, or wait for SVE support"
+                    .to_string()
+            ),
+            "the SVE form names what it saw and why it cannot be restored",
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn aarch64_a_short_sve_regset_is_named_not_guessed() {
+        assert_eq!(
+            parse_user_sve_header(&[0u8; 8]).expect_err("8 bytes is not a header"),
+            "NT_ARM_SVE returned 8 bytes, expected at least the 16-byte user_sve_header",
+        );
     }
 }

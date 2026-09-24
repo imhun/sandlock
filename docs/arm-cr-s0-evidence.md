@@ -12,7 +12,7 @@ S1–S3 可以按本页定下的常量动手。两处需要按实测修正计划
 | OS / 内核 | Rocky Linux 10.2 / `6.12.0-211.34.1.el10_2.aarch64`（与线上 worker 同族） |
 | 编译器 | gcc 14.3.1（节点自带；无 glibc-static，故探针用动态链接 + 手工 asm） |
 | 用户 VA | 48 位（实测，见 §3） |
-| 探针 | `spikes/arm-s0/`（`s0a`–`s0d` + `run.sh`）；两节点结果逐字段一致 |
+| 探针 | `spikes/arm-s0/`（`s0a`–`s0d` + `run.sh`）；两节点结果逐字段一致（`s0e-restart.c` 是 S2 期间补的，见 §5.6） |
 
 探针只做只读探测与"移动自己进程的 vDSO"，不触碰节点上任何服务；节点侧中间产物在
 `/tmp/arm-cr-s0`。
@@ -107,11 +107,20 @@ S1–S3 可以按本页定下的常量动手。两处需要按实测修正计划
    TLS，必须显式写回）、`x8 = __NR_rt_sigreturn` 后 `svc #0`；`pstate` 用 0 已被实测接受。
 5. **vdso 搬迁**：必须**同 delta 搬 `[vvar]` + `[vdso]`**，且目标就是 checkpoint 记录的原基址
    （§4 B/E）；不要读 `[vvar]` 的内容（第 2 页 SIGBUS）。
-6. **SVE 判据要改**：本机**普通 glibc 进程**的 `NT_ARM_SVE` 就有内容（`size=544`、`vl=16B`），
-   所以"regset 有内容就 fail-closed"会把一切都拒掉。正确判据是
-   `user_sve_header.vl > 16 || flags & SVE_PT_REGS_SVE`（VL=128 bit 时 SVE 视图 == FPSIMD，只存
-   fpsimd 即可）。SME/FPMR 不存在、`NT_ARM_PAC_MASK` 等 `EINVAL` ⇒ PAC/MTE 的 fail-closed 判据
-   也要按实测（不是按架构能力表）来写。
+6. **SVE 判据只看 `flags` 那一位**：本机**普通 glibc 进程**的 `NT_ARM_SVE` 就有内容
+   （`size=544`、`vl=16B`），所以"regset 有内容就 fail-closed"会把一切都拒掉；但判据也不能带
+   `vl`——本页初稿写的 `vl > 16 || flags & SVE_PT_REGS_SVE` 里，**`vl > 16` 那半条是错的**：
+   `vl` 是*线程*的向量长度，在有 SVE 的硬件上默认就等于系统默认 VL（64 字节，硬件最大更小时取
+   硬件最大），所以 Graviton3（256 位）上**每个普通进程**都会报 `vl = 32, flags = 0`，而那种状态
+   恰恰能恢复、也只需要按 fpsimd 存。内核文档 `Documentation/arch/arm64/sve.rst` 分得很清楚：
+
+   * `SVE_PT_REGS_FPSIMD`（= 0）：*"SVE registers are not live"*，payload 就是一个
+     `struct user_fpsimd_state`（16 字节头 + 528 = 实测的 `size = 544`）；
+   * `SVE_PT_REGS_SVE`（= 1）：*"SVE registers are live"*。
+
+   ⇒ 判据只有 `(flags & SVE_PT_REGS_MASK) != SVE_PT_REGS_SVE`；寄存器视图在 `flags` 位里，不在
+   长度里。SME/FPMR 不存在、`NT_ARM_PAC_MASK` 等 `EINVAL` ⇒ PAC/MTE 的 fail-closed 判据也要按
+   实测（不是按架构能力表）来写。
 7. **门槛**：`sandbox.rs` 的架构判断与 `build.rs::is_restore_arch` 加 aarch64（缺 stub 变致命）。
 
 ## 6. 仍然未知（留给 S5 与后续）

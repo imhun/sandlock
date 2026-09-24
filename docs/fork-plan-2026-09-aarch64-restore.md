@@ -167,3 +167,92 @@ ptrace_get_tls`；GREEN = aarch64 上 `checkpoint::` 子集 **32 passed / 0 fail
 
 **aarch64 lane 的搭法**（S2/S3/S5 复用，细节与坑见 `docs/arm-cr-s0-evidence.md` §7）：本地用
 fork 自带的 zig builder 镜像交叉编译，产物推到目标节点跑——**不在节点上装工具链、不在节点上编译**。
+
+---
+
+## S2 状态（2026-09-24，已落地）
+
+恢复侧的 aarch64 分支落地，`capture` 侧补上 SVE 门槛：
+
+* `restore_blob.rs`
+  * `STUB_BASE = 0x300_0000_0000`（**与 x86_64 同值**；S0c 实测 48 位 VA 下 3 TiB 可 mmap、不撞
+    `mmap_base`/栈，所以不需要第三个数字）。
+  * `build_fpstate_image` 的 aarch64 分支：把 ptrace 交回的 `user_fpsimd_state`（vregs 在前、
+    fpsr/fpcr 在后、末尾 2 个内核保留字）**重排**成内核 `rt_sigreturn` 要解析的
+    `struct fpsimd_context`（`{magic 0x46508001, size 0x210, fpsr, fpcr, vregs[32]}`），落在
+    `sigcontext + 0x120`；内核保留字**不转发**。
+  * `rearm_restartable_syscall`：aarch64 上是**空操作**，只在 `x0` 里出现重启哨兵时 fail-closed
+    （理由见下）。
+  * `plan()` 对 aarch64 增加 FP 长度门槛：只接受 0（无 FP）或 528 字节，其它长度直接报错并说明
+    期望值——x86_64 有"降级到 legacy fxsave"的安全形态，aarch64 没有，写错长度的记录要么被内核
+    拒绝，要么静默丢向量。
+  * 两个 sweep 窗口用例（`sweep_removes_a_leftover_stack...`、`plan_rejects_a_checkpoint_overlapping...`）
+    的 cfg 加上 aarch64——它们本来就只在 `STUB_BASE > 0` 的架构上有意义。
+* `capture.rs`
+  * restart 哨兵检查从 riscv64 扩到 aarch64（同为 fail-closed，且发生在内存转储之前）。
+  * 新增 **SVE fail-closed**（`reject_aarch64_sve` + 纯函数 `parse_user_sve_header` /
+    `sve_registers_are_restorable` / `sve_refusal`）。
+
+### 新增实测：arm64 上重启修复发生在 ptrace 停**之前**
+
+`spikes/arm-s0/s0e-restart.c`（两个阶段：`read` 的 -ERESTARTNOHAND、`nanosleep` 的
+-ERESTART_RESTARTBLOCK），用引擎同一条 attach 路径（`PTRACE_SEIZE` + `PTRACE_INTERRUPT`）：
+
+| 观测 | `read` (63) | `nanosleep` (101) |
+|---|---|---|
+| `pc - svc` | **0**（正好停在 `svc` 上） | **0** |
+| `x0` | 原参数（fd = 3） | 原参数（`&timespec`） |
+| `x8` | 63（原 syscall 号） | **101（原号，不是 128）** |
+| `/proc/<pid>/syscall` | `-1`（NO_SYSCALL） | `-1` |
+| `NT_ARM_SYSTEM_CALL` | `0xffffffff` | `0xffffffff` |
+| `GET_SYSCALL_INFO` | `op = NONE` | `op = NONE` |
+| CONT 之后 | syscall **真的重新执行**（read 返回 1） | 内核在**放行之后**才换成 `restart_syscall`(128) |
+
+内核源码印证（v6.12 `arch/arm64/kernel/signal.c::do_signal`）：`regs->regs[0] = regs->orig_x0;
+regs->pc = restart_addr;` 就在 `get_signal()` **之前**，代码注释原文是 *"Prepare for system call
+restart. We do this here so that a debugger will see the already changed PC."*；而
+`setup_restart_syscall()`（把 `x8` 换成 `__NR_restart_syscall`）在 `get_signal()` **之后**的"无信号"
+分支里。⇒ ptrace 停点上看到的永远是"可重执行"形态。
+
+两条推论：
+
+1. x86_64 那种"回退 `pc`、重载返回寄存器"的做法在 arm64 上**是错的**：`pc` 已经在 `svc` 上，
+   再减 4 就落到 `svc` 的前一条指令里；而 `orig_x0` 又不在 `user_pt_regs` 里，重载也做不到。
+2. arm64 比 x86_64 更省：`-ERESTART_RESTARTBLOCK` 因为 `x8` 保留原 syscall 号，恢复后是**重跑原
+   syscall**（超时按原值重来），与 x86_64 用 `orig_rax` 达到的效果相同，却不需要额外字段。
+
+### S0 §5.6 的 SVE 判据修正
+
+S0 写的判据是 `vl > 16 || flags & SVE_PT_REGS_SVE`。**`vl > 16` 那半条是错的**：`vl` 是线程的向量
+长度，在有 SVE 的硬件上默认等于系统默认 VL（64 字节；硬件最大更小时取硬件最大），因此 Graviton3
+（256 位）上**每个普通进程**都会报 `vl = 32, flags = 0`——按旧判据会把所有 checkpoint 都拒掉，而
+那种状态恰恰是能恢复的。内核文档 `Documentation/arch/arm64/sve.rst` 说的很直白：
+
+* `SVE_PT_REGS_FPSIMD`（= 0）: *"SVE registers are not live"*，payload 就是一个
+  `struct user_fpsimd_state`（16 字节头 + 528 = 实测到的 `size = 544`）；
+* `SVE_PT_REGS_SVE`（= 1）: *"SVE registers are live"*。
+
+⇒ 判据只有这一位：`(flags & SVE_PT_REGS_MASK) != SVE_PT_REGS_SVE`。落到代码里是
+`capture::sve_registers_are_restorable` / `sve_refusal`（纯函数，本地 lane 可测），regset 读取与
+"内核没有 SVE 就返回 EINVAL"的语义在 `reject_aarch64_sve`。
+
+### 证据（全部本地，2026-09-24）
+
+* **RED**（`tmp/arm-lane/s2-red.log`）：先只加测试、不实现 → aarch64 上 `checkpoint::` 子集
+  **33 passed / 3 failed**，三条正是新加的 `aarch64_fpstate_image_is_a_fpsimd_record_not_a_kernel_fpsimd_state`、
+  `aarch64_rearm_rejects_a_restart_sentinel_left_in_x0`、`aarch64_a_fp_capture_of_the_wrong_size_is_refused`
+  （`left: 0, right: 528`；`an un-fixed-up restart must be refused: ()`；`512 bytes is not a fpsimd state: RestorePlan { .. }`）。
+* **GREEN（aarch64）**：同一子集 **33 passed / 8 failed**，8 条失败全部是 qemu-user 不实现
+  `ptrace` / `process_vm_writev`（`Os { code: 38, kind: Unsupported, message: "Function not implemented" }`）
+  的用例；新增的帧布局、哨兵、FP 长度、SVE 判据全部通过。
+* **GREEN（x86_64 回归）**：`cargo test -p sandlock-core --lib checkpoint::` → **40 passed / 0 failed**。
+
+### 本地 lane 的边界（重要）
+
+本地 aarch64 目前只有 `--platform linux/arm64` 容器一条路，而它是 **qemu-user**（`ptrace` 直接
+ENOSYS）。于是：
+
+* 纯逻辑（FP 帧封装、blob 布局、策略、镜像格式、SVE 判据）**可以在本地跑**，速度也够；
+* 需要**真内核**的（capture 的 `PTRACE_*`、stub 的 `rt_sigreturn`/`mremap`、`process_vm_writev`
+  填页、`--oci-root` 的 C/R 往返）在 qemu-user 下**既跑不动也不可信**：S0 的 ABI 结论、S1 的绿、
+  以及 S3/S5 的动态验收都属于这一类。
