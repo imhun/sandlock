@@ -2205,10 +2205,16 @@ async fn test_chroot_hardlink_into_a_branch_is_refused() {
                 r.code(),
                 r.stderr_str().unwrap_or("")
             );
+            // The helper prints `ln: <path>: <strerror(EXDEV)>`, and that text
+            // is the libc's: glibc spells it "Invalid cross-device link", musl
+            // spells it "Cross-device link". The aarch64 lane cross-builds the
+            // helper statically with zigcc, which only offers a musl static
+            // libc (zig refuses `-static` against glibc), so pin the phrase and
+            // not one libc's wording.
+            let stderr = r.stderr_str().unwrap_or_default();
             assert!(
-                r.stderr_str().unwrap_or("").contains("Invalid cross-device link"),
-                "the refusal should read as a cross-device link, stderr={}",
-                r.stderr_str().unwrap_or("")
+                stderr.to_lowercase().contains("cross-device link"),
+                "the refusal should read as a cross-device link, stderr={stderr}"
             );
             assert!(
                 !tmp_dir.join("pulled-in.txt").exists(),
