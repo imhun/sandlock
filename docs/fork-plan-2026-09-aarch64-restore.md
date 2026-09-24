@@ -59,6 +59,11 @@ worker 节点内核是 `6.12.0-211.34.1.el10_2.aarch64`），而**恢复引擎�
 
 **S0 的产出**：一份 `docs/` 实测记录（三张表 + 原始输出），以及 S1–S3 需要的常量/布局定案。
 
+> **已完成（2026-09-24）**：`docs/arm-cr-s0-evidence.md` + `spikes/arm-s0/`。三条 spike 全部成立
+> （手工帧能 `rt_sigreturn`；EL0 能写 `TPIDR_EL0` 且 ptrace 通道往返；3 TiB 可用、`[vvar]`+`[vdso]` 按同一
+> delta 可搬迁）。两处与计划的差异：**SVE 判据**要按 `vl>16 || flags & SVE_PT_REGS_SVE` 而不是「regset 有
+> 内容」，**vdso 搬迁**在 arm64 上必须同 delta 搬两个映射（只搬 `[vdso]` 实测 `SEGV_MAPERR`）。
+
 ### S1 capture（arm64 分支）
 
 `PTRACE_GETREGSET(NT_PRSTATUS)` 取 34×u64 + `NT_PRFPREG` 取 FP + `NT_ARM_TLS` 取 TLS；
