@@ -32,6 +32,20 @@ use std::time::{Duration, Instant};
 const UID_X: u32 = 65533;
 const UID_WORKER: u32 = 65534;
 
+/// The syscall a sandboxed `chmod(2)` actually reaches, per architecture: the
+/// generic (asm-generic) syscall table has no `chmod` at all, so on aarch64
+/// glibc lowers `chmod(2)` to `fchmodat(AT_FDCWD, ...)`.  Naming `chmod` there
+/// is refused by the fork -- it will not install a rule for a syscall the
+/// running kernel has no number for -- which surfaced on the lane as
+/// "policy rejected: ... unknown syscall or group name(s): chmod"
+/// (measured 2026-09-24).  x86_64 keeps its own name, so that lane's policy is
+/// byte-for-byte what it always was.
+const CHMOD_DENY: &[&str] = if cfg!(target_arch = "aarch64") {
+    &["fchmodat"]
+} else {
+    &["chmod"]
+};
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_sandlock-supervise")
 }
@@ -97,6 +111,28 @@ fn chmod_dir(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777))
         .expect("chmod shared dir");
+}
+
+/// Hand a shared control root to the uid that will actually use it, the way
+/// the real per-user control root is owned by its uid.  The root phase starts
+/// as root and the sandbox runs as [`UID_X`], which has no CAP_FOWNER, so a
+/// root-owned 0777 directory is still not chmod-able by it -- and
+/// `setup_runtime_dir` tightens the root to 0700.  Measured 2026-09-24 on the
+/// real-root aarch64 lane: without this, the sandbox came up with
+/// "control socket setup failed ... Operation not permitted (os error 1)" and
+/// the acceptance failed for a reason that has nothing to do with isolation.
+fn chown_dir(path: &Path, uid: u32) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let raw = CString::new(path.as_os_str().as_bytes()).expect("path is NUL-free");
+    let rc = unsafe { libc::chown(raw.as_ptr(), uid, uid) };
+    assert_eq!(
+        rc,
+        0,
+        "chown {} to uid {uid}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
 }
 
 fn wait_until(deadline: Instant, what: &str, mut predicate: impl FnMut() -> bool) {
@@ -594,6 +630,7 @@ fn test_supervisor_as_foreign_uid_is_fully_functional() {
     let ctl_root = base.join("ctl");
     std::fs::create_dir_all(&ctl_root).expect("create ctl root");
     chmod_dir(&ctl_root);
+    chown_dir(&ctl_root, UID_X);
     let evidence_dir = base.join("evidence");
     std::fs::create_dir_all(&evidence_dir).expect("create evidence dir");
     chmod_dir(&evidence_dir);
@@ -612,7 +649,7 @@ fn test_supervisor_as_foreign_uid_is_fully_functional() {
         "fs_readable": readable,
         "fs_writable": [evidence_dir.to_string_lossy()],
         "fs_denied": ["/etc/shadow"],
-        "extra_deny_syscalls": ["chmod"],
+        "extra_deny_syscalls": CHMOD_DENY,
         "net_isolation": true,
         "net_allow": [
             "*.example.com:443",
@@ -924,6 +961,7 @@ fn test_supervisor_as_foreign_uid_fd_handoff_worker_close_first_leaves_no_residu
     let ctl_root = base.join("ctl");
     std::fs::create_dir_all(&ctl_root).expect("create ctl root");
     chmod_dir(&ctl_root);
+    chown_dir(&ctl_root, UID_X);
     let policy_path = base.join("policy.json");
     let mut readable = base_read_paths();
     readable.push(base.to_string_lossy().into_owned());
@@ -1056,6 +1094,7 @@ fn test_supervisor_as_foreign_uid_fd_handoff_serves_worker() {
     let ctl_root = base.join("ctl");
     std::fs::create_dir_all(&ctl_root).expect("create ctl root");
     chmod_dir(&ctl_root);
+    chown_dir(&ctl_root, UID_X);
 
     let mut readable = base_read_paths();
     readable.push(base.to_string_lossy().into_owned());

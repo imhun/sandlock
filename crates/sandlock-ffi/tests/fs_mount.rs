@@ -334,6 +334,22 @@ fn run_in_sandbox(policy: *mut sandlock_sandbox_t, argv: &[&str]) -> Run {
     out
 }
 
+/// The helper prints `<tool>: <path>: <strerror(EBUSY)>`, and that text belongs
+/// to the libc the helper was linked against: glibc says "Device or resource
+/// busy", musl says "Resource busy". The aarch64 lane links the helper
+/// statically with zigcc, which only offers a musl static libc (zig refuses
+/// `-static` against glibc), so pin both spellings exactly -- the refusal is the
+/// contract, the spelling is the libc's (same treatment
+/// `test_chroot_hardlink_into_a_branch_is_refused` got for `strerror(EXDEV)`).
+fn assert_ebusy(tool: &str, path: &str, stderr: &str, what: &str) {
+    let glibc = format!("{tool}: {path}: Device or resource busy\n");
+    let musl = format!("{tool}: {path}: Resource busy\n");
+    assert!(
+        stderr == glibc || stderr == musl,
+        "{what}: expected the exact EBUSY refusal of {tool} at {path}, got {stderr:?}"
+    );
+}
+
 /// Build a chroot policy through the C ABI with one read-only mount at
 /// `/ro` and one read-write mount at `/rw`.
 fn build_mount_policy(rootfs: &Path, ro_host: &Path, rw_host: &Path) -> *mut sandlock_sandbox_t {
@@ -585,9 +601,10 @@ fn test_rw_mount_point_resists_unlink_and_rename() {
         "rm of an rw single-file mount point must fail: stdout={} stderr={}",
         rm.stdout, rm.stderr,
     );
-    assert_eq!(
-        rm.stderr,
-        "rm: /etc/resolv.conf: Device or resource busy\n",
+    assert_ebusy(
+        "rm",
+        "/etc/resolv.conf",
+        &rm.stderr,
         "unlink at a mount point must surface EBUSY with the exact helper error",
     );
     assert_eq!(
@@ -605,9 +622,10 @@ fn test_rw_mount_point_resists_unlink_and_rename() {
         "mv of an rw single-file mount point must fail: stdout={} stderr={}",
         mv.stdout, mv.stderr,
     );
-    assert_eq!(
-        mv.stderr,
-        "mv: /etc/resolv.conf: Device or resource busy\n",
+    assert_ebusy(
+        "mv",
+        "/etc/resolv.conf",
+        &mv.stderr,
         "rename of a mount point must surface EBUSY with the exact helper error",
     );
     assert_eq!(
@@ -674,9 +692,10 @@ fn test_rw_mount_point_resists_link() {
         "hard-linking a mount point source must fail: stdout={} stderr={}",
         ln.stdout, ln.stderr,
     );
-    assert_eq!(
-        ln.stderr,
-        "ln: /etc/resolv-link.conf: Device or resource busy\n",
+    assert_ebusy(
+        "ln",
+        "/etc/resolv-link.conf",
+        &ln.stderr,
         "link at a mount point must surface EBUSY with the exact helper error",
     );
     assert_eq!(
@@ -736,9 +755,10 @@ fn test_directory_mount_point_rmdir_is_refused() {
         "rmdir of a directory mount point must fail: stdout={} stderr={}",
         rm.stdout, rm.stderr,
     );
-    assert_eq!(
-        rm.stderr,
-        "rmdir: /work: Device or resource busy\n",
+    assert_ebusy(
+        "rmdir",
+        "/work",
+        &rm.stderr,
         "rmdir at a directory mount point must surface EBUSY with the exact helper error",
     );
     assert!(

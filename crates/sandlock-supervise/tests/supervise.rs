@@ -140,6 +140,20 @@ fn euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// Current egid of the test process.
+///
+/// `RunAs(uid, gid)` is a *remap* as soon as either half differs from the
+/// caller's real ids, and an unprivileged supervisor must refuse a remap (fail
+/// closed: a single-entry userns map can only cover its own euid). So a
+/// "run as myself" policy has to name the real uid *and* the real gid -- the
+/// gate runs this suite as 65534/65534, where the two coincide and the
+/// distinction is invisible, but this lane's user is 501/1000, where
+/// `RunAs(501, 501)` was refused and the generation never started at all
+/// (measured 2026-09-24).
+fn egid() -> u32 {
+    unsafe { libc::getegid() }
+}
+
 /// Per-process control-root override shared by every supervise test in this
 /// binary (spawned supervise processes inherit it), so instance runtime dirs
 /// and the registered-path registry never collide with another suite's.
@@ -1183,24 +1197,53 @@ fn spawn_serve_supervisor_with_events(
     (child, worker, events_reader)
 }
 
-/// Read NDJSON events for `window`, summing the `append` payloads.
+/// Read NDJSON events until the writer has delivered `target_bytes`, or until
+/// the channel has been quiet for `idle` after the greeting, summing the
+/// `append` payloads.
 ///
 /// The reader is non-blocking because the publisher only writes when
 /// something grew: "no events" is a legitimate state to observe for a while,
 /// not a read that should block the test.
-fn sum_appended_events(events: &std::os::unix::net::UnixStream, window: Duration) -> (u64, usize) {
+///
+/// The greeting gets a deadline of its own rather than sharing the window: on
+/// an emulated lane (QEMU/TCG) booting the sandbox outlasts a flat window --
+/// measured 2026-09-24, the aarch64 lane took longer than the old flat 10 s to
+/// greet, which read as "the channel was never wired" rather than "this lane
+/// is slow". Waiting for the *bytes* rather than for wall-clock time also
+/// keeps the count exact on such a lane: the workload needs as long as it
+/// needs, and a publisher that really did go quiet is still caught by the
+/// quiet deadline and the hard cap instead of hanging the suite.
+fn sum_appended_events(
+    events: &std::os::unix::net::UnixStream,
+    idle: Duration,
+    target_bytes: u64,
+    child: &mut std::process::Child,
+) -> (u64, usize) {
     use std::io::Read;
     events
         .set_nonblocking(true)
         .expect("events reader non-blocking");
-    let deadline = Instant::now() + window;
+    let hello_deadline = Instant::now() + Duration::from_secs(180);
+    let hard_deadline = Instant::now() + Duration::from_secs(600);
     let mut total = 0u64;
     let mut count = 0usize;
     let mut greeted = 0usize;
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     let mut peek = events;
-    while Instant::now() < deadline {
+    let mut quiet_since: Option<Instant> = None;
+    loop {
+        if greeted > 0 && total >= target_bytes {
+            break;
+        }
+        if let Some(since) = quiet_since {
+            if since.elapsed() >= idle {
+                break;
+            }
+        }
+        if Instant::now() >= hard_deadline || (greeted == 0 && Instant::now() >= hello_deadline) {
+            break;
+        }
         match peek.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => buffer.extend_from_slice(&chunk[..n]),
@@ -1233,6 +1276,17 @@ fn sum_appended_events(events: &std::os::unix::net::UnixStream, window: Duration
                 other => panic!("unexpected event kind {other:?} in {value}"),
             }
         }
+        // Data arrived: the channel is alive. Only a real pause counts
+        // against `idle`, and only once the greeting has been seen.
+        if greeted > 0 {
+            quiet_since = Some(Instant::now());
+        }
+    }
+    if greeted == 0 {
+        // A generation that died before greeting closes the channel, and an
+        // empty channel on its own cannot be told from a supervisor that
+        // never started. Its stderr is the only thing that says which.
+        dump_child_stderr(child);
     }
     assert_eq!(greeted, 1, "the channel greets exactly once");
     (total, count)
@@ -1357,13 +1411,17 @@ fn instance_policy_chrooted_pid_ns_with_file_size(writable: &str, ceiling: &str)
 fn instance_policy_chrooted_pid_ns_self_userns(writable: &str, uid: u32) -> String {
     let mut readable = base_read_paths();
     readable.push(writable.to_string());
+    // "Himself" means the real uid *and* the real gid: naming the uid twice
+    // turns this into a remap wherever euid != egid, which the fork refuses
+    // (see `egid`). The shape under test is the *self* user namespace, so the
+    // policy must say what self actually is.
     serde_json::json!({
         "chroot": "/",
         "fs_readable": readable,
         "fs_writable": [writable],
         "pid_ns": true,
         "uid": uid,
-        "gid": uid,
+        "gid": egid(),
     })
     .to_string()
 }
@@ -1475,10 +1533,14 @@ fn test_events_fd_reports_a_running_writers_growth() {
         &serde_json::json!({ "argv": ["/bin/sh", "-c", script] }).to_string(),
     );
 
-    let (child, mut worker, events) =
+    let (mut child, mut worker, events) =
         spawn_serve_supervisor_with_events(&policy, &program, &[]);
 
-    let (appended, events_seen) = sum_appended_events(&events, Duration::from_secs(10));
+    // The workload writes exactly 8 MiB and then holds the descriptor open:
+    // wait for *that* many accounted bytes, with a 15 s quiet window as the
+    // backstop for a publisher that stopped.
+    let (appended, events_seen) =
+        sum_appended_events(&events, Duration::from_secs(15), 8 * 1024 * 1024, &mut child);
     let written = std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
     assert_eq!(
         written,
@@ -2009,19 +2071,33 @@ fn test_update_file_size_limit_stops_a_running_writer() {
     // The loop must now fail (EFBIG at `limit`) rather than reach 400 MiB:
     // wait for the size to stop moving, which is what "the writer can no
     // longer grow this file" looks like from the outside.
-    let stopped = Instant::now() + Duration::from_secs(20);
-    let mut last = std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
+    //
+    // An equal sample only means "stopped" once the file has grown past where
+    // the tightening caught it. On an emulated lane the next 1 MiB `dd` can
+    // take longer than one sampling interval, and the first equal sample is
+    // then "has not written yet", not "cannot write any more" (measured
+    // 2026-09-24: the aarch64 lane broke out at 2097152 -> 2097152 and failed
+    // the progress assertion below).
+    let stopped = Instant::now() + Duration::from_secs(120);
+    let mut last = before;
     let after = loop {
         std::thread::sleep(Duration::from_millis(400));
         let now = std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
         if now == last {
-            break now;
+            if last > before {
+                break now;
+            }
+            assert!(
+                Instant::now() < stopped,
+                "the tightened writer never wrote again after the tightening ({before} bytes)"
+            );
+            continue;
         }
-        last = now;
         assert!(
             Instant::now() < stopped,
             "the tightened writer never stopped; it reached {now} bytes"
         );
+        last = now;
     };
     assert!(
         after > before,

@@ -22,7 +22,16 @@ fn compile_and_run_c(src: &str) -> std::process::Output {
     // with "undefined reference" when the symbol set has changed). `--lib`
     // builds the cdylib/staticlib/rlib; the recursive `cargo` is safe because
     // the outer build lock is released before tests run.
-    let mut build = Command::new(env!("CARGO"));
+    //
+    // `CARGO` is the toolchain that *built the test*, which is not necessarily
+    // reachable where the test runs: the aarch64 lane cross-builds these
+    // binaries in a builder container and executes them on a machine with no
+    // toolchain at all, where the baked path fails with EACCES (measured
+    // 2026-09-24: `/root/.rustup/.../bin/cargo` under a 0700 `/root`). The
+    // env override lets such a lane point at whatever it does have; unset,
+    // this is the old behaviour exactly.
+    let cargo = std::env::var_os("SANLOCK_CARGO").unwrap_or_else(|| env!("CARGO").into());
+    let mut build = Command::new(cargo);
     build.args(["build", "-p", "sandlock-ffi", "--lib"]);
     if profile == "release" {
         build.arg("--release");
