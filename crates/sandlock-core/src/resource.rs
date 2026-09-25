@@ -132,6 +132,35 @@ pub(crate) async fn handle_fork(
     NotifAction::Continue
 }
 
+/// End a freeze: stop holding forks and **answer** the notifications that were
+/// held. Returns how many were released.
+///
+/// `NotifAction::Hold` deliberately answers nothing, so every held id is a
+/// sandboxed `fork()` parked in the kernel. Clearing the list instead of
+/// answering it is silent data loss with a nasty shape: the process never
+/// returns from `fork()` again, no error is reported anywhere, and the sandbox
+/// simply stops making progress in that subtree (measured 2026-09-25: a shell
+/// spawning `/bin/true` froze at the first capture and never resumed).
+///
+/// `hold_forks` is cleared *before* the answers go out, and without holding the
+/// state lock across them: a fork that arrives now must be allowed through
+/// rather than parked behind a lock the released processes are waiting on.
+pub(crate) async fn release_held_forks(
+    resource: &Arc<tokio::sync::Mutex<ResourceState>>,
+) -> usize {
+    let (notif_fd, ids) = {
+        let mut rs = resource.lock().await;
+        rs.hold_forks = false;
+        (rs.notif_fd, std::mem::take(&mut rs.held_notif_ids))
+    };
+    for id in &ids {
+        // A failure means the target is gone (or the kernel revoked the id);
+        // there is nothing left to release for that one.
+        let _ = crate::seccomp::notif::continue_notification(notif_fd, *id);
+    }
+    ids.len()
+}
+
 /// If `notif.pid` is not yet tracked in the ProcessIndex, register
 /// per-process supervisor state for it: open a pidfd, record the
 /// canonical PidKey, and spawn the exit watcher. Called from the
@@ -1674,5 +1703,39 @@ mod tests {
         }
         assert!(!ctx.processes.contains(thread_tid));
         assert!(ctx.processes.key_for(thread_tid).is_none());
+    }
+
+    /// Ending a freeze must **answer** the held ids, not forget them.
+    ///
+    /// `NotifAction::Hold` deliberately sends no response, so a held id is a
+    /// sandboxed `fork()` parked in the kernel: whatever ends the window has to
+    /// release it. This pins the contract's observable half -- the flag clears,
+    /// the list drains, and the count is reported so a caller can trace it. (The
+    /// answering itself needs a live seccomp listener, so the end-to-end proof
+    /// is `test_a_capture_does_not_wedge_a_forking_sibling`, which wedges a
+    /// sandboxed process deterministically when this drops the ids instead.)
+    #[tokio::test]
+    async fn release_held_forks_drains_and_reports_what_it_released() {
+        let resource = Arc::new(tokio::sync::Mutex::new(ResourceState::new(
+            1024 * 1024,
+            10,
+        )));
+        {
+            let mut rs = resource.lock().await;
+            rs.hold_forks = true;
+            rs.held_notif_ids = vec![7, 8, 9];
+            // No listener in this process: answering fails with EBADF and is
+            // ignored, which is the "target already gone" path.
+            rs.notif_fd = -1;
+        }
+
+        assert_eq!(release_held_forks(&resource).await, 3);
+
+        let rs = resource.lock().await;
+        assert!(!rs.hold_forks, "the window is over: new forks must pass");
+        assert!(
+            rs.held_notif_ids.is_empty(),
+            "the ids were handed to the release path, not left for the next freeze"
+        );
     }
 }

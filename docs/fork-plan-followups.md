@@ -98,32 +98,26 @@
   这一点），撤掉的收益不足以承担没有 soak 的风险。
 
 - **FUP-29 「已捕获的（park 形态）会话里再 exec」在本机 harness 上间歇性卡死
-  （2026-09-25，随 `checkpoint_excluding_main` 一起量到）** — 来源：为 E2B 的 route-B 形态
-  新增 `SandboxInstance::checkpoint_excluding_main()`（会话主子进程是 park 时，捕获"旁边
-  那一个"），在 `crates/sandlock-core/tests/integration/test_instance_exec.rs` 的新用例里
-  先捕获、再往**同一会话** `exec` 一条命令、然后读它的 stdout。
+  （2026-09-25 开、同日关闭）** — 来源：为 E2B 的 route-B 形态新增
+  `SandboxInstance::checkpoint_excluding_main()`（会话主子进程是 park 时，捕获"旁边那一个"），
+  在新用例里先捕获、再往**同一会话** `exec` 一条命令、然后读它的 stdout。
 
-  现象（本次量到 3 次，其中 1 次有标记文件佐证）：约 1/3 的运行卡在"`exec` 返回之后、
-  读到那条命令输出之前"（标记停在 `M5c exec returned`）。卡死瞬间的现场：park 仍在
-  （`T`）、workload 仍在（`S`，计数器继续涨）、**被 exec 的子进程已经不在进程表里**、
-  测试主线程停在 `futex`（`/proc/<tid>/syscall` = 202）——即在某个 `await` 里，而不是
-  阻塞的 `read(2)`（那会是 `pipe_read`）。
+  现象：约 1/3 的运行卡在"`exec` 返回之后、读到那条命令输出之前"，测试主线程停在 `futex`。
 
-  已排除：与 `--nocapture` 无关（两种跑法都出现过）、与并发跑同一用例无关（串行也出现）、
-  与 `exclude_main` 的**捕获本身**无关（同一轮里捕获的两条事实稳定成立：镜像 pid 是
-  workload 的、两个子进程都还活着）。
-  **未定位根因**（需要至少一次现场抓取 + `exec`/退出通知路由的读代码）。
+  **根因（已定位，2026-09-25）**：是**测试夹具**，不是引擎。`#[tokio::test]` 默认是
+  **单线程** runtime，而这个用例在 `read_exact_bytes` 里**阻塞**读子进程的 stdout——
+  那一次阻塞读占住了唯一的线程，于是沙箱的**通知循环**（同一个 runtime 里的一个 task）
+  再也跑不了，被 exec 的孩子的**第一次 `write` 都得不到应答**：读在等一段永远产不出来的
+  输出。之所以间歇，取决于"孩子是否在读开始之前就把输出写完了"。
+  `sandlock-supervise` 跑的是多线程 runtime，**夹具也必须**：改成
+  `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]` 后，那条 exec 断言**连跑 5 次
+  全绿**（0.12–0.14 s）。断言已回到用例里（`test_a_sessions_workload_is_captured_with_the_park_left_out`
+  的第 3 条），并连同"为什么必须多线程"写进用例注释。
+  同一陷阱的另一面见 FUP-30 的本机 half。
 
-  处理：那条 exec 断言先从 core_integ 用例里**撤掉**（用例注释与 `docs/test-baseline.md`
-  都记着它为什么不在），捕获侧的断言与 supervise 侧 `exclude_main` verb 用例保留；
-  产品路径（`pause` 捕获 → `resume` **解冻同一个会话** → 再 exec 命令）由 E2B 侧的集群
-  验收专门覆盖（`docs/checkpoint-restore-e2b-half.md` §6(g)）。**集群那边随后量到的不是这条
-  而是 FUP-30**（被恢复的动态程序直接不见了），两者是否同源未定 —— 都还没有现场栈。
-
-- **FUP-30 「恢复进会话的**动态**程序会死」——route-B 的 resume 因此拿不回真实程序
-  （2026-09-25，集群实测 + 本机 probe）** — 来源：E2B 侧 checkpoint/restore 的集群验收
-  （E2B 仓 `docs/checkpoint-restore-e2b-half.md` §6(g)；实现在本仓
-  `SandboxInstance::restore_into_session`）。
+- **FUP-30 「恢复进会话的**动态**程序会死」——本机 half 同上，集群 half 仍未结
+  （2026-09-25）** — 来源：E2B 侧 checkpoint/restore 的集群验收
+  （E2B 仓 `docs/checkpoint-restore-e2b-half.md` §6(g)）。
 
   集群现象（沙箱 `sbx_330afbc14840a8c5`，worker 重建后 resume）：镜像被**成功**恢复进
   新会话（worker 日志逐字：`resumed … into the session (child 1, pid 30); 4 fd(s) could
@@ -134,20 +128,43 @@
   也就是说：进程在恢复的瞬间被 `sandlock-init` 记为 child 1、被引擎报成 pid 30，
   随后**悄无声息地消失**（worker 侧没有 exit/refusal 日志）。
 
-  本机 probe（同形用例，源码留在 `tmp/probe_dynamic_restore.rs.txt`；没有接进
-  `integration.rs`，因为它今天不绿）：恢复后的 python **确实跑起来了**——sentinel 之后
-  计数器被写到 6——但用例随后卡住（与 FUP-29 同形的 wedge），所以本机能证"动态程序可以
-  被恢复进会话"，**不能**证"在集群形态下稳定"。
+  **本机 half 已关闭（2026-09-25）**：同形的本机用例（`test_a_dynamic_workload_resumes_into_a_session`，
+  现已入套件）在单线程 runtime 下会卡住（就是 FUP-29 那条），在多线程 runtime 下
+  **稳定通过**——恢复后的 python 继续写它的计数器，会话也继续服务 exec；把今天所有引擎改动
+  stash 掉再跑同样通过。⇒ 本机能证"动态程序恢复进会话"这条**引擎能力是好的**，
+  集群那半另有原因。
 
-  与既有用例的唯一差别：所有已绿的恢复用例恢复的都是**静态** `rootfs-helper`；这里是
-  **动态** `python3`（ld.so、brk 堆、libpython 的映射、线程）。集群侧还叠了
-  `E2B_REAL_ROOT=1`（真根：mount ns + pivot_root）这一层，而本机 probe 没有。
+  **剩下的（集群 half）**：与已绿的用例相比只差两轴——**动态**程序（既有用例全是静态
+  `rootfs-helper`）与 **真根**（`E2B_REAL_ROOT=1`：mount ns + pivot_root + image rootfs）。
+  本机把这两轴一起复现的尝试**卡在启动**：`launch_exec` + `chroot(rootfs)` + `real_root(true)`
+  在本 harness 里直接 `Runtime(Child("read notif fd from child: pipe closed before 4 bytes read"))`
+  —— 子进程（init）在装好通道之前就死了，而**它的错误看不见**（会话形态把子进程 stdio 指向
+  `/dev/null`）。probe 源码留在 `tmp/probe_realroot_dynamic_restore.rs.txt`。
+  下一步（按信息量）：① 用**一次性** API 跑同一个 policy（子进程保留调用方的 stderr），
+  读出它到底拒绝了什么；② 修好之后把 probe 接回套件（真根 + 会话 + 动态程序 + restore）；
+  ③ 若本机通了而集群仍红，再上节点抓 stub 的 stderr / 内核日志（容器内 `dmesg` 无权限）。
+  **优先级：高** —— 这是"pause 活过 worker 重启"唯一还没通的环节。
 
-  下一步（按信息量）：① 在集群形态下抓恢复后进程的退出原因（stub 的 stderr / 内核日志
-  —— 容器内 `dmesg` 无权限，需要在节点上跑）；② 在本机把 `E2B_REAL_ROOT` 等价形态
-  （chroot root）套到 probe 上，看是否只需真根就复现；③ 读 `restore_into_session` 与
-  `restore_interactive` 的差异（前者给子进程的 fd/栈/auxv 与后者是否一致）。
-  **优先级：高** —— 这是"pause 活过 worker 重启"唯一还没通的环节，且它落在引擎里。
+- **FUP-31 冻结窗口里的 fork 通知被"忘记"而不是释放（2026-09-25，已修）** — 来源：
+  E2B 的 checkpoint/restore 线上化（写"park 旁边的兄弟进程"这类用例时量到）。
+
+  描述：捕获/冻结会把 fork 通知**box-wide 挂起**（`NotifAction::Hold` = **不应答**），
+  让被冻结子树之外的兄弟进程停在 `fork()` 里；可两处收尾都只做
+  `held_notif_ids.clear()`——**把手里的 id 丢了**，于是那个进程永远停在内核里，
+  没有任何错误、没有任何日志，沙箱只是"某个子树不再前进"。实测：一个 `while :; do /bin/true; done`
+  的 park 在第一次捕获后停住（`held=1`），计数器不再增长。
+
+  **已修（2026-09-25）**：新增 `resource::release_held_forks`（先清 `hold_forks`、
+  再逐个 `seccomp::notif::continue_notification` 应答，答案失败即目标已死、忽略），
+  notify loop 把自己的 fd 发布到 `ResourceState.notif_fd` 供其应答；
+  `Sandbox::thaw` 与 `Instance::capture_checkpoint` 的收尾都改用它。
+
+  RED→GREEN：`test_a_capture_does_not_wedge_a_forking_sibling`（core_integ）——修复前
+  稳定红（`held=1`、park 停在 `fork()`），修复后连跑绿；单测
+  `release_held_forks_drains_and_reports_what_it_released` 钉住"清 flag + 抽干 + 报数"。
+  复现要点写在用例注释里：**多线程 runtime**（否则派发循环在捕获期间根本没机会跑，
+  这个 bug 就永远不会被触发）+ 一个**长窗口**（128 MiB 的 python 负载，dump 就是窗口）+
+  一个**在窗口内持续 fork 的兄弟**（不受 `killpg` 影响的 park）。
 
 - **FUP-24 `kill --all` 的兜底判据仍是「任何发送错误」而不是「连不上」（f1oci，
   2026-09-14）** — 来源：f1oci 对 oci `test_signal_to_sibling_pid_rejected` flake

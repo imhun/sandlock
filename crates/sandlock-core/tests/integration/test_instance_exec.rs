@@ -708,16 +708,26 @@ async fn test_a_child_restored_into_a_session_keeps_the_session_executable() {
 /// 1. the image is the *workload's* address space (its pid, not the park's);
 /// 2. the capture is not a kill: both children keep running, and the workload
 ///    keeps writing (the engine resolved what it stopped);
-/// 3. a session with nothing but the park left still refuses -- the park is not
+/// 3. the session still serves `exec` afterwards, and a command's output comes
+///    back (FUP-29: this assertion used to wedge about one run in three, and
+///    the cause was this *harness*, not the engine -- see the runtime note
+///    below);
+/// 4. a session with nothing but the park left still refuses -- the park is not
 ///    a workload, so "capture the one child beside it" has no answer to give.
 ///
-/// The `exclude_main` **verb** (what a pooled deployment actually calls) and the
-/// `exec`-after-capture path are pinned elsewhere: the verb in
-/// `sandlock-supervise`'s own suite, the exec path by the deployment acceptance
-/// and the (b) restore test -- an exec into a *captured* session wedged in this
-/// harness often enough to be useless as a pin, and that is recorded as FUP-29
-/// rather than papered over.
-#[tokio::test]
+/// The `exclude_main` **verb** (what a pooled deployment actually calls) is
+/// pinned over the wire in `sandlock-supervise`'s own suite.
+///
+/// **Multi-threaded runtime on purpose** (FUP-29's actual root cause): this test
+/// *blocks* the calling thread reading the exec'd child's stdout
+/// (`read_exact_bytes`), and the sandbox's notification loop is a task in the
+/// same runtime. On the default current-thread runtime that blocking read owns
+/// the only thread, so the child's own syscalls (its first `write`) are never
+/// answered: the read waits for output that cannot be produced, and the test
+/// wedges -- intermittently, because it depends on whether the child got its
+/// output out before the read started. `sandlock-supervise` runs a
+/// multi-threaded runtime; the harness has to as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_a_sessions_workload_is_captured_with_the_park_left_out() {
     let helper = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/rootfs-helper")
@@ -822,28 +832,25 @@ async fn test_a_sessions_workload_is_captured_with_the_park_left_out() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // 3. The session still serves exec after being captured.
-    // 3. Not a kill: both children are still registered and the workload is
-    //    still writing after the capture -- which is the "resolve what you
-    //    stopped" half of the engine's capture contract.
-    assert_eq!(session.stats().await.children_live, 2, "both children must live");
-    let seen = read_counter().expect("the workload is still counting");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while read_counter().is_some_and(|v| v <= seen) {
-        assert!(
-            Instant::now() < deadline,
-            "the workload must keep running through the capture"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    // What this test deliberately does *not* do is `exec` into the captured
-    // session: that path wedged intermittently here (one run in three, with the
-    // workload still alive and the exec'd child gone), it is not root-caused,
-    // and the deployment's own acceptance exercises it -- see
-    // `docs/fork-plan-followups.md` FUP-29 (this wedge) and FUP-30 (what the
-    // cluster measured instead: a *dynamic* workload restored into a session is
-    // announced by the engine and then gone from /proc).
+    // 3. The session still serves `exec` after being captured, and the command's
+    //    output comes back. This is the exec-after-capture path FUP-29 chased:
+    //    it wedged one run in three *in this harness* because the runtime was
+    //    single-threaded (see the test's runtime note) -- the engine was fine.
+    let helper = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/rootfs-helper")
+        .canonicalize()
+        .expect("rootfs-helper — build.rs should have compiled it");
+    let helper_s = helper.to_str().unwrap().to_string();
+    let echo = session
+        .exec(&[helper_s.as_str(), "echo", "still-execs"], ExecStdio::Piped)
+        .await
+        .expect("exec after a capture");
+    let out = read_exact_bytes(echo.stdout.expect("piped stdout"), "still-execs\n".len());
+    assert_eq!(String::from_utf8_lossy(&out), "still-execs\n");
+    assert_eq!(
+        session.wait_child(echo.child_id).await.expect("wait the exec"),
+        ExitStatus::Code(0)
+    );
 
     // 4. With the park alone left, there is no workload to capture -- and the
     //    scoped capture says so instead of imaging the park.
@@ -873,5 +880,253 @@ async fn test_a_sessions_workload_is_captured_with_the_park_left_out() {
     let _ = session.kill_child(0, libc::SIGKILL);
     let _ = session.wait_child(0).await;
     let _ = session.shutdown().await;
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+/// A capture must not wedge a **sibling that forks**.
+///
+/// The capture holds fork notifications box-wide for the length of its window
+/// -- which is the whole memory dump, i.e. milliseconds -- while it SIGSTOPs
+/// only the *target's* process group. `NotifAction::Hold` means "do not answer
+/// this notification", so any sandbox process outside that group which forks
+/// during the window parks in `fork()` until somebody answers that id. Both
+/// release paths (`Sandbox::thaw`, and the capture's own thaw) only did
+/// `held_notif_ids.clear()`: the hold was *forgotten*, never released, so the
+/// process stayed blocked in `fork()` forever and nothing reported it.
+///
+/// The sibling here is the session's park: a shell that spawns `/bin/true` in a
+/// loop (~500 forks/s -- enough to overlap, not enough to starve the
+/// single-threaded supervisor that answers them) and publishes its iteration
+/// count. The workload is a python that touches 128 MiB, so the capture window
+/// is *long* (the dump is the window) and dozens of the park's forks land
+/// inside it -- which is what makes this a fact rather than a coin toss.
+///
+/// **Multi-threaded runtime on purpose**: `capture()` is a blocking call
+/// inside an async fn, and the supervisor's notification loop is a task in the
+/// same runtime. On the default (current-thread) runtime the capture would own
+/// the only thread, no notification could be *processed* during the window, and
+/// the hold below could never be exercised -- which is what the first two
+/// versions of this test measured (0 held notifications in a 200 ms window).
+/// `sandlock-supervise` runs a multi-threaded runtime, so that is the shape
+/// that matters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_a_capture_does_not_wedge_a_forking_sibling() {
+    let python = ["/usr/local/bin/python3", "/usr/bin/python3"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.exists())
+        .expect("a python3 to allocate with (this image has one)");
+    let python_s = python.to_str().unwrap().to_string();
+    let workdir = std::env::temp_dir().join(format!(
+        "sandlock-forking-sibling-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&workdir);
+    std::fs::create_dir_all(&workdir).unwrap();
+    let park_progress = workdir.join("park-spawns");
+    let read_park = || {
+        std::fs::read_to_string(&park_progress)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+    // The park forks (and reaps) for as long as it lives.
+    let park = format!(
+        "i=0; while :; do i=$((i+1)); printf '%s' \"$i\" > {}; /bin/true; done",
+        park_progress.display()
+    );
+    // The workload: a big anonymous footprint, so the capture dumps it for a
+    // long time. Every fork the park issues in that window is held.
+    let program = "x = bytearray(128 * 1024 * 1024)\n\
+                   while True:\n\
+                   \x20   x[0] = (x[0] + 1) % 256\n\
+                   \x20   import time; time.sleep(0.05)\n";
+    let policy = base_policy()
+        .fs_read(python.parent().unwrap())
+        .fs_read(&workdir)
+        .fs_write(&workdir)
+        .build()
+        .unwrap();
+
+    let mut session = SandboxInstance::launch_exec(
+        policy.with_name("forking-sibling"),
+        &["sh", "-c", &park],
+    )
+    .await
+    .expect("launch the session whose park forks");
+    let work = session
+        .exec(
+            &[python_s.as_str(), "-c", program],
+            ExecStdio::Piped,
+        )
+        .await
+        .expect("exec the workload");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !read_park().is_some_and(|v| v >= 20) {
+        assert!(
+            Instant::now() < deadline,
+            "the forking park must be running before the capture (park {:?})",
+            read_park()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Let python finish the allocation, so the capture really is the long one.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let before = read_park().unwrap();
+    let cp = session
+        .checkpoint_excluding_main()
+        .await
+        .expect("capture the workload beside the forking park");
+    assert_eq!(cp.process_state.pid, work.pid, "the image is the workload's");
+
+    // The park must keep forking. A health check rather than a race: a shell
+    // spawning /bin/true does hundreds of these per second, so 50 more inside
+    // 10 s is a wide margin -- and with the hold never released it does *zero*.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !read_park().is_some_and(|v| v > before + 50) {
+        assert!(
+            Instant::now() < deadline,
+            "a capture must not wedge a forking sibling: the park was at {before} \
+             and is now at {:?} (its fork notification was held and never \
+             answered)",
+            read_park()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let _ = session.kill_child(work.child_id, libc::SIGKILL);
+    let _ = session.wait_child(work.child_id).await;
+    let _ = session.kill_child(0, libc::SIGKILL);
+    let _ = session.wait_child(0).await;
+    let _ = session.shutdown().await;
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+/// The deployment's shape with a **real program**: a dynamic interpreter.
+///
+/// Everything above uses the static `rootfs-helper`, the shape the restore
+/// engine was developed against. A sandbox runs `python3`/`node`/`sh`: a
+/// dynamically linked ELF with a full `ld.so`, a `brk` heap, libpython's own
+/// mappings and a thread. The cluster acceptance (2026-09-25) captured exactly
+/// that, restored it, and the restored child was **gone** from `/proc` seconds
+/// later while the park and the session stayed healthy -- so this pins the
+/// question where it can be debugged:
+///
+/// 1. a parked session's python workload is captured with `exclude_main`;
+/// 2. it is restored into a *fresh* session;
+/// 3. the restored process keeps writing its counter, from the sentinel value
+///    the test wrote after the source session was torn down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_a_dynamic_workload_resumes_into_a_session() {
+    let Some(python) = ["/usr/local/bin/python3", "/usr/bin/python3"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.exists())
+    else {
+        // Same convention as the restore suite's environment guards: this lane's
+        // image is a python dev image, so the case is real here -- but a lane
+        // without a python must skip rather than report a fake failure.
+        eprintln!("skipping: this image has no python3 to restore");
+        return;
+    };
+    let python_s = python.to_str().unwrap().to_string();
+    let workdir = std::env::temp_dir().join(format!(
+        "sandlock-dynamic-restore-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&workdir);
+    std::fs::create_dir_all(&workdir).unwrap();
+    let counter = workdir.join("clock.cnt");
+    let counter_s = counter.to_str().unwrap().to_string();
+    let read_counter = || {
+        std::fs::read_to_string(&counter)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+    let program = format!(
+        "n = 0\nwhile True:\n    n += 1\n    open({:?}, 'w').write(str(n))\n    import time; time.sleep(0.02)\n",
+        counter_s
+    );
+    let park = "trap '' TERM HUP INT QUIT USR1 USR2 PIPE; while :; do kill -STOP $$; done";
+    let policy = base_policy()
+        .fs_read(python.parent().unwrap())
+        .fs_read(&workdir)
+        .fs_write(&workdir)
+        .build()
+        .unwrap();
+
+    // --- a parked session whose workload is python ---
+    let mut src = SandboxInstance::launch_exec(
+        policy.clone().with_name("dynamic-src"),
+        &["sh", "-c", park],
+    )
+    .await
+    .expect("launch the parked source session");
+    let work = src
+        .exec(&[python_s.as_str(), "-c", program.as_str()], ExecStdio::Piped)
+        .await
+        .expect("exec the python workload");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !read_counter().is_some_and(|v| v >= 3) {
+        assert!(
+            Instant::now() < deadline,
+            "the python workload must run before the capture"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let cp = src
+        .checkpoint_excluding_main()
+        .await
+        .expect("capture the python workload beside the park");
+    assert_eq!(cp.process_state.pid, work.pid, "the image is the workload's");
+    src.shutdown().await.expect("tear the source session down");
+    // Sentinel: only the restored process can move this file now.
+    std::fs::write(&counter, b"0\n").unwrap();
+
+    // --- a fresh session resumes it ---
+    let mut dst = SandboxInstance::launch_exec(
+        policy.with_name("dynamic-dst"),
+        &["sh", "-c", park],
+    )
+    .await
+    .expect("launch the destination session");
+    let resumed = dst
+        .restore_into_session(&cp)
+        .await
+        .expect("restore the python workload into the session");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !read_counter().is_some_and(|v| v > 0) {
+        assert!(
+            Instant::now() < deadline,
+            "the restored python must keep writing its counter (child {} pid {}; \
+             session children_live = {})",
+            resumed.child_id,
+            resumed.pid,
+            dst.stats().await.children_live
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The session still serves exec afterwards: the (b) property, on a real
+    // program rather than on the static helper.
+    let echo = dst
+        .exec(
+            &[python_s.as_str(), "-c", "print('still-execs')"],
+            ExecStdio::Piped,
+        )
+        .await
+        .expect("exec after a dynamic restore");
+    let out = read_exact_bytes(echo.stdout.expect("piped stdout"), "still-execs\n".len());
+    assert_eq!(String::from_utf8_lossy(&out), "still-execs\n");
+    assert_eq!(
+        dst.wait_child(echo.child_id).await.expect("wait the exec"),
+        ExitStatus::Code(0)
+    );
+
+    let _ = dst.kill_child(resumed.child_id, libc::SIGKILL);
+    let _ = dst.kill_child(0, libc::SIGKILL);
+    let _ = dst.wait_child(0).await;
+    let _ = dst.shutdown().await;
     let _ = std::fs::remove_dir_all(&workdir);
 }

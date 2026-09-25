@@ -4,6 +4,7 @@
 // `ProcessIndex`; cleanup on exit is just dropping the entry's `Arc`.
 
 use std::collections::{HashMap, HashSet};
+use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
@@ -32,7 +33,17 @@ pub struct ResourceState {
     /// Whether fork notifications should be held (checkpoint/freeze).
     pub hold_forks: bool,
     /// Notification IDs held during a checkpoint freeze.
+    ///
+    /// `NotifAction::Hold` deliberately does not answer the notification, so
+    /// the sandboxed `fork()` stays parked in the kernel. Whoever ends the
+    /// freeze therefore has to *answer* these ids (see
+    /// [`crate::resource::release_held_forks`]) -- dropping the list instead
+    /// leaves each of those processes blocked in `fork()` forever, with no
+    /// error anywhere.
     pub held_notif_ids: Vec<u64>,
+    /// The supervisor's seccomp notification fd, published by the notify loop
+    /// so the held ids can be answered from outside it. `-1` until then.
+    pub notif_fd: RawFd,
     /// Exponentially-weighted load average.
     pub load_avg: crate::procfs::LoadAvg,
     /// Instant when the supervisor started (for uptime reporting).
@@ -52,6 +63,7 @@ impl ResourceState {
             max_memory_bytes,
             hold_forks: false,
             held_notif_ids: Vec::new(),
+            notif_fd: -1,
             load_avg: crate::procfs::LoadAvg::new(),
             start_instant: std::time::Instant::now(),
         }

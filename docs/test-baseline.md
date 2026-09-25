@@ -115,7 +115,11 @@
 # and core_integ (534 -> 539) move, by the A1/A2 test cases registered below;
 # ffi / cli / supervise / supervise_cost / cli_build / python / oci /
 # supervise_root / mediation_2uid are unchanged.
-core_lib = 911 # 2026-09-25: 910 -> 911, +1: the placement planner must accept targets
+core_lib = 912 # 2026-09-25: 911 -> 912, +1: ending a freeze must *answer* the held
+               # fork notifications instead of dropping them
+               # (`resource::tests::release_held_forks_drains_and_reports_what_it_released`;
+               # the end-to-end half is the core_integ case below).
+               # 2026-09-25: 910 -> 911, +1: the placement planner must accept targets
                # that overlap the received numbers, which is the *real* shape
                # (SCM_RIGHTS lands on the lowest free numbers; the stub wants 3/4/5/6)
                # -- relocation is what makes it safe, and it has to be tried first.
@@ -322,7 +326,16 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 555 # 2026-09-25: 554 -> 555, +1 for the shape a *pooled* deployment
+core_integ = 557 # 2026-09-25: 555 -> 557, +2:
+                 # * `test_a_capture_does_not_wedge_a_forking_sibling` -- a capture
+                 #   holds fork notifications box-wide; releasing the freeze by
+                 #   dropping the ids left that sibling parked in `fork()` forever.
+                 #   Deterministic red before the fix (`held=1`), green after.
+                 # * `test_a_dynamic_workload_resumes_into_a_session` -- the same
+                 #   (b) shape with a real program (python) instead of the static
+                 #   helper, which is what a sandbox actually runs, and what
+                 #   FUP-30 is about. Skips on an image without a python3.
+                 # 2026-09-25: 554 -> 555, +1 for the shape a *pooled* deployment
                  # has: the session's main child is a park, so its workload is the
                  # single child beside it -- `checkpoint()` refuses that shape by
                  # name (asserted byte for byte) and

@@ -974,6 +974,16 @@ fn respond_continue(fd: RawFd, id: u64) -> io::Result<()> {
     send_resp_raw(fd, &resp)
 }
 
+/// Answer one held notification with `CONTINUE` (see `NotifAction::Hold`).
+///
+/// Used by [`crate::resource::release_held_forks`] to end a freeze: the id was
+/// parked on purpose, so the response is "let the syscall run". A failure only
+/// means the target died (or the id was already revoked) -- the caller ignores
+/// it, because there is nothing left to release in that case.
+pub(crate) fn continue_notification(fd: RawFd, id: u64) -> io::Result<()> {
+    respond_continue(fd, id)
+}
+
 /// Send a response that returns -1 with the given errno.
 fn respond_errno(fd: RawFd, id: u64, errno: i32) -> io::Result<()> {
     let resp = SeccompNotifResp {
@@ -2608,6 +2618,17 @@ pub async fn supervisor(
         }
     };
     let fd = async_fd.get_ref().as_raw_fd();
+
+    // Publish the notification fd so a freeze can *release* the
+    // notifications it held: `NotifAction::Hold` deliberately answers
+    // nothing, and the frozen side is the only place that knows when the
+    // window is over (see `resource::release_held_forks`). Without this the
+    // held ids have no way back -- dropping the list leaves those processes
+    // parked in `fork()` forever.
+    {
+        let mut rs = ctx.resource.lock().await;
+        rs.notif_fd = fd;
+    }
 
     // Build the dispatch table once at startup.
     let dispatch_table = Arc::new(super::dispatch::build_dispatch_table(

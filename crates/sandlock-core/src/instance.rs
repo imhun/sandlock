@@ -1974,6 +1974,7 @@ impl SandboxInstance {
             let mut rs = resource.lock().await;
             rs.hold_forks = true;
         }
+        let window_started = std::time::Instant::now();
         unsafe { libc::kill(pid, libc::SIGSTOP) };
         unsafe { libc::killpg(pid, libc::SIGSTOP) };
 
@@ -1982,9 +1983,19 @@ impl SandboxInstance {
         unsafe { libc::killpg(pid, libc::SIGCONT) };
         unsafe { libc::kill(pid, libc::SIGCONT) };
         if let Some(ref resource) = self.supervisor_resource {
-            let mut rs = resource.lock().await;
-            rs.hold_forks = false;
-            rs.held_notif_ids.clear();
+            // Release, do not drop: every held id is a sandboxed `fork()`
+            // parked in the kernel (see `resource::release_held_forks`).
+            let released = crate::resource::release_held_forks(resource).await;
+            // A release is normal (a sibling that forked during the window), so
+            // it is a trace line rather than a warning.
+            if released > 0
+                && std::env::var("SANLOCK_EVENT_TRACE").is_ok_and(|v| v.trim() == "1")
+            {
+                eprintln!(
+                    "sandlock: released {released} fork notification(s) held by the \
+                     checkpoint freeze ({window_started:?} window)"
+                );
+            }
         }
         cp
     }

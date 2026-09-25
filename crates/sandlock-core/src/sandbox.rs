@@ -1614,9 +1614,9 @@ impl Sandbox {
         let pid = rt.leader_pid.or(rt.child_pid)
             .ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         if let Some(ref resource) = rt.supervisor_resource {
-            let mut rs = resource.lock().await;
-            rs.hold_forks = false;
-            rs.held_notif_ids.clear();
+            // Release, do not drop: each held id is a sandboxed `fork()` parked
+            // in the kernel (see `resource::release_held_forks`).
+            crate::resource::release_held_forks(resource).await;
         }
         unsafe { libc::killpg(pid, libc::SIGCONT); }
         Ok(())
