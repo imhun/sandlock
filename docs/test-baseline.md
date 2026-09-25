@@ -115,7 +115,12 @@
 # and core_integ (534 -> 539) move, by the A1/A2 test cases registered below;
 # ffi / cli / supervise / supervise_cost / cli_build / python / oci /
 # supervise_root / mediation_2uid are unchanged.
-core_lib = 909 # 2026-09-25: 904 -> 909, +5 and all five are the descriptor-placement
+core_lib = 910 # 2026-09-25: 909 -> 910, +1: `exec_at_fd` runs a program that exists
+               # only as a descriptor (`execveat(AT_EMPTY_PATH)`), which is how the
+               # restore stub can be a child of the session rather than of the
+               # supervisor -- the stub is a host artifact and is not in the tree the
+               # sandbox's paths resolve against.
+               # 2026-09-25: 904 -> 909, +5 and all five are the descriptor-placement
                # planner a restored session needs (`init::plan_fd_placements` /
                # `wire_fds`): relocation keeps the child's chosen numbers, declining
                # relocation when the reserved range is taken, and the three refusal

@@ -645,6 +645,70 @@ fn spawn(
     unsafe { libc::_exit(127) };
 }
 
+/// `execveat(fd, "", argv, envp, AT_EMPTY_PATH)`: run a program that exists only
+/// as a descriptor.
+///
+/// The restore stub is a host-side build artifact and is **not** in the tree the
+/// sandbox's paths resolve against, so no spelling can name it from inside the
+/// sandbox -- that is the whole reason route A of `docs/chroot-workspace-exec.md`
+/// §11 delivers it as a descriptor. This is the init-side counterpart: the
+/// session's child execs it by fd, which is what lets the resumed process be a
+/// child of `sandlock-init` (and therefore lets the session keep serving `exec`
+/// after a restore).
+///
+/// Failure discipline matches the path arm above: `errno` is read **once**,
+/// immediately, before anything else can overwrite it, and only a non-`ENOENT`
+/// failure earns a line on fd 2 -- the e2b contract pins "127 with no output" for
+/// a program that is simply not there. Returns only on failure.
+#[allow(dead_code)] // STAGED (2026-09-25): called by the placed-exec request, next.
+fn exec_at_fd(fd: RawFd, argv: &[String]) -> ! {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let cargv: Vec<CString> = argv
+        .iter()
+        .filter_map(|a| CString::new(a.as_str()).ok())
+        .collect();
+    let mut ptrs: Vec<*const libc::c_char> = cargv.iter().map(|c| c.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+    // `execveat` needs the environment explicitly (unlike `execvp`, which uses
+    // the ambient one), so it is marshalled here. `vars_os` rather than `vars`:
+    // a launcher may hand the session a non-UTF-8 value, and `vars` panics on
+    // those -- in the post-fork child that panic would be an abort, not an error.
+    let envv: Vec<CString> = std::env::vars_os()
+        .flat_map(|(k, v)| {
+            let mut entry = k.into_vec();
+            entry.push(b'=');
+            entry.extend_from_slice(v.as_bytes());
+            CString::new(entry).ok()
+        })
+        .collect();
+    let mut envp: Vec<*const libc::c_char> = envv.iter().map(|c| c.as_ptr()).collect();
+    envp.push(std::ptr::null());
+
+    crate::realroot::note(&format!(
+        "execveat(fd {fd}) {}",
+        cargv.first().map(|c| c.to_string_lossy()).unwrap_or_default()
+    ));
+    unsafe {
+        libc::syscall(
+            libc::SYS_execveat,
+            fd,
+            b"\0".as_ptr(),
+            ptrs.as_ptr(),
+            envp.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        );
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    crate::realroot::record_failure(&format!("execveat(fd {fd}) failed (errno {errno})"));
+    if errno != libc::ENOENT {
+        exec_fail(&format!(
+            "sandlock-init: exec by fd {fd} failed (errno {errno})\n"
+        ));
+    }
+    unsafe { libc::_exit(127) };
+}
+
 /// Write a child-side setup error to fd 2 and `_exit(125)`. Runs in the
 /// post-fork child; glibc's heap is fork-safe in this single-threaded loop.
 fn child_fail(msg: &str) -> ! {
@@ -1332,6 +1396,35 @@ mod signal_delivery_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A program that exists **only as a descriptor** runs -- the piece that lets
+    /// the restore stub be a child of the session instead of the supervisor's own.
+    #[test]
+    fn exec_at_fd_runs_a_program_that_has_no_path_inside_the_sandbox() {
+        let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/rootfs-helper")
+            .canonicalize()
+            .expect("rootfs-helper — build.rs should have compiled it");
+        let helper = CString::new(helper.to_str().expect("utf8 path")).expect("no NUL");
+        let fd = unsafe { libc::open(helper.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert!(fd >= 0, "open the helper: {}", std::io::Error::last_os_error());
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // The child: exec by descriptor. It does not return.
+            exec_at_fd(fd, &["rootfs-helper".to_string(), "true".to_string()]);
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        unsafe {
+            libc::close(fd);
+        }
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "the helper's `true` must run from a descriptor alone; status {status:#x}"
+        );
+    }
 
     /// `n` pipes, returned as `(one end each, the other ends)`; the caller keeps
     /// both sets open and closes them itself.
