@@ -6,7 +6,7 @@
 //! sandlock-supervise --policy <fd|path.json> --uid <X> \
 //!     (--control-fd <N> [--serve [--token TOKEN]]) | \
 //!     (--serve-path NAME --token TOKEN [--peer-uid UID]...) \
-//!     [--program <fd|path.json>]
+//!     ([--program <fd|path.json>] | [--restore-from DIR])
 //! ```
 //!
 //! 1. **uid self-check first**: the process refuses to start unless
@@ -129,6 +129,22 @@ struct Cli {
     /// or a path to a .json file containing `{"argv": [...]}`.
     #[arg(long, value_name = "FD|PATH.json")]
     program: Option<PolicySource>,
+
+    /// Resume a **checkpoint image** as this slot's generation instead of
+    /// launching a program: a directory written by the `checkpoint` verb
+    /// (`Checkpoint::save`). Mutually exclusive with --program.
+    ///
+    /// The image is self-describing, so the restored sandbox is built from the
+    /// policy *inside it* rather than from --policy (which is still required:
+    /// it is the slot's declared shape and what the uid self-check reads).
+    /// Restoring under a different policy than the one the memory was captured
+    /// under would be a different sandbox wearing the same pid.
+    ///
+    /// A restored generation serves config/stats/shutdown and **refuses exec by
+    /// name** -- it resumes a process, not the `sandlock-init` session exec
+    /// rides on (see `RestoredGeneration`).
+    #[arg(long = "restore-from", value_name = "DIR")]
+    restore_from: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -207,6 +223,13 @@ fn run(cli: Cli) -> Result<()> {
 
     // 3. Optional workload program spec (launch-first; parse failures name
     //    the field, same fail-closed posture as the policy).
+    if cli.restore_from.is_some() && cli.program.is_some() {
+        bail!(
+            "--restore-from and --program are mutually exclusive: a generation either \
+             resumes an image or launches a program, and doing both would race two \
+             owners for one pid"
+        );
+    }
     let program = match &cli.program {
         Some(source) => {
             let bytes = read_document(source).context("program read failed")?;
@@ -262,6 +285,20 @@ fn run(cli: Cli) -> Result<()> {
             let channel = RegisteredPathChannel::bind_with_token(name, cli.peer_uid.clone(), token)
                 .with_context(|| format!("bind registered path channel {name:?}"))?;
             let listener = channel.listener();
+            // A restored generation serves the same channel with a different
+            // handler: the transport/auth/framing are shared, the thing being
+            // served is not (it resumes a process instead of creating a
+            // session), and the verbs it cannot serve are refused by name.
+            if let Some(image_dir) = cli.restore_from.as_deref() {
+                return sandlock_supervise::serve::serve_registered_path_restored(
+                    &listener,
+                    token,
+                    &cli.peer_uid,
+                    image_dir,
+                    name,
+                )
+                .map_err(anyhow::Error::msg);
+            }
             sandlock_supervise::serve::serve_registered_path(
                 &listener,
                 token,

@@ -1221,6 +1221,238 @@ pub fn serve_registered_path(
     }
 }
 
+/// A generation **restored from a checkpoint image** (`--restore-from`).
+///
+/// Deliberately not a [`Generation`]. `restore_interactive` resumes a captured
+/// *process*, which is a different animal from the `sandlock-init` session a
+/// created generation serves: the verbs that ride on init cannot be served over
+/// it. `exec` is the one that matters, and the engine already has the wording
+/// for it -- OCI's restore path answers `exec is not supported on a restored
+/// container`, because exec is relayed through init and a restore has none. So
+/// this mode serves the verbs that are honest for a resumed process
+/// (`config`/`stats`/`shutdown`) and refuses the rest **by name**, rather than
+/// pretending to be a created generation and failing somewhere deeper.
+///
+/// The policy comes from the image, not from the slot's own `--policy`: a
+/// checkpoint is self-describing (its `policy` is the `Sandbox` the memory was
+/// captured under), and restoring those bytes under a different policy would be
+/// a different sandbox wearing the same pid.
+///
+/// Lifecycle matches the created path in the way the worker can observe: when
+/// the resumed process exits, the slot **keeps serving** and `stats` reports
+/// `Exited` (`test_supervise_main_exit_ends_generation_cleanly` pins the same
+/// property for a created generation) -- the worker owns the decision to end
+/// the slot.
+pub struct RestoredGeneration {
+    /// The policy the image was captured under; also what `config` reports.
+    policy: Arc<Sandbox>,
+    sandbox: Sandbox,
+    rt: tokio::runtime::Runtime,
+    /// Host pid of the resumed process (its own process-group id).
+    child_pid: i32,
+    /// What the restore could not bring back (sockets, pipes, memfds). Reported
+    /// rather than hidden: a caller that has to tell a user "your connections do
+    /// not come back" reads exactly this.
+    restore_skipped: Vec<sandlock_core::SkippedFd>,
+}
+
+impl RestoredGeneration {
+    /// Load `image_dir` and resume it as this slot's generation.
+    ///
+    /// The restore itself is the only async step; everything this slot then
+    /// serves is synchronous, like the created path.
+    pub fn new(image_dir: &str, name: &str) -> Result<RestoredGeneration, String> {
+        let cp = sandlock_core::Checkpoint::load(std::path::Path::new(image_dir))
+            .map_err(|e| format!("load checkpoint image {image_dir:?}: {e}"))?;
+        // The image carries the policy that produced the memory, and the
+        // restored process has to come back under it.
+        let mut sandbox = cp.policy.clone();
+        sandbox.set_name(name);
+        let policy = Arc::new(cp.policy.clone());
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("build restore runtime: {e}"))?;
+        // The returned `Process` is the live child handle; dropping it is what
+        // OCI's restore path does too, and core's own doc says why that is safe:
+        // the child runs until the `Sandbox` is dropped, so ownership stays with
+        // the sandbox we keep (and kill) rather than with a handle we would have
+        // to make self-referential.
+        let _ = rt
+            .block_on(sandbox.restore_interactive(&cp))
+            .map_err(|e| format!("restore {image_dir:?}: {e}"))?;
+        let child_pid = sandbox.pid().unwrap_or(0);
+        if child_pid <= 0 {
+            return Err(format!(
+                "restore {image_dir:?} reported no child pid; refusing to serve a \
+                 generation that is not there"
+            ));
+        }
+        let restore_skipped = sandbox.restore_skipped().to_vec();
+        Ok(RestoredGeneration {
+            policy,
+            sandbox,
+            rt,
+            child_pid,
+            restore_skipped,
+        })
+    }
+
+    /// Whether the resumed process is still **running**.
+    ///
+    /// `kill(pid, 0)` alone is not enough, and the difference is not academic:
+    /// a resumed process that dies stays a **zombie** until this slot reaps it
+    /// (it is our child), and `kill` on a zombie succeeds -- so the naive probe
+    /// reports `Live` for a corpse. Measured while building this: a workload
+    /// that segfaulted on restore was reported `Live` forever, with
+    /// `/proc/<pid>/stat` saying `Z`. Read the state instead, and treat "no
+    /// /proc entry" as gone too.
+    fn child_alive(&self) -> bool {
+        if self.child_pid <= 0 {
+            return false;
+        }
+        match std::fs::read_to_string(format!("/proc/{}/stat", self.child_pid)) {
+            // Field 3 is the state char; `Z` (zombie) means it has already
+            // exited and is only waiting to be reaped.
+            Ok(stat) => stat
+                .split_whitespace()
+                .nth(2)
+                .is_some_and(|state| state != "Z" && state != "X"),
+            Err(_) => false,
+        }
+    }
+
+    fn stats_value(&mut self) -> serde_json::Value {
+        let live = self.child_alive();
+        serde_json::json!({
+            "launched": true,
+            // Named so a caller cannot mistake this for a created generation:
+            // `exec` is not served here, and the worker has to know that
+            // before it tries.
+            "restored": true,
+            "instance_state": if live { "Live" } else { "Exited" },
+            // A restored generation is exactly one resumed process (init is
+            // what a created generation counts siblings through, and a restore
+            // has none).
+            "children_live": if live { 1 } else { 0 },
+            "pid": if self.child_pid > 0 { Some(self.child_pid) } else { None },
+            "guest_uid": if self.policy.userns_self_map {
+                "uid-0-in-userns"
+            } else {
+                "host-uid"
+            },
+            // The honest part of "restore": sockets/pipes/memfds do not come
+            // back, and the caller gets to say so instead of the sandbox
+            // failing at its first read.
+            "restore_skipped": self
+                .restore_skipped
+                .iter()
+                .map(|f| serde_json::json!({ "fd": f.fd, "path": f.path }))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// End the generation: kill the resumed process and reap it.
+    ///
+    /// `kill` reaches the process group (core sets it up as its own group
+    /// leader), so anything the resumed workload spawned dies with it -- the
+    /// same collapse the created path performs.
+    fn finish(&mut self) -> Result<(), String> {
+        if self.child_pid > 0 {
+            let _ = self.sandbox.kill();
+            let _ = self.rt.block_on(self.sandbox.wait());
+        }
+        Ok(())
+    }
+}
+
+impl ControlHandler for RestoredGeneration {
+    fn handle(
+        &mut self,
+        stream: &mut UnixStream,
+        req: &ControlRequest,
+        _fds: &[OwnedFd],
+    ) -> ServeOutcome {
+        match req.verb.as_str() {
+            "config" => {
+                let profile = sandbox_to_profile(&self.policy, &[]);
+                let data = serde_json::to_value(&profile).unwrap_or_else(
+                    |e| serde_json::json!({"error": format!("serialize config: {e}")}),
+                );
+                let _ = write_response_frame(stream, &ok_response(data));
+                ServeOutcome::Continue
+            }
+            "stats" => {
+                let data = self.stats_value();
+                let _ = write_response_frame(stream, &ok_response(data));
+                ServeOutcome::Continue
+            }
+            "shutdown" => {
+                let resp = match self.finish() {
+                    Ok(()) => ok_response(serde_json::json!({})),
+                    Err(e) => err_response(&Refusal::refused(e)),
+                };
+                let _ = write_response_frame(stream, &resp);
+                ServeOutcome::Shutdown
+            }
+            // The one verb whose refusal is a *property of the engine* rather
+            // than of this mode, so it keeps the engine's wording: exec is
+            // relayed through `sandlock-init`, and a restored generation has no
+            // init to relay through.
+            "exec" => {
+                let _ = write_response_frame(
+                    stream,
+                    &err_response(&Refusal::refused(
+                        "exec is not supported on a restored container: exec is relayed \
+                         through the session's sandlock-init, and a restored generation \
+                         resumes a process rather than creating a session",
+                    )),
+                );
+                ServeOutcome::Continue
+            }
+            other => {
+                let _ = write_response_frame(
+                    stream,
+                    &err_response(&Refusal::refused(format!(
+                        "{other} is not available on a restored generation: it needs the \
+                         session a created generation has (see `stats.restored`)"
+                    ))),
+                );
+                ServeOutcome::Continue
+            }
+        }
+    }
+}
+
+/// Serve a registered-path channel for a generation **restored from an image**.
+///
+/// Same transport, same auth and same framing as [`serve_registered_path`] (both
+/// go through core's `serve_registered_once`); the difference is what is being
+/// served, which is why the handler is a different type rather than a flag on
+/// [`Generation`].
+pub fn serve_registered_path_restored(
+    listener: &Arc<UnixListener>,
+    token: &str,
+    allowed_peer_uids: &[u32],
+    image_dir: &str,
+    name: &str,
+) -> Result<(), String> {
+    let mut generation = RestoredGeneration::new(image_dir, name)?;
+    let mut abnormal_ends = AbnormalEndLog::default();
+    loop {
+        match serve_registered_once(listener, token, allowed_peer_uids, &mut generation) {
+            Some(ServeOutcome::Continue) => {}
+            Some(ServeOutcome::Shutdown) => return generation.finish(),
+            Some(ServeOutcome::PeerGone) => {
+                if let Some(total) = abnormal_ends.note() {
+                    eprintln!("{}", registered_abnormal_end_line(total));
+                }
+            }
+            None => return Err("registered listener accept failed".to_string()),
+        }
+    }
+}
+
 /// Read a policy/program document from an already-open fd with a timeout and
 /// a hard size cap: the fd is a one-shot trusted startup transport (the
 /// launcher writes the JSON once and closes), so a peer that stalls past the

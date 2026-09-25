@@ -1164,6 +1164,33 @@ fn spawn_serving_slot(
     token: &str,
     program: Option<&std::path::Path>,
 ) -> (std::process::Child, PathBuf) {
+    spawn_slot_with(ctl_root, policy, name, token, program, None)
+}
+
+/// Spawn a `--serve-path` slot that **restores** a checkpoint image instead of
+/// launching a program.
+///
+/// The policy is still passed (it is what the slot declares and what its uid
+/// self-check reads), but the restored sandbox is built from the policy inside
+/// the image -- see `serve::RestoredGeneration`.
+fn spawn_restoring_slot(
+    ctl_root: &std::path::Path,
+    policy: &std::path::Path,
+    name: &str,
+    token: &str,
+    image_dir: &str,
+) -> (std::process::Child, PathBuf) {
+    spawn_slot_with(ctl_root, policy, name, token, None, Some(image_dir))
+}
+
+fn spawn_slot_with(
+    ctl_root: &std::path::Path,
+    policy: &std::path::Path,
+    name: &str,
+    token: &str,
+    program: Option<&std::path::Path>,
+    restore_from: Option<&str>,
+) -> (std::process::Child, PathBuf) {
     let mut cmd = Command::new(bin());
     cmd.args([
         "--policy",
@@ -1177,6 +1204,9 @@ fn spawn_serving_slot(
     ]);
     if let Some(program) = program {
         cmd.args(["--program", program.to_str().unwrap()]);
+    }
+    if let Some(image_dir) = restore_from {
+        cmd.args(["--restore-from", image_dir]);
     }
     cmd.env("SANDBOX_CTL_ROOT", ctl_root)
         .stdout(std::process::Stdio::piped())
@@ -3197,6 +3227,225 @@ fn test_supervise_refusal_carries_the_generation_closed_code() {
         "the generation must still end cleanly; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let _ = std::fs::remove_file(&policy);
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+/// `--restore-from` resumes a captured generation as a slot -- and the slot is
+/// explicit about what a resumed process cannot do.
+///
+/// This is the second half of the checkpoint verb: the worker's route-B slot
+/// owns the `Sandbox`, so a resume has to happen *in a slot*, started from the
+/// image. The test does the whole round trip the way a worker will: capture in
+/// one slot, end it, bring the generation back in another.
+///
+/// What a caller depending on "my paused work comes back" needs:
+///
+/// * the resumed process is really *running* -- asserted the strong way, by
+///   watching the workload's own counter keep advancing after the restore (a
+///   live pid would also be produced by a process stuck on its first
+///   instruction);
+/// * the slot says it is a restored generation (`stats.restored`) and **refuses
+///   `exec` by name**: exec rides on the session's `sandlock-init`, and a
+///   restore resumes a process instead of creating a session -- a caller that
+///   did not know this would meet a sandbox that answers everything except the
+///   verb it actually wants;
+/// * ending it is clean: the process group is gone and the slot exits 0.
+///
+/// The workload is `tests/rootfs-helper` (`clock-loop`), the static counter loop
+/// the rest of the restore suite uses. That is deliberate: it is the shape the
+/// engine's restore is *covered* for. A dynamic workload that segfaults on
+/// restore would be an engine finding, not a slot finding, and mixing the two
+/// here would make this test unable to say which side broke --
+/// `docs/checkpoint-restore-e2b-half.md` records what the slot path measured
+/// with `/bin/sh` and `python3`.
+#[test]
+fn test_supervise_restore_from_an_image_resumes_a_serving_slot() {
+    let ctl_root = isolate_ctl_root();
+    let workdir = repo_tmp_dir().join(format!("supervise-restore-{}", std::process::id()));
+    std::fs::create_dir_all(&workdir).expect("create restore workdir");
+    let image = workdir.join("image");
+    let counter = workdir.join("clock.cnt");
+    let helper = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/rootfs-helper")
+        .canonicalize()
+        .expect("rootfs-helper not found — build.rs should have compiled it");
+    let helper_dir = helper.parent().unwrap().to_str().unwrap().to_string();
+    let mut readable = base_read_paths();
+    readable.push(helper_dir);
+    readable.push(workdir.to_str().unwrap().to_string());
+    let policy = write_policy(
+        "restore-src",
+        &serde_json::json!({
+            "fs_readable": readable,
+            "fs_writable": [workdir.to_str().unwrap()],
+        })
+        .to_string(),
+    );
+    let program = write_policy(
+        "restore-program",
+        &serde_json::json!({
+            "argv": [
+                helper.to_str().unwrap(),
+                "clock-loop",
+                counter.to_str().unwrap(),
+            ]
+        })
+        .to_string(),
+    );
+    let token = "restore-token-0123456789abcdef";
+    let read_counter = |path: &std::path::Path| -> Option<u64> {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+
+    // ---- capture it in a normal (created) generation ----
+    let name = format!("supervise-restore-src-{}", std::process::id());
+    let (child, sock_path) =
+        spawn_serving_slot(&ctl_root, &policy, &name, token, Some(&program));
+    wait_until(
+        Instant::now() + Duration::from_secs(15),
+        "the workload counter to start moving",
+        || read_counter(&counter).is_some_and(|v| v >= 3),
+    );
+    let resp = registered_verb_args(
+        &sock_path,
+        token,
+        "checkpoint",
+        serde_json::json!({ "dir": image.to_str().unwrap(), "name": "sbx-restore" }),
+    );
+    assert_eq!(
+        resp["ok"],
+        serde_json::Value::Bool(true),
+        "checkpoint: {resp:?}"
+    );
+    let captured_pid = resp["data"]["pid"].as_i64().expect("captured pid");
+    let resp = registered_verb(&sock_path, token, "shutdown");
+    assert_eq!(
+        resp["ok"],
+        serde_json::Value::Bool(true),
+        "shutdown of the capturing slot: {resp:?}"
+    );
+    let out = child.wait_with_output().expect("wait capturing slot");
+    assert!(
+        out.status.success(),
+        "the capturing generation must end cleanly; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    wait_until(
+        Instant::now() + Duration::from_secs(10),
+        "the captured process to be gone with its slot",
+        || !process_alive(captured_pid as i32),
+    );
+    let value_before_restore = read_counter(&counter).expect("counter survived the capture");
+
+    // ---- bring it back in a slot started from the image ----
+    let name2 = format!("supervise-restore-dst-{}", std::process::id());
+    let (child2, sock_path2) =
+        spawn_restoring_slot(&ctl_root, &policy, &name2, token, image.to_str().unwrap());
+
+    let stats = registered_verb(&sock_path2, token, "stats");
+    assert_eq!(stats["ok"], serde_json::Value::Bool(true), "stats: {stats:?}");
+    assert_eq!(
+        stats["data"]["restored"],
+        serde_json::Value::Bool(true),
+        "a caller has to be able to tell a restored generation from a created one: {stats:?}"
+    );
+    assert_eq!(
+        stats["data"]["instance_state"],
+        serde_json::json!("Live"),
+        "the resumed process must be live: {stats:?}"
+    );
+    assert_eq!(
+        stats["data"]["children_live"],
+        serde_json::json!(1),
+        "a restored generation is exactly one resumed process: {stats:?}"
+    );
+    let resumed_pid = stats["data"]["pid"].as_i64().expect("resumed pid");
+    assert!(resumed_pid > 0, "resumed pid: {stats:?}");
+
+    // The strong assertion: the resumed process is *executing*, so its counter
+    // advances past where the capture left it.
+    wait_until(
+        Instant::now() + Duration::from_secs(15),
+        "the resumed workload to make progress",
+        || read_counter(&counter).is_some_and(|v| v > value_before_restore),
+    );
+
+    // A resumed process that dies must be reported as gone, not as live. It
+    // stays a **zombie** until this slot reaps it, and `kill(pid, 0)` succeeds
+    // on a zombie -- measured while building this: the first version of
+    // `child_alive` called a segfaulted workload `Live` forever, which is the
+    // one question a resume exists to answer.
+    unsafe { libc::kill(resumed_pid as i32, libc::SIGKILL) };
+    wait_until(
+        Instant::now() + Duration::from_secs(10),
+        "a dead resumed process to be reported as Exited",
+        || {
+            let s = registered_verb(&sock_path2, token, "stats");
+            s["data"]["instance_state"] == serde_json::json!("Exited")
+                && s["data"]["children_live"] == serde_json::json!(0)
+        },
+    );
+
+    // exec is the verb whose absence defines this shape, and the refusal keeps
+    // the engine's own wording -- a caller can tell "this sandbox was restored"
+    // from "something is broken".
+    let exec = registered_verb_args(
+        &sock_path2,
+        token,
+        "exec",
+        serde_json::json!({ "argv": ["/bin/echo", "hi"] }),
+    );
+    assert_eq!(
+        exec["ok"],
+        serde_json::Value::Bool(false),
+        "exec on a restored generation: {exec:?}"
+    );
+    assert!(
+        exec["err"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("exec is not supported on a restored container"),
+        "the refusal must keep the engine's wording: {exec:?}"
+    );
+
+    // Everything else that needs a session is refused by name too, rather than
+    // answered with a shape the caller would misread.
+    let run = registered_verb(&sock_path2, token, "run");
+    assert_eq!(
+        run["ok"],
+        serde_json::Value::Bool(false),
+        "run on a restored generation: {run:?}"
+    );
+    assert!(
+        run["err"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not available on a restored generation"),
+        "an unavailable verb must say so: {run:?}"
+    );
+
+    let resp = registered_verb(&sock_path2, token, "shutdown");
+    assert_eq!(
+        resp["ok"],
+        serde_json::Value::Bool(true),
+        "shutdown of the restored slot: {resp:?}"
+    );
+    let out2 = child2.wait_with_output().expect("wait restored slot");
+    assert!(
+        out2.status.success(),
+        "the restored generation must end cleanly; stderr: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    wait_until(
+        Instant::now() + Duration::from_secs(10),
+        "the resumed process to be gone after shutdown",
+        || !process_alive(resumed_pid as i32),
+    );
+
     let _ = std::fs::remove_file(&policy);
     let _ = std::fs::remove_file(&program);
     let _ = std::fs::remove_dir_all(&workdir);
