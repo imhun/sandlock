@@ -322,7 +322,13 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 554 # 2026-09-25: 553 -> 554, +1 and it is the acceptance test for an
+core_integ = 555 # 2026-09-25: 554 -> 555, +1 for the shape a *pooled* deployment
+                 # has: the session's main child is a park, so its workload is the
+                 # single child beside it -- `checkpoint()` refuses that shape by
+                 # name (asserted byte for byte) and
+                 # `checkpoint_excluding_main()` captures it
+                 # (`test_a_sessions_workload_is_captured_with_the_park_left_out`).
+                 # 2026-09-25: 553 -> 554, +1 and it is the acceptance test for an
                  # exec-capable restore: a checkpoint restored *into a session*, after
                  # which the session still serves `exec` and `children_live` counts the
                  # resumed child (`test_a_child_restored_into_a_session_keeps_the_session_executable`).
@@ -650,7 +656,12 @@ cli = 98      # 2026-09-23: 97 -> 98, +1
               # after F0.4 wiring (cli suite includes net_bind_map tests);
               # F5.1 updates the no-supervisor default validation to
               # DEFAULT_MAX_PROCESSES (256), no count change
-supervise = 54 # 2026-09-25: 53 -> 54, +1: the `restore` verb, which brings an image
+supervise = 55 # 2026-09-25: 54 -> 55, +1: `checkpoint` with `exclude_main`, the flag
+               # a pooled deployment's park-shape session needs -- assert the
+               # refusal without it is byte-exact, and that with it the image is
+               # the workload's pid while both children keep running
+               # (`test_supervise_checkpoint_can_leave_the_parking_main_child_out`).
+               # 2026-09-25: 53 -> 54, +1: the `restore` verb, which brings an image
                # back into a *live* generation (the pooled-slot shape of a resume) and
                # leaves its whole verb surface working.
                # 2026-09-25: 51 -> 53, +2 and both are this lane's own work --

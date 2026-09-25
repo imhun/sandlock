@@ -1431,6 +1431,164 @@ fn test_supervise_checkpoint_writes_an_image_and_leaves_the_generation_running()
     let _ = std::fs::remove_dir_all(&workdir);
 }
 
+/// `exclude_main` is how a **pooled** deployment captures its workload.
+///
+/// envd's route-B sandbox is a launch-first slot whose program is a park: it
+/// exists to keep `sandlock-init` (and therefore `exec`) served, so the main
+/// child is never the workload. Once the user runs something, the session has
+/// two live children and the plain `checkpoint` refuses -- which this test
+/// asserts verbatim, because that refusal is what the deployment must never
+/// paper over. With `exclude_main: true` the same verb captures the single
+/// child *beside* the park, and both children keep running.
+#[test]
+fn test_supervise_checkpoint_can_leave_the_parking_main_child_out() {
+    let ctl_root = isolate_ctl_root();
+    let workdir = repo_tmp_dir().join(format!(
+        "supervise-park-checkpoint-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&workdir).expect("create park checkpoint workdir");
+    let image = workdir.join("image");
+    let evidence = workdir.join("workload.txt");
+    let park_ready = workdir.join("park.txt");
+    let policy = write_policy(
+        "park-checkpoint-instance",
+        &instance_policy(workdir.to_str().expect("workdir utf8")),
+    );
+    // The parking program: never exits, so the session stays exec-capable.
+    let park = write_policy(
+        "park-checkpoint-program",
+        &serde_json::json!({
+            "argv": ["/bin/sh", "-c", format!(
+                "printf 'park-up\\n' > {}; exec sleep 300",
+                park_ready.display()
+            )],
+        })
+        .to_string(),
+    );
+    let name = format!("supervise-park-checkpoint-{}", std::process::id());
+    let token = "park-checkpoint-token-0123456789ab";
+
+    let (child, sock_path) =
+        spawn_serving_slot(&ctl_root, &policy, &name, token, Some(&park));
+    wait_until(
+        Instant::now() + Duration::from_secs(15),
+        "the parking main child",
+        || park_ready.is_file(),
+    );
+
+    // The workload: one exec child that stays alive (this is what a user's
+    // background command looks like from here).
+    let (host_stdin, host_stdout, host_stderr, child_ends) = make_exec_stdio();
+    let resp = registered_exec(
+        &sock_path,
+        token,
+        &[
+            "/bin/sh",
+            "-c",
+            &format!("printf 'workload-up\\n' > {}; exec sleep 300", evidence.display()),
+        ],
+        &child_ends,
+    );
+    for fd in child_ends {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+    assert_eq!(
+        resp["ok"],
+        serde_json::Value::Bool(true),
+        "exec the workload: {resp:?}"
+    );
+    let workload_pid = resp["data"]["pid"].as_i64().expect("workload pid");
+    wait_until(
+        Instant::now() + Duration::from_secs(15),
+        "the workload's evidence file",
+        || evidence.is_file(),
+    );
+
+    let stats = registered_verb(&sock_path, token, "stats");
+    assert_eq!(
+        stats["data"]["children_live"],
+        serde_json::json!(2),
+        "the parked shape is park + workload: {stats:?}"
+    );
+
+    // Without the flag the capture refuses, and says the count.
+    let resp = registered_verb_args(
+        &sock_path,
+        token,
+        "checkpoint",
+        serde_json::json!({ "dir": image.to_str().unwrap() }),
+    );
+    assert_eq!(
+        resp["ok"],
+        serde_json::Value::Bool(false),
+        "a parked session must not be captured blind: {resp:?}"
+    );
+    assert_eq!(
+        resp["err"].as_str(),
+        Some(
+            "instance checkpoint failed: process error: cannot checkpoint an exec \
+             session with 2 live children: a checkpoint image captures one address \
+             space; wait for all but one child first"
+        ),
+        "{resp:?}"
+    );
+    assert!(
+        !image.exists(),
+        "a refused checkpoint must not create an image"
+    );
+
+    // With it, the workload is captured -- and it is the workload's pid.
+    let resp = registered_verb_args(
+        &sock_path,
+        token,
+        "checkpoint",
+        serde_json::json!({ "dir": image.to_str().unwrap(), "exclude_main": true }),
+    );
+    assert_eq!(
+        resp["ok"],
+        serde_json::Value::Bool(true),
+        "exclude_main checkpoint: {resp:?}"
+    );
+    assert_eq!(
+        resp["data"]["pid"].as_i64(),
+        Some(workload_pid),
+        "the image must be the workload's address space, not the park's: {resp:?}"
+    );
+    assert!(image.join("meta.json").is_file(), "image meta.json");
+
+    // Still two live children, still Live: a capture is not a kill.
+    let stats = registered_verb(&sock_path, token, "stats");
+    assert_eq!(stats["data"]["instance_state"], serde_json::json!("Live"));
+    assert_eq!(
+        stats["data"]["children_live"],
+        serde_json::json!(2),
+        "both the park and the workload must survive the capture: {stats:?}"
+    );
+    assert!(
+        process_alive(workload_pid as i32),
+        "the captured workload must still be alive"
+    );
+
+    let resp = registered_verb(&sock_path, token, "shutdown");
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "shutdown: {resp:?}");
+    let out = child.wait_with_output().expect("wait park supervise");
+    assert!(
+        out.status.success(),
+        "a captured parked generation must still end cleanly; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    drop(host_stdin);
+    drop(host_stdout);
+    drop(host_stderr);
+    let _ = std::fs::remove_file(&policy);
+    let _ = std::fs::remove_file(&park);
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
 // ---------------------------------------------------------------------------
 // N25: pushed append accounting and the live per-file tightening.
 // ---------------------------------------------------------------------------

@@ -459,6 +459,23 @@ pub(crate) struct ExecChild {
     net_gen: u64,
 }
 
+/// Which of a session's live children a capture represents.
+///
+/// [`SandboxInstance::checkpoint`] takes the session's single live child and
+/// refuses when a sibling is running, because an image is one address space
+/// and picking one of several is a guess. [`SandboxInstance::checkpoint_excluding_main`]
+/// is the same capture with the session's **main** child (id 0) left out of
+/// that count -- the shape a pooled deployment has, where the main child is a
+/// park that exists only to keep `exec` served.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckpointScope {
+    /// Every live child counts (the historical rule).
+    SoleChild,
+    /// The main child (id 0) does not count; the workload is the single child
+    /// beside it.
+    SoleChildBesidesMain,
+}
+
 impl SandboxInstance {
     // ================================================================
     // Standalone entry point (explicit instance API)
@@ -1863,6 +1880,39 @@ impl SandboxInstance {
     pub async fn checkpoint(
         &mut self,
     ) -> Result<crate::checkpoint::Checkpoint, SandlockError> {
+        self.capture_checkpoint(CheckpointScope::SoleChild).await
+    }
+
+    /// Capture the session's single live child **besides its main child**.
+    ///
+    /// [`Self::checkpoint`] counts every live child, and that is the right rule
+    /// for a session whose main child *is* the workload. A pooled deployment is
+    /// the other shape: `sandlock-init` serves `exec` only while the main child
+    /// lives, so such a generation is launched with a **parking** program whose
+    /// only job is to keep the session alive -- and an envd sandbox, which has
+    /// no workload of its own at launch, is exactly that. Every such sandbox
+    /// that a user has run something in therefore has two live children, and
+    /// the plain capture refuses it (correctly: an image is one address space,
+    /// and guessing which child the caller meant would be worse than saying no).
+    ///
+    /// This is that same capture with the main child explicitly left out of the
+    /// count: the caller states what only it can know -- "my main child is a
+    /// park, the workload is the single child beside it" -- and the engine still
+    /// refuses everything it cannot answer (no workload child, or several).
+    /// The image is the workload's address space alone, which is what
+    /// [`Self::restore_into_session`] puts back as a child of a fresh session.
+    pub async fn checkpoint_excluding_main(
+        &mut self,
+    ) -> Result<crate::checkpoint::Checkpoint, SandlockError> {
+        self.capture_checkpoint(CheckpointScope::SoleChildBesidesMain)
+            .await
+    }
+
+    /// The body of both checkpoint entry points; see [`Self::checkpoint`].
+    async fn capture_checkpoint(
+        &mut self,
+        scope: CheckpointScope,
+    ) -> Result<crate::checkpoint::Checkpoint, SandlockError> {
         self.enter_exec_terminal_if_needed();
         if self.phase != InstancePhase::Live {
             return Err(self.closed_error().into());
@@ -1898,7 +1948,10 @@ impl SandboxInstance {
             .expect("exec session presence checked above")
             .children
             .iter()
-            .filter(|(_, child)| child.status.is_none())
+            .filter(|(id, child)| {
+                child.status.is_none()
+                    && !(scope == CheckpointScope::SoleChildBesidesMain && **id == 0)
+            })
             .map(|(id, child)| (*id, child.pid))
             .collect();
         let pid = match live.len() {

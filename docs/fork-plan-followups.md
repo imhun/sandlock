@@ -97,6 +97,29 @@
   在那之前**保留改写**（它的代价只是每沙箱建箱时一次树走查 + "沙箱看到的文件系统与镜像不同"
   这一点），撤掉的收益不足以承担没有 soak 的风险。
 
+- **FUP-29 「已捕获的（park 形态）会话里再 exec」在本机 harness 上间歇性卡死
+  （2026-09-25，随 `checkpoint_excluding_main` 一起量到）** — 来源：为 E2B 的 route-B 形态
+  新增 `SandboxInstance::checkpoint_excluding_main()`（会话主子进程是 park 时，捕获"旁边
+  那一个"），在 `crates/sandlock-core/tests/integration/test_instance_exec.rs` 的新用例里
+  先捕获、再往**同一会话** `exec` 一条命令、然后读它的 stdout。
+
+  现象（本次量到 3 次，其中 1 次有标记文件佐证）：约 1/3 的运行卡在"`exec` 返回之后、
+  读到那条命令输出之前"（标记停在 `M5c exec returned`）。卡死瞬间的现场：park 仍在
+  （`T`）、workload 仍在（`S`，计数器继续涨）、**被 exec 的子进程已经不在进程表里**、
+  测试主线程停在 `futex`（`/proc/<tid>/syscall` = 202）——即在某个 `await` 里，而不是
+  阻塞的 `read(2)`（那会是 `pipe_read`）。
+
+  已排除：与 `--nocapture` 无关（两种跑法都出现过）、与并发跑同一用例无关（串行也出现）、
+  与 `exclude_main` 的**捕获本身**无关（同一轮里捕获的两条事实稳定成立：镜像 pid 是
+  workload 的、两个子进程都还活着）。
+  **未定位根因**（需要至少一次现场抓取 + `exec`/退出通知路由的读代码）。
+
+  处理：那条 exec 断言先从 core_integ 用例里**撤掉**（用例注释与 `docs/test-baseline.md`
+  都记着它为什么不在），捕获侧的断言与 supervise 侧 `exclude_main` verb 用例保留；
+  产品路径（`pause` 捕获 → `resume` **解冻同一个会话** → 再 exec 命令）由 E2B 侧的集群
+  验收专门覆盖（`docs/checkpoint-restore-e2b-half.md` §6(g)）。**若那边也复现，这条升级为
+  P0**：route-B 沙箱的 resume 正是"同一个会话里再 exec"。
+
 - **FUP-24 `kill --all` 的兜底判据仍是「任何发送错误」而不是「连不上」（f1oci，
   2026-09-14）** — 来源：f1oci 对 oci `test_signal_to_sibling_pid_rejected` flake
   的定真因（见 `docs/CHANGELOG.md` 的 f1oci 两条 + `.superpowers/sdd/task-f1oci-report.md`）。

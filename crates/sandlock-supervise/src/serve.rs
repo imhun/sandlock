@@ -712,6 +712,17 @@ impl Generation {
     /// bring back: which fds are skippable is only known when a restore tries
     /// (`SkippedFd` is computed there), so a caller that has to tell a user
     /// "your connections will not come back" must read the restore reply.
+    ///
+    /// `exclude_main: true` says the caller's session runs a **park** as its
+    /// main child, so the workload is the single child beside it. It exists
+    /// because a launch-first slot always has a main child: `sandlock-init`
+    /// serves `exec` only while that child lives, so a pooled deployment (envd's
+    /// route-B sandbox is exactly this) starts a parking program whose lifetime
+    /// is the session's, and every sandbox a user has run something in then has
+    /// two live children. Without the flag the capture refuses that shape by
+    /// name -- which is what a caller that does *not* know its main child is a
+    /// park must keep getting. The caller states what only it can know; the
+    /// engine still refuses "no workload child" and "several workload children".
     fn handle_checkpoint(
         &mut self,
         args: &serde_json::Value,
@@ -726,14 +737,22 @@ impl Generation {
             .get("name")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        let exclude_main = args
+            .get("exclude_main")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let rt = &self.rt;
         let instance = self.instance.as_mut().ok_or_else(|| {
             Refusal::refused(
                 "generation has no instance: checkpoint requires a launched session",
             )
         })?;
-        let mut cp = rt
-            .block_on(instance.checkpoint())
+        let captured = if exclude_main {
+            rt.block_on(instance.checkpoint_excluding_main())
+        } else {
+            rt.block_on(instance.checkpoint())
+        };
+        let mut cp = captured
             .map_err(|e| Refusal::from_core("instance checkpoint failed", &e))?;
         if let Some(name) = name {
             cp.name = name;

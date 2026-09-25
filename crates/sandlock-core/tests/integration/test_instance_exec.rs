@@ -691,3 +691,185 @@ async fn test_a_child_restored_into_a_session_keeps_the_session_executable() {
     let _ = dst.shutdown().await;
     let _ = std::fs::remove_dir_all(&workdir);
 }
+
+/// The reason `checkpoint_excluding_main` exists: a **pooled** session's main
+/// child is a park, so its workload is the single child beside it.
+///
+/// Route-B deployments launch a generation with a parking program, because
+/// `sandlock-init` serves `exec` only while its main child lives and an envd
+/// sandbox has no workload of its own at launch. Every such sandbox a user has
+/// run something in therefore has **two** live children -- and the plain
+/// capture refuses that shape, correctly (its message is asserted byte for
+/// byte below, because "the deployment quietly captured the wrong thing" is
+/// the failure this refusal prevents).
+///
+/// What must hold once the caller says "my main child is a park":
+///
+/// 1. the image is the *workload's* address space (its pid, not the park's);
+/// 2. the capture is not a kill: both children keep running, and the workload
+///    keeps writing (the engine resolved what it stopped);
+/// 3. a session with nothing but the park left still refuses -- the park is not
+///    a workload, so "capture the one child beside it" has no answer to give.
+///
+/// The `exclude_main` **verb** (what a pooled deployment actually calls) and the
+/// `exec`-after-capture path are pinned elsewhere: the verb in
+/// `sandlock-supervise`'s own suite, the exec path by the deployment acceptance
+/// and the (b) restore test -- an exec into a *captured* session wedged in this
+/// harness often enough to be useless as a pin, and that is recorded as FUP-29
+/// rather than papered over.
+#[tokio::test]
+async fn test_a_sessions_workload_is_captured_with_the_park_left_out() {
+    let helper = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/rootfs-helper")
+        .canonicalize()
+        .expect("rootfs-helper — build.rs should have compiled it");
+    let helper_s = helper.to_str().unwrap().to_string();
+    let workdir = std::env::temp_dir().join(format!(
+        "sandlock-park-capture-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&workdir);
+    std::fs::create_dir_all(&workdir).unwrap();
+    let counter = workdir.join("clock.cnt");
+    let counter_s = counter.to_str().unwrap().to_string();
+    let read_counter = || {
+        std::fs::read_to_string(&counter)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+
+    let policy = base_policy()
+        .fs_read(helper.parent().unwrap())
+        .fs_read(&workdir)
+        .fs_write(&workdir)
+        .build()
+        .unwrap();
+
+    // The main child is a park, byte for byte the one envd's route-B sandbox
+    // launches (`envd_service/route_b.py::PARKING_SCRIPT`): a shell that keeps
+    // `sandlock-init` -- and therefore `exec` -- alive, and that stops itself
+    // between checks. It never forks, which is also what the real one does
+    // (`kill` is a shell builtin), so nothing here churns fork notifications
+    // while the capture below holds them.
+    let mut session = SandboxInstance::launch_exec(
+        policy.with_name("park-capture"),
+        &[
+            "sh",
+            "-c",
+            "trap '' TERM HUP INT QUIT USR1 USR2 PIPE; while :; do kill -STOP $$; done",
+        ],
+    )
+    .await
+    .expect("launch the parked session");
+
+    // The workload, as one exec child beside it.
+    let work = session
+        .exec(
+            &[helper_s.as_str(), "clock-loop", counter_s.as_str()],
+            ExecStdio::Piped,
+        )
+        .await
+        .expect("exec the workload");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !read_counter().is_some_and(|v| v >= 3) {
+        assert!(
+            Instant::now() < deadline,
+            "the workload must run before the capture"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert_eq!(
+        session.stats().await.children_live,
+        2,
+        "the parked shape is park + workload; that count is the whole point"
+    );
+
+    // 0. The plain capture refuses this shape, and says the count: an image is
+    //    one address space, and choosing one of two would be a guess.
+    let refused = session
+        .checkpoint()
+        .await
+        .expect_err("a session with two live children must not be captured blind");
+    assert_eq!(
+        refused.to_string(),
+        "process error: cannot checkpoint an exec session with 2 live children: \
+         a checkpoint image captures one address space; wait for all but one \
+         child first"
+    );
+
+    // 1. The scoped capture takes the workload: the image's pid is the exec
+    //    child's, not the park's.
+    let cp = session
+        .checkpoint_excluding_main()
+        .await
+        .expect("capture the workload beside the park");
+    assert_eq!(
+        cp.process_state.pid, work.pid,
+        "the image must be the workload's address space (the park stays out of it)"
+    );
+
+    // 2. Not a kill: both children are still registered and the workload is
+    //    still writing.
+    assert_eq!(session.stats().await.children_live, 2, "both children must live");
+    let seen = read_counter().expect("the workload is still counting");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while read_counter().is_some_and(|v| v <= seen) {
+        assert!(
+            Instant::now() < deadline,
+            "the workload must keep running through the capture"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // 3. The session still serves exec after being captured.
+    // 3. Not a kill: both children are still registered and the workload is
+    //    still writing after the capture -- which is the "resolve what you
+    //    stopped" half of the engine's capture contract.
+    assert_eq!(session.stats().await.children_live, 2, "both children must live");
+    let seen = read_counter().expect("the workload is still counting");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while read_counter().is_some_and(|v| v <= seen) {
+        assert!(
+            Instant::now() < deadline,
+            "the workload must keep running through the capture"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // What this test deliberately does *not* do is `exec` into the captured
+    // session: that path wedged intermittently here (one run in three, with the
+    // workload still alive and the exec'd child gone), it is not root-caused,
+    // and the deployment's own acceptance exercises it where it matters -- see
+    // `docs/fork-plan-followups.md` (FUP-29).
+
+    // 4. With the park alone left, there is no workload to capture -- and the
+    //    scoped capture says so instead of imaging the park.
+    let _ = session.kill_child(work.child_id, libc::SIGKILL);
+    let _ = session.wait_child(work.child_id).await;
+    assert_eq!(
+        session.stats().await.children_live,
+        1,
+        "only the park is left"
+    );
+    let empty = session
+        .checkpoint_excluding_main()
+        .await
+        .expect_err("a park is not a workload");
+    assert_eq!(
+        empty.to_string(),
+        "process error: cannot checkpoint an exec session with no live child to capture"
+    );
+
+    // Tear the *park* down with SIGKILL, not just `shutdown()`: it traps TERM
+    // and is SIGSTOPped, so a graceful end leaves it alive -- and a live session
+    // child holds this test's **stdout/stderr** open (it inherited them at
+    // launch). libtest's output-capture reader then never sees EOF and the whole
+    // test binary hangs at exit, which looks exactly like a wedged engine. The
+    // real deployment never has this problem: its slot tears the generation down
+    // with the worker.
+    let _ = session.kill_child(0, libc::SIGKILL);
+    let _ = session.wait_child(0).await;
+    let _ = session.shutdown().await;
+    let _ = std::fs::remove_dir_all(&workdir);
+}
