@@ -171,6 +171,154 @@ struct ExecStdioPlan {
     relocated: bool,
 }
 
+/// Base of the range init relocates **caller-chosen** descriptors into.
+///
+/// Distinct from [`EXEC_STDIO_BASE`] on purpose: a stdio plan and a placement
+/// plan can be in flight for the same init (a restore-into-session request
+/// arrives while ordinary execs keep being served), and overlapping ranges would
+/// turn a concurrent `dup` race back into a collision.
+#[allow(dead_code)]
+// STAGED (2026-09-25): the caller is the restore-into-session request, which lands
+// next -- see docs/checkpoint-restore-e2b-half.md §(g). Until then these live only
+// under their own unit tests, and this marker keeps that a visible decision rather
+// than a silent piece of dead code.
+const EXEC_FD_BASE: RawFd = 80;
+
+/// What a caller-chosen descriptor set needs in order to be wired into a child:
+/// the numbers init holds them on, the identity each had when the plan was built,
+/// the numbers the child must end up with, and whether the plan relocated.
+#[allow(dead_code)]
+struct FdPlacementPlan {
+    slots: Vec<RawFd>,
+    expect: Vec<(u64, u64, i32)>,
+    targets: Vec<RawFd>,
+    relocated: bool,
+}
+
+/// Plan the wiring of `received` (the numbers SCM_RIGHTS landed the descriptors
+/// on, which are arbitrary) onto `targets` (the numbers the child must have).
+///
+/// Same reasoning as [`plan_exec_stdio`], one step more general: a caller that
+/// needs descriptors at *specific* numbers in the child -- the restore stub plus
+/// its CTRL/READY/GO channel are the case this exists for -- must not have them
+/// stolen between the fork and the child's wiring, so they are relocated to a
+/// reserved range first, and the child dups them onto the targets.
+///
+/// `None` means "this plan cannot be wired safely", and every reason for it is a
+/// caller error rather than a race: the arrays disagree in length, the targets
+/// are not distinct, a target collides with a number another descriptor already
+/// occupies (the child-side `dup2` would clobber it), or a target sits inside the
+/// reserved range. The caller refuses the request; init never guesses.
+#[allow(dead_code)]
+fn plan_fd_placements(received: &[RawFd], targets: &[RawFd]) -> Option<FdPlacementPlan> {
+    if received.len() != targets.len() || received.is_empty() {
+        return None;
+    }
+    if targets.iter().any(|&t| t < 0) {
+        return None;
+    }
+    let mut sorted = targets.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.len() != targets.len() {
+        return None;
+    }
+    let reserved_end = EXEC_FD_BASE + received.len() as RawFd;
+    if targets.iter().any(|&t| (EXEC_FD_BASE..reserved_end).contains(&t)) {
+        return None;
+    }
+    let expect: Vec<(u64, u64, i32)> = received.iter().map(|&fd| fd_identity(fd)).collect();
+    // A target that another descriptor already sits on would be clobbered by the
+    // child's dup2 loop, whichever order it ran in.
+    let collides = targets
+        .iter()
+        .enumerate()
+        .any(|(i, &t)| received.iter().enumerate().any(|(j, &fd)| j != i && fd == t));
+    if collides {
+        return None;
+    }
+    let reserved_free = received
+        .iter()
+        .all(|&fd| !(EXEC_FD_BASE..reserved_end).contains(&fd))
+        && (EXEC_FD_BASE..reserved_end).all(fd_is_free);
+    if !reserved_free {
+        // Declining is what `plan_exec_stdio` does too, and it must never be
+        // worse than not relocating at all.
+        return Some(FdPlacementPlan {
+            slots: received.to_vec(),
+            expect,
+            targets: targets.to_vec(),
+            relocated: false,
+        });
+    }
+    let mut slots = Vec::with_capacity(received.len());
+    for (i, &fd) in received.iter().enumerate() {
+        let target = EXEC_FD_BASE + i as RawFd;
+        if fd == target {
+            slots.push(fd);
+            continue;
+        }
+        let rc = unsafe { libc::dup3(fd, target, libc::O_CLOEXEC) };
+        if rc < 0 {
+            for &made in &slots {
+                if made >= EXEC_FD_BASE {
+                    unsafe {
+                        libc::close(made);
+                    }
+                }
+            }
+            return Some(FdPlacementPlan {
+                slots: received.to_vec(),
+                expect,
+                targets: targets.to_vec(),
+                relocated: false,
+            });
+        }
+        slots.push(rc);
+    }
+    Some(FdPlacementPlan {
+        slots,
+        expect,
+        targets: targets.to_vec(),
+        relocated: true,
+    })
+}
+
+/// Put each planned descriptor on its target in the **child**, and drop every
+/// scratch number on the way.
+///
+/// The identity check comes first and covers the whole set: a slot that no longer
+/// holds what init put there means somebody else took the number over, and the
+/// workload must not run on a stale guess. `Err(i)` names the offending slot
+/// (same contract as [`wire_exec_stdio`]).
+#[allow(dead_code)]
+fn wire_fds(plan: &FdPlacementPlan) -> Result<(), usize> {
+    for (i, (&fd, &want)) in plan.slots.iter().zip(plan.expect.iter()).enumerate() {
+        if fd_identity(fd) != want {
+            return Err(i);
+        }
+    }
+    for (i, &target) in plan.targets.iter().enumerate() {
+        let fd = plan.slots[i];
+        if fd == target {
+            continue;
+        }
+        unsafe {
+            libc::dup2(fd, target);
+        }
+    }
+    // Drop the scratch numbers: a stray duplicate of, say, the stub fd would
+    // outlive the exec and keep a description alive the child should not hold.
+    for &fd in &plan.slots {
+        if !plan.targets.contains(&fd) && fd > 2 {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// True when `fd` is not currently open (a number the relocation may take over
 /// without destroying somebody else's descriptor).
 fn fd_is_free(fd: RawFd) -> bool {
@@ -1184,6 +1332,110 @@ mod signal_delivery_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `n` pipes, returned as `(one end each, the other ends)`; the caller keeps
+    /// both sets open and closes them itself.
+    fn pipes(n: usize) -> (Vec<RawFd>, Vec<RawFd>) {
+        let mut a = Vec::with_capacity(n);
+        let mut b = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut pair = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe2(pair.as_mut_ptr(), 0) }, 0, "pipe2");
+            a.push(pair[0]);
+            b.push(pair[1]);
+        }
+        (a, b)
+    }
+
+    fn close_all(fds: &[RawFd]) {
+        for &fd in fds {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+
+    /// The restore case in miniature: descriptors arrive on arbitrary numbers and
+    /// must end up on the child's *chosen* ones.
+    #[test]
+    fn placements_relocate_and_keep_the_targets() {
+        let (received, keep) = pipes(4);
+        let targets = [200, 201, 202, 203];
+        let plan = plan_fd_placements(&received, &targets).expect("a plan");
+        assert!(plan.relocated, "the reserved range was free; plan: {plan_slots:?}", plan_slots = plan.slots);
+        assert_eq!(plan.targets, targets);
+        for (i, &slot) in plan.slots.iter().enumerate() {
+            assert_eq!(slot, EXEC_FD_BASE + i as RawFd, "slots are the reserved range");
+            assert_ne!(slot, received[i], "and not the received numbers");
+        }
+        close_all(&plan.slots);
+        close_all(&received);
+        close_all(&keep);
+    }
+
+    /// Declining relocation must never be worse than not having planned at all.
+    #[test]
+    fn placements_decline_when_the_reserved_range_is_taken() {
+        let (received, keep) = pipes(2);
+        // Occupy the first reserved slot.
+        let mut spare = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe2(spare.as_mut_ptr(), 0) }, 0);
+        assert_eq!(unsafe { libc::dup2(spare[0], EXEC_FD_BASE) }, EXEC_FD_BASE);
+        let plan = plan_fd_placements(&received, &[200, 201]).expect("a plan");
+        assert!(!plan.relocated, "the reserved range is not free");
+        assert_eq!(plan.slots, received, "the received numbers are kept");
+        close_all(&[EXEC_FD_BASE]);
+        close_all(&spare);
+        close_all(&received);
+        close_all(&keep);
+    }
+
+    /// A target another descriptor already sits on would be clobbered by the
+    /// child's `dup2` loop, in either order, so the plan is refused instead.
+    #[test]
+    fn placements_refuse_a_target_occupied_by_another_descriptor() {
+        let (received, keep) = pipes(2);
+        assert!(
+            plan_fd_placements(&received, &[received[1], 201]).is_none(),
+            "targets[0] is where the second descriptor already lives"
+        );
+        close_all(&received);
+        close_all(&keep);
+    }
+
+    #[test]
+    fn placements_refuse_targets_that_are_not_distinct_or_are_reserved() {
+        let (received, keep) = pipes(2);
+        assert!(plan_fd_placements(&received, &[200, 200]).is_none(), "duplicate");
+        assert!(
+            plan_fd_placements(&received, &[EXEC_FD_BASE, 201]).is_none(),
+            "a target inside the reserved range cannot be relocated onto safely"
+        );
+        assert!(plan_fd_placements(&received, &[200]).is_none(), "length mismatch");
+        assert!(plan_fd_placements(&[], &[]).is_none(), "an empty set is not a plan");
+        close_all(&received);
+        close_all(&keep);
+    }
+
+    /// The swap check has to run over the whole set before anything is dup'd, and
+    /// it has to name the offending slot.
+    #[test]
+    fn wire_fds_refuses_a_swapped_slot() {
+        let (received, keep) = pipes(2);
+        let plan = plan_fd_placements(&received, &[200, 201]).expect("a plan");
+        let victim = plan.slots[1];
+        unsafe {
+            libc::close(victim);
+        }
+        let mut spare = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe2(spare.as_mut_ptr(), 0) }, 0);
+        assert_eq!(unsafe { libc::dup2(spare[0], victim) }, victim, "swap the slot");
+        assert_eq!(wire_fds(&plan), Err(1), "the second slot no longer holds the plan's fd");
+        close_all(&[victim]);
+        close_all(&spare);
+        close_all(&received);
+        close_all(&keep);
+    }
 
     /// An exec-shaped stdio triple: `(child ends, host ends)`, where the child
     /// ends are `[stdin read, stdout write, stderr write]` — exactly what

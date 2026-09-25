@@ -115,7 +115,13 @@
 # and core_integ (534 -> 539) move, by the A1/A2 test cases registered below;
 # ffi / cli / supervise / supervise_cost / cli_build / python / oci /
 # supervise_root / mediation_2uid are unchanged.
-core_lib = 904 # 2026-09-25: 902 -> 904, +2 and both are the RELRO capture fix
+core_lib = 909 # 2026-09-25: 904 -> 909, +5 and all five are the descriptor-placement
+               # planner a restored session needs (`init::plan_fd_placements` /
+               # `wire_fds`): relocation keeps the child's chosen numbers, declining
+               # relocation when the reserved range is taken, and the three refusal
+               # paths (a target another descriptor sits on, duplicate/reserved
+               # targets, a swapped slot caught before anything is dup'd).
+               # 2026-09-25: 902 -> 904, +2 and both are the RELRO capture fix
                # (`checkpoint::capture::is_relro_map`): one pins that the
                # loader's read-only-but-written range is dumped while `.rodata`
                # is not, the other that the rule does not claim anonymous,
