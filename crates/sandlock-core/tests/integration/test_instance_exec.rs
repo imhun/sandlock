@@ -578,3 +578,116 @@ async fn test_the_session_parent_can_write_into_an_init_spawned_child() {
     let _ = session.kill_child(handle.child_id, libc::SIGKILL);
     let _ = session.shutdown().await;
 }
+
+/// **The acceptance test for (b)**: a checkpoint restored *into a session* keeps
+/// the session executable.
+///
+/// The shape follows from what serves `exec`: the session's `sandlock-init`. A
+/// restore that produces the supervisor's own child can never be exec'd into
+/// again -- OCI's restore path literally answers "exec is not supported on a
+/// restored container" -- so a long-lived sandbox that pauses and resumes has to
+/// get its process back *as a session child*. This asserts the three things a
+/// caller depends on:
+///
+/// 1. the resumed process is running: the workload's counter advances, from a
+///    file zeroed after the source session was torn down, so only the restored
+///    process can have written it;
+/// 2. the session **still serves `exec`** afterwards -- the entire point;
+/// 3. the resumed child is a session child: `children_live` counts it, so
+///    `wait_child`/`kill_child`/shutdown see it like any other exec.
+#[tokio::test]
+async fn test_a_child_restored_into_a_session_keeps_the_session_executable() {
+    let helper = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/rootfs-helper")
+        .canonicalize()
+        .expect("rootfs-helper — build.rs should have compiled it");
+    let helper_s = helper.to_str().unwrap().to_string();
+    let workdir = std::env::temp_dir().join(format!(
+        "sandlock-session-restore-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&workdir);
+    std::fs::create_dir_all(&workdir).unwrap();
+    let counter = workdir.join("clock.cnt");
+    let counter_s = counter.to_str().unwrap().to_string();
+    let read_counter = || {
+        std::fs::read_to_string(&counter)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+
+    // One policy for both sessions: the image was captured under it, and a
+    // restore resolves the image's paths against the session it lands in.
+    let policy = base_policy()
+        .fs_read(helper.parent().unwrap())
+        .fs_read(&workdir)
+        .fs_write(&workdir)
+        .build()
+        .unwrap();
+
+    // --- the session that gets checkpointed (its single child is the counter) ---
+    let mut src = SandboxInstance::launch_exec(
+        policy.clone().with_name("session-restore-src"),
+        &[helper_s.as_str(), "clock-loop", counter_s.as_str()],
+    )
+    .await
+    .expect("launch the session that will be checkpointed");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !read_counter().is_some_and(|v| v >= 3) {
+        assert!(Instant::now() < deadline, "the counter must run before the checkpoint");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let cp = src.checkpoint().await.expect("checkpoint the session");
+    src.shutdown().await.expect("tear the source session down");
+    // Sentinel: from here only the restored process can move this file.
+    std::fs::write(&counter, b"0\n").unwrap();
+
+    // --- the session that resumes it ---
+    // The destination session needs a long-lived first child: a session whose
+    // M0 exits is *over* (that is the documented M0 semantic -- main exit
+    // collapses the container), so a `true` here would tear the session down
+    // before anything could be restored into it.
+    let mut dst = SandboxInstance::launch_exec(
+        policy.clone().with_name("session-restore-dst"),
+        &["sh", "-c", "exec sleep 30"],
+    )
+    .await
+    .expect("launch the session that resumes");
+    let resumed = dst
+        .restore_into_session(&cp)
+        .await
+        .expect("restore into the session");
+
+    // 1. It is running.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !read_counter().is_some_and(|v| v > 0) {
+        assert!(
+            Instant::now() < deadline,
+            "the restored process must resume and advance the counter"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // 2. The session still execs. This is the assertion the (b) shape exists for:
+    //    the same resume delivered to the supervisor's own child cannot do this.
+    let echo = dst
+        .exec(&[helper_s.as_str(), "echo", "still-execs"], ExecStdio::Piped)
+        .await
+        .expect("exec after a restore");
+    let out = read_exact_bytes(echo.stdout.expect("piped stdout"), "still-execs\n".len());
+    assert_eq!(String::from_utf8_lossy(&out), "still-execs\n");
+    let exit = dst.wait_child(echo.child_id).await.expect("wait the exec");
+    assert_eq!(exit, ExitStatus::Code(0));
+
+    // 3. The resumed child is a session child, not a stranger beside it.
+    let stats = dst.stats().await;
+    assert!(
+        stats.children_live >= 1,
+        "the restored child must be counted by the session: {stats:?}"
+    );
+
+    // And the resumed child is addressable like any other exec.
+    let _ = dst.kill_child(resumed.child_id, libc::SIGKILL);
+    let _ = dst.shutdown().await;
+    let _ = std::fs::remove_dir_all(&workdir);
+}

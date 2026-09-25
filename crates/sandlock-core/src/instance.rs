@@ -342,6 +342,11 @@ pub struct SandboxInstance {
     // The interactive child took the terminal's foreground process group at
     // spawn; whoever reaps it must hand the foreground back to this process.
     pub(crate) tty_foreground_taken: bool,
+    /// Fds the last [`SandboxInstance::restore_into_session`] could not recreate
+    /// (sockets, pipes, memfds, pseudo-filesystem paths); the resumed process runs
+    /// without them. Empty until a restore happens -- same meaning as
+    /// [`Sandbox::restore_skipped`], reported on the session that owns the child.
+    pub(crate) restore_skipped: Vec<crate::checkpoint::SkippedFd>,
     /// Session phase (see [`InstancePhase`]).
     pub(crate) phase: InstancePhase,
     /// COW-branch disposition captured when the session was provisioned.
@@ -541,6 +546,25 @@ impl SandboxInstance {
         // supervisor's own stdio must never fill up with workload output
         // (the legacy launch path discarded captures the same way).
         policy.ensure_runtime()?;
+        // A session is **restore-capable by construction**. `restore_into_session`
+        // delivers the restore stub by descriptor, and Landlock judges a file by
+        // its real path whether or not a descriptor named it -- so the ruleset has
+        // to grant that one *host* file, exactly as `restore_interactive` does for
+        // the one-shot path. It has to happen here because the domain is installed
+        // once, at launch, and a resume cannot add a rule later; and it is the
+        // platform's own static stub, which the guest cannot name (see
+        // docs/chroot-workspace-exec.md §11.6.1 for what this grant is and is not).
+        //
+        // The policy field is `serde(skip)`, so a caller that builds its policy
+        // from the wire document cannot arm this itself -- which is the second
+        // reason to do it here rather than ask.
+        let restore_stub = crate::checkpoint::resume::stub_path();
+        if restore_stub.exists() {
+            let stub_path = restore_stub.canonicalize().unwrap_or(restore_stub);
+            if !policy.fs_readable_host.contains(&stub_path) {
+                policy.fs_readable_host.push(stub_path);
+            }
+        }
         let null = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -1155,6 +1179,206 @@ impl SandboxInstance {
             stderr: host.stderr,
             pty: host.pty,
         })
+    }
+
+    /// Resume a checkpoint image **as a child of this session**.
+    ///
+    /// Same engine as [`Sandbox::restore_interactive`] -- the same plan, the same
+    /// `StubChannel`, the same `finish_restore` handshake -- and one deliberate
+    /// difference that is the whole reason it exists: the child is spawned by the
+    /// session's `sandlock-init`, not by the supervisor. `exec` is served by init,
+    /// so a resumed process that hangs off the supervisor can never be exec'd into
+    /// again (OCI's restore path refuses exactly that case: "exec is not supported
+    /// on a restored container"). Restoring *into* a session keeps `exec`,
+    /// `wait_child`, `kill_child` and the child table working, which is what a
+    /// long-lived sandbox needs after a resume.
+    ///
+    /// The stub's **host** grant is not asked for here, because it cannot be: a
+    /// Landlock domain is installed once, at launch, and `Sandbox::fs_readable_host`
+    /// is deliberately `serde(skip)` (it must not change the policy layout on the
+    /// wire or in an image). `SandboxInstance::launch_exec_inner` therefore arms
+    /// **every** session with that one file's grant -- the same grant
+    /// `Sandbox::restore_interactive` installs for the one-shot path, on the same
+    /// platform-owned static stub the guest cannot name.
+    ///
+    /// One boundary follows from taking the grant at launch: the stub's path
+    /// carries a build hash, so a session created before the stub was rebuilt
+    /// cannot resume into the new one. That shows up as a refusal inside the
+    /// sandbox (the guest's own rules), not as a silent pass.
+    ///
+    /// The image must also have been taken under a policy whose chroot/mount shape
+    /// this session can resolve; the retained snapshot is used, and a plan that
+    /// cannot be built is refused with the reason.
+    pub async fn restore_into_session(
+        &mut self,
+        cp: &crate::checkpoint::Checkpoint,
+    ) -> Result<ExecHandle, SandlockError> {
+        use std::os::fd::{AsRawFd, RawFd};
+        use std::os::unix::fs::OpenOptionsExt;
+
+        self.enter_exec_terminal_if_needed();
+        if self.phase != InstancePhase::Live {
+            return Err(self.closed_error().into());
+        }
+        if let Some(err) = self.drain_if_lifetime_expired().await {
+            return Err(err);
+        }
+        if self.exec_session.is_none() {
+            return Err(Self::not_exec_capable());
+        }
+        let Some(image) = self.policy_image.as_deref() else {
+            return Err(SandboxRuntimeError::Child(
+                "restore: the session kept no policy snapshot".into(),
+            )
+            .into());
+        };
+        let policy: crate::sandbox::Sandbox = bincode::deserialize(image)
+            .map_err(|e| SandboxRuntimeError::Child(format!("restore: policy snapshot: {e}")))?;
+
+        let stub = crate::checkpoint::resume::stub_path();
+        if !stub.exists() {
+            return Err(SandboxRuntimeError::Child(format!(
+                "restore-stub was not built ({}); a C compiler is required to build \
+                 sandlock with checkpoint restore",
+                stub.display()
+            ))
+            .into());
+        }
+        let stub_path = stub.canonicalize().unwrap_or_else(|_| stub.clone());
+
+        let chroot_root = crate::chroot::resolve::resolve_chroot_root(policy.chroot.as_deref())?;
+        let mounts = crate::chroot::resolve::resolve_chroot_mounts(&policy.fs_mount);
+        let plan = crate::checkpoint::restore_blob::plan(cp, chroot_root.as_deref(), &mounts)
+            .map_err(SandboxRuntimeError::Child)?;
+        let channel = crate::checkpoint::resume::StubChannel::new(&plan.blob)
+            .map_err(|e| SandboxRuntimeError::Child(format!("restore control channel: {e}")))?;
+
+        // The stub is a host build artifact that no path inside the sandbox can
+        // name, so it travels as a descriptor: the channel's three ends first, in
+        // the order it reports them, then the stub itself, which is also the
+        // program to execute.
+        let stub_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+            .open(&stub_path)
+            .map_err(|e| {
+                SandboxRuntimeError::Child(format!(
+                    "open the restore stub {}: {e}",
+                    stub_path.display()
+                ))
+            })?;
+        let mut targets: Vec<i32> = Vec::new();
+        let mut raw: Vec<RawFd> = Vec::new();
+        for (child_fd, parent_fd) in channel.extra_fds() {
+            targets.push(child_fd);
+            raw.push(parent_fd);
+        }
+        targets.push(crate::checkpoint::resume::STUB_EXEC_FD);
+        raw.push(stub_fd.as_raw_fd());
+        let exec_index = (targets.len() - 1) as u32;
+
+        let session = self
+            .exec_session
+            .as_ref()
+            .expect("exec session presence checked by callers");
+        let child_id = session.next_child_id;
+        let link = session.link.clone();
+        let req = Req::RunPlacedExec {
+            argv: vec![stub_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "restore-stub".to_string())],
+            // The image is what describes the process; inventing an environment
+            // from the session's would be exactly the kind of guess the format
+            // exists to avoid.
+            env: Vec::new(),
+            targets,
+            exec_index,
+        };
+        let reply = match link.request(child_id, &req, &raw).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.enter_exec_terminal_if_needed();
+                if self.phase() == InstancePhase::Dead {
+                    return Err(SandboxRuntimeError::InstanceDead.into());
+                }
+                return Err(e);
+            }
+        };
+        drop(stub_fd);
+        let pid = match reply {
+            Resp::Started { pid } => pid,
+            Resp::Err { msg } => return Err(SandboxRuntimeError::Child(msg).into()),
+            other => {
+                return Err(SandboxRuntimeError::Child(format!(
+                    "unexpected init reply to RunPlacedExec: {other:?}"
+                ))
+                .into())
+            }
+        };
+        let pid = self.translate_announced_pid(pid)?;
+
+        // Drive the handshake off the async worker: the stub's own `openat` calls
+        // flow through the notify supervisor, which only makes progress while
+        // this instance's runtime is pumped.
+        let (plan, channel, result) = tokio::task::spawn_blocking(move || {
+            let r = crate::checkpoint::resume::finish_restore(pid, &channel, &plan);
+            (plan, channel, r)
+        })
+        .await
+        .map_err(|e| SandboxRuntimeError::Child(format!("restore join error: {e}")))?;
+        drop(channel);
+        result?;
+
+        // Register it like any other attached exec: that is what makes the
+        // resumed process a child *of the session* (waitable, killable, counted)
+        // instead of a stranger standing next to it.
+        let (next_policy, net_gen) = {
+            let session = self
+                .exec_session
+                .as_ref()
+                .expect("exec session presence checked by callers");
+            (session.next_net_policy.clone(), session.next_net_gen)
+        };
+        if let Some(network) = self.supervisor_network.as_ref() {
+            network.lock().await.bind_exec_child(pid, next_policy);
+        }
+        let session = self
+            .exec_session
+            .as_mut()
+            .expect("exec session presence checked by callers");
+        session.next_child_id = child_id + 1;
+        session.children.insert(
+            child_id,
+            ExecChild {
+                pid,
+                pidfd: open_child_pidfd(pid),
+                pty: None,
+                // The restored child's cwd/env came from the image, not from a
+                // request of ours; the default says so instead of pretending.
+                params: ExecParams::default(),
+                status: None,
+                net_gen,
+            },
+        );
+        self.restore_skipped = plan.skipped;
+        self.refresh_idle_state();
+        Ok(ExecHandle {
+            child_id,
+            pid,
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            pty: None,
+        })
+    }
+
+    /// Fds the last [`SandboxInstance::restore_into_session`] could not recreate
+    /// (sockets, pipes, memfds, pseudo-filesystem paths); the resumed process runs
+    /// without them. Empty until a restore happens, and empty afterwards when
+    /// every fd came back -- same meaning as [`Sandbox::restore_skipped`].
+    pub fn restore_skipped(&self) -> &[crate::checkpoint::SkippedFd] {
+        &self.restore_skipped
     }
 
     /// F4.3 (S2): session-level outbound network update.

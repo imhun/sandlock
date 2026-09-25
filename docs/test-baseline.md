@@ -115,7 +115,11 @@
 # and core_integ (534 -> 539) move, by the A1/A2 test cases registered below;
 # ffi / cli / supervise / supervise_cost / cli_build / python / oci /
 # supervise_root / mediation_2uid are unchanged.
-core_lib = 910 # 2026-09-25: 909 -> 910, +1: `exec_at_fd` runs a program that exists
+core_lib = 911 # 2026-09-25: 910 -> 911, +1: the placement planner must accept targets
+               # that overlap the received numbers, which is the *real* shape
+               # (SCM_RIGHTS lands on the lowest free numbers; the stub wants 3/4/5/6)
+               # -- relocation is what makes it safe, and it has to be tried first.
+               # 2026-09-25: 909 -> 910, +1: `exec_at_fd` runs a program that exists
                # only as a descriptor (`execveat(AT_EMPTY_PATH)`), which is how the
                # restore stub can be a child of the session rather than of the
                # supervisor -- the stub is a host artifact and is not in the tree the
@@ -318,7 +322,11 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 553 # 2026-09-25: 552 -> 553, +1 and it is the prerequisite the
+core_integ = 554 # 2026-09-25: 553 -> 554, +1 and it is the acceptance test for an
+                 # exec-capable restore: a checkpoint restored *into a session*, after
+                 # which the session still serves `exec` and `children_live` counts the
+                 # resumed child (`test_a_child_restored_into_a_session_keeps_the_session_executable`).
+                 # 2026-09-25: 552 -> 553, +1 and it is the prerequisite the
                  # restore work's (b) shape rests on: the session's parent can
                  # `process_vm_writev`/`PTRACE_ATTACH` into an init-spawned child
                  # (`test_the_session_parent_can_write_into_an_init_spawned_child`).

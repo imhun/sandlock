@@ -258,6 +258,25 @@ pub enum Req {
         #[serde(default)]
         max_file_size: Option<u64>,
     },
+    /// Run a program **delivered as a descriptor**, with caller-chosen descriptors
+    /// placed in the child: the restore-into-session request.
+    ///
+    /// The descriptors arrive over SCM_RIGHTS in `targets` order. The one at
+    /// `exec_index` *is* the program, executed with `execveat(AT_EMPTY_PATH)` --
+    /// the only way to start something that has no path inside the sandbox, which
+    /// is exactly the restore stub's situation. The others are placed where the
+    /// caller needs them (for a restore: the stub's CTRL/READY/GO channel).
+    ///
+    /// `env` is the child's complete environment (this arm does not inherit):
+    /// a restored process's environment is part of what the image describes, and
+    /// guessing at the session's is exactly the kind of invention the checkpoint
+    /// format exists to avoid.
+    RunPlacedExec {
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+        targets: Vec<i32>,
+        exec_index: u32,
+    },
     /// Instance-level signal: `sandlock-init` delivers `signum` to every
     /// registered child's process group (group-first killpg + pidfd
     /// complement). No pid payload — see the module docs.

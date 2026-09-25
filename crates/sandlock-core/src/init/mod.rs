@@ -177,17 +177,11 @@ struct ExecStdioPlan {
 /// plan can be in flight for the same init (a restore-into-session request
 /// arrives while ordinary execs keep being served), and overlapping ranges would
 /// turn a concurrent `dup` race back into a collision.
-#[allow(dead_code)]
-// STAGED (2026-09-25): the caller is the restore-into-session request, which lands
-// next -- see docs/checkpoint-restore-e2b-half.md §(g). Until then these live only
-// under their own unit tests, and this marker keeps that a visible decision rather
-// than a silent piece of dead code.
 const EXEC_FD_BASE: RawFd = 80;
 
 /// What a caller-chosen descriptor set needs in order to be wired into a child:
 /// the numbers init holds them on, the identity each had when the plan was built,
 /// the numbers the child must end up with, and whether the plan relocated.
-#[allow(dead_code)]
 struct FdPlacementPlan {
     slots: Vec<RawFd>,
     expect: Vec<(u64, u64, i32)>,
@@ -209,7 +203,6 @@ struct FdPlacementPlan {
 /// are not distinct, a target collides with a number another descriptor already
 /// occupies (the child-side `dup2` would clobber it), or a target sits inside the
 /// reserved range. The caller refuses the request; init never guesses.
-#[allow(dead_code)]
 fn plan_fd_placements(received: &[RawFd], targets: &[RawFd]) -> Option<FdPlacementPlan> {
     if received.len() != targets.len() || received.is_empty() {
         return None;
@@ -228,22 +221,26 @@ fn plan_fd_placements(received: &[RawFd], targets: &[RawFd]) -> Option<FdPlaceme
         return None;
     }
     let expect: Vec<(u64, u64, i32)> = received.iter().map(|&fd| fd_identity(fd)).collect();
-    // A target that another descriptor already sits on would be clobbered by the
-    // child's dup2 loop, whichever order it ran in.
-    let collides = targets
-        .iter()
-        .enumerate()
-        .any(|(i, &t)| received.iter().enumerate().any(|(j, &fd)| j != i && fd == t));
-    if collides {
-        return None;
-    }
     let reserved_free = received
         .iter()
         .all(|&fd| !(EXEC_FD_BASE..reserved_end).contains(&fd))
         && (EXEC_FD_BASE..reserved_end).all(fd_is_free);
     if !reserved_free {
-        // Declining is what `plan_exec_stdio` does too, and it must never be
-        // worse than not relocating at all.
+        // Declining relocation is what `plan_exec_stdio` does too -- but here it
+        // has a precondition the stdio case cannot hit: the child's dup2 loop
+        // would clobber a target that another descriptor still occupies. That is
+        // *only* a problem without relocation (relocated sources sit in the
+        // reserved range, far from every target), so it is checked here rather
+        // than up front -- and it is a realistic shape, not a corner: the
+        // restore stub's targets are the fixed 3/4/5/6, while SCM_RIGHTS lands
+        // the received descriptors on the lowest free numbers, which overlap.
+        let collides = targets
+            .iter()
+            .enumerate()
+            .any(|(i, &t)| received.iter().enumerate().any(|(j, &fd)| j != i && fd == t));
+        if collides {
+            return None;
+        }
         return Some(FdPlacementPlan {
             slots: received.to_vec(),
             expect,
@@ -291,7 +288,6 @@ fn plan_fd_placements(received: &[RawFd], targets: &[RawFd]) -> Option<FdPlaceme
 /// holds what init put there means somebody else took the number over, and the
 /// workload must not run on a stale guess. `Err(i)` names the offending slot
 /// (same contract as [`wire_exec_stdio`]).
-#[allow(dead_code)]
 fn wire_fds(plan: &FdPlacementPlan) -> Result<(), usize> {
     for (i, (&fd, &want)) in plan.slots.iter().zip(plan.expect.iter()).enumerate() {
         if fd_identity(fd) != want {
@@ -437,16 +433,84 @@ fn wire_exec_stdio(plan: &ExecStdioPlan, received: [RawFd; 3]) -> Result<(), usi
     Ok(())
 }
 
-/// fork+exec `argv` with optional cwd/env and optional stdio fds (0,1,2).
-/// Returns the child pid, or -1 on fork failure.
-fn spawn(
-    argv: &[String],
-    env: &[(String, String)],
-    cwd: &Option<String>,
+/// How to bring one child up: what to run, and where its descriptors go.
+#[derive(Clone, Copy)]
+struct SpawnSpec<'a> {
+    argv: &'a [String],
+    env: &'a [(String, String)],
+    cwd: &'a Option<String>,
     clean_env: bool,
+    /// The classic stdio triple, as SCM_RIGHTS handed it over.
     stdio: Option<[RawFd; 3]>,
+    /// Caller-chosen placements, already planned against the received numbers.
+    /// Mutually exclusive with `stdio` in practice: an ordinary exec gets its
+    /// three ends, a restore gets its own set (the stub plus CTRL/READY/GO).
+    placements: Option<&'a FdPlacementPlan>,
+    /// Run the program *from* this descriptor (`execveat`, `AT_EMPTY_PATH`)
+    /// instead of resolving `argv[0]` against the sandbox's paths -- the only
+    /// way to start a program that has no path inside the sandbox.
+    exec_fd: Option<RawFd>,
     max_file_size: Option<u64>,
-) -> i32 {
+}
+
+impl<'a> SpawnSpec<'a> {
+    /// The ordinary case: a program found by path, with optional stdio ends.
+    fn by_path(
+        argv: &'a [String],
+        env: &'a [(String, String)],
+        cwd: &'a Option<String>,
+        stdio: Option<[RawFd; 3]>,
+        clean_env: bool,
+        max_file_size: Option<u64>,
+    ) -> SpawnSpec<'a> {
+        SpawnSpec {
+            argv,
+            env,
+            cwd,
+            clean_env,
+            stdio,
+            placements: None,
+            exec_fd: None,
+            max_file_size,
+        }
+    }
+
+    /// The restore-shaped case: descriptors on caller-chosen numbers, and the
+    /// program delivered as one of them.
+    fn placed(
+        argv: &'a [String],
+        env: &'a [(String, String)],
+        cwd: &'a Option<String>,
+        placements: &'a FdPlacementPlan,
+        exec_fd: RawFd,
+    ) -> SpawnSpec<'a> {
+        SpawnSpec {
+            argv,
+            env,
+            cwd,
+            clean_env: true,
+            stdio: None,
+            placements: Some(placements),
+            exec_fd: Some(exec_fd),
+            max_file_size: None,
+        }
+    }
+}
+
+/// fork+exec one child as described by `spec`. Returns the child pid, or -1 on
+/// fork failure.
+fn spawn(spec: &SpawnSpec<'_>) -> i32 {
+    // `SpawnSpec` is `Copy`, so the body below keeps working on plain values.
+    let SpawnSpec {
+        argv,
+        env,
+        cwd,
+        clean_env,
+        stdio,
+        placements,
+        exec_fd,
+        max_file_size,
+    } = *spec;
     // SL-4 belt: the control socket must never survive the workload's execvp.
     // fcntl is async-signal-safe and FD_CLOEXEC is per-fd-table state, so
     // setting it here — in init, before the fork — provably covers every exec
@@ -468,6 +532,17 @@ fn spawn(
         if let Some(plan) = plan.as_ref() {
             if plan.relocated {
                 for &fd in &plan.slots {
+                    unsafe {
+                        libc::close(fd);
+                    }
+                }
+            }
+        }
+        // Same for a placement plan: those copies were made for the child too,
+        // and init keeping one would leak it into every later exec.
+        if let Some(placements) = placements {
+            if placements.relocated {
+                for &fd in &placements.slots {
                     unsafe {
                         libc::close(fd);
                     }
@@ -550,7 +625,15 @@ fn spawn(
             }
         }
     }
-    if let (Some(plan), Some(received)) = (plan.as_ref(), stdio) {
+    if let Some(placements) = placements {
+        // The caller's own set (a restore's stub plus its control fds): the plan
+        // already knows where each descriptor has to land, and the same
+        // swap check applies -- a slot somebody else took over is named, never
+        // wired.
+        if let Err(slot) = wire_fds(placements) {
+            exec_placements_swapped(slot, placements);
+        }
+    } else if let (Some(plan), Some(received)) = (plan.as_ref(), stdio) {
         // FUP-23: a slot that no longer holds the description init relocated is
         // a slot somebody else took over — never run the workload on it.
         if let Err(slot) = wire_exec_stdio(plan, received) {
@@ -599,6 +682,12 @@ fn spawn(
     let cargv: Vec<CString> = argv.iter().filter_map(|a| CString::new(a.as_str()).ok()).collect();
     let mut ptrs: Vec<*const libc::c_char> = cargv.iter().map(|c| c.as_ptr()).collect();
     ptrs.push(std::ptr::null());
+    // A caller that delivered the program as a descriptor runs it by fd. That is
+    // not a shortcut: the program has no path this sandbox could resolve (the
+    // restore stub is a host artifact), so `execvp` could never find it.
+    if let Some(fd) = exec_fd {
+        exec_at_fd(fd, argv);
+    }
     // Under chroot the sandlock seccomp exec handler rewrites the pathname in
     // place (to /proc/self/fd/N for the injected binary fd). Pass a separate
     // PATH_MAX buffer as the `file` argument so that rewrite cannot clobber
@@ -660,7 +749,6 @@ fn spawn(
 /// immediately, before anything else can overwrite it, and only a non-`ENOENT`
 /// failure earns a line on fd 2 -- the e2b contract pins "127 with no output" for
 /// a program that is simply not there. Returns only on failure.
-#[allow(dead_code)] // STAGED (2026-09-25): called by the placed-exec request, next.
 fn exec_at_fd(fd: RawFd, argv: &[String]) -> ! {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
@@ -707,6 +795,25 @@ fn exec_at_fd(fd: RawFd, argv: &[String]) -> ! {
         ));
     }
     unsafe { libc::_exit(127) };
+}
+
+/// The placement-plan counterpart of [`exec_stdio_swapped`].
+fn exec_placements_swapped(slot: usize, plan: &FdPlacementPlan) -> ! {
+    let msg = format!(
+        "sandlock-init: placed descriptor slot {slot} was replaced between the fork \
+         and the workload start; refusing to run with swapped descriptors\n"
+    );
+    for (i, (&fd, &want)) in plan.slots.iter().zip(plan.expect.iter()).enumerate() {
+        if i != slot && fd_identity(fd) == want {
+            unsafe {
+                libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len());
+            }
+        }
+    }
+    unsafe {
+        libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+        libc::_exit(EXEC_STDIO_SWAPPED_EXIT);
+    }
 }
 
 /// Write a child-side setup error to fd 2 and `_exit(125)`. Runs in the
@@ -1198,7 +1305,8 @@ pub fn run_init() {
                                 replies.push(Resp::Err { msg: "main already running".into() });
                                 continue;
                             }
-                            let pid = spawn(&argv, &env, &cwd, false, None, None);
+                            let pid =
+                                spawn(&SpawnSpec::by_path(&argv, &env, &cwd, None, false, None));
                             if pid < 0 {
                                 replies.push(Resp::Err { msg: "fork failed".into() });
                                 continue;
@@ -1236,14 +1344,14 @@ pub fn run_init() {
                                 exec_fds[1].as_raw_fd(),
                                 exec_fds[2].as_raw_fd(),
                             ];
-                            let pid = spawn(
+                            let pid = spawn(&SpawnSpec::by_path(
                                 &argv,
                                 &env,
                                 &cwd,
-                                clean_env,
                                 Some(stdio),
+                                clean_env,
                                 max_file_size,
-                            );
+                            ));
                             if pid < 0 {
                                 replies.push(Resp::Err { msg: "fork failed".into() });
                                 continue;
@@ -1260,6 +1368,74 @@ pub fn run_init() {
                                     } else {
                                         ChildKind::ExecAttach
                                     },
+                                    pid,
+                                    pgid: pid,
+                                    pidfd: open_child_pidfd(pid),
+                                },
+                            );
+                            replies.push(Resp::Started { pid });
+                        }
+                        Req::RunPlacedExec {
+                            argv,
+                            env,
+                            targets,
+                            exec_index,
+                        } => {
+                            let placed = &received.fds[frame_fds];
+                            // Fail closed on every shape this arm cannot serve:
+                            // a count that disagrees with the plan, an empty set,
+                            // or an exec index that names no target.
+                            if placed.len() != targets.len() || placed.is_empty() {
+                                replies.push(Resp::Err {
+                                    msg: format!(
+                                        "placed exec: {} targets for {} descriptors",
+                                        targets.len(),
+                                        placed.len()
+                                    ),
+                                });
+                                continue;
+                            }
+                            let Some(&exec_fd) = targets.get(exec_index as usize) else {
+                                replies.push(Resp::Err {
+                                    msg: format!(
+                                        "placed exec: exec_index {exec_index} is outside {} targets",
+                                        targets.len()
+                                    ),
+                                });
+                                continue;
+                            };
+                            let received_nums: Vec<RawFd> =
+                                placed.iter().map(|f| f.as_raw_fd()).collect();
+                            let Some(plan) = plan_fd_placements(&received_nums, &targets) else {
+                                replies.push(Resp::Err {
+                                    msg: "placed exec: the descriptor set cannot be wired \
+                                          safely (duplicate/reserved/colliding targets)"
+                                        .into(),
+                                });
+                                continue;
+                            };
+                            let pid = spawn(&SpawnSpec::placed(
+                                &argv,
+                                &env,
+                                &None,
+                                &plan,
+                                exec_fd,
+                            ));
+                            if pid < 0 {
+                                replies.push(Resp::Err { msg: "fork failed".into() });
+                                continue;
+                            }
+                            // Every received descriptor is handed to the child;
+                            // the guard still closes the parent's copies.
+                            handed += placed.len();
+                            // Registered like any other attached exec: the
+                            // session's wait/kill/children_live have to see it,
+                            // which is the whole point of restoring *into* a
+                            // session instead of beside one.
+                            children.insert(
+                                pid,
+                                Child {
+                                    kind: ChildKind::ExecAttach,
                                     pid,
                                     pgid: pid,
                                     pidfd: open_child_pidfd(pid),
@@ -1401,6 +1577,7 @@ mod tests {
     /// the restore stub be a child of the session instead of the supervisor's own.
     #[test]
     fn exec_at_fd_runs_a_program_that_has_no_path_inside_the_sandbox() {
+        let _fd_table = FD_TABLE.lock().unwrap_or_else(|e| e.into_inner());
         let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/rootfs-helper")
             .canonicalize()
@@ -1426,6 +1603,13 @@ mod tests {
         );
     }
 
+    /// The descriptor tests below plan against, dup, and close real numbers in
+    /// **this** process, so they must not overlap each other: `cargo test` runs
+    /// them in parallel by default, and two of them trading the reserved range
+    /// makes the plan decline for a reason that has nothing to do with the case
+    /// under test. One mutex, taken by every test that touches the fd table.
+    static FD_TABLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// `n` pipes, returned as `(one end each, the other ends)`; the caller keeps
     /// both sets open and closes them itself.
     fn pipes(n: usize) -> (Vec<RawFd>, Vec<RawFd>) {
@@ -1440,6 +1624,20 @@ mod tests {
         (a, b)
     }
 
+    /// Free the reserved range. The tests share one process (and therefore one fd
+    /// table), so each one starts from the same state instead of from whatever a
+    /// neighbour left open.
+    fn free_reserved(n: usize) {
+        for i in 0..n {
+            let fd = EXEC_FD_BASE + i as RawFd;
+            if !fd_is_free(fd) {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+        }
+    }
+
     fn close_all(fds: &[RawFd]) {
         for &fd in fds {
             unsafe {
@@ -1452,6 +1650,8 @@ mod tests {
     /// must end up on the child's *chosen* ones.
     #[test]
     fn placements_relocate_and_keep_the_targets() {
+        let _fd_table = FD_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        free_reserved(4);
         let (received, keep) = pipes(4);
         let targets = [200, 201, 202, 203];
         let plan = plan_fd_placements(&received, &targets).expect("a plan");
@@ -1466,9 +1666,54 @@ mod tests {
         close_all(&keep);
     }
 
+    /// The real shape for a restore: SCM_RIGHTS lands the descriptors on the
+    /// lowest free numbers, and the stub wants them at its fixed ones -- so the
+    /// received numbers and the targets overlap. Relocation is what makes that
+    /// safe (sources move to the reserved range first), and this is the case that
+    /// would otherwise refuse every real request.
+    #[test]
+    fn placements_accept_targets_that_overlap_the_received_numbers() {
+        let _fd_table = FD_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        free_reserved(3);
+        let (received, keep) = pipes(3);
+        // A rotation: every target is a number another descriptor occupies.
+        let targets = [received[1], received[2], received[0]];
+        let plan = plan_fd_placements(&received, &targets).expect("overlap must still plan");
+        assert!(
+            plan.relocated,
+            "sources move out of the way first, so nothing can clobber a target"
+        );
+        assert_eq!(plan.targets, targets);
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // The child asserts the wiring: each descriptor, on its target.
+            if wire_fds(&plan).is_err() {
+                unsafe { libc::_exit(1) }
+            }
+            for (i, &target) in plan.targets.iter().enumerate() {
+                if fd_identity(target) != plan.expect[i] {
+                    unsafe { libc::_exit(2) }
+                }
+            }
+            unsafe { libc::_exit(0) }
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "each descriptor must land on its target; status {status:#x}"
+        );
+        close_all(&plan.slots);
+        close_all(&received);
+        close_all(&keep);
+    }
+
     /// Declining relocation must never be worse than not having planned at all.
     #[test]
     fn placements_decline_when_the_reserved_range_is_taken() {
+        let _fd_table = FD_TABLE.lock().unwrap_or_else(|e| e.into_inner());
         let (received, keep) = pipes(2);
         // Occupy the first reserved slot.
         let mut spare = [0i32; 2];
@@ -1483,21 +1728,32 @@ mod tests {
         close_all(&keep);
     }
 
-    /// A target another descriptor already sits on would be clobbered by the
-    /// child's `dup2` loop, in either order, so the plan is refused instead.
+    /// Without relocation the child's `dup2` loop would clobber a source it still
+    /// needs, so that shape is refused. (With relocation it is fine -- see
+    /// `placements_accept_targets_that_overlap_the_received_numbers`; the
+    /// difference is precisely whether the sources could be moved out of the
+    /// way first.)
     #[test]
-    fn placements_refuse_a_target_occupied_by_another_descriptor() {
+    fn placements_refuse_a_target_occupied_by_another_descriptor_when_they_cannot_move() {
+        let _fd_table = FD_TABLE.lock().unwrap_or_else(|e| e.into_inner());
         let (received, keep) = pipes(2);
+        // Occupy the reserved range, which is what declines relocation.
+        let mut spare = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe2(spare.as_mut_ptr(), 0) }, 0);
+        assert_eq!(unsafe { libc::dup2(spare[0], EXEC_FD_BASE) }, EXEC_FD_BASE);
         assert!(
             plan_fd_placements(&received, &[received[1], 201]).is_none(),
-            "targets[0] is where the second descriptor already lives"
+            "with the sources pinned, targets[0] is where the second descriptor lives"
         );
+        close_all(&[EXEC_FD_BASE]);
+        close_all(&spare);
         close_all(&received);
         close_all(&keep);
     }
 
     #[test]
     fn placements_refuse_targets_that_are_not_distinct_or_are_reserved() {
+        let _fd_table = FD_TABLE.lock().unwrap_or_else(|e| e.into_inner());
         let (received, keep) = pipes(2);
         assert!(plan_fd_placements(&received, &[200, 200]).is_none(), "duplicate");
         assert!(
@@ -1514,6 +1770,7 @@ mod tests {
     /// it has to name the offending slot.
     #[test]
     fn wire_fds_refuses_a_swapped_slot() {
+        let _fd_table = FD_TABLE.lock().unwrap_or_else(|e| e.into_inner());
         let (received, keep) = pipes(2);
         let plan = plan_fd_placements(&received, &[200, 201]).expect("a plan");
         let victim = plan.slots[1];
@@ -1578,6 +1835,7 @@ mod tests {
     /// (the FUP-23 failure) cannot pass.
     #[test]
     fn exec_child_wires_stdio_from_the_reserved_slots_without_cross_talk() {
+        let _fd_table = FD_TABLE.lock().unwrap_or_else(|e| e.into_inner());
         let (child, host) = exec_ends();
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
@@ -1628,6 +1886,7 @@ mod tests {
     /// hand a fresh child a descriptor at the number the child still dups from.
     #[test]
     fn exec_stdio_plan_relocates_the_received_ends_into_the_reserved_range() {
+        let _fd_table = FD_TABLE.lock().unwrap_or_else(|e| e.into_inner());
         let (child, host) = exec_ends();
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0);
@@ -1667,6 +1926,7 @@ mod tests {
     /// number makes the plan decline instead.
     #[test]
     fn exec_stdio_plan_declines_when_a_reserved_number_is_already_taken() {
+        let _fd_table = FD_TABLE.lock().unwrap_or_else(|e| e.into_inner());
         let (child, host) = exec_ends();
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0);
@@ -1710,6 +1970,7 @@ mod tests {
     /// aborts the exec (exit 124) instead of losing its output silently.
     #[test]
     fn wire_exec_stdio_refuses_a_swapped_slot_before_touching_stdio() {
+        let _fd_table = FD_TABLE.lock().unwrap_or_else(|e| e.into_inner());
         let (child, host) = exec_ends();
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0);
