@@ -164,14 +164,15 @@ S1 起需要在 **aarch64 的真内核上跑 fork 自己的测试**：QEMU 用�
    产物在 `$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/debug/deps/`，是 aarch64 ELF（glibc 2.34 基线，
    节点上能直接跑）。
 2. **本地真内核 VM（S3 起主用）**：Lima + qemu，在宿主（Darwin/amd64）上跑一台 aarch64 虚拟机，
-   把上面那份二进制放进去运行。实例定义 `tmp/arm-vm/sandlock-arm.yaml`、驱动脚本
-   `tmp/arm-lane/lima-vm.sh`（`sync` / `run` / `shell` / `start` / `stop`）都在主仓：
+   把上面那份二进制放进去运行。实例定义 `deploy/scripts/arm-lane/vm.yaml`、驱动脚本
+   `deploy/scripts/arm-lane/lima-vm.sh`（`sync` / `run` / `shell` / `start` / `stop`）都在主仓
+   （lane 全貌、脚本清单与坑的对照表在主仓 `docs/cross-platform-lanes.md`）：
 
    ```sh
-   limactl create --name sandlock-arm --tty=false tmp/arm-vm/sandlock-arm.yaml
+   limactl create --name sandlock-arm --tty=false deploy/scripts/arm-lane/vm.yaml
    limactl start  sandlock-arm --tty=false
-   tmp/arm-lane/lima-vm.sh sync
-   tmp/arm-lane/lima-vm.sh run '/tmp/target-aarch64/aarch64-unknown-linux-gnu/debug/deps/\
+   deploy/scripts/arm-lane/lima-vm.sh sync
+   deploy/scripts/arm-lane/lima-vm.sh run '/tmp/target-aarch64/aarch64-unknown-linux-gnu/debug/deps/\
        integration-* test_restore:: --test-threads=1'
    ```
 

@@ -238,7 +238,7 @@ S0 写的判据是 `vl > 16 || flags & SVE_PT_REGS_SVE`。**`vl > 16` 那半条�
 
 ### 证据（全部本地，2026-09-24）
 
-* **RED**（`tmp/arm-lane/s2-red.log`）：先只加测试、不实现 → aarch64 上 `checkpoint::` 子集
+* **RED**（`deploy/scripts/arm-lane/evidence/s2-red.log`）：先只加测试、不实现 → aarch64 上 `checkpoint::` 子集
   **33 passed / 3 failed**，三条正是新加的 `aarch64_fpstate_image_is_a_fpsimd_record_not_a_kernel_fpsimd_state`、
   `aarch64_rearm_rejects_a_restart_sentinel_left_in_x0`、`aarch64_a_fp_capture_of_the_wrong_size_is_refused`
   （`left: 0, right: 528`；`an un-fixed-up restart must be refused: ()`；`512 bytes is not a fpsimd state: RestorePlan { .. }`）。
@@ -291,7 +291,7 @@ stub 的 aarch64 分支落地，并在**本地真内核**上第一次跑通完�
 
 本地起了一个 **Lima qemu VM**（Ubuntu 24.04 + 6.14 内核，宿主是 amd64 Darwin），把宿主交叉编出的
 aarch64 二进制放进去跑：**真内核、真 ptrace、真 `rt_sigreturn`**，不再是 qemu-user。搭法、驱动脚本
-`tmp/arm-lane/lima-vm.sh` 与两条踩到的约束写在 `docs/arm-cr-s0-evidence.md` §7。
+`deploy/scripts/arm-lane/lima-vm.sh` 与两条踩到的约束写在 `docs/arm-cr-s0-evidence.md` §7。
 
 ### 本轮抓到并修掉的两个 RED
 
@@ -337,14 +337,14 @@ S3 的代码在 qemu-user 下**跑不到**（`ptrace`/`process_vm_writev` 直接
 `sandbox.rs` / `resume.rs` / `tests/integration/test_restore.rs` 的架构门放行 aarch64，链接地址按
 工具链分派（GCC `-Wl,-Ttext-segment=`；zig/clang 拒绝该选项、用 `-Wl,--image-base=`）。
 
-* **RED（改前，主仓 `tmp/arm-lane/s4-red-old-buildrs-full.log`）**：把 C 编译器从构建环境里拿掉
+* **RED（改前，主仓 `deploy/scripts/arm-lane/evidence/s4-red-old-buildrs-full.log`）**：把 C 编译器从构建环境里拿掉
   （`CC_aarch64_unknown_linux_gnu=/nonexistent/cc`），aarch64 构建**照样成功**，只在日志里留一句
   `warning: sandlock-core@0.9.0-beta: failed to compile restore-stub: no working C compiler
   (install cc/gcc); checkpoint restore is unavailable` —— 出的是一个 `stub_path()` 指向不存在
   文件的包，C/R 在运行期才失败。
-* **GREEN（改后，`tmp/arm-lane/s4-missing-stub-aarch64.log`）**：同一条命令变成**致命**
+* **GREEN（改后，`deploy/scripts/arm-lane/evidence/s4-missing-stub-aarch64.log`）**：同一条命令变成**致命**
   （`error occurred in cc-rs: failed to find tool "/nonexistent/cc"`，`build failed`）。
-* **GREEN（stub 放回，`tmp/arm-lane/s4-green-restored.log`）**：6.19s 构建成功（`Finished dev
+* **GREEN（stub 放回，`deploy/scripts/arm-lane/evidence/s4-green-restored.log`）**：6.19s 构建成功（`Finished dev
   profile`）。
 * **GREEN（x86_64 回归）**：四种门禁相位与 `checkpoint::` 子集未动，证据见 S3 状态。
 
@@ -356,7 +356,7 @@ amd64 Darwin）：宿主用 wheel builder 的 zig 工具链交叉编译 aarch64 
 本机文件系统**后直接跑（不是 9p 就地跑，原因见 §7 / `docs/arm-cr-s0-evidence.md` §7）。
 **一个测试二进制都没有离开这台机器。**
 
-五条相位在 arm64 上**逐条等于 x86_64 基线**（驱动脚本 `tmp/arm-lane/phase-run.sh`，与
+五条相位在 arm64 上**逐条等于 x86_64 基线**（驱动脚本 `deploy/scripts/arm-lane/phase-run.sh`，与
 `scripts/test-all.sh` 同口径：按 dep-info 找到每个 target 的二进制、把每条
 `test result: ok. N passed` 求和）：
 
@@ -421,5 +421,7 @@ arm64 多出的 8 条 skip 全是 lane 能力（guest 里没有 docker 守护进
 N35 的那三条 shebang/binfmt 用例 —— 它们在没有真根时走**运行期** `pytest.xfail()`，真根下走到
 断言并通过，所以 xfailed 从 4 降到 1。
 
-日志（全部在宿主 `tmp/arm-lane/`）：`s5-arm-security-realroot{0,1}.log`、
-`s5-x86-security-realroot{0,1}.log`（x86 用 `tmp/arm-lane/x86-security.sh` 取，见 pitfalls B4）。
+日志（入库在 `deploy/scripts/arm-lane/evidence/`）：`s5-arm-security-realroot{0,1}.log` 与
+`s5-x86-security-realroot{0,1}.log`（x86 那两条用 `deploy/scripts/arm-lane/x86-security.sh` 取，
+不是 `test-prod-shaped.sh`，见 pitfalls B4；脚本、VM 定义与坑的全貌见主仓
+`docs/cross-platform-lanes.md`）。

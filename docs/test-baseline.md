@@ -923,7 +923,7 @@ python = 465  # F19/SL-13 (2026-09-14): 464 -> 465, +1 in
 # kernel 6.14.0-37-generic, 6 vCPU, host = amd64 Darwin). No test binary leaves
 # this machine; the aarch64 binaries are cross-built here with the wheel
 # builder's zig toolchain (`CC_aarch64_unknown_linux_gnu=zigcc`) and copied
-# into the guest over ssh (`tmp/arm-lane/lima-vm.sh`, and see
+# into the guest over ssh (`deploy/scripts/arm-lane/lima-vm.sh`, and see
 # `docs/arm-cr-s0-evidence.md` §7 for the four constraints + the 9p staleness
 # trap that makes rsync-through-9p silently run the previous build).
 #
