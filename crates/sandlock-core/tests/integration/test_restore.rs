@@ -573,36 +573,35 @@ async fn test_restore_resumes_without_exec_and_without_chroot() {
     );
 }
 
-/// **Pinned gap**: a program that uses the libc allocator does not survive a
-/// restore, while one that does not, does.
+/// **Pinned gap, with its mechanism**: the loader's writes into read-only pages
+/// are lost on restore, and any libc path that reads one dies.
 ///
-/// Found from the other end: a supervisor slot restoring its own images saw
-/// `/bin/sh` and `python3` die right after restore, while the static helper and
-/// `/bin/sleep` came back. The first framing ("static works, dynamic fails") was
-/// wrong, and this test is what corrects it -- three workloads through **one**
-/// harness (one-shot `spawn_interactive`, restored in-process, same policy, same
-/// code path), so the result is attribution rather than correlation:
+/// The symptom first showed up as "real programs cannot be restored" (a
+/// supervisor slot saw `/bin/sh` and `python3` die right after restore, while the
+/// static helper and `/bin/sleep` came back). Two framings were wrong before this
+/// one, and the cases below are what corrected them:
 ///
-///   static freestanding helper   resumes   (control)
-///   dynamic, raw syscalls only   resumes   (dynamic linking is NOT the problem)
-///   dynamic, libc stdio/heap     SIGSEGV   (state=Z, exit_code=11)
+/// * "static works, dynamic fails" -- no: a dynamically linked program with no
+///   libc machinery resumes (`libc-malloc` here allocates and survives).
+/// * "the libc allocator is the problem" -- no: `malloc`/`free` resume fine.
 ///
-/// The measurement that goes with it: the checkpoint records the heap *range*
-/// and the restore maps it back (verified on the live control), but the kernel's
-/// program break is **not** restored -- a live restored process has no `[heap]`
-/// label, which the kernel only puts on the break range. And it cannot be fixed
-/// by calling `brk()` in the restore stub: the break may only move *above* the
-/// exec'd image's initial break (measured: the kernel refuses a lower target and
-/// returns the old one), while the stub is linked at 3 TiB and a workload's heap
-/// is far below it. A variant that keeps malloc off `brk` (`mallopt(
-/// M_MMAP_THRESHOLD, 1)`) dies too, so the break is one demonstrated defect in
-/// this area rather than the whole of it.
+/// What actually separates the cases is whether the program touches a value the
+/// **dynamic loader wrote into a read-only page** at startup. The capture dumps
+/// writable (or unreopenable) mappings only, so `PT_GNU_RELRO` pages -- where the
+/// loader stores relocated pointers and the vDSO function caches -- are left to
+/// be re-read *from the file*, where they are zero. The first libc call that
+/// dereferences one then faults: measured as `segfault at 300 ... in libc.so.6`
+/// with the loaded pointer NULL, inside `clock_gettime`'s vDSO path.
 ///
-/// **When the allocator case starts working, this test fails** -- that is the
-/// point (the same shape the security suite uses for a residual). Delete it then
-/// and update `docs/checkpoint-restore-e2b-half.md` §1(e).
+/// The fix-shaped case is `vdso-clock-relro`: the same program, with its RELRO
+/// pages made writable before the capture so the capture dumps them -- and it
+/// resumes. That is the mechanism, isolated.
+///
+/// **When the gap cases start passing, this test fails** -- deliberately, the way
+/// the security suite pins a residual. Then delete this test and update
+/// `docs/checkpoint-restore-e2b-half.md` §1(e).
 #[tokio::test]
-async fn test_libc_allocator_workload_restore_is_a_known_gap() {
+async fn test_loader_readonly_page_writes_are_lost_on_restore() {
     let has_cc = ["cc", "gcc"].iter().any(|cc| {
         std::process::Command::new(cc)
             .arg("--version")
@@ -614,75 +613,127 @@ async fn test_libc_allocator_workload_restore_is_a_known_gap() {
         eprintln!("skipping: no C compiler (cc/gcc) available");
         return;
     }
-    let tmp = std::env::temp_dir().join(format!("sandlock-allocgap-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("sandlock-relro-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
 
-    // (a) the failing shape: libc stdio, which allocates.
-    let stdio_src = tmp.join("stdio.c");
-    let stdio_bin = tmp.join("stdio_counter");
-    std::fs::write(
-        &stdio_src,
-        r#"
-#include <stdio.h>
-#include <unistd.h>
-int main(int argc, char **argv) {
-    unsigned long i = 0;
-    if (argc < 2) return 2;
-    for (;;) {
-        FILE *f = fopen(argv[1], "w");
-        if (f) { fprintf(f, "%lu\n", i++); fclose(f); }
-        usleep(50000);
-    }
-}
-"#,
-    )
-    .unwrap();
-    // (b) the sharpener: dynamically linked, but no libc allocator.
-    let raw_src = tmp.join("raw.c");
-    let raw_bin = tmp.join("raw_counter");
-    std::fs::write(
-        &raw_src,
-        r#"
+    // Every workload writes its counter with raw syscalls (a mechanism this
+    // suite already proves works), so "did it advance" measures the one libc
+    // operation under test and nothing else.
+    fn source(op: &str, extra: &str, startup: &str) -> String {
+        format!(
+            r#"
 #include <unistd.h>
 #include <sys/syscall.h>
-int main(int argc, char **argv) {
+{extra}
+int main(int argc, char **argv) {{
+    {startup}
     unsigned long i = 0;
     char buf[32];
     if (argc < 2) return 2;
-    for (;;) {
+    for (;;) {{
         int n = 0;
         unsigned long v = i++;
         char t[24];
-        while (v) { t[n++] = '0' + (v % 10); v /= 10; }
+        while (v) {{ t[n++] = '0' + (v % 10); v /= 10; }}
         if (n == 0) t[n++] = '0';
         int p = 0;
         while (n > 0) buf[p++] = t[--n];
         buf[p++] = '\n';
         int fd = syscall(SYS_openat, -100, argv[1], 1 | 0100 | 01000, 0644);
-        if (fd >= 0) { syscall(SYS_write, fd, buf, p); syscall(SYS_close, fd); }
-        struct { long s, ns; } ts = { 0, 50000000 };
+        if (fd >= 0) {{ syscall(SYS_write, fd, buf, p); syscall(SYS_close, fd); }}
+        {op}
+        struct {{ long s, ns; }} ts = {{ 0, 50000000 }};
         syscall(SYS_nanosleep, &ts, 0);
+    }}
+}}
+"#
+        )
     }
+
+    /// Make every loaded object's RELRO read-only-at-startup region writable,
+    /// so a capture dumps it instead of leaving it to be re-read from the file.
+    /// This is the *fix shape*, written from the outside because the engine
+    /// cannot do it yet.
+    const RELRO_RELAX: &str = r#"
+#include <link.h>
+#include <sys/mman.h>
+static int relro_cb(struct dl_phdr_info *info, size_t size, void *data) {
+    (void)size; (void)data;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        if (ph->p_type == PT_GNU_RELRO) {
+            unsigned long start = (unsigned long)info->dlpi_addr + ph->p_vaddr;
+            unsigned long end = start + ph->p_memsz;
+            start &= ~4095UL;
+            mprotect((void *)start, end - start, PROT_READ | PROT_WRITE);
+        }
+    }
+    return 0;
 }
-"#,
-    )
-    .unwrap();
-    for (label, src, out) in [
-        ("stdio", &stdio_src, &stdio_bin),
-        ("raw", &raw_src, &raw_bin),
-    ] {
+static void relro_relax(void) { dl_iterate_phdr(relro_cb, 0); }
+"#;
+
+    let variants: Vec<(&str, String)> = vec![
+        (
+            "libc-malloc",
+            source(
+                "void *q = malloc(64); if (q) { *(volatile char *)q = 1; free(q); }",
+                "#include <stdlib.h>",
+                "",
+            ),
+        ),
+        (
+            "vdso-clock",
+            source(
+                "struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);",
+                "#include <time.h>",
+                "",
+            ),
+        ),
+        (
+            "vdso-clock-relro",
+            source(
+                "struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);",
+                &format!("#include <time.h>\n{RELRO_RELAX}"),
+                "relro_relax();",
+            ),
+        ),
+        (
+            "stdio-fopen",
+            source(
+                "FILE *f = fopen(\"/dev/null\", \"w\"); if (f) fclose(f);",
+                "#include <stdio.h>",
+                "",
+            ),
+        ),
+        (
+            "stdio-fopen-relro",
+            source(
+                "FILE *f = fopen(\"/dev/null\", \"w\"); if (f) fclose(f);",
+                &format!("#include <stdio.h>\n{RELRO_RELAX}"),
+                "relro_relax();",
+            ),
+        ),
+    ];
+
+    let mut bins = Vec::new();
+    for (name, src) in &variants {
+        let c = tmp.join(format!("{name}.c"));
+        let bin = tmp.join(name);
+        std::fs::write(&c, src).unwrap();
         let build = std::process::Command::new("cc")
-            .args(["-O0", "-o"])
-            .arg(out)
-            .arg(src)
+            .args(["-O0", "-D_GNU_SOURCE", "-o"])
+            .arg(&bin)
+            .arg(&c)
             .output()
             .expect("run cc");
         assert!(
             build.status.success(),
-            "cc failed for {label}: {}",
+            "cc failed for {name}: {}",
             String::from_utf8_lossy(&build.stderr)
         );
+        bins.push((name.to_string(), bin));
     }
 
     let helper = helper_binary();
@@ -698,13 +749,30 @@ int main(int argc, char **argv) {
     }
     let policy = builder.build().unwrap();
 
-    // Returns (advanced past the capture, the resumed process's state char, and
-    // whether the recorded heap range came back as a mapping).
-    async fn round_trip(policy: &Sandbox, argv: &[String], tag: &str) -> (bool, String) {
-        let counter = std::path::PathBuf::from(argv.last().unwrap());
+    // Returns whether the process advanced past the capture (and its state).
+    async fn round_trip(
+        policy: &Sandbox,
+        helper: &std::path::Path,
+        tmp: &std::path::Path,
+        bin: Option<&std::path::Path>,
+        tag: &str,
+    ) -> (bool, String) {
+        let counter = tmp.join(format!("cnt-{tag}"));
         let _ = std::fs::remove_file(&counter);
+        let (program, args): (String, Vec<String>) = match bin {
+            Some(b) => (
+                b.to_str().unwrap().to_string(),
+                vec![counter.to_str().unwrap().to_string()],
+            ),
+            None => (
+                helper.to_str().unwrap().to_string(),
+                vec!["clock-loop".to_string(), counter.to_str().unwrap().to_string()],
+            ),
+        };
+        let mut argv = vec![program];
+        argv.extend(args);
         let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let mut sb = policy.clone().with_name(&format!("allocgap-{tag}"));
+        let mut sb = policy.clone().with_name(&format!("relro-{tag}"));
         sb.spawn_interactive(&refs)
             .await
             .unwrap_or_else(|e| panic!("{tag}: spawn: {e}"));
@@ -714,7 +782,7 @@ int main(int argc, char **argv) {
             .and_then(|s| s.trim().parse::<u64>().ok());
         assert!(
             before.is_some_and(|v| v >= 2),
-            "{tag}: counter before capture: {before:?}"
+            "{tag}: the counter must move before the capture: {before:?}"
         );
         let cp = sb
             .checkpoint()
@@ -722,8 +790,7 @@ int main(int argc, char **argv) {
             .unwrap_or_else(|e| panic!("{tag}: checkpoint: {e}"));
         let _ = sb.kill();
         let _ = sb.wait().await;
-
-        let mut sb2 = policy.clone().with_name(&format!("allocgap-{tag}-dst"));
+        let mut sb2 = policy.clone().with_name(&format!("relro-{tag}-dst"));
         let _ = sb2
             .restore_interactive(&cp)
             .await
@@ -747,67 +814,87 @@ int main(int argc, char **argv) {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
         let state = stat.split_whitespace().nth(2).unwrap_or("?").to_string();
         let exit_code = stat.split_whitespace().nth(51).unwrap_or("-").to_string();
-        // The kernel labels only the break range `[heap]`, so a live restored
-        // process without that label is the direct evidence that the break was
-        // not restored (the range itself is still mapped -- see the doc).
-        let heap_in_cp = cp
-            .process_state
-            .memory_maps
-            .iter()
-            .any(|m| m.path.as_deref().is_some_and(|p| p.starts_with("[heap]")));
-        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
-        let heap_after = maps.lines().any(|l| l.contains("[heap]"));
-        eprintln!(
-            "allocgap {tag}: advanced={advanced} state={state} exit_code={exit_code} \
-             heap_in_checkpoint={heap_in_cp} heap_after_restore={heap_after}"
-        );
+        eprintln!("relro {tag}: advanced={advanced} state={state} exit_code={exit_code}");
         let _ = sb2.kill();
         let _ = sb2.wait().await;
         (advanced, state)
     }
 
-    // Control 1: the static freestanding helper the rest of this suite uses.
-    let control = vec![
-        helper.to_str().unwrap().to_string(),
-        "clock-loop".to_string(),
-        tmp.join("cnt_static").to_str().unwrap().to_string(),
-    ];
-    let (control_advanced, _) = round_trip(&policy, &control, "static-control").await;
+    // Control: the static freestanding helper the rest of this suite uses.
+    let (control_advanced, _) =
+        round_trip(&policy, &helper, &tmp, None, "static-control").await;
     assert!(
         control_advanced,
-        "the static control must resume -- if this fails the harness is wrong and \
+        "the static control must resume -- otherwise the harness is wrong and \
          nothing below means anything"
     );
 
-    // Control 2: dynamically linked, but no libc allocator. This is what makes
-    // the finding "the allocator", not "dynamic".
-    let raw = vec![
-        raw_bin.to_str().unwrap().to_string(),
-        tmp.join("cnt_raw").to_str().unwrap().to_string(),
-    ];
-    let (raw_advanced, raw_state) = round_trip(&policy, &raw, "dynamic-noalloc").await;
+    // Allocation is *not* the problem; this is the case that says so.
+    let malloc_bin = bins.iter().find(|(n, _)| n == "libc-malloc").unwrap().1.clone();
+    let (malloc_advanced, malloc_state) =
+        round_trip(&policy, &helper, &tmp, Some(&malloc_bin), "libc-malloc").await;
     assert!(
-        raw_advanced,
-        "a dynamically linked program that never allocates must resume \
-         (state was {raw_state}); if this fails, the gap is wider than the \
-         allocator and the doc's §1(e) needs rewriting"
+        malloc_advanced,
+        "malloc/free must resume (state {malloc_state}) -- if this fails, the \
+         mechanism in this test's docs is wrong"
     );
 
-    // The gap itself.
-    let stdio = vec![
-        stdio_bin.to_str().unwrap().to_string(),
-        tmp.join("cnt_stdio").to_str().unwrap().to_string(),
-    ];
-    let (alloc_advanced, alloc_state) = round_trip(&policy, &stdio, "dynamic-alloc").await;
+    // The mechanism, isolated: dumping the loader's read-only-but-written pages
+    // is what makes the vDSO path survive.
+    let relro_clock = bins
+        .iter()
+        .find(|(n, _)| n == "vdso-clock-relro")
+        .unwrap()
+        .1
+        .clone();
+    let (relro_advanced, relro_state) = round_trip(
+        &policy,
+        &helper,
+        &tmp,
+        Some(&relro_clock),
+        "vdso-clock-relro",
+    )
+    .await;
     assert!(
-        !alloc_advanced,
-        "a libc-allocator workload resumed! That is the fix, not a regression: delete \
-         this test and the matching entry in docs/checkpoint-restore-e2b-half.md §1(e)"
+        relro_advanced,
+        "a vDSO call must resume once the loader's read-only pages are captured \
+         (state {relro_state}); that is the mechanism this test is about"
     );
-    assert_eq!(
-        alloc_state, "Z",
-        "the allocator workload must be gone (zombie) after the restore, not merely idle"
+    let relro_stdio = bins
+        .iter()
+        .find(|(n, _)| n == "stdio-fopen-relro")
+        .unwrap()
+        .1
+        .clone();
+    let (relro_stdio_advanced, relro_stdio_state) = round_trip(
+        &policy,
+        &helper,
+        &tmp,
+        Some(&relro_stdio),
+        "stdio-fopen-relro",
+    )
+    .await;
+    assert!(
+        relro_stdio_advanced,
+        "stdio must resume once those pages are captured (state \
+         {relro_stdio_state}) -- so it shares the cause, it is not a second bug"
     );
+
+    // The gaps themselves. Both fail on purpose once the engine captures those
+    // pages; the messages say what to do then.
+    for (tag, name) in [("vdso-clock", "vdso-clock"), ("stdio-fopen", "stdio-fopen")] {
+        let bin = bins.iter().find(|(n, _)| n == name).unwrap().1.clone();
+        let (advanced, state) = round_trip(&policy, &helper, &tmp, Some(&bin), tag).await;
+        // The counter is written *before* the libc call in every variant, so a
+        // dying case still advances once: being alive is the real signal.
+        let _ = advanced;
+        assert!(
+            state == "Z",
+            "{tag} survived the restore (state {state})! That is the fix, not a \
+             regression: delete this test and the matching entry in \
+             docs/checkpoint-restore-e2b-half.md §1(e)"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
