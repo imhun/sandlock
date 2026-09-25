@@ -1416,18 +1416,20 @@ impl Sandbox {
         // without a chroot, leaving paths untranslated.
         let chroot_root = crate::chroot::resolve::resolve_chroot_root(self.chroot.as_deref())?;
         let mounts = crate::chroot::resolve::resolve_chroot_mounts(&self.fs_mount);
-        // A chroot root -- emulated or real -- resolves the workload's paths
-        // inside the rootfs, while the stub is a host build artifact that this
-        // method execs by its host path (`resume::stub_path`). It can never be
-        // reached there, and the failure is otherwise a 10 s READY timeout over
-        // a process nobody can see. Measured 2026-09-23 on both shapes:
-        // `execvp '/src/target/.../restore-stub': No such file or directory`,
-        // then "restore stub never signalled READY within 10000ms: exited with
-        // restore-stub code 127". Chroot-free policies do work
-        // (test_restore_glibc_vdso_program_resumes). Refuse up front instead,
-        // naming the reason and the way out; E2B never calls this
-        // (docs/chroot-workspace-exec.md §9.7.9) and its production shape is a
-        // chroot root, so this is a documented gap, not a regression.
+        // A chroot root -- emulated or real -- used to make this impossible: the
+        // stub is a host build artifact and the exec route handed it to the child
+        // by its host path, which no rootfs resolves. Measured 2026-09-23 on both
+        // shapes: `execvp '/src/target/.../restore-stub': No such file or
+        // directory`, then "restore stub never signalled READY within 10000ms:
+        // exited with restore-stub code 127" -- and for a while the call was
+        // refused up front instead (43cc62a), because that was true.
+        //
+        // It is not true any more: the stub goes in by descriptor
+        // (`RestoreLaunch::Exec` below) and the ruleset grants that one host file
+        // the right Landlock actually judges, so *both* chroot shapes restore --
+        // pinned by `test_restore_resumes_inside_a_chroot_root`, which runs the
+        // emulated and the real root. This paragraph is kept (corrected) because
+        // it is the reason the delivery route looks the way it does.
         let plan = restore_blob::plan(cp, chroot_root.as_deref(), &mounts)
             .map_err(SandboxRuntimeError::Child)?;
 
