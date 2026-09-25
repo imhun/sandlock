@@ -326,7 +326,15 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 558 # 2026-09-25: 555 -> 558, +3:
+core_integ = 559 # 2026-09-25: 558 -> 559, +1 and it is N14/S3's first released
+                 # handler: `getcwd` inside a real root answers from the kernel
+                 # instead of the mediator's recorded spelling
+                 # (`test_getcwd_under_a_real_root_is_the_kernels_answer`: the
+                 # policy cwd, a plain chdir, and a chdir through a symlink, which
+                 # comes back canonical). Verified as a discriminator -- with the
+                 # pivot check forced false it is red on exactly that third
+                 # assertion (`left: "OK /alias\n"`).
+                 # 2026-09-25: 555 -> 558, +3:
                  # * `test_a_dynamic_workload_resumes_into_a_session_under_a_real_root`
                  #   -- the deployment's shape exactly (real root + mounted /usr,
                  #   /bin, /lib, /etc + a dynamic python workload restored into a

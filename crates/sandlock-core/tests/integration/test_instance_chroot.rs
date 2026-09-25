@@ -91,6 +91,29 @@ fn cleanup(dir: &PathBuf) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Run one command in an instance and collect `(status, stdout, stderr)`.
+///
+/// Both pipes are read because a failure worth pinning is usually *named* on
+/// stderr (`rootfs-helper` reports the errno there), and a bare `Code(1)` does
+/// not say which of the two syscalls in that helper's command failed.
+async fn exec_capture(
+    inst: &mut SandboxInstance,
+    args: &[&str],
+) -> (ExitStatus, String, String) {
+    let h = inst.exec(args, ExecStdio::Piped).await.expect("exec");
+    let status = inst.wait_child(h.child_id).await.expect("wait");
+    let read = |fd: Option<std::os::fd::OwnedFd>, what: &str| {
+        let mut out = Vec::new();
+        std::fs::File::from(fd.expect(what))
+            .read_to_end(&mut out)
+            .expect("read pipe");
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    let stdout = read(h.stdout, "piped stdout");
+    let stderr = read(h.stderr, "piped stderr");
+    (status, stdout, stderr)
+}
+
 /// F10 acceptance 2 (non-root half): a mainless exec-only instance over a
 /// chroot launches and serves an `exec()` — holder == sandbox host uid
 /// (route A), so the mediated-path identity gate must not fire even though
@@ -523,6 +546,83 @@ async fn test_getcwd_reports_the_requested_alias_not_the_best_match() {
         String::from_utf8_lossy(&out),
         "OK /workspace\n",
         "the requested alias, not the reverse-lookup winner"
+    );
+
+    inst.shutdown().await.expect("shutdown");
+    cleanup(&rootfs);
+    cleanup(&base);
+}
+
+/// S3 (`docs/n14-retire-the-emulation.md` §4.1): `getcwd` is the first handler
+/// handed back to the kernel once the child has a real root, and this pins what
+/// that *means* — not just that it works.
+///
+/// The emulated shape rewrites the child's buffer with the path the mediator
+/// recorded, and that record is deliberately the spelling the caller asked for
+/// (see `test_getcwd_reports_the_requested_alias_not_the_best_match` above).
+/// Under a real root the kernel answers instead, and the kernel resolves
+/// symlinks: a cwd entered through a symlink comes back canonical, exactly as
+/// it would in a container. Both are legitimate spellings of one directory;
+/// what this pins is *which* one the real-root shape produces. An edit that
+/// puts the buffer rewrite back into the pivoted path answers `/alias` here and
+/// is red.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_getcwd_under_a_real_root_is_the_kernels_answer() {
+    let base = temp_dir("realroot-cwd");
+    let rootfs = base.join("rootfs");
+    let work = base.join("work");
+    for dir in ["usr/bin", "work/sub", "etc", "proc"] {
+        std::fs::create_dir_all(rootfs.join(dir)).expect("create rootfs dir");
+    }
+    // `/work` is the *host* directory bind-mounted over the rootfs's own
+    // `/work`, so the subdirectory a case chdir's into has to exist on the host
+    // side of the mount — the mount point inside the rootfs is just a stub.
+    std::fs::create_dir_all(work.join("sub")).expect("create host work dir");
+    // The helper is static (build.rs), so the rootfs needs nothing else to
+    // exec it: no /lib, no interpreter, no /dev.
+    let helper = helper_binary();
+    let dest = rootfs.join("usr/bin/rootfs-helper");
+    std::fs::hard_link(&helper, &dest)
+        .or_else(|_| std::fs::copy(&helper, &dest).map(|_| ()))
+        .expect("install rootfs-helper into rootfs");
+    // Relative, so it means `/work` on both sides of the pivot.
+    std::os::unix::fs::symlink("work", rootfs.join("alias")).expect("symlink /alias -> /work");
+
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    let mut builder = Sandbox::builder()
+        .chroot(&rootfs)
+        .real_root(true)
+        .user(euid, egid)
+        .fs_read("/usr")
+        .fs_mount("/work", &work)
+        .fs_write("/work")
+        .cwd("/work");
+    builder.userns_self_map = true;
+    let policy = builder.build().expect("real-root policy builds");
+
+    let mut inst = SandboxInstance::launch_exec_only(policy).await.expect("launch");
+    let (status, stdout, stderr) = exec_capture(&mut inst, &["rootfs-helper", "pwd"]).await;
+    assert_eq!(status, ExitStatus::Code(0), "pwd failed: {stderr}");
+    assert_eq!(
+        stdout, "/work\n",
+        "the policy's cwd, as the sandbox spells it"
+    );
+
+    let (status, stdout, stderr) =
+        exec_capture(&mut inst, &["rootfs-helper", "chdir", "/work/sub"]).await;
+    assert_eq!(status, ExitStatus::Code(0), "chdir failed: {stderr}");
+    assert_eq!(
+        stdout, "OK /work/sub\n",
+        "a cwd with no symlink in it reads back as written"
+    );
+
+    let (status, stdout, stderr) =
+        exec_capture(&mut inst, &["rootfs-helper", "chdir", "/alias"]).await;
+    assert_eq!(status, ExitStatus::Code(0), "chdir failed: {stderr}");
+    assert_eq!(
+        stdout, "OK /work\n",
+        "the kernel's answer: symlinks resolved, not the spelling the mediator recorded"
     );
 
     inst.shutdown().await.expect("shutdown");

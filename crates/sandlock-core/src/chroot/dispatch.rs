@@ -2839,6 +2839,22 @@ pub(crate) async fn handle_chroot_getcwd(
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
+    // N14/S3 (`docs/n14-retire-the-emulation.md` §4.1): a child with a real
+    // root reports its own spelling already. The task's root *is* the rootfs,
+    // so the kernel walks up to it and returns a path the sandbox itself would
+    // name -- there is nothing here to translate, and handing the syscall back
+    // is *more* than cheaper than the rewrite below: the kernel resolves
+    // symlinks (a cwd entered through one comes back canonical, as it does in
+    // any container), and the ERANGE window this handler opens disappears,
+    // because its length check is against the spelling the mediator recorded
+    // rather than against the path the kernel would return.
+    //
+    // The emulated shape keeps the rewrite: there the kernel would report a
+    // host path, which no sandbox may ever see.
+    if ctx.child_is_pivoted(notif.pid) {
+        return NotifAction::Continue;
+    }
+
     let buf_addr = notif.data.args[0];
     let buf_size = (notif.data.args[1] & 0xFFFFFFFF) as usize;
 
