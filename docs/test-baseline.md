@@ -115,7 +115,12 @@
 # and core_integ (534 -> 539) move, by the A1/A2 test cases registered below;
 # ffi / cli / supervise / supervise_cost / cli_build / python / oci /
 # supervise_root / mediation_2uid are unchanged.
-core_lib = 902 # 2026-09-24: 897 -> 902, and all +5 are the aarch64 C/R port
+core_lib = 904 # 2026-09-25: 902 -> 904, +2 and both are the RELRO capture fix
+               # (`checkpoint::capture::is_relro_map`): one pins that the
+               # loader's read-only-but-written range is dumped while `.rodata`
+               # is not, the other that the rule does not claim anonymous,
+               # cross-object, text-following or shared read-only ranges.
+               # 2026-09-24: 897 -> 902, and all +5 are the aarch64 C/R port
                # (S3), not a new unit-test surface: `restore_blob.rs` gained
                # three (a checkpoint with no FP bytes is refused; the blob
                # header carries the thread pointer; and it says when there is
@@ -302,7 +307,12 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 551 # 2026-09-24: 548 -> 551, and all +3 are the aarch64 lane's
+core_integ = 552 # 2026-09-25: 551 -> 552, +1 and it is the RELRO capture fix's
+                 # regression case (`test_libc_workloads_resume_after_restore`:
+                 # malloc, a vDSO `clock_gettime`, stdio, plus the static
+                 # control, all asserted to resume). It replaced the diagnostic
+                 # test that pinned the gap, which is why this is +1 and not +2.
+                 # 2026-09-24: 548 -> 551, and all +3 are the aarch64 lane's
                  # own find, not a new integration surface: `net_fixture.rs`
                  # gained three unit cases for the pre-seeded `/etc/hosts`
                  # scan (`mapping_rides_over_blank_lines`,
