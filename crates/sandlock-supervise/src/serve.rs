@@ -692,6 +692,64 @@ impl Generation {
             .map_err(|e| Refusal::from_core("instance kill_child failed", &e))?;
         Ok(serde_json::json!({}))
     }
+
+    /// Capture the live generation into a checkpoint image directory.
+    ///
+    /// The capture has to happen *here*: the sandbox's process tree belongs to
+    /// this slot, so no other process can take it. The image is the engine's
+    /// own file form (`Checkpoint::save`, the same one `sandlock-oci` restores
+    /// from), which is what makes a verb the right shape rather than a new
+    /// mechanism -- the caller decides *where* the image goes (`dir`), which
+    /// keeps ownership, quota and cleanup in the deployment that already
+    /// accounts for them.
+    ///
+    /// Capture is not destructive: the core stops the child, reads it, and
+    /// resumes it, so the generation keeps running afterwards and the caller
+    /// can take another checkpoint later.
+    ///
+    /// The reply describes the *capture* (where it went, which process, how
+    /// many fds were recorded), deliberately not what a restore will be able to
+    /// bring back: which fds are skippable is only known when a restore tries
+    /// (`SkippedFd` is computed there), so a caller that has to tell a user
+    /// "your connections will not come back" must read the restore reply.
+    fn handle_checkpoint(
+        &mut self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, Refusal> {
+        let dir = args
+            .get("dir")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Refusal::refused("checkpoint requires a non-empty `dir`"))?
+            .to_string();
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let rt = &self.rt;
+        let instance = self.instance.as_mut().ok_or_else(|| {
+            Refusal::refused(
+                "generation has no instance: checkpoint requires a launched session",
+            )
+        })?;
+        let mut cp = rt
+            .block_on(instance.checkpoint())
+            .map_err(|e| Refusal::from_core("instance checkpoint failed", &e))?;
+        if let Some(name) = name {
+            cp.name = name;
+        }
+        // Read what the reply needs *before* the image is consumed by `save`.
+        let pid = cp.process_state.pid;
+        let fds = cp.fd_table.len();
+        cp.save(std::path::Path::new(&dir))
+            .map_err(|e| Refusal::from_core("checkpoint save failed", &e))?;
+        Ok(serde_json::json!({
+            "dir": dir,
+            "name": cp.name,
+            "pid": pid,
+            "fds": fds,
+        }))
+    }
 }
 
 /// Decode F4.1 per-exec parameters from an `exec` verb's args object. Every
@@ -945,6 +1003,14 @@ impl ControlHandler for Generation {
             }
             "update_network" => {
                 let resp = match self.handle_update_network(&req.args) {
+                    Ok(data) => ok_response(data),
+                    Err(e) => err_response(&e),
+                };
+                let _ = write_response_frame(stream, &resp);
+                ServeOutcome::Continue
+            }
+            "checkpoint" => {
+                let resp = match self.handle_checkpoint(&req.args) {
                     Ok(data) => ok_response(data),
                     Err(e) => err_response(&e),
                 };

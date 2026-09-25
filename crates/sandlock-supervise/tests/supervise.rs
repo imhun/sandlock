@@ -226,6 +226,17 @@ fn wait_until(deadline: Instant, what: &str, mut predicate: impl FnMut() -> bool
 
 /// One verb over the registered path (one connection per verb).
 fn registered_verb(sock_path: &std::path::Path, token: &str, verb: &str) -> serde_json::Value {
+    registered_verb_args(sock_path, token, verb, serde_json::json!({}))
+}
+
+/// A verb with an explicit `args` object over the registered path; the same
+/// framing as [`registered_verb`] for verbs that take arguments.
+fn registered_verb_args(
+    sock_path: &std::path::Path,
+    token: &str,
+    verb: &str,
+    args: serde_json::Value,
+) -> serde_json::Value {
     let mut stream =
         std::os::unix::net::UnixStream::connect(sock_path).expect("connect registered socket");
     stream
@@ -240,7 +251,7 @@ fn registered_verb(sock_path: &std::path::Path, token: &str, verb: &str) -> serd
             "v": 1,
             "verb": verb,
             "token": token,
-            "args": {},
+            "args": args,
         }),
     )
 }
@@ -1136,6 +1147,256 @@ fn test_supervise_fd_serve_launches_instance_and_serves_instance_verbs() {
         || !process_alive(pid as i32),
     );
     let _ = std::fs::remove_file(&policy);
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+/// Spawn a `--serve-path` slot and wait for its registered socket.
+///
+/// `program` is the optional launch-first spec: a slot started with one has a
+/// live generation as soon as it serves (which is why the checkpoint case below
+/// needs no `run` verb first), and a slot started without one still serves --
+/// verbs that need no instance work, the rest refuse by name.
+fn spawn_serving_slot(
+    ctl_root: &std::path::Path,
+    policy: &std::path::Path,
+    name: &str,
+    token: &str,
+    program: Option<&std::path::Path>,
+) -> (std::process::Child, PathBuf) {
+    let mut cmd = Command::new(bin());
+    cmd.args([
+        "--policy",
+        policy.to_str().unwrap(),
+        "--uid",
+        &euid().to_string(),
+        "--serve-path",
+        name,
+        "--token",
+        token,
+    ]);
+    if let Some(program) = program {
+        cmd.args(["--program", program.to_str().unwrap()]);
+    }
+    cmd.env("SANDBOX_CTL_ROOT", ctl_root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = cmd.spawn().expect("spawn serving slot");
+    let registry = ctl_root.join(format!(
+        "{}-registry",
+        ctl_root.to_string_lossy().trim_end_matches('/')
+    ));
+    let sock_path = registry
+        .join(format!("{}.d", sandlock_core::control::fnv1a_hex(name)))
+        .join("control.sock");
+    wait_until(
+        Instant::now() + Duration::from_secs(15),
+        "registered socket to appear",
+        || sock_path.exists(),
+    );
+    (child, sock_path)
+}
+
+/// `checkpoint` captures the live generation into an image directory -- and the
+/// generation keeps running afterwards.
+///
+/// This is the verb E2B's half of the feature needs before any worker-side code
+/// can exist (`docs/checkpoint-restore-e2b-half.md` §1a): under route B the
+/// `Sandbox` belongs to this process, so a capture taken anywhere else is not
+/// possible. What a caller depending on "pause survives its worker" needs:
+///
+/// * the agent names a destination, and a refused call leaves no image;
+/// * the image is the engine's own format (`meta.json` + `policy.dat`, exactly
+///   what `Checkpoint::load` reads on the other side), not a private blob;
+/// * capture is not a kill -- the generation stays Live, its child keeps
+///   running, its workload's file survives, and a *second* capture works, which
+///   is the observable proof that the first resumed what it stopped;
+/// * a slot with nothing to capture (no launch-first program, so no instance)
+///   refuses by name rather than writing an empty image.
+#[test]
+fn test_supervise_checkpoint_writes_an_image_and_leaves_the_generation_running() {
+    let ctl_root = isolate_ctl_root();
+    let workdir = repo_tmp_dir().join(format!("supervise-checkpoint-{}", std::process::id()));
+    std::fs::create_dir_all(&workdir).expect("create checkpoint workdir");
+    let image = workdir.join("image");
+    let second = workdir.join("image-2");
+    let empty_image = workdir.join("image-empty");
+    let evidence = workdir.join("evidence.txt");
+    let policy = write_policy(
+        "checkpoint-instance",
+        &instance_policy(workdir.to_str().expect("workdir utf8")),
+    );
+    let script = format!(
+        "printf 'still-alive\\n' > {} && exec sleep 30",
+        evidence.display()
+    );
+    let program = write_policy(
+        "checkpoint-program",
+        &serde_json::json!({ "argv": ["/bin/sh", "-c", script] }).to_string(),
+    );
+    let name = format!("supervise-checkpoint-{}", std::process::id());
+    let token = "checkpoint-token-0123456789abcdef";
+
+    let (child, sock_path) =
+        spawn_serving_slot(&ctl_root, &policy, &name, token, Some(&program));
+    // Launch-first: the program above is already running by the time the slot
+    // serves, so the capture below needs no `run` verb.
+    wait_until(
+        Instant::now() + Duration::from_secs(15),
+        "checkpoint workload evidence",
+        || {
+            std::fs::read_to_string(&evidence)
+                .map(|s| s == "still-alive\n")
+                .unwrap_or(false)
+        },
+    );
+
+    // The verb needs a destination, and a refused call must not leave one.
+    let resp = registered_verb_args(&sock_path, token, "checkpoint", serde_json::json!({}));
+    assert_eq!(
+        resp["ok"],
+        serde_json::Value::Bool(false),
+        "checkpoint without dir: {resp:?}"
+    );
+    assert!(
+        resp["err"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("non-empty `dir`"),
+        "a missing dir must be refused by name: {resp:?}"
+    );
+    assert!(
+        !image.exists(),
+        "a refused checkpoint must not create an image"
+    );
+
+    let resp = registered_verb_args(
+        &sock_path,
+        token,
+        "checkpoint",
+        serde_json::json!({ "dir": image.to_str().unwrap(), "name": "sbx-from-e2b" }),
+    );
+    assert_eq!(
+        resp["ok"],
+        serde_json::Value::Bool(true),
+        "checkpoint: {resp:?}"
+    );
+    assert_eq!(
+        resp["data"]["dir"],
+        serde_json::json!(image.to_str().unwrap()),
+        "the reply names where the image went: {resp:?}"
+    );
+    assert_eq!(
+        resp["data"]["name"],
+        serde_json::json!("sbx-from-e2b"),
+        "the caller's name is carried into the image: {resp:?}"
+    );
+    let pid = resp["data"]["pid"].as_i64().expect("captured pid");
+    assert!(
+        resp["data"]["fds"].as_u64().unwrap_or(0) >= 1,
+        "the capture records an fd table: {resp:?}"
+    );
+
+    // The image is an engine image: `meta.json` is its index and `policy.dat`
+    // is what makes it self-describing, which is what a restore reads.
+    assert!(image.is_dir(), "image directory must exist");
+    assert!(image.join("meta.json").is_file(), "image meta.json");
+    assert!(image.join("policy.dat").is_file(), "image policy.dat");
+    assert!(
+        !image.with_extension("tmp").exists(),
+        "the atomic write must leave no tmp directory behind"
+    );
+
+    // Not a kill: same generation, same child, workload file intact.
+    let stats = registered_verb(&sock_path, token, "stats");
+    assert_eq!(
+        stats["data"]["instance_state"],
+        serde_json::json!("Live"),
+        "the generation must still be Live after a capture: {stats:?}"
+    );
+    assert_eq!(
+        stats["data"]["children_live"],
+        serde_json::json!(1),
+        "the captured child must still be running: {stats:?}"
+    );
+    assert!(
+        process_alive(pid as i32),
+        "the checkpointed child must still be alive"
+    );
+    assert!(
+        evidence.is_file(),
+        "the workload's own file must survive the capture"
+    );
+
+    let resp = registered_verb_args(
+        &sock_path,
+        token,
+        "checkpoint",
+        serde_json::json!({ "dir": second.to_str().unwrap() }),
+    );
+    assert_eq!(
+        resp["ok"],
+        serde_json::Value::Bool(true),
+        "second checkpoint: {resp:?}"
+    );
+    assert!(second.join("meta.json").is_file(), "second image meta.json");
+
+    let resp = registered_verb(&sock_path, token, "shutdown");
+    assert_eq!(
+        resp["ok"],
+        serde_json::Value::Bool(true),
+        "shutdown: {resp:?}"
+    );
+    let out = child.wait_with_output().expect("wait checkpoint supervise");
+    assert!(
+        out.status.success(),
+        "a checkpointed generation must still end cleanly; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A slot started without `--program` has no instance, so there is nothing
+    // to capture: it says which precondition is missing and writes nothing.
+    let empty_policy = write_policy(
+        "checkpoint-empty-instance",
+        &instance_policy(workdir.to_str().expect("workdir utf8")),
+    );
+    let empty_name = format!("supervise-checkpoint-empty-{}", std::process::id());
+    let (child, sock_path) =
+        spawn_serving_slot(&ctl_root, &empty_policy, &empty_name, token, None);
+    let resp = registered_verb_args(
+        &sock_path,
+        token,
+        "checkpoint",
+        serde_json::json!({ "dir": empty_image.to_str().unwrap() }),
+    );
+    assert_eq!(
+        resp["ok"],
+        serde_json::Value::Bool(false),
+        "checkpoint without an instance: {resp:?}"
+    );
+    assert!(
+        resp["err"].as_str().unwrap_or_default().contains("no instance"),
+        "an unlaunched generation must be refused by name: {resp:?}"
+    );
+    assert!(
+        !empty_image.exists(),
+        "a refused checkpoint must not create an image"
+    );
+    let resp = registered_verb(&sock_path, token, "shutdown");
+    assert_eq!(
+        resp["ok"],
+        serde_json::Value::Bool(true),
+        "second shutdown: {resp:?}"
+    );
+    let out = child.wait_with_output().expect("wait empty supervise");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_file(&policy);
+    let _ = std::fs::remove_file(&empty_policy);
     let _ = std::fs::remove_file(&program);
     let _ = std::fs::remove_dir_all(&workdir);
 }
