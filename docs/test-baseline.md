@@ -307,7 +307,11 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 552 # 2026-09-25: 551 -> 552, +1 and it is the RELRO capture fix's
+core_integ = 553 # 2026-09-25: 552 -> 553, +1 and it is the prerequisite the
+                 # restore work's (b) shape rests on: the session's parent can
+                 # `process_vm_writev`/`PTRACE_ATTACH` into an init-spawned child
+                 # (`test_the_session_parent_can_write_into_an_init_spawned_child`).
+                 # 2026-09-25: 551 -> 552, +1 and it is the RELRO capture fix's
                  # regression case (`test_libc_workloads_resume_after_restore`:
                  # malloc, a vDSO `clock_gettime`, stdio, plus the static
                  # control, all asserted to resume). It replaced the diagnostic

@@ -465,3 +465,116 @@ async fn test_exec_mode_main_exit_is_terminal_and_verbs_close() {
     assert!(!dir.exists(), "shutdown must still remove the control dir");
     let _ = std::fs::remove_file(&marker);
 }
+
+/// The session's parent can inject into an **init-spawned child** -- the
+/// prerequisite for making a restored session exec-capable.
+///
+/// Why this is a test and not an assumption: route B's slot owns the sandbox, and
+/// `checkpoint/restore` can only keep `exec` working if the resumed process is a
+/// child of the session's `sandlock-init` (that is what serves `exec` at all --
+/// OCI's restore path refuses it with "exec is not supported on a restored
+/// container" precisely because its restore has no init). But then the supervisor
+/// stops being the resumed process's parent and becomes its *grandparent*, and
+/// the injection it performs (`process_vm_writev`, plus `PTRACE_ATTACH` for the
+/// ptrace-shaped routes) asks `PTRACE_MODE_ATTACH` permission across that gap.
+///
+/// Measured 2026-09-25: both work -- `process_vm_writev` transfers the exact
+/// payload into a writable mapping of the child, and `PTRACE_ATTACH` (followed by
+/// `PTRACE_DETACH`) succeeds. Same host uid plus the same user namespace mapping
+/// is the reason, and this pins it: if a kernel or a policy change ever breaks it,
+/// the (b) design loses its footing and this test is where that shows up.
+#[tokio::test]
+async fn test_the_session_parent_can_write_into_an_init_spawned_child() {
+    let mut session = launch_exec_session("spike-grandchild-write").await;
+    let handle = session
+        .exec(&["sh", "-c", "exec sleep 30"], ExecStdio::Piped)
+        .await
+        .expect("exec a child under init");
+    let pid = handle.pid;
+    assert!(pid > 0, "the session must report the child's host pid");
+
+    // A writable anonymous mapping to poke at.
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).expect("read child maps");
+    let (start, end) = maps
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let range = parts.next()?;
+            let perms = parts.next()?;
+            let path = parts.nth(3).unwrap_or("");
+            if !(perms.starts_with("rw") && path.is_empty()) {
+                return None;
+            }
+            let (lo, hi) = range.split_once('-')?;
+            Some((
+                u64::from_str_radix(lo, 16).ok()?,
+                u64::from_str_radix(hi, 16).ok()?,
+            ))
+        })
+        .find(|(lo, hi)| hi - lo >= 4096)
+        .expect("the child has a writable anonymous mapping");
+    let _ = end;
+
+    // 1. The plain injection path: process_vm_writev, no attach.
+    let payload = [0x5Au8; 8];
+    let local = libc::iovec {
+        iov_base: payload.as_ptr() as *mut libc::c_void,
+        iov_len: payload.len(),
+    };
+    let remote = libc::iovec {
+        iov_base: start as *mut libc::c_void,
+        iov_len: payload.len(),
+    };
+    let written = unsafe {
+        libc::process_vm_writev(
+            pid,
+            &local as *const libc::iovec,
+            1,
+            &remote as *const libc::iovec,
+            1,
+            0,
+        )
+    };
+    let write_err = std::io::Error::last_os_error();
+
+    // 2. The attach path (what a ptrace-based injection would need).
+    let attach = unsafe {
+        libc::ptrace(
+            libc::PTRACE_ATTACH,
+            pid,
+            std::ptr::null_mut::<libc::c_void>(),
+            std::ptr::null_mut::<libc::c_void>(),
+        )
+    };
+    let attach_err = std::io::Error::last_os_error();
+    if attach == 0 {
+        let mut status = 0;
+        let _ = unsafe { libc::waitpid(pid, &mut status, 0) };
+        let detach = unsafe {
+            libc::ptrace(
+                libc::PTRACE_DETACH,
+                pid,
+                std::ptr::null_mut::<libc::c_void>(),
+                std::ptr::null_mut::<libc::c_void>(),
+            )
+        };
+        assert_eq!(detach, 0, "detach: {}", std::io::Error::last_os_error());
+    }
+
+    assert_eq!(
+        written,
+        payload.len() as isize,
+        "process_vm_writev into an init-spawned child must transfer the payload \
+         (errno {})",
+        write_err.raw_os_error().unwrap_or(0)
+    );
+    assert_eq!(
+        attach,
+        0,
+        "PTRACE_ATTACH into an init-spawned child must be permitted (errno {})",
+        attach_err.raw_os_error().unwrap_or(0)
+    );
+
+    let _ = session.kill_child(handle.child_id, libc::SIGKILL);
+    let _ = session.shutdown().await;
+}
