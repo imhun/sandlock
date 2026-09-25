@@ -1248,7 +1248,16 @@ impl SandboxBuilder {
                 .iter()
                 .chain(self.fs_writable.iter())
                 .chain(self.fs_mount.iter().map(|(_, host)| host))
-                .chain(self.chroot.as_ref());
+                // Root "/" is the pure shape's identity translation (N15), not
+                // a jail: it would make *every* host path an exposing grant and
+                // turn a real check into noise. The reachable set in that shape
+                // is the allow-list above, which is where the sandbox's view is
+                // actually bounded (`can_read`).
+                .chain(
+                    self.chroot
+                        .as_ref()
+                        .filter(|root| root.as_path() != std::path::Path::new("/")),
+                );
             if let Some(exposure) = exposing_grant(
                 std::path::Path::new(path),
                 grants,

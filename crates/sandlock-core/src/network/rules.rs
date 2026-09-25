@@ -654,26 +654,36 @@ pub fn compose_virtual_etc_hosts(
     let mut has_v6_localhost = false;
 
     if let Some(root) = chroot_root {
-        if let Ok(image) = std::fs::read_to_string(root.join("etc").join("hosts")) {
-            for line in image.lines() {
-                // Strip an inline `#` comment before tokenizing — the
-                // hosts(5) format treats everything after `#` as a comment.
-                let stripped = line.split('#').next().unwrap_or("");
-                let mut parts = stripped.split_whitespace();
-                let Some(ip) = parts.next() else { continue };
-                for name in parts {
-                    if name == "localhost" {
-                        if ip == "127.0.0.1" {
-                            has_v4_localhost = true;
-                        } else if ip == "::1" {
-                            has_v6_localhost = true;
+        // Root "/" is the pure shape's identity translation (N15): it is not
+        // an image, and the file under it is the **host's** /etc/hosts. Reading
+        // it would leak the worker's own name table into the sandbox -- and,
+        // worse, it would resolve a wildcard-rule name to a literal address,
+        // which no rule can then intercept (measured 2026-09-25: a test that
+        // appended `127.0.0.1 api.egress.test` to the host's file made the
+        // sandbox dial 127.0.0.1 directly instead of the gateway's synthetic
+        // address, and the egress proxy never saw the connection).
+        if root != std::path::Path::new("/") {
+            if let Ok(image) = std::fs::read_to_string(root.join("etc").join("hosts")) {
+                for line in image.lines() {
+                    // Strip an inline `#` comment before tokenizing — the
+                    // hosts(5) format treats everything after `#` as a comment.
+                    let stripped = line.split('#').next().unwrap_or("");
+                    let mut parts = stripped.split_whitespace();
+                    let Some(ip) = parts.next() else { continue };
+                    for name in parts {
+                        if name == "localhost" {
+                            if ip == "127.0.0.1" {
+                                has_v4_localhost = true;
+                            } else if ip == "::1" {
+                                has_v6_localhost = true;
+                            }
                         }
                     }
                 }
-            }
-            out.push_str(&image);
-            if !out.is_empty() && !out.ends_with('\n') {
-                out.push('\n');
+                out.push_str(&image);
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
             }
         }
     }
@@ -1284,6 +1294,41 @@ mod tests {
     fn compose_no_chroot_appends_concrete_entries() {
         let out = compose_virtual_etc_hosts(None, "10.0.0.1 api\n");
         assert_eq!(out, "127.0.0.1 localhost\n::1 localhost\n10.0.0.1 api\n");
+    }
+
+    #[test]
+    fn compose_root_slash_is_not_an_image_and_leaks_no_host_entry() {
+        // N15: the pure shape hands the mediator the *host* root. Joining
+        // `/etc/hosts` onto it would read the worker's own table -- which is
+        // not a name table the sandbox was ever meant to see, and which turns a
+        // wildcard-rule name into a literal address no rule can intercept.
+        // ("/" must behave exactly like "no image".)
+        let with_slash = compose_virtual_etc_hosts(Some(std::path::Path::new("/")), "10.9.9.9 api\n");
+        let without = compose_virtual_etc_hosts(None, "10.9.9.9 api\n");
+        assert_eq!(
+            with_slash, without,
+            "root \"/\" must compose exactly as \"no image rootfs\""
+        );
+        assert!(with_slash.contains("10.9.9.9 api\n"));
+
+        // Name what the leak would have brought in, from the file itself: the
+        // loopback lines are re-emitted by this function anyway, so every other
+        // name in the host's table must be absent.
+        let host_file = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+        for line in host_file.lines() {
+            let stripped = line.split('#').next().unwrap_or("");
+            let mut parts = stripped.split_whitespace();
+            let Some(_ip) = parts.next() else { continue };
+            for name in parts {
+                if name == "localhost" {
+                    continue;
+                }
+                assert!(
+                    !with_slash.contains(name),
+                    "the host's /etc/hosts entry {name:?} leaked into the synthetic file"
+                );
+            }
+        }
     }
 
     #[test]
