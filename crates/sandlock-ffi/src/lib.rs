@@ -3072,9 +3072,11 @@ pub unsafe extern "C" fn sandlock_checkpoint_free(cp: *mut sandlock_checkpoint_t
 /// pseudo-filesystem paths) are recorded on the handle; enumerate them with
 /// `sandlock_handle_restore_skipped_len` / `_fd` / `_path`.
 ///
-/// x86_64 restore engine only. The image is rebuilt by an `execve`'d restore
-/// stub in a fresh, already-confined process, and the kernel vDSO is relocated
-/// onto the checkpoint-recorded base, so ordinary libc programs resume; see
+/// The restore engine covers x86_64, aarch64 and riscv64 (`build.rs` makes a
+/// missing stub fatal on exactly those targets, so a wheel that ships without
+/// one cannot be built). The image is rebuilt by an `execve`'d restore stub in
+/// a fresh, already-confined process, and the kernel vDSO is relocated onto the
+/// checkpoint-recorded base, so ordinary libc programs resume; see
 /// `Sandbox::restore_interactive` in sandlock-core.
 ///
 /// # Safety
