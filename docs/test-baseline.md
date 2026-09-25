@@ -627,7 +627,11 @@ cli = 98      # 2026-09-23: 97 -> 98, +1
               # after F0.4 wiring (cli suite includes net_bind_map tests);
               # F5.1 updates the no-supervisor default validation to
               # DEFAULT_MAX_PROCESSES (256), no count change
-supervise = 51 # 2026-09-22 catch-up, not this round's work: the first
+supervise = 53 # 2026-09-25: 51 -> 53, +2 and both are this lane's own work --
+               # the checkpoint verb (its test writes an image and asserts the
+               # generation keeps running) and the restore-from-image mode
+               # (a slot started from an image serves stats/refuses exec).
+               # 2026-09-22 catch-up, not this round's work: the first
                # complete gate run since the N25 series reported "baseline says
                # 43 passed, run produced 51". The +8 are the supervise-side
                # cases that series added and never re-ran this gate for
