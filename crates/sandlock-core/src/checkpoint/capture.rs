@@ -332,6 +332,42 @@ pub(crate) fn parse_proc_maps(pid: i32) -> io::Result<Vec<MemoryMap>> {
 /// refusal to checkpoint, never a partial image.
 const MAX_REGION_BYTES: usize = 256 * 1024 * 1024;
 
+/// Whether a region is part of an object's `GNU_RELRO` range: a file-backed page
+/// that is read-only **now**, but was writable when the dynamic loader wrote into
+/// it.
+///
+/// The loader relocates pointers and caches the vDSO entry points (and other
+/// runtime-resolved addresses) in `.data.rel.ro`, then `mprotect`s that range
+/// read-only. At capture time it looks like any other read-only file page, so
+/// [`must_dump`] would leave it to be re-read from the file -- where those writes
+/// do not exist. The restored process then reads **zeros** where the loader put
+/// its pointers and faults on the first one it dereferences. Measured on the
+/// restore suite's own harness: `segfault at 300 ... in libc.so.6`, in
+/// `clock_gettime`'s vDSO path, with the loaded pointer NULL; and both that shape
+/// and a stdio shape resume once the range travels in the image instead
+/// (`test_loader_readonly_page_writes_are_lost_on_restore`).
+///
+/// Identified from the map list rather than by parsing each ELF's program
+/// headers: RELRO is exactly the read-only file-backed region that *immediately
+/// precedes* the same object's private writable data region. That adjacency is
+/// what separates it from the object's other read-only pages (`.rodata`), which
+/// the file really does still hold.
+fn is_relro_map(maps: &[MemoryMap], index: usize) -> bool {
+    let Some(map) = maps.get(index) else {
+        return false;
+    };
+    if map.writable() || map.perms.contains('x') || !map.private() {
+        return false;
+    }
+    let Some(path) = map.path.as_deref().filter(|p| p.starts_with('/')) else {
+        return false;
+    };
+    let Some(next) = maps.get(index + 1) else {
+        return false;
+    };
+    next.writable() && !next.perms.contains('x') && next.path.as_deref() == Some(path)
+}
+
 /// Whether a region's bytes have to travel inside the image, because restore
 /// cannot obtain them from anywhere else.
 ///
@@ -391,8 +427,11 @@ fn capture_memory(pid: i32, maps: &[MemoryMap]) -> Result<Vec<MemorySegment>, Sa
     };
     let mut segments = Vec::new();
 
-    for map in maps {
-        if !must_dump(map) {
+    for (index, map) in maps.iter().enumerate() {
+        // Two reasons to carry bytes: the region holds data nothing else can
+        // supply (`must_dump`), or the loader wrote into it and then made it
+        // read-only (`is_relro_map`), which the file no longer reflects.
+        if !must_dump(map) && !is_relro_map(maps, index) {
             continue;
         }
         // Past this point the region's bytes ARE the image. Nothing else can
@@ -688,6 +727,86 @@ mod tests {
             offset: 0,
             path: path.map(Into::into),
         }
+    }
+
+    fn map_at(perms: &str, path: Option<&str>, start: u64, end: u64) -> MemoryMap {
+        MemoryMap {
+            start,
+            end,
+            perms: perms.into(),
+            offset: 0,
+            path: path.map(Into::into),
+        }
+    }
+
+    /// The kernel's rendering of a loaded object: text, `.rodata`, the loader's
+    /// RELRO range (read-only *now*, written at startup), then data.
+    fn object_maps(path: &str) -> Vec<MemoryMap> {
+        vec![
+            map_at("r--p", Some(path), 0x1000, 0x2000),
+            map_at("r-xp", Some(path), 0x2000, 0x6000),
+            map_at("r--p", Some(path), 0x6000, 0x7000), // <- RELRO
+            map_at("rw-p", Some(path), 0x7000, 0x8000),
+        ]
+    }
+
+    #[test]
+    fn the_loaders_relro_range_is_dumped_not_left_to_the_file() {
+        let maps = object_maps("/lib/libc.so");
+        assert!(
+            is_relro_map(&maps, 2),
+            "the read-only range immediately before the object's data is RELRO: \
+             the loader wrote relocated pointers there and the file does not have them"
+        );
+        assert!(
+            !is_relro_map(&maps, 0),
+            ".rodata is not RELRO: nothing wrote to it, so the file still holds it"
+        );
+        assert!(
+            !is_relro_map(&maps, 1),
+            "program text is not RELRO (and the data segment does not follow it)"
+        );
+        assert!(
+            !is_relro_map(&maps, 3),
+            "the data segment is writable, so it is dumped for the ordinary reason"
+        );
+    }
+
+    #[test]
+    fn relro_detection_does_not_claim_other_read_only_regions() {
+        // No path: anonymous memory has no loader bookkeeping, and this rule must
+        // not become a second way to decide `must_dump`.
+        let anon = vec![
+            map_at("r--p", None, 0x1000, 0x2000),
+            map_at("rw-p", None, 0x2000, 0x3000),
+        ];
+        assert!(!is_relro_map(&anon, 0), "an anonymous read-only region is not RELRO");
+
+        // A read-only range followed by *another object's* data is not this
+        // object's RELRO: the adjacency has to be within one file.
+        let mixed = vec![
+            map_at("r--p", Some("/lib/a.so"), 0x1000, 0x2000),
+            map_at("rw-p", Some("/lib/b.so"), 0x2000, 0x3000),
+        ];
+        assert!(!is_relro_map(&mixed, 0), "the following data belongs to another object");
+
+        // Read-only followed by executable (a layout that exists) is not RELRO.
+        let ro_then_text = vec![
+            map_at("r--p", Some("/lib/a.so"), 0x1000, 0x2000),
+            map_at("r-xp", Some("/lib/a.so"), 0x2000, 0x3000),
+        ];
+        assert!(!is_relro_map(&ro_then_text, 0), "text follows, not data");
+
+        // Shared read-only file pages are not the loader's private RELRO either.
+        let shared = vec![
+            map_at("r--s", Some("/lib/a.so"), 0x1000, 0x2000),
+            map_at("rw-p", Some("/lib/a.so"), 0x2000, 0x3000),
+        ];
+        assert!(!is_relro_map(&shared, 0), "a shared read-only page is not RELRO");
+
+        // The last map has no successor, so it cannot be RELRO.
+        let last = vec![map_at("r--p", Some("/lib/a.so"), 0x1000, 0x2000)];
+        assert!(!is_relro_map(&last, 0), "no following region to be the data segment");
     }
 
     #[test]

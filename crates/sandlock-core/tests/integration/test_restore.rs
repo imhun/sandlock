@@ -573,35 +573,25 @@ async fn test_restore_resumes_without_exec_and_without_chroot() {
     );
 }
 
-/// **Pinned gap, with its mechanism**: the loader's writes into read-only pages
-/// are lost on restore, and any libc path that reads one dies.
+/// **Regression**: workloads that touch the dynamic loader's read-only pages
+/// resume after a restore.
 ///
-/// The symptom first showed up as "real programs cannot be restored" (a
-/// supervisor slot saw `/bin/sh` and `python3` die right after restore, while the
-/// static helper and `/bin/sleep` came back). Two framings were wrong before this
-/// one, and the cases below are what corrected them:
+/// This started as the opposite test. A supervisor slot restoring its own images
+/// saw `/bin/sh` and `python3` die right after restore while the static helper
+/// and `/bin/sleep` came back, and two framings of the cause were measured and
+/// discarded before the real one ("static works, dynamic fails"; "the libc
+/// allocator is the problem" -- `malloc`/`free` resume fine). What separated the
+/// cases was whether the program touches a value the loader wrote into a
+/// **read-only** page at startup: `GNU_RELRO`, where relocated pointers and the
+/// vDSO caches live. The capture left those to be re-read from the file, where
+/// they are zero, and the first dereference faulted (`segfault at 300 ... in
+/// libc.so.6`, loaded pointer NULL, inside `clock_gettime`'s vDSO path).
 ///
-/// * "static works, dynamic fails" -- no: a dynamically linked program with no
-///   libc machinery resumes (`libc-malloc` here allocates and survives).
-/// * "the libc allocator is the problem" -- no: `malloc`/`free` resume fine.
-///
-/// What actually separates the cases is whether the program touches a value the
-/// **dynamic loader wrote into a read-only page** at startup. The capture dumps
-/// writable (or unreopenable) mappings only, so `PT_GNU_RELRO` pages -- where the
-/// loader stores relocated pointers and the vDSO function caches -- are left to
-/// be re-read *from the file*, where they are zero. The first libc call that
-/// dereferences one then faults: measured as `segfault at 300 ... in libc.so.6`
-/// with the loaded pointer NULL, inside `clock_gettime`'s vDSO path.
-///
-/// The fix-shaped case is `vdso-clock-relro`: the same program, with its RELRO
-/// pages made writable before the capture so the capture dumps them -- and it
-/// resumes. That is the mechanism, isolated.
-///
-/// **When the gap cases start passing, this test fails** -- deliberately, the way
-/// the security suite pins a residual. Then delete this test and update
-/// `docs/checkpoint-restore-e2b-half.md` §1(e).
+/// The fix carries those ranges in the image (`checkpoint::capture::is_relro_map`),
+/// and this test is what says so. It is the same harness the diagnosis used, so
+/// the shapes below are the ones that were failing, now asserted to work.
 #[tokio::test]
-async fn test_loader_readonly_page_writes_are_lost_on_restore() {
+async fn test_libc_workloads_resume_after_restore() {
     let has_cc = ["cc", "gcc"].iter().any(|cc| {
         std::process::Command::new(cc)
             .arg("--version")
@@ -613,21 +603,19 @@ async fn test_loader_readonly_page_writes_are_lost_on_restore() {
         eprintln!("skipping: no C compiler (cc/gcc) available");
         return;
     }
-    let tmp = std::env::temp_dir().join(format!("sandlock-relro-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("sandlock-libcr-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
 
-    // Every workload writes its counter with raw syscalls (a mechanism this
-    // suite already proves works), so "did it advance" measures the one libc
-    // operation under test and nothing else.
-    fn source(op: &str, extra: &str, startup: &str) -> String {
+    // Every workload writes its counter with raw syscalls, so "did it advance"
+    // measures the one libc operation under test and nothing else.
+    fn source(op: &str, extra: &str) -> String {
         format!(
             r#"
 #include <unistd.h>
 #include <sys/syscall.h>
 {extra}
 int main(int argc, char **argv) {{
-    {startup}
     unsigned long i = 0;
     char buf[32];
     if (argc < 2) return 2;
@@ -651,68 +639,28 @@ int main(int argc, char **argv) {{
         )
     }
 
-    /// Make every loaded object's RELRO read-only-at-startup region writable,
-    /// so a capture dumps it instead of leaving it to be re-read from the file.
-    /// This is the *fix shape*, written from the outside because the engine
-    /// cannot do it yet.
-    const RELRO_RELAX: &str = r#"
-#include <link.h>
-#include <sys/mman.h>
-static int relro_cb(struct dl_phdr_info *info, size_t size, void *data) {
-    (void)size; (void)data;
-    for (int i = 0; i < info->dlpi_phnum; i++) {
-        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
-        if (ph->p_type == PT_GNU_RELRO) {
-            unsigned long start = (unsigned long)info->dlpi_addr + ph->p_vaddr;
-            unsigned long end = start + ph->p_memsz;
-            start &= ~4095UL;
-            mprotect((void *)start, end - start, PROT_READ | PROT_WRITE);
-        }
-    }
-    return 0;
-}
-static void relro_relax(void) { dl_iterate_phdr(relro_cb, 0); }
-"#;
-
     let variants: Vec<(&str, String)> = vec![
         (
             "libc-malloc",
             source(
                 "void *q = malloc(64); if (q) { *(volatile char *)q = 1; free(q); }",
                 "#include <stdlib.h>",
-                "",
             ),
         ),
         (
+            // Reads the vDSO cache the loader wrote into RELRO.
             "vdso-clock",
             source(
                 "struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);",
                 "#include <time.h>",
-                "",
             ),
         ),
         (
-            "vdso-clock-relro",
-            source(
-                "struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);",
-                &format!("#include <time.h>\n{RELRO_RELAX}"),
-                "relro_relax();",
-            ),
-        ),
-        (
+            // libc stdio: the shape `/bin/sh`- and `python3`-like programs take.
             "stdio-fopen",
             source(
                 "FILE *f = fopen(\"/dev/null\", \"w\"); if (f) fclose(f);",
                 "#include <stdio.h>",
-                "",
-            ),
-        ),
-        (
-            "stdio-fopen-relro",
-            source(
-                "FILE *f = fopen(\"/dev/null\", \"w\"); if (f) fclose(f);",
-                &format!("#include <stdio.h>\n{RELRO_RELAX}"),
-                "relro_relax();",
             ),
         ),
     ];
@@ -749,7 +697,7 @@ static void relro_relax(void) { dl_iterate_phdr(relro_cb, 0); }
     }
     let policy = builder.build().unwrap();
 
-    // Returns whether the process advanced past the capture (and its state).
+    // Returns whether the process advanced past the capture and its state char.
     async fn round_trip(
         policy: &Sandbox,
         helper: &std::path::Path,
@@ -759,20 +707,13 @@ static void relro_relax(void) { dl_iterate_phdr(relro_cb, 0); }
     ) -> (bool, String) {
         let counter = tmp.join(format!("cnt-{tag}"));
         let _ = std::fs::remove_file(&counter);
-        let (program, args): (String, Vec<String>) = match bin {
-            Some(b) => (
-                b.to_str().unwrap().to_string(),
-                vec![counter.to_str().unwrap().to_string()],
-            ),
-            None => (
-                helper.to_str().unwrap().to_string(),
-                vec!["clock-loop".to_string(), counter.to_str().unwrap().to_string()],
-            ),
+        let mut argv: Vec<String> = match bin {
+            Some(b) => vec![b.to_str().unwrap().to_string()],
+            None => vec![helper.to_str().unwrap().to_string(), "clock-loop".to_string()],
         };
-        let mut argv = vec![program];
-        argv.extend(args);
+        argv.push(counter.to_str().unwrap().to_string());
         let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let mut sb = policy.clone().with_name(&format!("relro-{tag}"));
+        let mut sb = policy.clone().with_name(&format!("libcr-{tag}"));
         sb.spawn_interactive(&refs)
             .await
             .unwrap_or_else(|e| panic!("{tag}: spawn: {e}"));
@@ -790,7 +731,7 @@ static void relro_relax(void) { dl_iterate_phdr(relro_cb, 0); }
             .unwrap_or_else(|e| panic!("{tag}: checkpoint: {e}"));
         let _ = sb.kill();
         let _ = sb.wait().await;
-        let mut sb2 = policy.clone().with_name(&format!("relro-{tag}-dst"));
+        let mut sb2 = policy.clone().with_name(&format!("libcr-{tag}-dst"));
         let _ = sb2
             .restore_interactive(&cp)
             .await
@@ -814,85 +755,28 @@ static void relro_relax(void) { dl_iterate_phdr(relro_cb, 0); }
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
         let state = stat.split_whitespace().nth(2).unwrap_or("?").to_string();
         let exit_code = stat.split_whitespace().nth(51).unwrap_or("-").to_string();
-        eprintln!("relro {tag}: advanced={advanced} state={state} exit_code={exit_code}");
+        eprintln!("libcr {tag}: advanced={advanced} state={state} exit_code={exit_code}");
         let _ = sb2.kill();
         let _ = sb2.wait().await;
         (advanced, state)
     }
 
-    // Control: the static freestanding helper the rest of this suite uses.
-    let (control_advanced, _) =
-        round_trip(&policy, &helper, &tmp, None, "static-control").await;
-    assert!(
-        control_advanced,
-        "the static control must resume -- otherwise the harness is wrong and \
-         nothing below means anything"
-    );
+    // The static freestanding helper the rest of this suite uses, as the control.
+    let (control_advanced, _) = round_trip(&policy, &helper, &tmp, None, "static-control").await;
+    assert!(control_advanced, "the static control must resume");
 
-    // Allocation is *not* the problem; this is the case that says so.
-    let malloc_bin = bins.iter().find(|(n, _)| n == "libc-malloc").unwrap().1.clone();
-    let (malloc_advanced, malloc_state) =
-        round_trip(&policy, &helper, &tmp, Some(&malloc_bin), "libc-malloc").await;
-    assert!(
-        malloc_advanced,
-        "malloc/free must resume (state {malloc_state}) -- if this fails, the \
-         mechanism in this test's docs is wrong"
-    );
-
-    // The mechanism, isolated: dumping the loader's read-only-but-written pages
-    // is what makes the vDSO path survive.
-    let relro_clock = bins
-        .iter()
-        .find(|(n, _)| n == "vdso-clock-relro")
-        .unwrap()
-        .1
-        .clone();
-    let (relro_advanced, relro_state) = round_trip(
-        &policy,
-        &helper,
-        &tmp,
-        Some(&relro_clock),
-        "vdso-clock-relro",
-    )
-    .await;
-    assert!(
-        relro_advanced,
-        "a vDSO call must resume once the loader's read-only pages are captured \
-         (state {relro_state}); that is the mechanism this test is about"
-    );
-    let relro_stdio = bins
-        .iter()
-        .find(|(n, _)| n == "stdio-fopen-relro")
-        .unwrap()
-        .1
-        .clone();
-    let (relro_stdio_advanced, relro_stdio_state) = round_trip(
-        &policy,
-        &helper,
-        &tmp,
-        Some(&relro_stdio),
-        "stdio-fopen-relro",
-    )
-    .await;
-    assert!(
-        relro_stdio_advanced,
-        "stdio must resume once those pages are captured (state \
-         {relro_stdio_state}) -- so it shares the cause, it is not a second bug"
-    );
-
-    // The gaps themselves. Both fail on purpose once the engine captures those
-    // pages; the messages say what to do then.
-    for (tag, name) in [("vdso-clock", "vdso-clock"), ("stdio-fopen", "stdio-fopen")] {
-        let bin = bins.iter().find(|(n, _)| n == name).unwrap().1.clone();
-        let (advanced, state) = round_trip(&policy, &helper, &tmp, Some(&bin), tag).await;
-        // The counter is written *before* the libc call in every variant, so a
-        // dying case still advances once: being alive is the real signal.
-        let _ = advanced;
+    for (name, bin) in &bins {
+        let (advanced, state) = round_trip(&policy, &helper, &tmp, Some(bin), name).await;
         assert!(
-            state == "Z",
-            "{tag} survived the restore (state {state})! That is the fix, not a \
-             regression: delete this test and the matching entry in \
-             docs/checkpoint-restore-e2b-half.md §1(e)"
+            advanced,
+            "{name} did not advance after the restore (state {state}) -- a workload that \
+             touches the loader's read-only pages must resume; see \
+             checkpoint::capture::is_relro_map"
+        );
+        assert_ne!(
+            state, "Z",
+            "{name} is a zombie after the restore: the loader's read-only pages did not \
+             travel in the image"
         );
     }
 
