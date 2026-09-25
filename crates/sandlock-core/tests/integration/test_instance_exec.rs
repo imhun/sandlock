@@ -1130,3 +1130,145 @@ async fn test_a_dynamic_workload_resumes_into_a_session() {
     let _ = dst.shutdown().await;
     let _ = std::fs::remove_dir_all(&workdir);
 }
+
+/// The deployment's shape **exactly**: a *dynamic* workload, restored into a
+/// session that runs inside a **real root** (`pivot_root`, what production
+/// runs), with the host's `/usr`, `/bin`, `/lib`, `/etc` mounted in and a
+/// writable `/work`.
+///
+/// This is the shape the cluster acceptance left open (FUP-30): the resume
+/// announced a restored child (`child 1, pid 30`), and seconds later that child
+/// was **gone from `/proc`** while the park and the session stayed healthy --
+/// and the counter file never moved again, i.e. the restored program died
+/// before its first iteration. The fork's own suite covers the *static*
+/// `rootfs-helper` (and, above, a dynamic python in the chroot-free shape), so
+/// the two untested axes are exactly "dynamic" and "real root".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_a_dynamic_workload_resumes_into_a_session_under_a_real_root() {
+    let python = ["/usr/local/bin/python3", "/usr/bin/python3"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.exists())
+        .expect("a python3 to restore (this image has one)");
+    let python_s = python.to_str().unwrap().to_string();
+    let tmp = std::env::temp_dir().join(format!(
+        "sandlock-dynamic-realroot-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let rootfs = tmp.join("rootfs");
+    let work = tmp.join("work");
+    for dir in ["usr", "lib", "lib64", "bin", "etc", "work", "tmp", "proc", "dev"] {
+        std::fs::create_dir_all(rootfs.join(dir)).unwrap();
+    }
+    std::fs::create_dir_all(&work).unwrap();
+    let counter = work.join("clock.cnt");
+    let read_counter = || {
+        std::fs::read_to_string(&counter)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    let mut builder = Sandbox::builder()
+        .chroot(&rootfs)
+        .real_root(true)
+        .user(euid, egid)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/etc")
+        .fs_mount_ro("/proc", "/proc")
+        // The rootfs has to *contain* every mount destination before the
+        // sandbox starts (the engine refuses otherwise, and says so in its
+        // real-root trace); `lib64` is created with the other directories above,
+        // and `/dev` is bound whole because the device nodes are not ours to
+        // create in a test.
+        .fs_mount("/dev", "/dev")
+        .fs_mount("/usr", "/usr")
+        .fs_mount("/bin", "/bin")
+        .fs_mount("/lib", "/lib")
+        .fs_mount("/etc", "/etc")
+        .fs_mount("/work", &work)
+        .fs_write("/work")
+        .cwd("/work");
+    if std::path::Path::new("/lib64").exists() {
+        builder = builder.fs_mount("/lib64", "/lib64");
+    }
+    builder.userns_self_map = true;
+    let policy = builder.build().expect("real-root policy builds");
+
+    let park = "trap '' TERM HUP INT QUIT USR1 USR2 PIPE; while :; do kill -STOP $$; done";
+    let program = "n = 0\n\
+                   while True:\n\
+                   \x20   n += 1\n\
+                   \x20   open('/work/clock.cnt', 'w').write(str(n))\n\
+                   \x20   import time; time.sleep(0.02)\n";
+
+    // --- a parked session under a real root, whose workload is python ---
+    let mut src = SandboxInstance::launch_exec(
+        policy.clone().with_name("realroot-src"),
+        &["/bin/sh", "-c", park],
+    )
+    .await
+    .expect("launch the parked real-root session");
+    let work_handle = src
+        .exec(&[python_s.as_str(), "-c", program], ExecStdio::Piped)
+        .await
+        .expect("exec the python workload");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !read_counter().is_some_and(|v| v >= 3) {
+        assert!(
+            Instant::now() < deadline,
+            "the python workload must run before the capture (counter {:?})",
+            read_counter()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let cp = src
+        .checkpoint_excluding_main()
+        .await
+        .expect("capture the python workload beside the park");
+    assert_eq!(
+        cp.process_state.pid, work_handle.pid,
+        "the image is the workload's"
+    );
+    src.shutdown().await.expect("tear the source session down");
+    // Sentinel: only the restored process can move this file now.
+    std::fs::write(&counter, b"0\n").unwrap();
+
+    // --- a fresh real-root session resumes it ---
+    let mut dst = SandboxInstance::launch_exec(
+        policy.with_name("realroot-dst"),
+        &["/bin/sh", "-c", park],
+    )
+    .await
+    .expect("launch the destination session");
+    let resumed = dst
+        .restore_into_session(&cp)
+        .await
+        .expect("restore the python workload into the session");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !read_counter().is_some_and(|v| v > 0) {
+        assert!(
+            Instant::now() < deadline,
+            "a dynamic workload restored under a real root must keep running: \
+             counter is {:?}, restored child {} (pid {}) alive = {}, session \
+             children_live = {}",
+            read_counter(),
+            resumed.child_id,
+            resumed.pid,
+            std::path::Path::new(&format!("/proc/{}", resumed.pid)).exists(),
+            dst.stats().await.children_live
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let _ = dst.kill_child(resumed.child_id, libc::SIGKILL);
+    let _ = dst.kill_child(0, libc::SIGKILL);
+    let _ = dst.wait_child(0).await;
+    let _ = dst.shutdown().await;
+    let _ = std::fs::remove_dir_all(&tmp);
+}

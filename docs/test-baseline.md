@@ -326,7 +326,13 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 557 # 2026-09-25: 555 -> 557, +2:
+core_integ = 558 # 2026-09-25: 555 -> 558, +3:
+                 # * `test_a_dynamic_workload_resumes_into_a_session_under_a_real_root`
+                 #   -- the deployment's shape exactly (real root + mounted /usr,
+                 #   /bin, /lib, /etc + a dynamic python workload restored into a
+                 #   session). The fixture has to create every mount destination
+                 #   inside the rootfs (`lib64`) and bind `/dev` (the device nodes
+                 #   of `minimal_dev()` cannot be created in a test).
                  # * `test_a_capture_does_not_wedge_a_forking_sibling` -- a capture
                  #   holds fork notifications box-wide; releasing the freeze by
                  #   dropping the ids left that sibling parked in `fork()` forever.

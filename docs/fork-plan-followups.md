@@ -136,14 +136,38 @@
 
   **剩下的（集群 half）**：与已绿的用例相比只差两轴——**动态**程序（既有用例全是静态
   `rootfs-helper`）与 **真根**（`E2B_REAL_ROOT=1`：mount ns + pivot_root + image rootfs）。
-  本机把这两轴一起复现的尝试**卡在启动**：`launch_exec` + `chroot(rootfs)` + `real_root(true)`
-  在本 harness 里直接 `Runtime(Child("read notif fd from child: pipe closed before 4 bytes read"))`
-  —— 子进程（init）在装好通道之前就死了，而**它的错误看不见**（会话形态把子进程 stdio 指向
-  `/dev/null`）。probe 源码留在 `tmp/probe_realroot_dynamic_restore.rs.txt`。
+ 本机把这两轴一起复现的尝试**卡在启动**：`launch_exec` + `chroot(rootfs)` + `real_root(true)`
+ 在本 harness 里直接 `Runtime(Child("read notif fd from child: pipe closed before 4 bytes read"))`
+ —— 子进程（init）在装好通道之前就死了，而**它的错误看不见**（会话形态把子进程 stdio 指向
+ `/dev/null`）。**（当天下班前已经修好夹具并把它接回套件，见下。）**
   下一步（按信息量）：① 用**一次性** API 跑同一个 policy（子进程保留调用方的 stderr），
   读出它到底拒绝了什么；② 修好之后把 probe 接回套件（真根 + 会话 + 动态程序 + restore）；
   ③ 若本机通了而集群仍红，再上节点抓 stub 的 stderr / 内核日志（容器内 `dmesg` 无权限）。
   **优先级：高** —— 这是"pause 活过 worker 重启"唯一还没通的环节。
+
+  **2026-09-25 当天的推进（本机那半做完、集群那半定位到"恢复本身"）**：
+
+  * 本机 probe 的"卡在启动"**不是引擎问题，是夹具**：真根的每个 `fs_mount` 目标都必须在
+    rootfs 里先存在，而 `minimal_dev()` 要的是 `/dev/ptmx` 这类**设备节点**（测试里造不出）。
+    修法：rootfs 里建 `lib64`、用 `.fs_mount("/dev", "/dev")` 代替 `minimal_dev()`；诊断靠引擎
+    自带的 `SANLOCK_REALROOT_TRACE`（子进程 stdio 指向 /dev/null 时，失败原因只写在那里）。
+    修好之后 **会话 + 真根 + 动态 python + restore 在本机是通过的**
+    （`test_a_dynamic_workload_resumes_into_a_session_under_a_real_root`，已进套件）。
+  * 本机还把集群的两条形态开关单独叠上去试过：`pid_ns(true)`、`net_isolation(true)` +
+    `fd_inject_connect(true)` —— **同样通过**。也就是说本机能设的轴（动态、真根、pid ns、netns）
+    都排除了。
+  * 集群侧这一次拿到了**最硬的一条证据**（E2B `tmp/k0s/checkpoint_acceptance.py` 的 boot 标记）：
+    被捕获的进程第一件事是写 `boot2.txt`（内容是自己的 pid），捕获后 resume，**`boot2.txt`
+    仍是旧 pid**、`err2.txt`/`out2.txt` 都是空的 —— 即**被恢复的进程连一行 Python 都没跑到**，
+    死在恢复本身里（不是"跑起来之后被系统调用拒绝"，那会留下 traceback）。
+    同一次运行里 **thaw 路径是好的**（同一个进程在 capture+freeze+thaw 之后继续计数、
+    会话继续服务 exec），所以问题锁定在 `restore_into_session`。
+  * 还没排除的差别（都在 route-B/部署这一侧）：**image rootfs**（E2B 解包出来的真 rootfs，
+    本机是宿主目录直挂）、worker 交给子进程的**额外 pipe fd**（本次日志里 fd 3/4 也被 skip）、
+    以及 slot（uid 10000）向 init 孩子做 `process_vm_writev`/PTRACE 在**线上那套 uid/userns**
+    下是否真的写进去了（本机的 S1b spike 只证了同 uid 的情况）。
+    下一步：给 restore 加一条**落盘**的失败/进度 trace（和 realroot 的 `SANLOCK_REALROOT_TRACE`
+    同形），在集群上跑一次就知道是"没写进去"、"写进去了但 stub 没跳转"还是"跳转了立刻崩"。
 
 - **FUP-31 冻结窗口里的 fork 通知被"忘记"而不是释放（2026-09-25，已修）** — 来源：
   E2B 的 checkpoint/restore 线上化（写"park 旁边的兄弟进程"这类用例时量到）。
