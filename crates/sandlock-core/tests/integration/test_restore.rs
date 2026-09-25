@@ -572,3 +572,163 @@ async fn test_restore_resumes_without_exec_and_without_chroot() {
         "no-exec restore must resume chroot-free; last seen {last}, exit {exit:?}"
     );
 }
+
+/// **Pinned gap**: a dynamically linked, libc-using program does not survive a
+/// restore, while a static freestanding one does.
+///
+/// This was found from the other end -- a supervisor slot restoring its own
+/// images saw `/bin/sh` and `python3` die with SIGSEGV right after restore while
+/// the static helper and `/bin/sleep` came back -- and every restore test in this
+/// crate uses the static helper, so the dynamic case was never covered. The test
+/// keeps both shapes in **one** harness (one-shot `spawn_interactive`, restored
+/// in-process) so the result is attribution, not correlation: same policy, same
+/// code path, one variable. Measured 2026-09-25: the control advances and the
+/// dynamic program is a zombie afterwards.
+///
+/// **When the dynamic case starts working, this test fails** — that is the point
+/// (the same shape as the security suite's "the gap has to be there when the
+/// shape that closes it is off"). Delete it then, and remove the matching entry
+/// in the E2B doc (`docs/checkpoint-restore-e2b-half.md` §1(e)).
+#[tokio::test]
+async fn test_dynamic_libc_restore_is_a_known_gap() {
+    // Same guard the FFI restore test uses: without a C compiler there is no
+    // dynamic program to ask about, and a missing tool must not read as a
+    // regression.
+    let has_cc = ["cc", "gcc"].iter().any(|cc| {
+        std::process::Command::new(cc)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    });
+    if !has_cc {
+        eprintln!("skipping: no C compiler (cc/gcc) available");
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("sandlock-dyngap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    // A real program: libc, stdio, heap, a sleep between writes.
+    let src = tmp.join("counter.c");
+    let dyn_bin = tmp.join("counter_dyn");
+    std::fs::write(
+        &src,
+        r#"
+#include <stdio.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    unsigned long i = 0;
+    if (argc < 2) return 2;
+    for (;;) {
+        FILE *f = fopen(argv[1], "w");
+        if (f) { fprintf(f, "%lu\n", i++); fclose(f); }
+        usleep(50000);
+    }
+}
+"#,
+    )
+    .unwrap();
+    let build = std::process::Command::new("cc")
+        .args(["-O0", "-o"])
+        .arg(&dyn_bin)
+        .arg(&src)
+        .output()
+        .expect("run cc");
+    assert!(
+        build.status.success(),
+        "cc failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let helper = helper_binary();
+    let helper_dir = helper.parent().unwrap().to_path_buf();
+
+    let mut builder = Sandbox::builder()
+        .fs_read(&tmp)
+        .fs_write(&tmp)
+        .fs_read(&helper_dir);
+    for d in ["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/dev"] {
+        if std::path::Path::new(d).exists() {
+            builder = builder.fs_read(d);
+        }
+    }
+    let policy = builder.build().unwrap();
+
+    // Returns (advanced past the checkpoint, the resumed process's state char).
+    async fn round_trip(policy: &Sandbox, argv: &[String], tag: &str) -> (bool, String) {
+        let counter = std::path::PathBuf::from(argv.last().unwrap());
+        let _ = std::fs::remove_file(&counter);
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let mut sb = policy.clone().with_name(&format!("dyngap-{tag}"));
+        sb.spawn_interactive(&refs)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: spawn: {e}"));
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let before = std::fs::read_to_string(&counter)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        assert!(before.is_some_and(|v| v >= 2), "{tag}: counter before capture: {before:?}");
+        let cp = sb.checkpoint().await.unwrap_or_else(|e| panic!("{tag}: checkpoint: {e}"));
+        let _ = sb.kill();
+        let _ = sb.wait().await;
+
+        let mut sb2 = policy.clone().with_name(&format!("dyngap-{tag}-dst"));
+        let _ = sb2
+            .restore_interactive(&cp)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: restore: {e}"));
+        let pid = sb2.pid().unwrap_or(0);
+        let baseline = before.unwrap();
+        let mut advanced = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while std::time::Instant::now() < deadline {
+            if let Some(v) = std::fs::read_to_string(&counter)
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+            {
+                if v > baseline {
+                    advanced = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let state = stat.split_whitespace().nth(2).unwrap_or("?").to_string();
+        let exit_code = stat.split_whitespace().nth(51).unwrap_or("-").to_string();
+        eprintln!("dyngap {tag}: advanced={advanced} state={state} exit_code={exit_code}");
+        let _ = sb2.kill();
+        let _ = sb2.wait().await;
+        (advanced, state)
+    }
+
+    // The control: the static freestanding helper the rest of this suite uses.
+    let control = vec![
+        helper.to_str().unwrap().to_string(),
+        "clock-loop".to_string(),
+        tmp.join("cnt_static").to_str().unwrap().to_string(),
+    ];
+    let (control_advanced, _) = round_trip(&policy, &control, "static").await;
+    assert!(
+        control_advanced,
+        "the static control must resume -- if this fails, the harness is wrong and \
+         the dynamic result below means nothing"
+    );
+
+    let dynamic = vec![
+        dyn_bin.to_str().unwrap().to_string(),
+        tmp.join("cnt_dyn").to_str().unwrap().to_string(),
+    ];
+    let (dyn_advanced, dyn_state) = round_trip(&policy, &dynamic, "dynamic").await;
+    assert!(
+        !dyn_advanced,
+        "a dynamically linked libc program resumed! That is the fix, not a regression: \
+         delete this test and the matching entry in docs/checkpoint-restore-e2b-half.md §1(e)"
+    );
+    assert_eq!(
+        dyn_state, "Z",
+        "the dynamic program must be gone (zombie) after the restore, not merely idle"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
