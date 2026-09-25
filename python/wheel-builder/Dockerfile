@@ -78,6 +78,15 @@ RUN set -eu; \
             src/sandlock/bin/sandlock-supervise; \
         cp -p src/sandlock/bin/sandlock-supervise \
             "/tmp/supervise/$archdir/sandlock-supervise"; \
+        # F2b.5b: the restore stub is a build.rs artifact like the supervise \
+        # binary, and it has to travel for the same reason -- the path baked \
+        # into the wheel names *this* container's target/ directory, so a \
+        # slot installed elsewhere refused every restore ("restore-stub was \
+        # not built", measured on the deployment 2026-09-25). \
+        mkdir -p "/tmp/restore-stub/$archdir"; \
+        stub=$(ls -1 "../target/$triple"/release/build/sandlock-core-*/out/restore-stub 2>/dev/null | head -1); \
+        if [ -z "$stub" ]; then echo "build: no restore-stub built for $triple" >&2; exit 1; fi; \
+        install -m755 "$stub" "/tmp/restore-stub/$archdir/restore-stub"; \
         rm -rf build src/sandlock.egg-info; \
         echo "==> cross-building $triple"; \
         CARGO_BUILD_TARGET="$triple" ZIG_TARGET="$plat" \
@@ -109,3 +118,5 @@ COPY --from=build /out/x86_64/*.whl /
 COPY --from=repair-arm /out/*.whl /
 COPY --from=build /tmp/supervise/x86_64/ /supervise/x86_64/
 COPY --from=build /tmp/supervise/aarch64/ /supervise/aarch64/
+COPY --from=build /tmp/restore-stub/x86_64/ /restore-stub/x86_64/
+COPY --from=build /tmp/restore-stub/aarch64/ /restore-stub/aarch64/

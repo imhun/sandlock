@@ -840,8 +840,10 @@ async fn test_a_sessions_workload_is_captured_with_the_park_left_out() {
     // What this test deliberately does *not* do is `exec` into the captured
     // session: that path wedged intermittently here (one run in three, with the
     // workload still alive and the exec'd child gone), it is not root-caused,
-    // and the deployment's own acceptance exercises it where it matters -- see
-    // `docs/fork-plan-followups.md` (FUP-29).
+    // and the deployment's own acceptance exercises it -- see
+    // `docs/fork-plan-followups.md` FUP-29 (this wedge) and FUP-30 (what the
+    // cluster measured instead: a *dynamic* workload restored into a session is
+    // announced by the engine and then gone from /proc).
 
     // 4. With the park alone left, there is no workload to capture -- and the
     //    scoped capture says so instead of imaging the park.

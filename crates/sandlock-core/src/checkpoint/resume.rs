@@ -44,8 +44,41 @@ fn child_err(msg: String) -> SandlockError {
 }
 
 /// Path to the freestanding restore-stub binary, compiled by `build.rs`.
+///
+/// The compile-time path is inside the **build** directory, which is right for
+/// a native build (and for this fork's own suites) and wrong for a wheel: a
+/// wheel is installed on another host, which has no `target/`. Measured on the
+/// deployment 2026-09-25: every resume failed with *"restore-stub was not
+/// built"* because the slot only had the wheel's `sandlock/bin/`. The stub
+/// therefore ships in the wheel next to `sandlock-supervise` (see
+/// `python/build-wheels.sh`), and this resolves it in that order:
+///
+/// 1. `SANDLOCK_RESTORE_STUB`, for a deployment that ships it elsewhere (the
+///    wheel's own `sandlock/__init__.py` sets it when it ships with the wheel);
+/// 2. the `build.rs` path, when the build tree is still there;
+/// 3. `restore-stub` **beside the running image** -- the slot is
+///    `sandlock/bin/sandlock-supervise`, and the stub sits next to it.
+///
+/// Without any of them the engine keeps refusing by name ("a C compiler is
+/// required to build sandlock with checkpoint restore"), which is a true
+/// statement about a build that never produced one.
 pub(crate) fn stub_path() -> PathBuf {
-    PathBuf::from(env!("RESTORE_STUB_PATH"))
+    if let Some(explicit) = std::env::var_os("SANDLOCK_RESTORE_STUB") {
+        return PathBuf::from(explicit);
+    }
+    let built = PathBuf::from(env!("RESTORE_STUB_PATH"));
+    if built.exists() {
+        return built;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let beside_image = dir.join("restore-stub");
+            if beside_image.exists() {
+                return beside_image;
+            }
+        }
+    }
+    built
 }
 
 /// The fds the stub inherits, held open in the supervisor for the handshake.

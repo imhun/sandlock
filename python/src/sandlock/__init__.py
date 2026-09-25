@@ -6,6 +6,28 @@ without root or namespaces.
 """
 
 from ._version import __version__
+
+# F2b.5b: point the engine at the restore stub that travels *inside* the wheel.
+# `build.rs` compiles the stub into its OUT_DIR, i.e. a path under the build
+# container's `target/`, which does not exist where a wheel is installed -- a
+# restore from an installed wheel therefore failed with "restore-stub was not
+# built" (measured on the deployment 2026-09-25). `sandlock/bin/` carries the
+# same bytes as `sandlock/bin/sandlock-supervise`, so the slot finds it beside
+# itself too; this covers the in-process (FFI) path and anything the process
+# spawns, since the environment is inherited. `setdefault`: an operator who
+# shipped the stub elsewhere wins.
+def _point_at_the_wheel_restore_stub() -> None:
+    import os
+    from pathlib import Path
+
+    stub = Path(__file__).resolve().parent / "bin" / "restore-stub"
+    if stub.is_file():
+        os.environ.setdefault("SANDLOCK_RESTORE_STUB", str(stub))
+
+
+_point_at_the_wheel_restore_stub()
+del _point_at_the_wheel_restore_stub
+
 from ._sdk import (
     Stage, Pipeline, Result, ExitReason, SyscallEvent, PolicyContext, Checkpoint, SkippedFd,
     NamedStage, Gather, GatherPipeline,

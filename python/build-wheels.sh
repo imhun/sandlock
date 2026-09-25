@@ -128,8 +128,30 @@ for arch in ("x86_64", "aarch64"):
     digest = hashlib.sha256(data).digest()
     manifest_lines.append(f"{digest.hex()}  supervise/{arch}/sandlock-supervise")
 
+    # F2b.5b: the restore stub travels in the wheel too. `build.rs` compiles it
+    # into its OUT_DIR (a path in the *build* container), so an installed wheel
+    # had no stub at all and every restore was refused with "restore-stub was
+    # not built" -- measured on the deployment 2026-09-25. Same bytes, same
+    # injection, next to the supervise binary the slot resolves beside itself.
+    stub_path = os.path.join(out, "restore-stub", arch, "restore-stub")
+    if not os.path.exists(stub_path):
+        raise SystemExit(
+            f"build-wheels: no restore-stub for {arch} in {out}; the docker "
+            "export stage must carry /restore-stub/<arch>/restore-stub"
+        )
+    stub = open(stub_path, "rb").read()
+    stub_digest = hashlib.sha256(stub).digest()
+    manifest_lines.append(
+        f"{stub_digest.hex()}  restore-stub/{arch}/restore-stub"
+    )
+
     wheel = wheel_by_arch[arch]
-    target = "sandlock/bin/sandlock-supervise"
+    # Both injected entries are executables: pip installs from the wheel's
+    # stored mode, and the slot execs both of them directly.
+    payload = {
+        "sandlock/bin/sandlock-supervise": data,
+        "sandlock/bin/restore-stub": stub,
+    }
     infos = {}
     entries = {}
     with zipfile.ZipFile(wheel) as zin:
@@ -142,41 +164,48 @@ for arch in ("x86_64", "aarch64"):
             f"build-wheels: expected one RECORD in {wheel}, found {records}"
         )
     record_name = records[0]
-    changed = entries.get(target) != data
-    entries[target] = data
-    b64 = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
-    # FUP-16: replace-in-place RECORD rows for the injected supervise (an
-    # older injector that appended a second row on re-injection must not
-    # leave duplicates for pip).
-    record_lines = [
-        line
-        for line in entries[record_name].decode().splitlines()
-        if not line.startswith(target + ",")
-    ]
-    record_lines.append(f"{target},sha256={b64},{len(data)}")
-    entries[record_name] = ("\n".join(record_lines) + "\n").encode()
+    changed = [t for t, blob in payload.items() if entries.get(t) != blob]
+    for target, blob in payload.items():
+        entries[target] = blob
+        b64 = (
+            base64.urlsafe_b64encode(hashlib.sha256(blob).digest())
+            .rstrip(b"=")
+            .decode()
+        )
+        # FUP-16: replace-in-place RECORD rows for the injected entries (an
+        # older injector that appended a second row on re-injection must not
+        # leave duplicates for pip).
+        record_lines = [
+            line
+            for line in entries[record_name].decode().splitlines()
+            if not line.startswith(target + ",")
+        ]
+        record_lines.append(f"{target},sha256={b64},{len(blob)}")
+        entries[record_name] = ("\n".join(record_lines) + "\n").encode()
     tmp = wheel + ".inject-tmp"
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
         for name in entries:
             info = infos.get(name)
-            if info is None or name == target:
-                # Injected supervise: executable so pip installs it as 0755
-                # and E2B can exec it directly (also repair an old entry that
-                # lost the exec bit).
-                info = zipfile.ZipInfo(target)
+            if info is None or name in payload:
+                # Injected binary: executable so pip installs it as 0755 and
+                # E2B can exec it directly (also repair an old entry that lost
+                # the exec bit).
+                info = zipfile.ZipInfo(name)
                 info.external_attr = 0o100755 << 16
             zout.writestr(info, entries[name])
     os.replace(tmp, wheel)
     print(
-        f"  supervise {'updated' if changed else 'verified'} in {wheel} ({arch})"
+        f"  supervise + restore-stub "
+        f"{'updated' if changed else 'verified'} in {wheel} ({arch})"
     )
 
 with open(os.path.join(out, "SHA256SUMS.supervise"), "w") as f:
     f.write("\n".join(manifest_lines) + "\n")
-print(f"  supervise manifest written ({head})")
+print(f"  supervise + restore-stub manifest written ({head})")
 PY
 
-echo "==> wheels + supervise in $OUT_DIR/:"
+echo "==> wheels + supervise + restore-stub in $OUT_DIR/:"
 ls -lh "$OUT_DIR"/*.whl
 ls -lh "$OUT_DIR/supervise"/*/sandlock-supervise
+ls -lh "$OUT_DIR/restore-stub"/*/restore-stub
 ls -lh "$OUT_DIR/SHA256SUMS.supervise"

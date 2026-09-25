@@ -117,8 +117,37 @@
   处理：那条 exec 断言先从 core_integ 用例里**撤掉**（用例注释与 `docs/test-baseline.md`
   都记着它为什么不在），捕获侧的断言与 supervise 侧 `exclude_main` verb 用例保留；
   产品路径（`pause` 捕获 → `resume` **解冻同一个会话** → 再 exec 命令）由 E2B 侧的集群
-  验收专门覆盖（`docs/checkpoint-restore-e2b-half.md` §6(g)）。**若那边也复现，这条升级为
-  P0**：route-B 沙箱的 resume 正是"同一个会话里再 exec"。
+  验收专门覆盖（`docs/checkpoint-restore-e2b-half.md` §6(g)）。**集群那边随后量到的不是这条
+  而是 FUP-30**（被恢复的动态程序直接不见了），两者是否同源未定 —— 都还没有现场栈。
+
+- **FUP-30 「恢复进会话的**动态**程序会死」——route-B 的 resume 因此拿不回真实程序
+  （2026-09-25，集群实测 + 本机 probe）** — 来源：E2B 侧 checkpoint/restore 的集群验收
+  （E2B 仓 `docs/checkpoint-restore-e2b-half.md` §6(g)；实现在本仓
+  `SandboxInstance::restore_into_session`）。
+
+  集群现象（沙箱 `sbx_330afbc14840a8c5`，worker 重建后 resume）：镜像被**成功**恢复进
+  新会话（worker 日志逐字：`resumed … into the session (child 1, pid 30); 4 fd(s) could
+  not come back (sockets/pipes/memfds): [fd 0 pipe, fd 1 pipe, fd 2 pipe, fd 3 pipe]`），
+  但几秒后节点上只剩 worker、slot（3 个 `sandlock-supervise`）与 park
+  （`/bin/sh -c 'trap …; while :; do kill -STOP $$; done'`，状态 `T`）——
+  **被恢复的 pid 30 已不在 `/proc`**，计数器文件停在 pause 时的值（`3`），文件本身还在。
+  也就是说：进程在恢复的瞬间被 `sandlock-init` 记为 child 1、被引擎报成 pid 30，
+  随后**悄无声息地消失**（worker 侧没有 exit/refusal 日志）。
+
+  本机 probe（同形用例，源码留在 `tmp/probe_dynamic_restore.rs.txt`；没有接进
+  `integration.rs`，因为它今天不绿）：恢复后的 python **确实跑起来了**——sentinel 之后
+  计数器被写到 6——但用例随后卡住（与 FUP-29 同形的 wedge），所以本机能证"动态程序可以
+  被恢复进会话"，**不能**证"在集群形态下稳定"。
+
+  与既有用例的唯一差别：所有已绿的恢复用例恢复的都是**静态** `rootfs-helper`；这里是
+  **动态** `python3`（ld.so、brk 堆、libpython 的映射、线程）。集群侧还叠了
+  `E2B_REAL_ROOT=1`（真根：mount ns + pivot_root）这一层，而本机 probe 没有。
+
+  下一步（按信息量）：① 在集群形态下抓恢复后进程的退出原因（stub 的 stderr / 内核日志
+  —— 容器内 `dmesg` 无权限，需要在节点上跑）；② 在本机把 `E2B_REAL_ROOT` 等价形态
+  （chroot root）套到 probe 上，看是否只需真根就复现；③ 读 `restore_into_session` 与
+  `restore_interactive` 的差异（前者给子进程的 fd/栈/auxv 与后者是否一致）。
+  **优先级：高** —— 这是"pause 活过 worker 重启"唯一还没通的环节，且它落在引擎里。
 
 - **FUP-24 `kill --all` 的兜底判据仍是「任何发送错误」而不是「连不上」（f1oci，
   2026-09-14）** — 来源：f1oci 对 oci `test_signal_to_sibling_pid_rejected` flake
