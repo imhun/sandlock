@@ -1267,6 +1267,15 @@ impl SandboxInstance {
         let mounts = crate::chroot::resolve::resolve_chroot_mounts(&policy.fs_mount);
         let plan = crate::checkpoint::restore_blob::plan(cp, chroot_root.as_deref(), &mounts)
             .map_err(SandboxRuntimeError::Child)?;
+        crate::checkpoint::resume::note(&format!(
+            "restore: image pid={} maps={} fds={} -> plan maps={} blob={}B skipped={}",
+            cp.process_state.pid,
+            cp.process_state.memory_maps.len(),
+            cp.fd_table.len(),
+            plan.maps.len(),
+            plan.blob.len(),
+            plan.skipped.len(),
+        ));
         let channel = crate::checkpoint::resume::StubChannel::new(&plan.blob)
             .map_err(|e| SandboxRuntimeError::Child(format!("restore control channel: {e}")))?;
 
@@ -1334,6 +1343,9 @@ impl SandboxInstance {
             }
         };
         let pid = self.translate_announced_pid(pid)?;
+        crate::checkpoint::resume::note(&format!(
+            "child announced: child_id={child_id} pid={pid}"
+        ));
 
         // Drive the handshake off the async worker: the stub's own `openat` calls
         // flow through the notify supervisor, which only makes progress while
@@ -1345,6 +1357,9 @@ impl SandboxInstance {
         .await
         .map_err(|e| SandboxRuntimeError::Child(format!("restore join error: {e}")))?;
         drop(channel);
+        if let Err(e) = &result {
+            crate::checkpoint::resume::note(&format!("FAILURE: {e}"));
+        }
         result?;
 
         // Register it like any other attached exec: that is what makes the
@@ -1380,6 +1395,16 @@ impl SandboxInstance {
         );
         self.restore_skipped = plan.skipped;
         self.refresh_idle_state();
+        // Diagnostic for the "announced and then gone" shape (FUP-30): a trace run
+        // says whether the restored child was still alive right after the
+        // handshake, which separates "never got there" from "died later".
+        if crate::checkpoint::resume::trace_on() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            crate::checkpoint::resume::note(&format!(
+                "child alive 50ms after the handshake: {alive}"
+            ));
+        }
         Ok(ExecHandle {
             child_id,
             pid,

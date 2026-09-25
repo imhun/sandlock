@@ -39,6 +39,27 @@ pub(crate) const STUB_EXEC_FD: RawFd = 6;
 /// and its startup stack to shed, so this is far above what a restore produces.
 const MAX_SWEEP_ENTRIES: usize = 256;
 
+/// One breadcrumb per restore step, when `SANLOCK_RESTORE_TRACE=1`.
+///
+/// A restore that fails *after* the child is announced is otherwise invisible:
+/// a session points the child's stdio at `/dev/null`, so the stub's own view is
+/// gone, and the deployment only keeps a *tail* of the slot's stderr. That is
+/// exactly the shape FUP-30 records (the engine announces `child 1, pid 30` and
+/// the process is gone seconds later with no error), so the steps are worth a
+/// switch: a caller that turns this on gets "how far did it get" instead of
+/// "it vanished", and the deployment can log the slot's stderr tail.
+pub(crate) fn trace_on() -> bool {
+    std::env::var("SANLOCK_RESTORE_TRACE")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+pub(crate) fn note(step: &str) {
+    if trace_on() {
+        eprintln!("sandlock-restore: {step}");
+    }
+}
+
 fn child_err(msg: String) -> SandlockError {
     SandlockError::Runtime(SandboxRuntimeError::Child(msg))
 }
@@ -297,12 +318,18 @@ pub(crate) fn finish_restore(
             io::Error::last_os_error()
         )));
     }
+    note("stub READY");
 
+    let filled: usize = plan.anon.iter().map(|(_, b)| b.len()).sum();
     for (start, bytes) in &plan.anon {
         write_child_mem(pid, *start, bytes).map_err(|e| {
             child_err(format!("restore fill region {start:#x} ({} bytes): {e}", bytes.len()))
         })?;
     }
+    note(&format!(
+        "filled {} anonymous region(s), {filled} bytes",
+        plan.anon.len()
+    ));
 
     // The stub has finished mapping, so /proc now shows the final layout plus
     // whatever the kernel left over from its own startup. Diff it against the
@@ -316,13 +343,11 @@ pub(crate) fn finish_restore(
     // §11.5): the sweep list is the fork's leftovers minus the image, so its size
     // is the clearest number for what that route costs versus an exec'd stub
     // (where `current` is two mappings).
-    if std::env::var("SANLOCK_RESTORE_TRACE").map(|v| v.trim() == "1").unwrap_or(false) {
-        eprintln!(
-            "sandlock-restore: child mappings={} sweep entries={}",
-            current.len(),
-            sweep.len()
-        );
-    }
+    note(&format!(
+        "child mappings={} sweep entries={}",
+        current.len(),
+        sweep.len()
+    ));
     if sweep.len() > MAX_SWEEP_ENTRIES {
         return Err(child_err(format!(
             "restore sweep list has {} entries, more than the stub accepts ({MAX_SWEEP_ENTRIES})",
@@ -338,6 +363,7 @@ pub(crate) fn finish_restore(
     }
     write_all(channel.go_w.as_raw_fd(), &msg)
         .map_err(|e| child_err(format!("restore signal GO: {e}")))?;
+    note("GO sent: the stub now jumps to the restored entry point");
     Ok(())
 }
 
