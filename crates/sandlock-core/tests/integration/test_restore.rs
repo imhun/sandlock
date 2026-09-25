@@ -573,27 +573,36 @@ async fn test_restore_resumes_without_exec_and_without_chroot() {
     );
 }
 
-/// **Pinned gap**: a dynamically linked, libc-using program does not survive a
-/// restore, while a static freestanding one does.
+/// **Pinned gap**: a program that uses the libc allocator does not survive a
+/// restore, while one that does not, does.
 ///
-/// This was found from the other end -- a supervisor slot restoring its own
-/// images saw `/bin/sh` and `python3` die with SIGSEGV right after restore while
-/// the static helper and `/bin/sleep` came back -- and every restore test in this
-/// crate uses the static helper, so the dynamic case was never covered. The test
-/// keeps both shapes in **one** harness (one-shot `spawn_interactive`, restored
-/// in-process) so the result is attribution, not correlation: same policy, same
-/// code path, one variable. Measured 2026-09-25: the control advances and the
-/// dynamic program is a zombie afterwards.
+/// Found from the other end: a supervisor slot restoring its own images saw
+/// `/bin/sh` and `python3` die right after restore, while the static helper and
+/// `/bin/sleep` came back. The first framing ("static works, dynamic fails") was
+/// wrong, and this test is what corrects it -- three workloads through **one**
+/// harness (one-shot `spawn_interactive`, restored in-process, same policy, same
+/// code path), so the result is attribution rather than correlation:
 ///
-/// **When the dynamic case starts working, this test fails** — that is the point
-/// (the same shape as the security suite's "the gap has to be there when the
-/// shape that closes it is off"). Delete it then, and remove the matching entry
-/// in the E2B doc (`docs/checkpoint-restore-e2b-half.md` §1(e)).
+///   static freestanding helper   resumes   (control)
+///   dynamic, raw syscalls only   resumes   (dynamic linking is NOT the problem)
+///   dynamic, libc stdio/heap     SIGSEGV   (state=Z, exit_code=11)
+///
+/// The measurement that goes with it: the checkpoint records the heap *range*
+/// and the restore maps it back (verified on the live control), but the kernel's
+/// program break is **not** restored -- a live restored process has no `[heap]`
+/// label, which the kernel only puts on the break range. And it cannot be fixed
+/// by calling `brk()` in the restore stub: the break may only move *above* the
+/// exec'd image's initial break (measured: the kernel refuses a lower target and
+/// returns the old one), while the stub is linked at 3 TiB and a workload's heap
+/// is far below it. A variant that keeps malloc off `brk` (`mallopt(
+/// M_MMAP_THRESHOLD, 1)`) dies too, so the break is one demonstrated defect in
+/// this area rather than the whole of it.
+///
+/// **When the allocator case starts working, this test fails** -- that is the
+/// point (the same shape the security suite uses for a residual). Delete it then
+/// and update `docs/checkpoint-restore-e2b-half.md` §1(e).
 #[tokio::test]
-async fn test_dynamic_libc_restore_is_a_known_gap() {
-    // Same guard the FFI restore test uses: without a C compiler there is no
-    // dynamic program to ask about, and a missing tool must not read as a
-    // regression.
+async fn test_libc_allocator_workload_restore_is_a_known_gap() {
     let has_cc = ["cc", "gcc"].iter().any(|cc| {
         std::process::Command::new(cc)
             .arg("--version")
@@ -605,15 +614,15 @@ async fn test_dynamic_libc_restore_is_a_known_gap() {
         eprintln!("skipping: no C compiler (cc/gcc) available");
         return;
     }
-    let tmp = std::env::temp_dir().join(format!("sandlock-dyngap-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("sandlock-allocgap-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
 
-    // A real program: libc, stdio, heap, a sleep between writes.
-    let src = tmp.join("counter.c");
-    let dyn_bin = tmp.join("counter_dyn");
+    // (a) the failing shape: libc stdio, which allocates.
+    let stdio_src = tmp.join("stdio.c");
+    let stdio_bin = tmp.join("stdio_counter");
     std::fs::write(
-        &src,
+        &stdio_src,
         r#"
 #include <stdio.h>
 #include <unistd.h>
@@ -629,20 +638,55 @@ int main(int argc, char **argv) {
 "#,
     )
     .unwrap();
-    let build = std::process::Command::new("cc")
-        .args(["-O0", "-o"])
-        .arg(&dyn_bin)
-        .arg(&src)
-        .output()
-        .expect("run cc");
-    assert!(
-        build.status.success(),
-        "cc failed: {}",
-        String::from_utf8_lossy(&build.stderr)
-    );
+    // (b) the sharpener: dynamically linked, but no libc allocator.
+    let raw_src = tmp.join("raw.c");
+    let raw_bin = tmp.join("raw_counter");
+    std::fs::write(
+        &raw_src,
+        r#"
+#include <unistd.h>
+#include <sys/syscall.h>
+int main(int argc, char **argv) {
+    unsigned long i = 0;
+    char buf[32];
+    if (argc < 2) return 2;
+    for (;;) {
+        int n = 0;
+        unsigned long v = i++;
+        char t[24];
+        while (v) { t[n++] = '0' + (v % 10); v /= 10; }
+        if (n == 0) t[n++] = '0';
+        int p = 0;
+        while (n > 0) buf[p++] = t[--n];
+        buf[p++] = '\n';
+        int fd = syscall(SYS_openat, -100, argv[1], 1 | 0100 | 01000, 0644);
+        if (fd >= 0) { syscall(SYS_write, fd, buf, p); syscall(SYS_close, fd); }
+        struct { long s, ns; } ts = { 0, 50000000 };
+        syscall(SYS_nanosleep, &ts, 0);
+    }
+}
+"#,
+    )
+    .unwrap();
+    for (label, src, out) in [
+        ("stdio", &stdio_src, &stdio_bin),
+        ("raw", &raw_src, &raw_bin),
+    ] {
+        let build = std::process::Command::new("cc")
+            .args(["-O0", "-o"])
+            .arg(out)
+            .arg(src)
+            .output()
+            .expect("run cc");
+        assert!(
+            build.status.success(),
+            "cc failed for {label}: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+    }
+
     let helper = helper_binary();
     let helper_dir = helper.parent().unwrap().to_path_buf();
-
     let mut builder = Sandbox::builder()
         .fs_read(&tmp)
         .fs_write(&tmp)
@@ -654,12 +698,13 @@ int main(int argc, char **argv) {
     }
     let policy = builder.build().unwrap();
 
-    // Returns (advanced past the checkpoint, the resumed process's state char).
+    // Returns (advanced past the capture, the resumed process's state char, and
+    // whether the recorded heap range came back as a mapping).
     async fn round_trip(policy: &Sandbox, argv: &[String], tag: &str) -> (bool, String) {
         let counter = std::path::PathBuf::from(argv.last().unwrap());
         let _ = std::fs::remove_file(&counter);
         let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let mut sb = policy.clone().with_name(&format!("dyngap-{tag}"));
+        let mut sb = policy.clone().with_name(&format!("allocgap-{tag}"));
         sb.spawn_interactive(&refs)
             .await
             .unwrap_or_else(|e| panic!("{tag}: spawn: {e}"));
@@ -667,12 +712,18 @@ int main(int argc, char **argv) {
         let before = std::fs::read_to_string(&counter)
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok());
-        assert!(before.is_some_and(|v| v >= 2), "{tag}: counter before capture: {before:?}");
-        let cp = sb.checkpoint().await.unwrap_or_else(|e| panic!("{tag}: checkpoint: {e}"));
+        assert!(
+            before.is_some_and(|v| v >= 2),
+            "{tag}: counter before capture: {before:?}"
+        );
+        let cp = sb
+            .checkpoint()
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: checkpoint: {e}"));
         let _ = sb.kill();
         let _ = sb.wait().await;
 
-        let mut sb2 = policy.clone().with_name(&format!("dyngap-{tag}-dst"));
+        let mut sb2 = policy.clone().with_name(&format!("allocgap-{tag}-dst"));
         let _ = sb2
             .restore_interactive(&cp)
             .await
@@ -696,38 +747,66 @@ int main(int argc, char **argv) {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
         let state = stat.split_whitespace().nth(2).unwrap_or("?").to_string();
         let exit_code = stat.split_whitespace().nth(51).unwrap_or("-").to_string();
-        eprintln!("dyngap {tag}: advanced={advanced} state={state} exit_code={exit_code}");
+        // The kernel labels only the break range `[heap]`, so a live restored
+        // process without that label is the direct evidence that the break was
+        // not restored (the range itself is still mapped -- see the doc).
+        let heap_in_cp = cp
+            .process_state
+            .memory_maps
+            .iter()
+            .any(|m| m.path.as_deref().is_some_and(|p| p.starts_with("[heap]")));
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
+        let heap_after = maps.lines().any(|l| l.contains("[heap]"));
+        eprintln!(
+            "allocgap {tag}: advanced={advanced} state={state} exit_code={exit_code} \
+             heap_in_checkpoint={heap_in_cp} heap_after_restore={heap_after}"
+        );
         let _ = sb2.kill();
         let _ = sb2.wait().await;
         (advanced, state)
     }
 
-    // The control: the static freestanding helper the rest of this suite uses.
+    // Control 1: the static freestanding helper the rest of this suite uses.
     let control = vec![
         helper.to_str().unwrap().to_string(),
         "clock-loop".to_string(),
         tmp.join("cnt_static").to_str().unwrap().to_string(),
     ];
-    let (control_advanced, _) = round_trip(&policy, &control, "static").await;
+    let (control_advanced, _) = round_trip(&policy, &control, "static-control").await;
     assert!(
         control_advanced,
-        "the static control must resume -- if this fails, the harness is wrong and \
-         the dynamic result below means nothing"
+        "the static control must resume -- if this fails the harness is wrong and \
+         nothing below means anything"
     );
 
-    let dynamic = vec![
-        dyn_bin.to_str().unwrap().to_string(),
-        tmp.join("cnt_dyn").to_str().unwrap().to_string(),
+    // Control 2: dynamically linked, but no libc allocator. This is what makes
+    // the finding "the allocator", not "dynamic".
+    let raw = vec![
+        raw_bin.to_str().unwrap().to_string(),
+        tmp.join("cnt_raw").to_str().unwrap().to_string(),
     ];
-    let (dyn_advanced, dyn_state) = round_trip(&policy, &dynamic, "dynamic").await;
+    let (raw_advanced, raw_state) = round_trip(&policy, &raw, "dynamic-noalloc").await;
     assert!(
-        !dyn_advanced,
-        "a dynamically linked libc program resumed! That is the fix, not a regression: \
-         delete this test and the matching entry in docs/checkpoint-restore-e2b-half.md §1(e)"
+        raw_advanced,
+        "a dynamically linked program that never allocates must resume \
+         (state was {raw_state}); if this fails, the gap is wider than the \
+         allocator and the doc's §1(e) needs rewriting"
+    );
+
+    // The gap itself.
+    let stdio = vec![
+        stdio_bin.to_str().unwrap().to_string(),
+        tmp.join("cnt_stdio").to_str().unwrap().to_string(),
+    ];
+    let (alloc_advanced, alloc_state) = round_trip(&policy, &stdio, "dynamic-alloc").await;
+    assert!(
+        !alloc_advanced,
+        "a libc-allocator workload resumed! That is the fix, not a regression: delete \
+         this test and the matching entry in docs/checkpoint-restore-e2b-half.md §1(e)"
     );
     assert_eq!(
-        dyn_state, "Z",
-        "the dynamic program must be gone (zombie) after the restore, not merely idle"
+        alloc_state, "Z",
+        "the allocator workload must be gone (zombie) after the restore, not merely idle"
     );
 
     let _ = std::fs::remove_dir_all(&tmp);
