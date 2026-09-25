@@ -750,6 +750,54 @@ impl Generation {
             "fds": fds,
         }))
     }
+
+    /// Resume a checkpoint image **into this generation**, as a child of its
+    /// session.
+    ///
+    /// This is the pooled-slot shape: the worker leases a slot the usual way and
+    /// *then* tells it what to bring back, rather than starting a slot per image
+    /// (`--restore-from` exists for the other shape). It matters because the
+    /// session is what serves `exec`: a resume that produced the supervisor's own
+    /// child could never be exec'd into again, while this one keeps `run`/`exec`/
+    /// `wait_child`/`kill_child` working -- which is what a sandbox that pauses
+    /// and resumes needs.
+    ///
+    /// The image is loaded from a path the caller names: storage, ownership and
+    /// the accounting for it are the deployment's business, so the slot is handed
+    /// the answer, not the policy. `restore_skipped` comes back in the reply --
+    /// sockets, pipes and memfds do not come back, and a caller that has to tell a
+    /// user "your connections will not return" reads exactly that.
+    fn handle_restore(
+        &mut self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, Refusal> {
+        let dir = args
+            .get("dir")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Refusal::refused("restore requires a non-empty `dir`"))?
+            .to_string();
+        let cp = sandlock_core::Checkpoint::load(std::path::Path::new(&dir))
+            .map_err(|e| Refusal::refused(format!("load checkpoint image {dir:?}: {e}")))?;
+        let rt = &self.rt;
+        let instance = self.instance.as_mut().ok_or_else(|| {
+            Refusal::refused("generation has no instance: restore requires a launched session")
+        })?;
+        let handle = rt
+            .block_on(instance.restore_into_session(&cp))
+            .map_err(|e| Refusal::from_core("instance restore failed", &e))?;
+        let skipped: Vec<serde_json::Value> = instance
+            .restore_skipped()
+            .iter()
+            .map(|f| serde_json::json!({ "fd": f.fd, "path": f.path }))
+            .collect();
+        Ok(serde_json::json!({
+            "dir": dir,
+            "child_id": handle.child_id,
+            "pid": handle.pid,
+            "restore_skipped": skipped,
+        }))
+    }
 }
 
 /// Decode F4.1 per-exec parameters from an `exec` verb's args object. Every
@@ -1011,6 +1059,14 @@ impl ControlHandler for Generation {
             }
             "checkpoint" => {
                 let resp = match self.handle_checkpoint(&req.args) {
+                    Ok(data) => ok_response(data),
+                    Err(e) => err_response(&e),
+                };
+                let _ = write_response_frame(stream, &resp);
+                ServeOutcome::Continue
+            }
+            "restore" => {
+                let resp = match self.handle_restore(&req.args) {
                     Ok(data) => ok_response(data),
                     Err(e) => err_response(&e),
                 };

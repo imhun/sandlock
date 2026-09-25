@@ -3450,3 +3450,150 @@ fn test_supervise_restore_from_an_image_resumes_a_serving_slot() {
     let _ = std::fs::remove_file(&program);
     let _ = std::fs::remove_dir_all(&workdir);
 }
+
+/// `restore` brings an image back **into a live generation**, and that generation
+/// keeps its whole verb surface.
+///
+/// This is the pooled-slot shape of a resume -- the worker leases a slot the
+/// usual way and then tells it what to bring back -- as opposed to
+/// `--restore-from`, which starts a slot per image. It is the shape a sandbox
+/// that pauses and resumes needs, because the session is what serves `exec`: the
+/// restored process has to be its child, not the supervisor's.
+///
+/// What the test asserts, in the order a worker depends on it: the image loads,
+/// the restored process **runs** (the workload's counter advances from a file
+/// zeroed after the source generation ended, so only the restored process can
+/// have written it), the generation still serves `exec`, and `stats` counts the
+/// resumed child alongside the session's own M0.
+#[test]
+fn test_supervise_restore_brings_an_image_into_a_live_generation() {
+    let ctl_root = isolate_ctl_root();
+    let workdir = repo_tmp_dir().join(format!("supervise-restore-verb-{}", std::process::id()));
+    std::fs::create_dir_all(&workdir).expect("create restore-verb workdir");
+    let image = workdir.join("image");
+    let counter = workdir.join("clock.cnt");
+    let helper = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/rootfs-helper")
+        .canonicalize()
+        .expect("rootfs-helper — build.rs should have compiled it");
+    let helper_s = helper.to_str().unwrap().to_string();
+    let helper_dir = helper.parent().unwrap().to_str().unwrap().to_string();
+    let mut readable = base_read_paths();
+    readable.push(helper_dir);
+    readable.push(workdir.to_str().unwrap().to_string());
+    let policy = write_policy(
+        "restore-verb",
+        &serde_json::json!({
+            "fs_readable": readable,
+            "fs_writable": [workdir.to_str().unwrap()],
+        })
+        .to_string(),
+    );
+    let counter_s = counter.to_str().unwrap().to_string();
+    let read_counter = || {
+        std::fs::read_to_string(&counter)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+    let token = "restore-verb-token-0123456789abcdef";
+
+    // --- the generation that gets checkpointed ---
+    let program = write_policy(
+        "restore-verb-program",
+        &serde_json::json!({
+            "argv": [helper_s, "clock-loop", counter_s]
+        })
+        .to_string(),
+    );
+    let name = format!("supervise-restore-verb-src-{}", std::process::id());
+    let (child, sock_path) =
+        spawn_serving_slot(&ctl_root, &policy, &name, token, Some(&program));
+    wait_until(
+        Instant::now() + Duration::from_secs(15),
+        "the counter to run before the checkpoint",
+        || read_counter().is_some_and(|v| v >= 3),
+    );
+    let resp = registered_verb_args(
+        &sock_path,
+        token,
+        "checkpoint",
+        serde_json::json!({ "dir": image.to_str().unwrap() }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "checkpoint: {resp:?}");
+    let resp = registered_verb(&sock_path, token, "shutdown");
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "shutdown src: {resp:?}");
+    let out = child.wait_with_output().expect("wait the source generation");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // Sentinel: from here only the restored process can move this file.
+    std::fs::write(&counter, b"0\n").unwrap();
+
+    // --- the live generation that receives it ---
+    let long_lived = write_policy(
+        "restore-verb-long-lived",
+        &serde_json::json!({ "argv": ["/bin/sleep", "30"] }).to_string(),
+    );
+    let name2 = format!("supervise-restore-verb-dst-{}", std::process::id());
+    let (child2, sock_path2) =
+        spawn_serving_slot(&ctl_root, &policy, &name2, token, Some(&long_lived));
+
+    let resp = registered_verb_args(
+        &sock_path2,
+        token,
+        "restore",
+        serde_json::json!({ "dir": image.to_str().unwrap() }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "restore: {resp:?}");
+    let resumed_pid = resp["data"]["pid"].as_i64().expect("restored pid");
+    assert!(resumed_pid > 0, "restore names the process it resumed: {resp:?}");
+    assert!(
+        resp["data"]["child_id"].as_u64().is_some(),
+        "the resumed child is registered with an id: {resp:?}"
+    );
+
+    // 1. It is running.
+    wait_until(
+        Instant::now() + Duration::from_secs(15),
+        "the restored process to advance the counter",
+        || read_counter().is_some_and(|v| v > 0),
+    );
+
+    // 2. The generation still execs -- the reason this shape exists.
+    let (_host_stdin, _host_stdout, _host_stderr, child_ends) = make_exec_stdio();
+    let resp = registered_exec(
+        &sock_path2,
+        token,
+        &[helper_s.as_str(), "echo", "still-execs"],
+        &child_ends,
+    );
+    for fd in child_ends {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "exec after restore: {resp:?}");
+    let exec_child = resp["data"]["child_id"].as_u64().expect("exec child id");
+    let resp = registered_verb_args(
+        &sock_path2,
+        token,
+        "wait_child",
+        serde_json::json!({ "child_id": exec_child }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "wait the exec: {resp:?}");
+
+    // 3. The resumed child is a child of this session, next to its own M0.
+    let stats = registered_verb(&sock_path2, token, "stats");
+    assert_eq!(stats["ok"], serde_json::Value::Bool(true), "stats: {stats:?}");
+    assert!(
+        stats["data"]["children_live"].as_u64().unwrap_or(0) >= 2,
+        "the resumed child must be counted alongside the session's M0: {stats:?}"
+    );
+
+    let resp = registered_verb(&sock_path2, token, "shutdown");
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "shutdown dst: {resp:?}");
+    let out2 = child2.wait_with_output().expect("wait the destination generation");
+    assert!(out2.status.success(), "stderr: {}", String::from_utf8_lossy(&out2.stderr));
+    let _ = std::fs::remove_file(&policy);
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_file(&long_lived);
+    let _ = std::fs::remove_dir_all(&workdir);
+}

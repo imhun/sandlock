@@ -650,7 +650,10 @@ cli = 98      # 2026-09-23: 97 -> 98, +1
               # after F0.4 wiring (cli suite includes net_bind_map tests);
               # F5.1 updates the no-supervisor default validation to
               # DEFAULT_MAX_PROCESSES (256), no count change
-supervise = 53 # 2026-09-25: 51 -> 53, +2 and both are this lane's own work --
+supervise = 54 # 2026-09-25: 53 -> 54, +1: the `restore` verb, which brings an image
+               # back into a *live* generation (the pooled-slot shape of a resume) and
+               # leaves its whole verb surface working.
+               # 2026-09-25: 51 -> 53, +2 and both are this lane's own work --
                # the checkpoint verb (its test writes an image and asserts the
                # generation keeps running) and the restore-from-image mode
                # (a slot started from an image serves stats/refuses exec).
