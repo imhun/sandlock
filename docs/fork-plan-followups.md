@@ -115,59 +115,45 @@
   的第 3 条），并连同"为什么必须多线程"写进用例注释。
   同一陷阱的另一面见 FUP-30 的本机 half。
 
-- **FUP-30 「恢复进会话的**动态**程序会死」——本机 half 同上，集群 half 仍未结
-  （2026-09-25）** — 来源：E2B 侧 checkpoint/restore 的集群验收
-  （E2B 仓 `docs/checkpoint-restore-e2b-half.md` §6(g)）。
+- **FUP-30 「恢复进会话的**动态**程序会死」——2026-09-25 开、同日关闭：
+  **不是引擎问题，是验收脚本的命令形状**（本机 probe 的"卡死"则是 FUP-29 的 runtime 问题）**
+  — 来源：E2B 侧 checkpoint/restore 的集群验收（E2B 仓
+  `docs/checkpoint-restore-e2b-half.md` §6(g)）。
 
-  集群现象（沙箱 `sbx_330afbc14840a8c5`，worker 重建后 resume）：镜像被**成功**恢复进
-  新会话（worker 日志逐字：`resumed … into the session (child 1, pid 30); 4 fd(s) could
-  not come back (sockets/pipes/memfds): [fd 0 pipe, fd 1 pipe, fd 2 pipe, fd 3 pipe]`），
-  但几秒后节点上只剩 worker、slot（3 个 `sandlock-supervise`）与 park
-  （`/bin/sh -c 'trap …; while :; do kill -STOP $$; done'`，状态 `T`）——
-  **被恢复的 pid 30 已不在 `/proc`**，计数器文件停在 pause 时的值（`3`），文件本身还在。
-  也就是说：进程在恢复的瞬间被 `sandlock-init` 记为 child 1、被引擎报成 pid 30，
-  随后**悄无声息地消失**（worker 侧没有 exit/refusal 日志）。
+  集群现象（当时的读法）：沙箱 pause（捕获）、删宿主 worker 的 pod、resume，worker 日志逐字报告
+  `resumed … into the session (child 1, pid 30)`，但几秒后节点上只剩 worker、slot 与 park，
+  **被恢复的 pid 不在 `/proc`**，计数器文件停在 pause 时的值。
 
-  **本机 half 已关闭（2026-09-25）**：同形的本机用例（`test_a_dynamic_workload_resumes_into_a_session`，
-  现已入套件）在单线程 runtime 下会卡住（就是 FUP-29 那条），在多线程 runtime 下
-  **稳定通过**——恢复后的 python 继续写它的计数器，会话也继续服务 exec；把今天所有引擎改动
-  stash 掉再跑同样通过。⇒ 本机能证"动态程序恢复进会话"这条**引擎能力是好的**，
-  集群那半另有原因。
+  **定位过程（值得留下的是方法，不是结论）**：
+  1. 先给验收脚本加 **boot 标记**：负载第一句把自己的 pid 写进文件 —— resume 之后文件仍是旧 pid
+     ⇒ 被恢复的进程**连一行都没跑到**（不是"跑起来后被拒"）。
+  2. 再给引擎加 **restore 面包屑**（本仓 `89e8ab2`：`checkpoint::resume::note`，`SANLOCK_RESTORE_TRACE=1`
+     打开；E2B 侧 `65ad183` 在 restore 之后把 slot 的 stderr 尾巴打进 worker 日志，因为会话里
+     子进程的 stdio 是 /dev/null、slot stderr 只被留了一个尾巴）。
+  3. 面包屑一眼看出两件事：**握手全部走完**（READY → 填了内存 → sweep → GO 发出），
+     而 **50 ms 后子进程已经死了**（`child alive 50ms after the handshake: false`）；
+     更关键的是**这张图根本不像 python**：`maps=19`、填进 397312 字节（~388 KiB）。
+     本机同样形状（真 python）是 `maps=32..40`、6 MB 上下。
+     **19 个映射 / 388 KiB 是 dash 的大小** —— 被捕获的是**包装用的 shell**。
 
-  **剩下的（集群 half）**：与已绿的用例相比只差两轴——**动态**程序（既有用例全是静态
-  `rootfs-helper`）与 **真根**（`E2B_REAL_ROOT=1`：mount ns + pivot_root + image rootfs）。
- 本机把这两轴一起复现的尝试**卡在启动**：`launch_exec` + `chroot(rootfs)` + `real_root(true)`
- 在本 harness 里直接 `Runtime(Child("read notif fd from child: pipe closed before 4 bytes read"))`
- —— 子进程（init）在装好通道之前就死了，而**它的错误看不见**（会话形态把子进程 stdio 指向
- `/dev/null`）。**（当天下班前已经修好夹具并把它接回套件，见下。）**
-  下一步（按信息量）：① 用**一次性** API 跑同一个 policy（子进程保留调用方的 stderr），
-  读出它到底拒绝了什么；② 修好之后把 probe 接回套件（真根 + 会话 + 动态程序 + restore）；
-  ③ 若本机通了而集群仍红，再上节点抓 stub 的 stderr / 内核日志（容器内 `dmesg` 无权限）。
-  **优先级：高** —— 这是"pause 活过 worker 重启"唯一还没通的环节。
+  **根因**：验收脚本的命令串写成 `sh -c 'exec python3 …'`，而 E2B worker 本来就把每条命令包成
+  `/bin/sh -c "<串>"`。于是**会话的活子进程是第二个 shell**，python 成了它的孙子：
+  捕获按设计只抓"会话里那一个活子进程" ⇒ 抓到的就是那个 shell；恢复出来的也是 shell，
+  而它唯一的孩子早就不在了，于是它 `wait4` 拿到 ECHILD、走完脚本、**立刻退出**。
+  把命令串改成 `exec python3 …`（`exec` 是**第一个词**，worker 自己的 shell 会原地把自己换成
+  python）之后：图变成 `maps=32`、填充 6279168 字节（6.3 MB），
+  `child alive 50ms after the handshake: true`，计数器继续前进，验收脚本**全绿**。
 
-  **2026-09-25 当天的推进（本机那半做完、集群那半定位到"恢复本身"）**：
+  **顺带留下的产品语义**（已写进 E2B 的设计文档）：一次 pause 捕获的是**会话里那个活子进程**，
+  也就是 worker 自己 exec 的那条 `/bin/sh -c <命令串>`。单条简单命令会被 dash 原地 `exec`，
+  但 `sh -c '…'`、管道、`&&` 列表这类**会 fork 出子 shell** 的形状，被抓的就是那个子 shell。
+  引擎没有错（它只答应"抓一个地址空间"），要改的是"谁来做那个地址空间"。
 
-  * 本机 probe 的"卡在启动"**不是引擎问题，是夹具**：真根的每个 `fs_mount` 目标都必须在
-    rootfs 里先存在，而 `minimal_dev()` 要的是 `/dev/ptmx` 这类**设备节点**（测试里造不出）。
-    修法：rootfs 里建 `lib64`、用 `.fs_mount("/dev", "/dev")` 代替 `minimal_dev()`；诊断靠引擎
-    自带的 `SANLOCK_REALROOT_TRACE`（子进程 stdio 指向 /dev/null 时，失败原因只写在那里）。
-    修好之后 **会话 + 真根 + 动态 python + restore 在本机是通过的**
-    （`test_a_dynamic_workload_resumes_into_a_session_under_a_real_root`，已进套件）。
-  * 本机还把集群的两条形态开关单独叠上去试过：`pid_ns(true)`、`net_isolation(true)` +
-    `fd_inject_connect(true)` —— **同样通过**。也就是说本机能设的轴（动态、真根、pid ns、netns）
-    都排除了。
-  * 集群侧这一次拿到了**最硬的一条证据**（E2B `tmp/k0s/checkpoint_acceptance.py` 的 boot 标记）：
-    被捕获的进程第一件事是写 `boot2.txt`（内容是自己的 pid），捕获后 resume，**`boot2.txt`
-    仍是旧 pid**、`err2.txt`/`out2.txt` 都是空的 —— 即**被恢复的进程连一行 Python 都没跑到**，
-    死在恢复本身里（不是"跑起来之后被系统调用拒绝"，那会留下 traceback）。
-    同一次运行里 **thaw 路径是好的**（同一个进程在 capture+freeze+thaw 之后继续计数、
-    会话继续服务 exec），所以问题锁定在 `restore_into_session`。
-  * 还没排除的差别（都在 route-B/部署这一侧）：**image rootfs**（E2B 解包出来的真 rootfs，
-    本机是宿主目录直挂）、worker 交给子进程的**额外 pipe fd**（本次日志里 fd 3/4 也被 skip）、
-    以及 slot（uid 10000）向 init 孩子做 `process_vm_writev`/PTRACE 在**线上那套 uid/userns**
-    下是否真的写进去了（本机的 S1b spike 只证了同 uid 的情况）。
-    下一步：给 restore 加一条**落盘**的失败/进度 trace（和 realroot 的 `SANLOCK_REALROOT_TRACE`
-    同形），在集群上跑一次就知道是"没写进去"、"写进去了但 stub 没跳转"还是"跳转了立刻崩"。
+  **这条追下来的真产出**（都不是它自己，见各自条目）：restore-stub 必须随 wheel（`2d5f2e9`）、
+  冻结窗口挂起的 fork 通知必须**释放**而不是丢掉（`685301c` / FUP-31）、
+  `SANLOCK_RESTORE_TRACE` 面包屑（`89e8ab2`）。
+  本机那半（probe 卡死）是 FUP-29 的 runtime 问题；把动态程序 + 真根 + 会话 + restore 做成了
+  两个常驻用例。**集群验收（E2B `tmp/k0s/checkpoint_acceptance.py`）现在全绿**。
 
 - **FUP-31 冻结窗口里的 fork 通知被"忘记"而不是释放（2026-09-25，已修）** — 来源：
   E2B 的 checkpoint/restore 线上化（写"park 旁边的兄弟进程"这类用例时量到）。
