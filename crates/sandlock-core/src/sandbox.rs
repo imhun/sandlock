@@ -2965,17 +2965,51 @@ impl Sandbox {
                 })?;
                 (gateway_ip, dns_sock)
             } else {
-                let gateway_ip =
-                    crate::network::dns_synth::allocate_gateway_addr().ok_or_else(|| {
-                        SandboxRuntimeError::Child(
-                            "per-sandbox DNS gateway pool exhausted (127.0.1.0/24)".into(),
-                        )
-                    })?;
-                let gateway_addr = std::net::SocketAddr::from((gateway_ip, 53));
-                let dns_sock = tokio::net::UdpSocket::bind(gateway_addr)
-                    .await
-                    .map_err(|e| SandboxRuntimeError::Child(format!("bind DNS gateway: {}", e)))?;
-                (gateway_ip, dns_sock)
+                // Shared-netns mode: this supervisor binds, and on a worker
+                // that runs route-B slots the supervisor is one of *several*
+                // processes -- each with its own allocator, each starting at
+                // 127.0.1.1 (the counter is process-global because one process
+                // used to serve one sandbox at a time). Two live sandboxes
+                // that both need a wildcard gateway therefore collide: the
+                // second supervisor dies at launch with EADDRINUSE, which is
+                // what happened as soon as two route-B slots needed one
+                // (measured 2026-09-25 -- reproduced by keeping the first
+                // executor alive and starting a second wildcard sandbox).
+                //
+                // So probe instead of assuming: take the next candidate and
+                // keep it only if the bind takes. `AddrInUse` means someone
+                // else holds that address and the pool has another; anything
+                // else is a real failure and is reported as such.
+                let mut taken: Option<(std::net::Ipv4Addr, tokio::net::UdpSocket)> = None;
+                let mut last_err: Option<std::io::Error> = None;
+                while let Some(ip) = crate::network::dns_synth::allocate_gateway_addr() {
+                    let gateway_addr = std::net::SocketAddr::from((ip, 53));
+                    match tokio::net::UdpSocket::bind(gateway_addr).await {
+                        Ok(sock) => {
+                            taken = Some((ip, sock));
+                            break;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                            last_err = Some(e);
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(SandboxRuntimeError::Child(format!(
+                                "bind DNS gateway: {}",
+                                e
+                            ))
+                            .into());
+                        }
+                    }
+                }
+                taken.ok_or_else(|| {
+                    crate::error::SandlockError::Runtime(SandboxRuntimeError::Child(format!(
+                        "no free per-sandbox DNS gateway address in 127.0.1.0/24{}",
+                        last_err
+                            .map(|e| format!(" (last: {e})"))
+                            .unwrap_or_default()
+                    )))
+                })?
             };
             let dns = crate::network::dns_synth::SyntheticDns::new();
             gateway_synthetic_dns = Some(dns.clone());

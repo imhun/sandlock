@@ -53,6 +53,37 @@ fn base_policy_with_gateway() -> sandlock_core::SandboxBuilder {
     base_policy().net_allow("*.lifecycle.example:443")
 }
 
+/// A gateway address some *other* supervisor holds must be skipped, not fatal.
+///
+/// The allocator is a process-global counter, so every supervisor process
+/// starts at 127.0.1.1 -- correct when one process served one sandbox at a
+/// time, wrong the moment a worker runs route-B slots, where each sandbox has
+/// its own supervisor. Two live wildcard sandboxes therefore both reached for
+/// 127.0.1.1 and the second one died at launch (`bind DNS gateway: Address
+/// already in use`; measured 2026-09-25, by keeping one wildcard executor
+/// alive and starting a second). The bind now probes the pool instead.
+///
+/// The test does not care *who* holds the address: binding it here stands in
+/// for the other supervisor, and if a leftover already holds it the property
+/// under test is the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_a_held_gateway_address_is_skipped_not_fatal() {
+    let held = UdpSocket::bind("127.0.1.1:53").ok();
+    let mut inst = SandboxInstance::launch(
+        base_policy_with_gateway()
+            .build()
+            .unwrap()
+            .with_name("inst-gateway-probe"),
+        &["sh", "-c", "exit 0"],
+    )
+    .await
+    .expect("a gateway address held by another supervisor must not stop a launch");
+    let result = inst.wait_main().await.expect("wait for the process");
+    assert!(result.success(), "the session's process must run");
+    inst.shutdown().await.expect("shutdown");
+    drop(held);
+}
+
 /// Count this process's open fds (`/proc/self/fd`), used to pin "no leftover
 /// fd" after a session shutdown. The counting test runs on a multi-thread
 /// tokio runtime whose worker fds exist before the baseline is taken, so the
