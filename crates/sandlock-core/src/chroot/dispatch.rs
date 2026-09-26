@@ -361,10 +361,18 @@ impl ChrootCtx<'_> {
     /// Translate a path the kernel reported *about the child* into the
     /// sandbox's virtual spelling.
     ///
-    /// A pivoted child's reports are already virtual -- they are relative to
-    /// the rootfs -- so they must not be put through the host-to-virtual
-    /// mapping, which would look them up under the rootfs and find nothing.
-    /// Everything else goes through the mapping exactly as before.
+    /// A pivoted child's *cwd* report is already virtual: the task sits on a
+    /// mount inside its own namespace, so `/proc/<pid>/cwd` renders the
+    /// sandbox's spelling, and putting it through the host-to-virtual mapping
+    /// would look it up under the rootfs and find nothing. Everything else
+    /// goes through the mapping exactly as before.
+    ///
+    /// `/proc/<pid>/fd/N` is NOT in that family, which is why the dirfd site
+    /// below maps first and only falls back to this: nearly every sandbox
+    /// descriptor is one the mediator opened on the *host* and injected
+    /// (`inject_watched` -> `ADDFD`), so the kernel renders the host path and
+    /// "already virtual" hands the resolver a path that is not under the
+    /// rootfs at all (N43).
     fn reported_to_virtual(&self, pid: u32, path: &Path) -> Option<PathBuf> {
         if self.child_is_pivoted(pid) {
             return Some(path.to_path_buf());
@@ -607,7 +615,16 @@ fn build_virtual_path(
             virtual_cwd_of(notif, ctx)?
         } else {
             let base_host = std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, dirfd)).ok()?;
-            ctx.reported_to_virtual(notif.pid, &base_host)?
+            // N43: two spellings come back for a pivoted child's descriptor.
+            // A descriptor the mediator opened and injected -- which is what
+            // the sandbox holds for every path-based open -- sits on the
+            // mediator's host mount, so the kernel renders the *host* path and
+            // it has to be mapped back. Only a descriptor that really is on a
+            // mount inside the child's own namespace renders the sandbox's
+            // (virtual) spelling, and no host source prefixes that one. So:
+            // map when it maps, and only then take the report as virtual.
+            ctx.host_to_virtual(&base_host)
+                .or_else(|| ctx.reported_to_virtual(notif.pid, &base_host))?
         };
         let combined = base_virtual.join(path);
         combined.to_string_lossy().to_string()

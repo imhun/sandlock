@@ -948,6 +948,167 @@ async fn test_chroot_chdir_proc_self_resolves_to_child() {
 /// chroot handler which ENOENT'd on the empty rootfs procfs, while the absolute
 /// spelling was synthesized. The resolver now maps the dirfd base back into the
 /// virtual namespace so both spellings synthesize identically.
+///
+/// N43 (the other half of "translate the dirfd"): the descriptor a sandbox
+/// holds is one the mediator opened on the *host* and injected (ADDFD), so the
+/// kernel renders `/proc/<pid>/fd/N` as the host path of the directory. Under a
+/// real root the translator read that report as "the child is pivoted, so it is
+/// already virtual" and looked the *host* path up inside the rootfs -- ENOENT
+/// for the following stat, EACCES for the nofollow / open / readlink family.
+/// That is exactly the set `find` / `du` / `tar` use to walk a tree (they hold
+/// the parent directory, never an absolute name), which is why those three
+/// tools were dead in production sandboxes while every absolute spelling
+/// worked.
+///
+/// All three roots the deployment builds are asserted against the same
+/// expected bytes, because only one of them was broken: the emulated root
+/// mapped the host report back all along, and the pure shape's root is the
+/// host root itself (N15: no image rootfs, identity translation), where the
+/// mapping is the identity -- so the real root has to answer exactly what those
+/// two answer. The fixture is also the shape the tools use, not just the
+/// syscalls: the descriptor is opened on a directory that is a *mount point*
+/// and the name under it is a symlink, so the mapped base has to survive the
+/// mount table and the link has to be followed through it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_dirfd_relative_reads_resolve_in_both_chroot_shapes() {
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    // `stdout_str` trims the trailing newline only; the four lines themselves
+    // are compared whole.
+    let expected = "stat size=3000\nlstat size=8\nopen bytes=3000\nreadlink seed.bin";
+
+    let base = temp_dir("dirfd-relative");
+    let rootfs = base.join("rootfs");
+    let ws = base.join("workspace");
+    for dir in ["usr/bin", "work", "etc"] {
+        fs::create_dir_all(rootfs.join(dir)).expect("create rootfs dir");
+    }
+    fs::create_dir_all(&ws).expect("create the host workspace dir");
+    let helper = helper_binary();
+    for dest in [rootfs.join("usr/bin/rootfs-helper")] {
+        fs::hard_link(&helper, &dest)
+            .or_else(|_| fs::copy(&helper, &dest).map(|_| ()))
+            .unwrap_or_else(|e| panic!("install rootfs-helper at {}: {e}", dest.display()));
+    }
+    fs::write(ws.join("seed.bin"), vec![b'x'; 3000]).expect("seed the workspace file");
+    std::os::unix::fs::symlink("seed.bin", ws.join("link")).expect("seed the symlink");
+
+    // The identity root's grants are compared against the path the *kernel*
+    // resolved, while a grant declared under a symlinked directory keeps the
+    // spelling it was written with. This lane's `target` is exactly such a
+    // symlink, so the pure-shape fixture has to sit somewhere plain: the
+    // repo's own `tmp/`. (The chroot shapes are unaffected -- their mount
+    // sources are canonicalized when the policy is built, which is why the
+    // workspace can stay under `CARGO_TARGET_TMPDIR` for them.)
+    // Canonicalized, like a deployment's own paths: a grant is compared
+    // against the path the kernel resolved, so a spelling still carrying `..`
+    // or a symlink is a spelling that never matches.
+    let plain = fs::canonicalize(env!("CARGO_MANIFEST_DIR"))
+        .expect("canonicalize the crate directory")
+        .join("../..")
+        .join("tmp")
+        .join(format!("n43-dirfd-identity-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&plain);
+    fs::create_dir_all(&plain).expect("create the symlink-free workspace");
+    let plain = fs::canonicalize(&plain).expect("canonicalize the plain workspace");
+    fs::copy(&helper, plain.join("rootfs-helper")).expect("install rootfs-helper (plain)");
+    fs::write(plain.join("seed.bin"), vec![b'x'; 3000]).expect("seed the plain file");
+    std::os::unix::fs::symlink("seed.bin", plain.join("link")).expect("seed the plain symlink");
+    let plain_str = plain.to_str().expect("workspace path is UTF-8").to_string();
+
+    // (label, chroot root, real root, cwd, argv[0], the dirfd the probe opens)
+    let host_root = PathBuf::from("/");
+    let shapes = [
+        (
+            "emulated chroot",
+            &rootfs,
+            false,
+            "/work".to_string(),
+            "rootfs-helper".to_string(),
+            "/work".to_string(),
+        ),
+        (
+            "real root",
+            &rootfs,
+            true,
+            "/work".to_string(),
+            "rootfs-helper".to_string(),
+            "/work".to_string(),
+        ),
+        (
+            "identity root (the pure shape's mediated root)",
+            &host_root,
+            false,
+            plain_str.clone(),
+            plain.join("rootfs-helper").to_string_lossy().into_owned(),
+            plain_str.clone(),
+        ),
+    ];
+
+    // Every shape is run before anything is asserted, so a red run names what
+    // each root answered rather than stopping at the first one.
+    let mut observed: Vec<(String, String, String)> = Vec::new();
+    for (label, chroot_root, real_root, cwd, argv0, dir) in shapes {
+        // The second half of the fixture: for the chroot shapes `/work` is a
+        // *mount point* (declared below) whose host side is the workspace, and
+        // it has to exist inside the rootfs before the pivot -- the real root
+        // installs the policy's own binds, and a missing mount point is an
+        // error there rather than a silently absent path (realroot.rs). The
+        // identity root has no mount table: the workspace is reachable by its
+        // host spelling, which is the sandbox's own cwd in that shape, and the
+        // policy is the pure shape's -- the system directories readable and the
+        // workspace writable. The readable list is deliberately not empty (the
+        // fixture's own helper runs out of the workspace, so it is readable
+        // too): `can_read` short-circuits to "allow" on an empty allow-list,
+        // and a case that only ever saw that path would not say anything about
+        // how the workspace is looked up.
+        let is_identity = chroot_root.as_path() == std::path::Path::new("/");
+        let mut builder = Sandbox::builder()
+            .chroot(chroot_root)
+            .real_root(real_root)
+            .user(euid, egid)
+            .cwd(&cwd);
+        builder = if is_identity {
+            builder
+                .fs_read("/usr")
+                .fs_read("/lib")
+                .fs_read("/bin")
+                .fs_read("/opt")
+                .fs_read(&plain)
+                .fs_write(&plain)
+        } else {
+            builder
+                .fs_read("/usr")
+                .fs_mount("/work", &ws)
+                .fs_write("/work")
+        };
+        builder.userns_self_map = true;
+        let policy = builder.build().unwrap_or_else(|e| panic!("{label}: the policy builds: {e}"));
+
+        let r = policy
+            .clone()
+            .run(&[&argv0, "dirfd-probe", &dir, "link"])
+            .await
+            .unwrap_or_else(|e| panic!("{label}: the probe must run: {e}"));
+        observed.push((
+            label.to_string(),
+            r.stdout_str().unwrap_or("<no stdout>").to_string(),
+            r.stderr_str().unwrap_or("<no stderr>").to_string(),
+        ));
+    }
+    let want: Vec<(String, String, String)> = observed
+        .iter()
+        .map(|(label, _, _)| (label.clone(), expected.to_string(), String::new()))
+        .collect();
+    assert_eq!(
+        observed, want,
+        "a dirfd-relative name must resolve exactly like its absolute spelling, in every root shape"
+    );
+
+    let _ = fs::remove_dir_all(&plain);
+    cleanup_rootfs(&rootfs);
+}
+
 #[tokio::test]
 async fn test_chroot_proc_dirfd_relative_is_virtualized() {
     let rootfs = build_test_rootfs("proc-dirfd");

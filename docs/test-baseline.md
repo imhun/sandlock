@@ -333,7 +333,20 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 562 # 2026-09-26 (checkpoint/restore Task 1): 560 -> 562, +2, both
+core_integ = 563 # 2026-09-26 (N43): 562 -> 563, +1: the dirfd-relative resolution
+                 # a real root got wrong (`test_chroot::test_dirfd_relative_reads_
+                 # resolve_in_both_chroot_shapes`). All three roots the
+                 # deployment builds (emulated chroot, real root, and the pure
+                 # shape's host root) in one case, one exact four-line
+                 # assertion -- `stat`/`lstat`/`open`/`readlink` relative to a
+                 # *directory descriptor*, which is the spelling `find`/`du`/
+                 # `tar` walk with. Measured before the fix: the emulated root
+                 # and the pure root answered correctly, the real root answered
+                 # ENOENT for the following stat and EACCES for the other three,
+                 # because the descriptor is the mediator's host-side one and
+                 # the kernel renders `/proc/<pid>/fd/N` as the host path. RED +
+                 # GREEN: the E2B repo's tmp/n43/{RED,GREEN}.log.
+                 # 2026-09-26 (checkpoint/restore Task 1): 560 -> 562, +2, both
                  # in `crates/sandlock-core/tests/integration/test_instance_exec.rs`
                  # and both about the resume route the deployment actually uses
                  # (E2B resumes *into a session*; `--restore-from` is the other

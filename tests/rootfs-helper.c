@@ -812,6 +812,82 @@ static int cmd_proc_dirfd(int argc, char **argv) {
     return 0;
 }
 
+/* ── dirfd-probe (all four dirfd-relative spellings of one name) ─ */
+/*
+ * Opens <dir> as a directory descriptor, then runs every descriptor-relative
+ * spelling against <name> (the fixture makes it a symlink): newfstatat()
+ * following and with AT_SYMLINK_NOFOLLOW, openat(), and readlinkat(). This is
+ * the syscall set `find`, `du` and `tar` use to walk a tree -- they hold the
+ * parent directory, not a path, so the mediator has to translate the *dirfd*
+ * rather than an absolute name.
+ *
+ * N43: the descriptor a sandbox holds is one the mediator opened on the host
+ * and injected (ADDFD), so `/proc/<pid>/fd/N` renders the *host* path of
+ * <dir> -- not the sandbox's spelling of it. One line per spelling keeps the
+ * whole family in a single exact-match assertion, and each spelling has its
+ * own failure mode (ENOENT for the must-exist stat, EACCES for the nofollow /
+ * open / readlink family).
+ *
+ * Always exits 0, so a failing probe shows up as one exact stdout line instead
+ * of ending the output at the first error.
+ */
+static const char *err_token(int e) {
+    switch (e) {
+        case ENOENT:  return "ENOENT";
+        case EACCES:  return "EACCES";
+        case EINVAL:  return "EINVAL";
+        case ELOOP:   return "ELOOP";
+        case ENOTDIR: return "ENOTDIR";
+        default:      return "errno";
+    }
+}
+
+static int cmd_dirfd_probe(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "dirfd-probe: need <dir> <name>\n"); return 2; }
+    const char *dir = argv[0];
+    const char *name = argv[1];
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) {
+        fprintf(stderr, "dirfd-probe: open %s: %s\n", dir, strerror(errno));
+        return 1;
+    }
+    struct stat st;
+
+    if (fstatat(dfd, name, &st, 0) == 0)
+        printf("stat size=%lld\n", (long long)st.st_size);
+    else
+        printf("stat %s(%d)\n", err_token(errno), errno);
+
+    if (fstatat(dfd, name, &st, AT_SYMLINK_NOFOLLOW) == 0)
+        printf("lstat size=%lld\n", (long long)st.st_size);
+    else
+        printf("lstat %s(%d)\n", err_token(errno), errno);
+
+    int fd = openat(dfd, name, O_RDONLY);
+    if (fd >= 0) {
+        char buf[4096];
+        long long total = 0;
+        ssize_t n;
+        while ((n = read(fd, buf, sizeof(buf))) > 0) total += (long long)n;
+        close(fd);
+        printf("open bytes=%lld\n", total);
+    } else {
+        printf("open %s(%d)\n", err_token(errno), errno);
+    }
+
+    char link[4096];
+    ssize_t ln = readlinkat(dfd, name, link, sizeof(link) - 1);
+    if (ln >= 0) {
+        link[ln] = '\0';
+        printf("readlink %s\n", link);
+    } else {
+        printf("readlink %s(%d)\n", err_token(errno), errno);
+    }
+
+    close(dfd);
+    return 0;
+}
+
 /* ── write-fd-link (open a path that resolves to a magic fd link) ─ */
 /*
  * Open <path> for writing and write <text> to it. Used to exercise paths that
@@ -842,6 +918,7 @@ static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "openat2") == 0)        return cmd_openat2(argc, argv);
     if (strcmp(cmd, "chdir-self") == 0)     return cmd_chdir_self(argc, argv);
     if (strcmp(cmd, "proc-dirfd") == 0)     return cmd_proc_dirfd(argc, argv);
+    if (strcmp(cmd, "dirfd-probe") == 0)    return cmd_dirfd_probe(argc, argv);
     if (strcmp(cmd, "write-fd-link") == 0)  return cmd_write_fd_link(argc, argv);
     if (strcmp(cmd, "echo") == 0)           return cmd_echo(argc, argv);
     if (strcmp(cmd, "cat") == 0)            return cmd_cat(argc, argv);
