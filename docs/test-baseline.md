@@ -115,7 +115,14 @@
 # and core_integ (534 -> 539) move, by the A1/A2 test cases registered below;
 # ffi / cli / supervise / supervise_cost / cli_build / python / oci /
 # supervise_root / mediation_2uid are unchanged.
-core_lib = 912 # 2026-09-25: 911 -> 912, +1: ending a freeze must *answer* the held
+core_lib = 913 # 2026-09-26: 912 -> 913, +1 and it is the pure shape's root:
+               # `network::rules::tests::compose_root_slash_is_not_an_image_and_leaks_no_host_entry`
+               # -- composing the synthetic /etc/hosts under root "/" used to read
+               # the **host's** file, which turns a wildcard-rule name into a
+               # literal address no `allowOut` rule can intercept. The case
+               # asserts root "/" composes exactly like "no image" and that no
+               # name from the real /etc/hosts leaks in.
+               # 2026-09-25: 911 -> 912, +1: ending a freeze must *answer* the held
                # fork notifications instead of dropping them
                # (`resource::tests::release_held_forks_drains_and_reports_what_it_released`;
                # the end-to-end half is the core_integ case below).
@@ -326,7 +333,13 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 559 # 2026-09-25: 558 -> 559, +1 and it is N14/S3's first released
+core_integ = 560 # 2026-09-26: 559 -> 560, +1: a wildcard DNS gateway address
+                 # that another *supervisor* already holds must be skipped, not
+                 # fatal (`test_instance_lifecycle::test_a_held_gateway_address_is_skipped_not_fatal`).
+                 # The allocator is a process-global counter, so every route-B
+                 # slot process starts at 127.0.1.1 and two live wildcard
+                 # sandboxes collided with EADDRINUSE at launch.
+                 # 2026-09-25: 558 -> 559, +1 and it is N14/S3's first released
                  # handler: `getcwd` inside a real root answers from the kernel
                  # instead of the mediator's recorded spelling
                  # (`test_getcwd_under_a_real_root_is_the_kernels_answer`: the
