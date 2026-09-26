@@ -753,7 +753,13 @@ cli = 98      # 2026-09-23: 97 -> 98, +1
               # after F0.4 wiring (cli suite includes net_bind_map tests);
               # F5.1 updates the no-supervisor default validation to
               # DEFAULT_MAX_PROCESSES (256), no count change
-supervise = 55 # 2026-09-25: 54 -> 55, +1: `checkpoint` with `exclude_main`, the flag
+supervise = 56 # 2026-09-26: 55 -> 56, +1: the checkpoint reply names the captured program
+               # (`test_the_checkpoint_reply_names_the_captured_program`) —— FUP-30 的教训是
+               # "抓到了谁"必须由引擎说出来，而不是靠映射数量猜：`exe` 是 `/proc/<pid>/exe`
+               # 的 realpath、`argv` 是 `/proc/<pid>/cmdline`，精确相等断言（`/bin` -> `/usr/bin`
+               # 的符号链接现场 canonicalize）。Measured: lib 21 + tests/supervise 35 = 56，
+               # 0 failed（E2B 仓 tmp/k0s/f2-supervise-full.log）。
+               # 2026-09-25: 54 -> 55, +1: `checkpoint` with `exclude_main`, the flag
                # a pooled deployment's park-shape session needs -- assert the
                # refusal without it is byte-exact, and that with it the image is
                # the workload's pid while both children keep running

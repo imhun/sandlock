@@ -713,6 +713,14 @@ impl Generation {
     /// (`SkippedFd` is computed there), so a caller that has to tell a user
     /// "your connections will not come back" must read the restore reply.
     ///
+    /// "Which process" is answered literally: `exe` is the captured pid's
+    /// `/proc/<pid>/exe` real path and `argv` is its `/proc/<pid>/cmdline`.
+    /// Both are read after the capture resumes the child, and both come back
+    /// empty when the pid is already gone -- an empty answer is the true one,
+    /// and a caller that has to say *what* it paused (a wrapper shell and its
+    /// payload have very different sizes, which is all a mapping count shows)
+    /// reads these rather than guessing from the image.
+    ///
     /// `exclude_main: true` says the caller's session runs a **park** as its
     /// main child, so the workload is the single child beside it. It exists
     /// because a launch-first slot always has a main child: `sandlock-init`
@@ -762,11 +770,28 @@ impl Generation {
         let fds = cp.fd_table.len();
         cp.save(std::path::Path::new(&dir))
             .map_err(|e| Refusal::from_core("checkpoint save failed", &e))?;
+        // FUP-30：让调用方能写出一句"这次 pause 抓到的是 dash"，
+        // 而不是让使用者自己去比映射数量。捕获会 SIGSTOP→SIGCONT 目标进程，
+        // 所以在 `save` 之后读的正是"那个还在跑的进程"；读不到（进程在捕获窗口里
+        // 死了）就给空值 —— 空值是真实答案，不要为它编一个猜测。
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let argv: Vec<String> = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|raw| {
+                raw.split(|b| *b == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(serde_json::json!({
             "dir": dir,
             "name": cp.name,
             "pid": pid,
             "fds": fds,
+            "exe": exe,
+            "argv": argv,
         }))
     }
 

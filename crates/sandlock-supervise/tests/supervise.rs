@@ -1589,6 +1589,69 @@ fn test_supervise_checkpoint_can_leave_the_parking_main_child_out() {
     let _ = std::fs::remove_dir_all(&workdir);
 }
 
+/// FUP-30 的真因是"抓到的是包装用的那个 shell，而不是负载"—— 而当时唯一的证据是映射数量
+/// 与填充字节（19 / 388 KiB 是 dash）。这条用例要求 verb 的回复**直接给出**被捕获进程的身份：
+/// `exe` 是 `/proc/<pid>/exe` 的 realpath，`argv` 是 `/proc/<pid>/cmdline`。
+///
+/// 用 `sleep 30` 而不是 `sh -c '… && exec …'`：后者的 pid 会在证据文件写完之后**变成** sleep，
+/// 于是断言与 exec 赛跑（FUP-30 的调试经验：会读到随机一侧）。`sleep 30` 的 argv 从 execve
+/// 那一刻起就固定，`exe` 也固定。
+#[test]
+fn test_the_checkpoint_reply_names_the_captured_program() {
+    let ctl_root = isolate_ctl_root();
+    let workdir = repo_tmp_dir().join(format!("supervise-cp-names-{}", std::process::id()));
+    std::fs::create_dir_all(&workdir).expect("create workdir");
+    let image = workdir.join("image");
+    let policy = write_policy(
+        "names-instance",
+        &instance_policy(workdir.to_str().expect("workdir utf8")),
+    );
+    let program = write_policy(
+        "names-program",
+        &serde_json::json!({ "argv": ["/bin/sleep", "30"] }).to_string(),
+    );
+    let name = format!("supervise-cp-names-{}", std::process::id());
+    let token = "cp-names-token-0123456789abcdef";
+    let (mut child, sock_path) =
+        spawn_serving_slot(&ctl_root, &policy, &name, token, Some(&program));
+
+    // 让 slot 真的把程序跑起来（launch-first：程序在 slot 开始服务之前就起了）。
+    wait_until(
+        Instant::now() + Duration::from_secs(15),
+        "the sleep workload to be running",
+        || {
+            let resp = registered_verb_args(&sock_path, token, "stats", serde_json::json!({}));
+            resp["data"]["children_live"].as_u64().unwrap_or(0) >= 1
+        },
+    );
+
+    let resp = registered_verb_args(
+        &sock_path,
+        token,
+        "checkpoint",
+        serde_json::json!({ "dir": image.to_str().unwrap(), "exclude_main": false }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "checkpoint: {resp:?}");
+
+    // 精确相等，不做子串判据：`/bin` 在多数发行版上是 `/usr/bin` 的符号链接，所以期望值
+    // 现场用 canonicalize 取（这也是"哪个 inode 被捕获了"的正确问法）。
+    let expected_exe = std::fs::canonicalize("/bin/sleep").expect("/bin/sleep exists");
+    assert_eq!(
+        resp["data"]["exe"],
+        serde_json::json!(expected_exe.to_str().unwrap()),
+        "the reply must name the captured program by its real path: {resp:?}"
+    );
+    assert_eq!(
+        resp["data"]["argv"],
+        serde_json::json!(["/bin/sleep", "30"]),
+        "the reply must carry the captured program's argv: {resp:?}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
 // ---------------------------------------------------------------------------
 // N25: pushed append accounting and the live per-file tightening.
 // ---------------------------------------------------------------------------
