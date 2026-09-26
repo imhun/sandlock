@@ -333,7 +333,28 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 563 # 2026-09-26 (N43): 562 -> 563, +1: the dirfd-relative resolution
+core_integ = 564 # 2026-09-26 (N16): 563 -> 564, +1: the pure shape's synthesized
+                 # root -- a *plain directory* the sandbox binds the host's
+                 # system directories into, not an extracted image and not a
+                 # tmpfs, pivoted by `real_root(true)`
+                 # (`test_instance_chroot::test_a_plain_directory_root_pivots_
+                 # and_hides_the_host`). One case, four places an image
+                 # assumption could have hidden: absolute and relative exec
+                 # through the binds, a host-only path unreachable after the
+                 # pivot, and the skeleton's own empty `/proc` answering
+                 # `ls /proc`. No product change was needed -- `real_root` takes
+                 # a root path and a mount list and never asks whether the root
+                 # is an image. RED before that was settled, all three measured:
+                 # a skeleton missing the policy's mount point (`work`) died in
+                 # the child's step-6 `chdir` with ENOENT; with the policy's
+                 # read list pinned to `/usr`, `ls /proc` answered EACCES
+                 # *whether or not* the skeleton had a `proc` directory (the
+                 # allow-list refuses before the root is consulted), so the case
+                 # grants `/` -- the whole rootfs, the same grant the image
+                 # shape carries -- and the missing-`proc` counter-arm answers
+                 # ENOENT instead. Evidence: E2B repo's
+                 # .superpowers/sdd/pure-task-7-report.md and tmp/task7/.
+                 # 2026-09-26 (N43): 562 -> 563, +1: the dirfd-relative resolution
                  # a real root got wrong (`test_chroot::test_dirfd_relative_reads_
                  # resolve_in_both_chroot_shapes`). All three roots the
                  # deployment builds (emulated chroot, real root, and the pure

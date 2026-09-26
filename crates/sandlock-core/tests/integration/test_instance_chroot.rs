@@ -802,3 +802,94 @@ async fn test_read_only_declared_under_one_alias_covers_the_other_alias() {
     cleanup(&rootfs);
     cleanup(&base);
 }
+
+/// N16 (E2B `docs/superpowers/plans/2026-09-26-pure-shape-synthetic-rootfs.md`):
+/// the pure shape's root is a *plain directory* the sandbox binds the host's
+/// system directories into -- not an extracted image, and not a tmpfs (the
+/// shipped worker profile refuses every `mount` whose fstype is not NULL).
+///
+/// The fork has no "image" concept on this path at all: `real_root` takes a root
+/// path and a `(virtual, host)` mount list, so nothing here should need a
+/// production change. The case exists to make that claim falsifiable -- each
+/// assertion is one place an image assumption could have hidden.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_a_plain_directory_root_pivots_and_hides_the_host() {
+    let base = temp_dir("synth-root");
+    let rootfs = base.join("skeleton");
+    let work = base.join("work");
+    let host_only = base.join("host-only");
+    std::fs::create_dir_all(&host_only).expect("create host-only dir");
+    std::fs::write(host_only.join("SECRET"), b"secret\n").expect("write sentinel");
+    // `work` is not decoration: it is the policy's `fs_mount` destination *and*
+    // its cwd, and the engine refuses a root whose mount point is missing
+    // (realroot.rs says so; the child's step-6 `chdir` into the host spelling of
+    // the cwd fails first, with ENOENT, before the pivot). The E2B side creates
+    // exactly this set next to the skeleton (`_ensure_chroot_mount_points`).
+    for dir in ["usr/bin", "dev", "proc", "etc", "tmp", "work"] {
+        std::fs::create_dir_all(rootfs.join(dir)).expect("create skeleton dir");
+    }
+    std::fs::create_dir_all(&work).expect("create host work dir");
+    std::fs::write(work.join("hello.txt"), b"hello\n").expect("write workspace file");
+    let helper = helper_binary();
+    let dest = rootfs.join("usr/bin/rootfs-helper");
+    std::fs::hard_link(&helper, &dest)
+        .or_else(|_| std::fs::copy(&helper, &dest).map(|_| ()))
+        .expect("install rootfs-helper into the skeleton");
+
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    // `/` — the whole root — and not `/usr`. Under a chroot that spelling means
+    // *this rootfs* (landlock.rs translates it to `root.join("")`; it is the
+    // same grant the image shape carries), so it names the subject of the case
+    // rather than a corner of it. With the narrower `/usr` the two anatomical
+    // assertions become vacuous and pass for the wrong reason, both measured:
+    // a path outside the allow-list is answered `EACCES` by policy before
+    // anything looks at the root, so `/proc` read `Permission denied` *whether
+    // or not the skeleton had a `proc` directory*, and the host-only path in ③
+    // was refused by the allow-list instead of by the pivot. Granting the whole
+    // root makes ③ and ④ measure what they claim: the policy permits every
+    // path inside the root, so what is left hiding the host is the pivot, and
+    // `ls /proc` is answered by the skeleton's own directory.
+    let mut builder = Sandbox::builder()
+        .chroot(&rootfs)
+        .real_root(true)
+        .user(euid, egid)
+        .fs_read("/")
+        .fs_mount("/work", &work)
+        .fs_mount("/dev", "/dev")
+        .fs_write("/work")
+        .cwd("/work");
+    builder.userns_self_map = true;
+    let policy = builder.build().expect("synthetic-root policy builds");
+    let mut inst = SandboxInstance::launch_exec_only(policy).await.expect("launch");
+
+    // ① absolute exec through the bound host directory
+    let (status, stdout, stderr) =
+        exec_capture(&mut inst, &["/usr/bin/rootfs-helper", "pwd"]).await;
+    assert_eq!(status, ExitStatus::Code(0), "absolute exec failed: {stderr}");
+    assert_eq!(stdout, "/work\n");
+    // ② relative exec -- the symptom of a self-bind taken in the wrong order
+    let (status, stdout, stderr) =
+        exec_capture(&mut inst, &["rootfs-helper", "cat", "hello.txt"]).await;
+    assert_eq!(status, ExitStatus::Code(0), "relative exec failed: {stderr}");
+    assert_eq!(stdout, "hello\n");
+    // ③ the host-only path is gone: this is what the pivot bought
+    let (status, _stdout, _stderr) = exec_capture(
+        &mut inst,
+        &["rootfs-helper", "stat", &host_only.display().to_string()],
+    )
+    .await;
+    assert_eq!(
+        status,
+        ExitStatus::Code(1),
+        "the host-only path is still reachable"
+    );
+    // ④ the skeleton's own /proc is an empty directory, not a missing one
+    let (status, stdout, stderr) = exec_capture(&mut inst, &["rootfs-helper", "ls", "/proc"]).await;
+    assert_eq!(status, ExitStatus::Code(0), "ls /proc failed: {stderr}");
+    assert_eq!(stdout, "");
+
+    inst.shutdown().await.expect("shutdown");
+    cleanup(&rootfs);
+    cleanup(&base);
+}
