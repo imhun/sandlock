@@ -1916,6 +1916,10 @@ impl Sandbox {
                 exec_ceiling: None,
                 exec_session: None,
                 policy_image: None,
+                // A clone of a `Sandbox` is not an exec-capable session, so it
+                // never arms the stub grant itself (`restore_into_session`
+                // refuses it as "not exec-capable" before this is read).
+                restore_stub_grant: None,
                 pid_ns_map: None,
                 lifetime: crate::instance::InstanceLifetime::default(),
                 launched_at: std::time::Instant::now(),
@@ -2036,6 +2040,7 @@ impl Sandbox {
             exec_ceiling: None,
             exec_session: None,
             policy_image: None,
+            restore_stub_grant: None,
             pid_ns_map: None,
             lifetime: crate::instance::InstanceLifetime::default(),
             launched_at: std::time::Instant::now(),

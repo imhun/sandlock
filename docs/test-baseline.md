@@ -333,7 +333,30 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 560 # 2026-09-26: 559 -> 560, +1: a wildcard DNS gateway address
+core_integ = 562 # 2026-09-26 (checkpoint/restore Task 1): 560 -> 562, +2, both
+                 # in `crates/sandlock-core/tests/integration/test_instance_exec.rs`
+                 # and both about the resume route the deployment actually uses
+                 # (E2B resumes *into a session*; `--restore-from` is the other
+                 # route and E2B does not consume it):
+                 #  (1) `test_a_static_workload_resumes_into_a_session_under_an_
+                 #      emulated_chroot` -- the session route under
+                 #      `real_root(false)`, i.e. the other half of the root-shape
+                 #      pair that the one-shot case runs. This is the shape the
+                 #      chroot/stub hand-off used to break (43cc62a refused a
+                 #      chroot root, a6f6b04 delivers the stub by descriptor,
+                 #      1f41f1a gave the session route the same delivery), and
+                 #      "the real-root case is green" never implied it.
+                 #  (2) `test_a_session_launched_without_the_stub_grant_
+                 #      refuses_a_restore_by_name` -- a session whose launch
+                 #      found no stub to grant must refuse *by name*. Red before
+                 #      the fix, on "restore stub never signalled READY within
+                 #      10000ms": that 10 s timeout is exactly the failure the
+                 #      name replaces (10.08s for the RED run).
+                 # Same commit, no count change: `test_a_dynamic_workload_
+                 # resumes_into_a_session_under_a_real_root` gained the
+                 # exec-after-restore assertion (the real-root shape asserted a
+                 # live process but not that the session still serves `exec`).
+                 # 2026-09-26: 559 -> 560, +1: a wildcard DNS gateway address
                  # that another *supervisor* already holds must be skipped, not
                  # fatal (`test_instance_lifecycle::test_a_held_gateway_address_is_skipped_not_fatal`).
                  # The allocator is a process-global counter, so every route-B

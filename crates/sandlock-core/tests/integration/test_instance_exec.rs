@@ -1266,7 +1266,286 @@ async fn test_a_dynamic_workload_resumes_into_a_session_under_a_real_root() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    // A live process is not the whole product semantic: the resumed workload has
+    // to be a **session** child (D9, closed 2026-09-25 by fork 1f41f1a -- a
+    // resume *into* a session keeps `exec`/`wait_child`/`kill_child` working,
+    // which is what a long-lived sandbox needs after a pause). The restored
+    // program is exec'd by `sandlock-init`, so both halves follow from the same
+    // fact and neither was asserted on the real-root shape before this.
+    assert!(
+        dst.stats().await.children_live >= 2,
+        "the restored child must be registered in the session's child table \
+         (park + restored workload), got {}",
+        dst.stats().await.children_live
+    );
+    let echoed = dst
+        .exec(&["/bin/echo", "EXEC_OK"], ExecStdio::Piped)
+        .await
+        .expect("the restored session must still serve exec");
+    let out = read_exact_bytes(echoed.stdout.expect("piped stdout"), "EXEC_OK\n".len());
+    assert_eq!(String::from_utf8_lossy(&out), "EXEC_OK\n");
+    assert_eq!(
+        dst.wait_child(echoed.child_id).await.expect("wait the exec"),
+        ExitStatus::Code(0)
+    );
+
     let _ = dst.kill_child(resumed.child_id, libc::SIGKILL);
+    let _ = dst.kill_child(0, libc::SIGKILL);
+    let _ = dst.wait_child(0).await;
+    let _ = dst.shutdown().await;
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// The **other** root shape of the deployment: an emulated root
+/// (`real_root(false)`), which is what `E2B_REAL_ROOT=0` selects.
+///
+/// The real-root session shape above and the one-shot path's
+/// `test_restore_resumes_inside_a_chroot_root` (which runs both root shapes) are
+/// not a substitute: the deployment resumes over the **session** route, and the
+/// two differ exactly in the family that used to break -- chroot-mediated path
+/// resolution of the restore stub (fork `43cc62a` refused a chroot root up
+/// front because the stub was exec'd by its host path; `a6f6b04` delivers it by
+/// descriptor instead, and `1f41f1a` gave the session route the same delivery).
+/// A regression on either half has to turn this red on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_a_static_workload_resumes_into_a_session_under_an_emulated_chroot() {
+    let helper = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/rootfs-helper")
+        .canonicalize()
+        .expect("rootfs-helper — build.rs should have compiled it");
+    let tmp = std::env::temp_dir().join(format!(
+        "sandlock-emulated-session-restore-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let rootfs = tmp.join("rootfs");
+    let work = tmp.join("work");
+    std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
+    std::fs::create_dir_all(rootfs.join("work")).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::copy(&helper, rootfs.join("usr/bin/rootfs-helper"))
+        .expect("install the helper inside the rootfs");
+    let counter = work.join("clock.cnt");
+    let read_counter = || {
+        std::fs::read_to_string(&counter)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    let mut builder = Sandbox::builder()
+        .chroot(&rootfs)
+        .real_root(false)
+        .user(euid, egid)
+        .fs_read("/usr")
+        .fs_mount("/work", &work)
+        .fs_write("/work")
+        .cwd("/work");
+    builder.userns_self_map = true;
+    let policy = builder.build().expect("emulated-chroot policy builds");
+
+    // The main child is a park in the same sense route B means it: a long-lived
+    // program that never forks, so `sandlock-init` (and with it `exec`) stays
+    // alive while `checkpoint_excluding_main` captures the workload beside it.
+    // Both counters are named by their **in-sandbox** path, which is the only
+    // spelling this root resolves (the host path is what the image records and
+    // what this test reads back).
+    let mut src = SandboxInstance::launch_exec(
+        policy.clone().with_name("emulated-src"),
+        &["/usr/bin/rootfs-helper", "clock-loop", "/work/park.cnt"],
+    )
+    .await
+    .expect("launch the parked emulated-chroot session");
+    let work_handle = src
+        .exec(
+            &["/usr/bin/rootfs-helper", "clock-loop", "/work/clock.cnt"],
+            ExecStdio::Piped,
+        )
+        .await
+        .expect("exec the workload");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !read_counter().is_some_and(|v| v >= 3) {
+        assert!(
+            Instant::now() < deadline,
+            "the workload must run before the capture (counter {:?})",
+            read_counter()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let cp = src
+        .checkpoint_excluding_main()
+        .await
+        .expect("capture the workload beside the park");
+    assert_eq!(
+        cp.process_state.pid, work_handle.pid,
+        "the image must be the workload's address space"
+    );
+    src.shutdown().await.expect("tear the source session down");
+    // Sentinel: from here only the restored process can move this file.
+    std::fs::write(&counter, b"0\n").unwrap();
+
+    let mut dst = SandboxInstance::launch_exec(
+        policy.with_name("emulated-dst"),
+        &["/usr/bin/rootfs-helper", "clock-loop", "/work/park.cnt"],
+    )
+    .await
+    .expect("launch the destination session");
+    let resumed = dst
+        .restore_into_session(&cp)
+        .await
+        .expect("restore into an emulated-chroot session");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !read_counter().is_some_and(|v| v > 0) {
+        assert!(
+            Instant::now() < deadline,
+            "the restored workload must keep running under an emulated chroot \
+             (counter {:?}, restored child {} pid {})",
+            read_counter(),
+            resumed.child_id,
+            resumed.pid
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // And the session still serves exec through the same root shape.
+    let echoed = dst
+        .exec(
+            &["/usr/bin/rootfs-helper", "echo", "EXEC_OK"],
+            ExecStdio::Piped,
+        )
+        .await
+        .expect("the restored session must still serve exec");
+    let out = read_exact_bytes(echoed.stdout.expect("piped stdout"), "EXEC_OK\n".len());
+    assert_eq!(String::from_utf8_lossy(&out), "EXEC_OK\n");
+    assert_eq!(
+        dst.wait_child(echoed.child_id).await.expect("wait the exec"),
+        ExitStatus::Code(0)
+    );
+
+    let _ = dst.kill_child(resumed.child_id, libc::SIGKILL);
+    let _ = dst.kill_child(0, libc::SIGKILL);
+    let _ = dst.wait_child(0).await;
+    let _ = dst.shutdown().await;
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// A session whose launch found **no** restore stub cannot resume: say so by
+/// name instead of letting the sandbox's own rules answer.
+///
+/// `launch_exec_inner` arms the stub's Landlock grant at launch, and a domain is
+/// installed once and cannot be widened later -- so "the stub was not there when
+/// this session started" is a structural refusal, not a retryable one. Without
+/// naming it the failure surfaces *inside* the sandbox (the stub cannot be exec'd
+/// there) and reads like a broken restore. `SANDLOCK_RESTORE_STUB` is the first
+/// priority of `checkpoint::resume::stub_path`, so it is what builds this state:
+/// the destination session is launched while the path does not exist, and the
+/// file appears only afterwards -- exactly the shape a stub rebuilt under a live
+/// session has (the path carries a build hash).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_a_session_launched_without_the_stub_grant_refuses_a_restore_by_name() {
+    let helper = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/rootfs-helper")
+        .canonicalize()
+        .expect("rootfs-helper — build.rs should have compiled it");
+    let helper_s = helper.to_str().unwrap().to_string();
+    let tmp = std::env::temp_dir().join(format!("sandlock-stub-grant-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let absent = tmp.join("restore-stub");
+    let counter = tmp.join("clock.cnt");
+    let counter_s = counter.to_str().unwrap().to_string();
+    let read_counter = || {
+        std::fs::read_to_string(&counter)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+    // The same park the route-B shape uses: it keeps `sandlock-init` -- and so
+    // `exec` -- alive, and it never forks.
+    const PARK: &str = "trap '' TERM HUP INT QUIT USR1 USR2 PIPE; while :; do kill -STOP $$; done";
+    // This test is about the stub's grant and nothing else, so the policy is the
+    // shape the existing session cases use: host paths, no chroot.
+    let policy = base_policy()
+        .fs_read(helper.parent().unwrap())
+        .fs_read(&tmp)
+        .fs_write(&tmp)
+        .cwd(&tmp)
+        .build()
+        .expect("stub-free policy builds");
+
+    // Restore the variable on drop: a failing assertion must not leave every
+    // later case in this binary looking at a stub path that is not there.
+    struct StubEnvGuard(Option<std::ffi::OsString>);
+    impl Drop for StubEnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("SANDLOCK_RESTORE_STUB", value),
+                None => std::env::remove_var("SANDLOCK_RESTORE_STUB"),
+            }
+        }
+    }
+    let _guard = StubEnvGuard(std::env::var_os("SANDLOCK_RESTORE_STUB"));
+    // Single-threaded by canon (`--test-threads=1`), and the guard above puts the
+    // previous value back even if an assertion unwinds.
+    std::env::set_var("SANDLOCK_RESTORE_STUB", &absent);
+
+    let mut src = SandboxInstance::launch_exec(
+        policy.clone().with_name("nogrant-src"),
+        &["sh", "-c", PARK],
+    )
+    .await
+    .expect("launch the parked session");
+    let work_handle = src
+        .exec(
+            &[helper_s.as_str(), "clock-loop", counter_s.as_str()],
+            ExecStdio::Piped,
+        )
+        .await
+        .expect("exec the workload");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !read_counter().is_some_and(|v| v >= 3) {
+        assert!(
+            Instant::now() < deadline,
+            "the workload must run before the capture (counter {:?})",
+            read_counter()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let cp = src
+        .checkpoint_excluding_main()
+        .await
+        .expect("capture the workload beside the park");
+    assert_eq!(cp.process_state.pid, work_handle.pid);
+    let _ = src.kill_child(work_handle.child_id, libc::SIGKILL);
+    let _ = src.wait_child(work_handle.child_id).await;
+    src.shutdown().await.expect("tear the source session down");
+
+    // The destination session comes up while the stub is still missing, so its
+    // domain carries no grant for it.
+    let mut dst = SandboxInstance::launch_exec(
+        policy.with_name("nogrant-dst"),
+        &["sh", "-c", PARK],
+    )
+    .await
+    .expect("launch the destination session");
+    // And *now* the stub appears: `restore_into_session`'s existence check passes
+    // while the grant is still missing, which is the whole point of this case.
+    std::fs::write(&absent, b"not a real stub").unwrap();
+    let named = absent.canonicalize().unwrap_or_else(|_| absent.clone());
+    let err = dst
+        .restore_into_session(&cp)
+        .await
+        .expect_err("a session without the stub's grant must refuse, not fail inside the sandbox");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "process error: child process error: restore: this session was launched without a \
+             grant for the restore stub ({}): the sandbox's Landlock domain is installed once, \
+             at launch, so a stub that appeared afterwards cannot be exec'd here; lease a fresh \
+             slot and resume into that",
+            named.display()
+        )
+    );
+
     let _ = dst.kill_child(0, libc::SIGKILL);
     let _ = dst.wait_child(0).await;
     let _ = dst.shutdown().await;

@@ -380,6 +380,18 @@ pub struct SandboxInstance {
     /// surface stays on the live `Sandbox`, unchanged) or if the snapshot
     /// failed to encode.
     pub(crate) policy_image: Option<Vec<u8>>,
+    /// The restore stub's host path, when its Landlock grant was armed at
+    /// launch (`launch_exec_inner`); `None` when there was no stub to grant, or
+    /// for the runtimes that never arm one (one-shot sessions and the
+    /// `Sandbox` clone path -- neither is exec-capable, and
+    /// `restore_into_session` refuses them before it reads this).
+    ///
+    /// A Landlock domain is installed once and cannot be widened afterwards, so
+    /// a session can only ever resume into *this* path:
+    /// [`SandboxInstance::restore_into_session`] reads it to refuse a session
+    /// whose launch predates the stub (or a stub rebuilt under it) **by name**,
+    /// instead of leaving the sandbox's own rules to answer.
+    pub(crate) restore_stub_grant: Option<std::path::PathBuf>,
     /// F5.3: namespace-pid → host-pid translation for a pid-ns exec session.
     /// `sandlock-init` runs inside the sandbox's PID namespace (it *is* ns
     /// PID 1), so the pids it announces over the control channel
@@ -576,12 +588,23 @@ impl SandboxInstance {
         // from the wire document cannot arm this itself -- which is the second
         // reason to do it here rather than ask.
         let restore_stub = crate::checkpoint::resume::stub_path();
-        if restore_stub.exists() {
+        let restore_stub_grant = if restore_stub.exists() {
             let stub_path = restore_stub.canonicalize().unwrap_or(restore_stub);
             if !policy.fs_readable_host.contains(&stub_path) {
-                policy.fs_readable_host.push(stub_path);
+                policy.fs_readable_host.push(stub_path.clone());
             }
-        }
+            Some(stub_path)
+        } else {
+            // Not fatal here -- a session that never resumes needs no stub -- but
+            // it *is* the state `restore_into_session` has to refuse by name, so
+            // leave the breadcrumb where the launch happened.
+            crate::checkpoint::resume::note(&format!(
+                "no restore-stub at launch ({}): this session cannot resume into a stub that \
+                 appears afterwards",
+                restore_stub.display()
+            ));
+            None
+        };
         let null = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -617,6 +640,10 @@ impl SandboxInstance {
             .map_err(SandboxRuntimeError::Io)?;
         let link = ExecLink::new(writer, reader);
         rt.exec_ceiling = Some(ceiling);
+        // Which stub's grant the domain armed above actually carries (`None`
+        // when there was no stub to grant), carried on the session so a resume
+        // that has to refuse can name the path it was never granted.
+        rt.restore_stub_grant = restore_stub_grant;
         // Runtime-less policy snapshot (Sandbox::clone drops the runtime
         // block) encoded with bincode — see `policy_image` for why the
         // snapshot is serialized rather than held live.
@@ -1220,8 +1247,11 @@ impl SandboxInstance {
     ///
     /// One boundary follows from taking the grant at launch: the stub's path
     /// carries a build hash, so a session created before the stub was rebuilt
-    /// cannot resume into the new one. That shows up as a refusal inside the
-    /// sandbox (the guest's own rules), not as a silent pass.
+    /// cannot resume into the new one. That is refused here, **by name** --
+    /// naming the path this session was granted and the one it would have to
+    /// exec -- because the alternative is the sandbox's own rules answering
+    /// from inside the restore, or the READY handshake timing out, and both of
+    /// those read as "the restore broke".
     ///
     /// The image must also have been taken under a policy whose chroot/mount shape
     /// this session can resolve; the retained snapshot is used, and a plan that
@@ -1262,6 +1292,24 @@ impl SandboxInstance {
             .into());
         }
         let stub_path = stub.canonicalize().unwrap_or_else(|_| stub.clone());
+
+        // The stub's grant is armed once, at launch, and a Landlock domain
+        // cannot be widened later -- so a session whose launch found no stub (or
+        // a different one, the path carries a build hash) can never exec this
+        // file. Say that here, by name: the alternatives are the sandbox's own
+        // rules refusing somewhere inside the restore and the stub's READY
+        // handshake timing out after 10s, and both read as "the restore broke"
+        // (measured: the timeout is what a session without the grant produced).
+        if self.restore_stub_grant.as_deref() != Some(stub_path.as_path()) {
+            return Err(SandboxRuntimeError::Child(format!(
+                "restore: this session was launched without a grant for the restore stub ({}): \
+                 the sandbox's Landlock domain is installed once, at launch, so a stub that \
+                 appeared afterwards cannot be exec'd here; lease a fresh slot and resume into \
+                 that",
+                stub_path.display()
+            ))
+            .into());
+        }
 
         let chroot_root = crate::chroot::resolve::resolve_chroot_root(policy.chroot.as_deref())?;
         let mounts = crate::chroot::resolve::resolve_chroot_mounts(&policy.fs_mount);
