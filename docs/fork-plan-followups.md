@@ -59,7 +59,8 @@
   变异证明：把 `tmp_storage_base` 改回 `sandlock-cow-<uid>-<pid>` ⇒ 每次必红
   （`tmp/f26-f27-mutant-r03.log`）。计数不变（core_lib 仍 848）。
 
-- **FUP-28 e2b 侧「`..` 相对软链改写」可以撤掉的条件（跨仓 follow-up，2026-09-15）** —
+- **FUP-28 e2b 侧「`..` 相对软链改写」可以撤掉的条件（跨仓 follow-up，2026-09-15；
+  已撤，2026-09-27）** —
   来源：FUP-26（本批）在 fork 侧吃掉了这一切。
   背景：`envd_service/runtime/image_resolver.py::_root_absolute_links` 会把镜像里带 `..` 的
   相对软链改写为等价的 root-absolute 目标，用来绕开「`openat2(RESOLVE_IN_ROOT)` 的 `EAGAIN`
@@ -73,6 +74,15 @@
   在**等价竞态负载**下用产品路径打点：受管 open 连续 97482 次必须 0 失败、300 条
   `exec /bin/echo` 必须 0 次「127 + 空 stderr」，同时内核侧原始 `EAGAIN` 必须 > 0（证明
   重试真的在起作用）。本批的这条命令与数字见 `.superpowers/sdd/task-f26-report.md` §3。
+  **注（2026-09-27，arm64 更正）**：中间那条 `exec /bin/echo` 判据在 **arm64 上恒真** ——
+  镜像 `/bin/echo` 的 `PT_INTERP = /lib/ld-linux-aarch64.so.1`，`/lib -> usr/lib` 整条链
+  一个 `..` 分量都没有（x86 那个缺陷靠的是
+  `/lib64/ld-linux-x86-64.so.2 -> ../lib/x86_64-linux-gnu/…` 里的 `..`）。arm64 上有效的
+  形状是"**解释器挂在 `..` 相对软链后面**"：造
+  `lib64/ld-linux-aarch64.so.1 -> ../lib/ld-linux-aarch64.so.1`，再编一个
+  `--dynamic-linker` 指向它的二进制。执行口径、原始输出与变异对照（预算改 0 ⇒
+  122/300 与 223/300 红，而同一批运行里 `exec /bin/echo` 仍 0/300）见 E2B 仓的
+  `.superpowers/sdd/debt-fup28-exec-shape-report.md` §5。
   撤掉后的回归网：`tests/unit/test_image_rootfs_links.py`（整树无 `..` 相对软链）与
   `tests/unit/test_oci_registry.py` 的「chroot 内解析到同一 inode」钉子需要同步调整/删除，
   这正是当初为了绕开本 bug 才加的那两条。
@@ -93,9 +103,24 @@
   HEAD = `7b60349c`，含 FUP-26）。**剩下的只有前提③**：那是**产品路径**的竞态 soak
   （受管 open 连续 97482 次 0 失败、300 条 `exec /bin/echo` 0 次「127 + 空 stderr」、
   同时内核侧原始 EAGAIN > 0），要在**部署宿主**上跑，而 worker 镜像里没有 cargo ——
-  要么在节点上起 sandlock-dev 类镜像，要么交叉编译出 arm64 的 soak 二进制塞进一次性 pod。
-  在那之前**保留改写**（它的代价只是每沙箱建箱时一次树走查 + "沙箱看到的文件系统与镜像不同"
-  这一点），撤掉的收益不足以承担没有 soak 的风险。
+
+  **已撤（2026-09-27，E2B 侧执行）—— 三条前提全部满足，且都有在部署宿主上跑出来的、
+  带变异对照的原始输出**：
+  ① 重试代码 = 上线那一份（`crates/sandlock-core/src/sys/fs.rs` 与线上 wheel manifest HEAD
+  `7b60349c` 逐字节相同，`EAGAIN_RETRY_BUDGET: u32 = 4`）⇒ E2B 仓
+  `.superpowers/sdd/debt-fup28-soak-report.md` §4；
+  ② 两个部署宿主内核（`6.12.0-211.34.1.el10_2.aarch64`）实测在 `RESOLVE_IN_ROOT` + `..` 上
+  返回 EAGAIN（本文上面那张表：`.94` 8107/40000、`.140` 6855/40000）；
+  ③ 产品路径 soak（**arm64 有效形状 = "解释器挂 `..`"**）：受管 open **0 / 97482**、
+  `..`-interp exec **0 / 300**、同一次运行里内核原始 EAGAIN **3411 / 40000（`.94`）、
+  3125 / 40000（`.140`）> 0**；把预算改 0 ⇒ exec **122 / 300、223 / 300** 红（旧形状的
+  `exec /bin/echo` 同时仍是 0/300），改回来两宿主回绿 ⇒ 同上报告 §3–§5。
+  于是 E2B 侧 `envd_service/runtime/image_resolver.py` 的 `_root_absolute_links`（连同
+  `_prepared_rootfs` 与 5 个调用点）**已删除**；上面说的那两条回归网同步调整 ——
+  `tests/unit/test_image_rootfs_links.py` **删除**，`tests/unit/test_oci_registry.py` 的
+  「chroot 内解析到同一 inode」钉子改成「**链接保留 `..`**、仍解析到同一 inode」。
+  E2B 两档 lane 复跑全 `0 failed` 且与基线相等或更好；撤回记录
+  `.superpowers/sdd/debt-fup28-retire-the-rewrite-report.md`。
 
 - **FUP-29 「已捕获的（park 形态）会话里再 exec」在本机 harness 上间歇性卡死
   （2026-09-25 开、同日关闭）** — 来源：为 E2B 的 route-B 形态新增
