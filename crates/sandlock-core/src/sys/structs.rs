@@ -353,6 +353,19 @@ pub const DEFAULT_BLOCKLIST_SYSCALLS: &[&str] = &[
     "ptrace",
     "process_vm_readv",
     "process_vm_writev",
+    // The same capability as `ptrace` through a newer interface: it duplicates
+    // a file descriptor out of another process. The supervisor needs it -- that
+    // is how it picks up the child's seccomp-notification fd
+    // (`sandbox.rs::dup_child_fd`) -- but it runs *outside* this filter, so
+    // blocking it here only takes it away from sandbox code, which has no
+    // legitimate use for it. Measured 2026-09-30 on the k0s cluster: without
+    // this entry a sandbox process could `pidfd_open` + `pidfd_getfd` its own
+    // sandbox's processes and duplicate their descriptors (it could not name or
+    // reach anything outside its own sandbox, but `ptrace` is blocked for
+    // exactly this class). `--no-supervisor` mode keeps it allowed via
+    // NO_SUPERVISOR_BLOCKLIST_SYSCALLS, because an inner supervisor may run
+    // there.
+    "pidfd_getfd",
     "open_by_handle_at",
     "name_to_handle_at",
     "ioperm",
