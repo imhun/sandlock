@@ -371,13 +371,98 @@ pub const DEFAULT_BLOCKLIST_SYSCALLS: &[&str] = &[
     "ioperm",
     "iopl",
     "quotactl",
+    // `quotactl_fd` is the fd spelling of the same quota interface. A sandbox
+    // has no use for it: the platform's quota work runs in the worker
+    // (`envd_service/xfs_quota.py` calls `quotactl_fd` through ctypes), which
+    // is outside this filter. Measured 2026-09-30 on the k0s cluster (arm64,
+    // worker pod, no effective capabilities): inside a real sandbox the call
+    // reaches the kernel (EBADF for a deliberately-bad fd), i.e. nothing but
+    // the missing capability was in the way.
+    "quotactl_fd",
     "acct",
     "lookup_dcookie",
     "nfsservctl",
     "io_uring_setup",
     "io_uring_enter",
     "io_uring_register",
+    // The legacy POSIX AIO interface is the generation before io_uring: the
+    // same class of "batch I/O submitted through one syscall", with no
+    // per-request interception point. Nothing in a sandbox needs it (glibc's
+    // `aio_*` is the only consumer), and `io_uring`'s own entry above is the
+    // precedent. Measured on the same cluster run: `io_setup` and `io_submit`
+    // both reached the kernel from inside the sandbox (EFAULT/EINVAL).
+    "io_setup",
+    "io_submit",
+    "io_cancel",
+    "io_getevents",
+    "io_pgetevents",
     "personality",
+    // ---- the ptrace class, newer interfaces ------------------------------
+    // `pidfd_getfd` above is one member; these are the rest of the family.
+    // `process_madvise`/`process_mrelease` act on another process's memory
+    // through a pidfd and are gated by the same `PTRACE_MODE_ATTACH` check
+    // `process_vm_readv/writev` carry -- and which this blocklist already
+    // refuses. `kcmp` compares two processes' descriptors/memory and was
+    // historically the same-side-channel primitive. A workload has no use for
+    // any of them; measured inside a real sandbox on the k0s cluster
+    // (2026-09-30): all three reached the kernel (EBADF/ESRCH for bad
+    // arguments).
+    "process_madvise",
+    "process_mrelease",
+    "kcmp",
+    // ---- kernel code / kexec ---------------------------------------------
+    // `kexec_load` is refused above; this is the file-based spelling of the
+    // same capability. Measured inside a sandbox: EPERM, i.e. the call was
+    // reaching the kernel and stopping only at the missing `CAP_SYS_BOOT`.
+    "kexec_file_load",
+    // ---- the new mount API ------------------------------------------------
+    // `mount`/`umount2`/`pivot_root`/`open_tree` are refused above; these are
+    // the remaining entry points to the same capability. They matter more than
+    // the rest of this list because **no Landlock access right covers them**
+    // (the ledger in `sys/path_surface.rs` records each one), so the seccomp
+    // filter is the only barrier that survives a host whose outer profile is
+    // wider than the shipped worker profile. Measured 2026-09-30 inside a real
+    // sandbox on the k0s cluster: every one of them reached the kernel from
+    // sandbox code (`fsconfig`/`mount_setattr` answered EINVAL, proving the
+    // argument parse ran; the others stopped at the capability check). The
+    // deployment's own rule for these -- written when the real-root shape was
+    // designed -- is "allow `mount` + `pivot_root` in the worker, and never
+    // hand the companions to a workload" (docs/task-backlog.md, N14).
+    "fsopen",
+    "fsconfig",
+    "fsmount",
+    "move_mount",
+    "fspick",
+    "mount_setattr",
+    // `statmount`/`listmount` take a mount id rather than a path, but return
+    // host mount metadata (root/mountpoint strings, mount options) -- a
+    // disclosure surface with no workload use. Both were `Open` (unmediated,
+    // no gate) in the path-surface ledger.
+    "statmount",
+    "listmount",
+    // ---- host/device surfaces with no sandbox use -------------------------
+    // `memfd_secret` allocates pages the kernel itself cannot read back; it is
+    // a hardening primitive for secrets handling, never something a sandboxed
+    // workload needs, and measured inside the sandbox it *succeeded*
+    // (returned a real fd). `memfd_create` is deliberately left allowed --
+    // runtimes and JITs use it.
+    "memfd_secret",
+    // x86-only and absent on the deployed arm64 ABI (the name resolves to
+    // nothing there, so the entry is inert on arm64). Only emulators that
+    // build 16-bit segments need it.
+    "modify_ldt",
+    // ---- NUMA policy ------------------------------------------------------
+    // No sandbox workload needs to set or read the host's memory policy, and
+    // `get_mempolicy` reports the host topology, which is exactly the kind of
+    // host fact a sandbox is not supposed to learn. Measured inside a real
+    // sandbox (k0s, 2026-09-30): `get_mempolicy` and `set_mempolicy` *succeeded*
+    // there -- these are not capability-gated.
+    "get_mempolicy",
+    "set_mempolicy",
+    "mbind",
+    "move_pages",
+    "migrate_pages",
+    "set_mempolicy_home_node",
 ];
 
 /// Deny list for --no-supervisor mode.

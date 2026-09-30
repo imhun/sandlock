@@ -94,6 +94,195 @@ async fn test_chroot_blocked() {
 }
 
 // ------------------------------------------------------------------
+// 1c. the 2026-09-30 hardening list is refused inside a real sandbox
+// ------------------------------------------------------------------
+//
+// Each of these was measured *reaching the kernel from inside a sandbox on the
+// deployed cluster* (k0s, arm64, worker pod with no effective capabilities --
+// `fsconfig`/`mount_setattr` answered EINVAL, so their argument parse ran;
+// `memfd_secret` returned a usable fd; `get_mempolicy`/`set_mempolicy` returned
+// 0). They are in `DEFAULT_BLOCKLIST_SYSCALLS` now, so the assertion is on the
+// errno the sandbox observes: EPERM, not "the call failed" (a bad argument
+// would also fail and prove nothing).
+//
+// The numbers come from the crate's own resolver, so the test is arch-correct:
+// `modify_ldt` (x86 only) simply drops out on aarch64.
+#[tokio::test]
+async fn test_first_tier_blocklist_refused() {
+    use sandlock_core::seccomp::syscall::syscall_name_to_nr;
+
+    // name -> deliberately-bad arguments, so a regression cannot have side
+    // effects while it is being measured.
+    const PROBES: &[(&str, &[i64])] = &[
+        // mount API companions
+        ("fsopen", &[0, 0]),
+        ("fsconfig", &[0x7FFF_FFF0, 0, 0, 0, 0]),
+        ("fsmount", &[0x7FFF_FFF0, 0, 0]),
+        ("move_mount", &[0x7FFF_FFF0, 0, 0x7FFF_FFF0, 0, 0]),
+        ("fspick", &[0x7FFF_FFF0, 0, 0]),
+        ("mount_setattr", &[0x7FFF_FFF0, 0, 0, 0, 0]),
+        ("statmount", &[0, 0, 0, 0, 0, 0]),
+        ("listmount", &[0, 0, 0, 0, 0]),
+        // the ptrace class
+        ("process_madvise", &[0x7FFF_FFF0, 0, 0, 4, 0]),
+        ("process_mrelease", &[0x7FFF_FFF0, 0]),
+        ("kcmp", &[0x7FFF_FFF0, 0x7FFF_FFF0, 0, 0, 0]),
+        // quota / kexec / legacy AIO
+        ("quotactl_fd", &[0x7FFF_FFF0, 0, 0, 0, 0]),
+        ("kexec_file_load", &[0x7FFF_FFF0, 0x7FFF_FFF0, 0, 0, 0]),
+        ("io_setup", &[0, 0]),
+        ("io_submit", &[0x7FFF_FFF0, 0, 0]),
+        ("io_cancel", &[0x7FFF_FFF0, 0, 0]),
+        ("io_getevents", &[0x7FFF_FFF0, 0, 0, 0, 0]),
+        ("io_pgetevents", &[0x7FFF_FFF0, 0, 0, 0, 0, 0]),
+        // host/device
+        ("memfd_secret", &[0]),
+        ("modify_ldt", &[0, 0, 0]),
+        // NUMA
+        ("get_mempolicy", &[0, 0, 0, 0, 0]),
+        ("set_mempolicy", &[0, 0, 0]),
+        ("mbind", &[0, 4096, 0, 0, 0, 0]),
+        ("move_pages", &[0, 0, 0, 0, 0, 0]),
+        ("migrate_pages", &[0, 0, 0, 0]),
+        ("set_mempolicy_home_node", &[0, 0, 0, 0]),
+    ];
+
+    let mut table = String::new();
+    for (name, args) in PROBES {
+        let Some(nr) = syscall_name_to_nr(name) else {
+            // ABI-specific name (x86-only `modify_ldt`): nothing to enforce.
+            continue;
+        };
+        table.push_str(&format!("    {name:?}: ({nr}, {args:?}),\n"));
+    }
+    assert!(
+        table.matches("\n").count() > 20,
+        "the probe table resolved almost nothing: {table}"
+    );
+
+    let out = temp_out("first-tier-blocklist");
+    let script = format!(concat!(
+        "import ctypes, sys\n",
+        "libc = ctypes.CDLL(None, use_errno=True)\n",
+        "libc.syscall.restype = ctypes.c_long\n",
+        "PROBES = {{\n",
+        "{table}",
+        "}}\n",
+        "lines = []\n",
+        "for name, (nr, args) in PROBES.items():\n",
+        "    a = list(args) + [0] * (6 - len(args))\n",
+        "    ctypes.set_errno(0)\n",
+        "    libc.syscall(ctypes.c_long(nr), *[ctypes.c_long(x) for x in a])\n",
+        "    lines.append('%s %d' % (name, ctypes.get_errno()))\n",
+        "open(sys.argv[1], 'w').write('\\n'.join(lines))\n",
+    ), table = table);
+    let policy = base_policy().build().unwrap();
+    let result = policy.clone()
+        .run_interactive(&["python3", "-c", &script, &out.display().to_string()])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "the probe process must run inside the sandbox (stderr: {})",
+        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default())
+    );
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    let mut wrong: Vec<String> = Vec::new();
+    let mut checked = 0;
+    for line in content.lines() {
+        let (name, errno) = line.split_once(' ').expect("name errno");
+        checked += 1;
+        if errno != "1" {
+            wrong.push(format!("{name}={errno}"));
+        }
+    }
+    assert_eq!(checked, table.matches("\n").count(), "probe count mismatch: {content}");
+    assert!(
+        wrong.is_empty(),
+        "these must be refused with EPERM(1) by the default blocklist, got: {wrong:?}"
+    );
+}
+
+// ------------------------------------------------------------------
+// 1d. clone3's namespace flags are refused by the sandbox's own check
+// ------------------------------------------------------------------
+//
+// `clone3` carries its flags inside a `clone_args` struct behind a user
+// pointer, so the BPF arg filter -- which reads arg0 directly, the way it does
+// for `clone` -- cannot see them. Only the notif handler can, by reading the
+// struct out of the caller. Until 2026-09-30 `handle_fork` guarded its
+// namespace check with `nr == SYS_clone`, so `clone3(CLONE_NEWUSER|...)` was
+// answered `Continue` and the kernel executed it. On the deployed worker
+// profile that was masked by the outer profile denying `clone3` outright
+// (ENOSYS, measured on the k0s cluster) -- which is exactly the problem: the
+// namespace ban was being enforced by the container profile, not by sandlock.
+//
+// `CLONE_NEWUSER|CLONE_THREAD` is deliberate. A thread cannot create a new user
+// namespace, so a build that lets the call through gets `EINVAL` from the
+// kernel: distinguishable from the `EPERM` this test requires, and with no side
+// effect in either case (no task is created). The same test also spawns two
+// threads, which glibc implements with `clone3`: the check must refuse the
+// namespace flag without refusing ordinary thread creation.
+#[tokio::test]
+async fn test_clone3_namespace_flags_refused() {
+    let out = temp_out("clone3-ns");
+    let script = format!(concat!(
+        "import ctypes, errno, sys, threading\n",
+        "CLONE_NEWUSER = 0x10000000\n",
+        "CLONE_THREAD = 0x00010000\n",
+        "CLONE_NEWNS = 0x00020000\n",
+        "SIGCHLD = 17\n",
+        // clone_args: 11 __aligned_u64 fields, flags first.
+        "class CloneArgs(ctypes.Structure):\n",
+        "    _fields_ = [('flags', ctypes.c_ulonglong)] + [\n",
+        "        (n, ctypes.c_ulonglong) for n in ('pidfd', 'child_tid', 'parent_tid',\n",
+        "         'exit_signal', 'stack', 'stack_size', 'tls', 'set_tid', 'set_tid_size',\n",
+        "         'cgroup')]\n",
+        "libc = ctypes.CDLL(None, use_errno=True)\n",
+        "libc.syscall.restype = ctypes.c_long\n",
+        "def clone3(flags):\n",
+        "    a = CloneArgs()\n",
+        "    a.flags = flags\n",
+        "    a.exit_signal = SIGCHLD\n",
+        "    ctypes.set_errno(0)\n",
+        "    libc.syscall(ctypes.c_long(435), ctypes.byref(a), ctypes.sizeof(a))\n",
+        "    return ctypes.get_errno()\n",
+        "notes = []\n",
+        "notes.append('newuser_thread=%d' % clone3(CLONE_NEWUSER | CLONE_THREAD))\n",
+        // Control: ordinary thread creation (glibc: clone3) must still work.
+        "ts = [threading.Thread(target=lambda: None) for _ in range(2)]\n",
+        "for t in ts: t.start()\n",
+        "for t in ts: t.join()\n",
+        "notes.append('threads=ok')\n",
+        "open(sys.argv[1], 'w').write('\\n'.join(notes))\n",
+    ));
+    let policy = base_policy().build().unwrap();
+    let result = policy.clone()
+        .run_interactive(&["python3", "-c", &script, &out.display().to_string()])
+        .await
+        .unwrap();
+    assert!(
+        result.success(),
+        "the probe process must run inside the sandbox (stderr: {})",
+        String::from_utf8_lossy(result.stderr.as_deref().unwrap_or_default())
+    );
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(
+        content,
+        // EPERM = 1; the thread control line proves the same check did not cost
+        // ordinary clone3 (only the invalid-combination spelling is exercised,
+        // because a *valid* namespace clone would create a task).
+        "newuser_thread=1\nthreads=ok",
+        "clone3's namespace flags must be refused with EPERM, and plain \
+         thread creation must keep working"
+    );
+}
+
+// ------------------------------------------------------------------
 // 2. ptrace is blocked (strace should fail)
 // ------------------------------------------------------------------
 #[tokio::test]

@@ -88,12 +88,30 @@ pub(crate) async fn handle_fork(
     ctx: &Arc<SupervisorCtx>,
     _policy: &NotifPolicy,
 ) -> NotifAction {
-    let nr = notif.data.nr as i64;
-    let args = &notif.data.args;
-
-    // Namespace flags are denied for clone (clone3's are caught by the
-    // BPF arg filter; vfork takes no flags).
-    if nr == libc::SYS_clone && (args[0] & CLONE_NS_FLAGS) != 0 {
+    // Namespace creation is refused across the whole fork family.
+    //
+    // The BPF arg filter covers `clone` (its flags are arg0, which a cBPF
+    // filter can read), but `clone3` keeps its flags inside a `clone_args`
+    // struct behind a user pointer that cBPF cannot follow -- only this handler
+    // can see them, and `clone_flags` is the reader that already does (it is
+    // the same one `is_thread_create` uses below).
+    //
+    // Until 2026-09-30 this check was guarded by `nr == SYS_clone`, so a
+    // `clone3(CLONE_NEWUSER | ...)` was answered `Continue` and the kernel
+    // executed it. What hid that was the outer container profile, which denies
+    // `clone3` outright (`ENOSYS`, measured on the k0s cluster 2026-09-30):
+    // the ban was being enforced by the host profile instead of by the
+    // sandbox's own mediation, and any host running a wider profile lost it.
+    // Measured inside a real sandbox before this change (`CLONE_NEWUSER |
+    // CLONE_THREAD`, an invalid combination so nothing is created):
+    // `EINVAL` -- the kernel, i.e. the flag reached it.
+    //
+    // A failed read leaves the flags unknown and falls through: a caller whose
+    // memory cannot be read is on its way out (killed, exiting) and the kernel
+    // will refuse its `clone3` on its own, while denying an unreadable call
+    // would turn a transient read failure into a spurious `EPERM` for ordinary
+    // `pthread_create` (glibc 2.34+ implements it with `clone3`).
+    if matches!(clone_flags(notif, notif_fd), Some(f) if f & CLONE_NS_FLAGS != 0) {
         return NotifAction::Errno(EPERM);
     }
 

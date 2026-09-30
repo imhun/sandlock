@@ -188,18 +188,13 @@ pub(crate) const UNMEDIATED_PATH_TAKING: &[(&str, Disposition)] = &[
         Disposition::Open("at-style xattr remove (kernel 466); see getxattrat for the mechanism"),
     ),
     ("open_tree_attr", Disposition::Blocked),
-    (
-        "statmount",
-        Disposition::Open(
-            "takes a mount id, not a path, but returns host mount metadata (root/mountpoint \
-             strings): a disclosure surface rather than a path-resolution one. Kernel 457, \
-             refused by the shipped profile like the rest of this group",
-        ),
-    ),
-    (
-        "listmount",
-        Disposition::Open("mount enumeration by id (kernel 458); see statmount"),
-    ),
+    // `statmount`/`listmount` used to be `Open` (kernel 457/458, refused only
+    // by the shipped worker profile, which is a host-dependent gate): they
+    // return host mount metadata (root/mountpoint strings, options) and no
+    // sandbox workload reads it. Blocked 2026-09-30 after the k0s probe showed
+    // a sandbox process reaching the kernel for the sibling mount-API calls.
+    ("statmount", Disposition::Blocked),
+    ("listmount", Disposition::Blocked),
     (
         "file_getattr",
         Disposition::Open(
@@ -248,18 +243,15 @@ pub(crate) const UNMEDIATED_PATH_TAKING: &[(&str, Disposition)] = &[
         "fanotify_mark",
         Disposition::Gated("fanotify_init needs CAP_SYS_ADMIN; MEASURED EPERM, so no mark can be established"),
     ),
-    (
-        "move_mount",
-        Disposition::Gated("CAP_SYS_ADMIN in the mount namespace's userns; MEASURED EPERM"),
-    ),
-    (
-        "fspick",
-        Disposition::Gated("mount API; CAP_SYS_ADMIN-gated like move_mount (fsopen measured EPERM)"),
-    ),
-    (
-        "mount_setattr",
-        Disposition::Gated("CAP_SYS_ADMIN-gated mount API; the attribute argument was rejected (EINVAL) before any path effect"),
-    ),
+    // The mount API's companions were `Gated` (CAP_SYS_ADMIN in the mount
+    // namespace's userns) until 2026-09-30. That gate is a property of the
+    // *host profile and capability set*, not of the sandbox: the k0s probe
+    // measured them reaching the kernel from inside a real sandbox, and no
+    // Landlock right covers them. They are blocklisted in every shape now, the
+    // same as `open_tree`.
+    ("move_mount", Disposition::Blocked),
+    ("fspick", Disposition::Blocked),
+    ("mount_setattr", Disposition::Blocked),
     (
         "uselib",
         Disposition::Gated("obsolete: ENOSYS on every supported kernel"),
@@ -338,13 +330,13 @@ pub(crate) const PURE_GATED_ELSEWHERE: &[(&str, &str)] = &[
     ("lchown", "ownership/DAC only, see chown"),
     ("fchownat", "ownership/DAC only, see chown"),
     ("fanotify_mark", "fanotify_init needs CAP_SYS_ADMIN in the initial userns (measured EPERM)"),
-    ("move_mount", "CAP_SYS_ADMIN in the mount namespace's userns (measured EPERM)"),
-    ("fspick", "mount API, CAP_SYS_ADMIN-gated like move_mount"),
-    ("mount_setattr", "mount API, CAP_SYS_ADMIN-gated"),
+    ("move_mount", "blocklisted in every shape (2026-09-30); no Landlock right covers it"),
+    ("fspick", "blocklisted in every shape (2026-09-30), see move_mount"),
+    ("mount_setattr", "blocklisted in every shape (2026-09-30), see move_mount"),
     ("file_getattr", "kernel 6.13+; ENOSYS on the audit kernel, signature unverified"),
     ("file_setattr", "kernel 6.13+; ENOSYS on the audit kernel, signature unverified"),
-    ("statmount", "takes a mount id, not a path; ENOSYS on the audit kernel. Would disclose mount metadata when it lands"),
-    ("listmount", "mount enumeration by id, see statmount; ENOSYS on the audit kernel"),
+    ("statmount", "blocklisted in every shape (2026-09-30): host mount metadata, no workload use"),
+    ("listmount", "blocklisted in every shape (2026-09-30), see statmount"),
     ("uselib", "obsolete, ENOSYS"),
     ("mq_open", "resolves in the mqueue filesystem, which the worker does not mount"),
     ("mq_unlink", "same as mq_open"),
@@ -627,8 +619,6 @@ mod tests {
                 "setxattrat",
                 "listxattrat",
                 "removexattrat",
-                "statmount",
-                "listmount",
                 "file_getattr",
                 "file_setattr",
             ],

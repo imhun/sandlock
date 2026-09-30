@@ -434,12 +434,15 @@ fn test_syscall_name_to_nr_covers_defaults() {
     // running architecture does not expose that syscall.
     // `nfsservctl` now resolves: the syscalls crate carries it (kernel
     // returns ENOSYS, but the ABI number exists), so it is enforced in the
-    // blocklist rather than silently dropped. `ioperm`/`iopl` are x86-only.
+    // blocklist rather than silently dropped. `ioperm`/`iopl`/`modify_ldt`
+    // are x86-only, so they resolve to nothing on the generic-ABI arches.
     let expected_unresolved: &[&str] = &[
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         "ioperm",
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         "iopl",
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        "modify_ldt",
     ];
     let mut skipped = 0;
     for name in DEFAULT_BLOCKLIST_SYSCALLS {
@@ -478,6 +481,63 @@ fn test_chroot_is_blocklisted() {
 }
 
 #[test]
+fn test_first_tier_hardening_syscalls_are_blocklisted() {
+    // The 2026-09-30 hardening pass. Each of these was measured *reaching the
+    // kernel from inside a real sandbox* on the k0s cluster (arm64, worker pod,
+    // `CapEff=0`), i.e. nothing but a host-dependent gate stood in the way:
+    //
+    //   mount API companions (fsconfig/mount_setattr answered EINVAL, so the
+    //   argument parse ran), process_madvise/process_mrelease, kcmp,
+    //   quotactl_fd, kexec_file_load, io_setup/io_submit, memfd_secret
+    //   (returned a working fd), get_mempolicy/set_mempolicy (returned 0).
+    //
+    // Pinned by resolved number, like `chroot`: a name that fails to resolve is
+    // silently dropped from the filter, which is the failure mode this test
+    // exists to catch.
+    const ADDED: &[&str] = &[
+        "fsopen",
+        "fsconfig",
+        "fsmount",
+        "move_mount",
+        "fspick",
+        "mount_setattr",
+        "statmount",
+        "listmount",
+        "process_madvise",
+        "process_mrelease",
+        "kcmp",
+        "quotactl_fd",
+        "kexec_file_load",
+        "io_setup",
+        "io_submit",
+        "io_cancel",
+        "io_getevents",
+        "io_pgetevents",
+        "memfd_secret",
+        "modify_ldt",
+        "get_mempolicy",
+        "set_mempolicy",
+        "mbind",
+        "move_pages",
+        "migrate_pages",
+        "set_mempolicy_home_node",
+    ];
+    let policy = Sandbox::builder().build().unwrap();
+    let numbers = crate::seccomp_plan::blocklist_syscall_numbers(&policy);
+    for name in ADDED {
+        let nr = syscall_name_to_nr(name);
+        if nr.is_none() {
+            // ABI-specific (x86-only) name: nothing to enforce on this arch.
+            continue;
+        }
+        assert!(
+            numbers.contains(&nr.unwrap()),
+            "{name} must resolve into the default blocklist (resolved {numbers:?})"
+        );
+    }
+}
+
+#[test]
 fn test_effective_nofile_clamps_to_both_inherited_bounds() {
     // A request below both bounds is applied verbatim, the ordinary case.
     let split = libc::rlimit { rlim_cur: 1024, rlim_max: 1_048_576 };
@@ -503,4 +563,3 @@ fn test_effective_nofile_clamps_to_both_inherited_bounds() {
     };
     assert_eq!(effective_nofile(4096, &unlimited), 4096);
 }
-
