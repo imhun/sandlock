@@ -1762,6 +1762,11 @@ mod tests {
             nrs.contains(&(libc::SYS_statfs as u32)),
             "SYS_statfs must be trapped when the accounting file is configured"
         );
+        assert!(
+            nrs.contains(&(libc::SYS_fstatfs as u32)),
+            "SYS_fstatfs must be trapped too: `os.fstatvfs(fd)` takes the \
+             fd-based sibling, which a path-only trap never sees"
+        );
     }
 
     #[test]

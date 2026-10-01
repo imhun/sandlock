@@ -618,6 +618,16 @@ pub(crate) fn build_dispatch_table(
             let path = path.clone();
             async move { crate::procfs::handle_statfs(&notif, &path, notif_fd) }
         });
+        // The fd-based sibling (`os.fstatvfs`, `df` on an open handle) is a
+        // *different* syscall, so it needs its own registration: the path trap
+        // never sees it. Same answer, seeded from the child's own fd.
+        let fd_path = stats_path.clone();
+        table.register(libc::SYS_fstatfs, move |cx: &HandlerCtx| {
+            let notif = cx.notif;
+            let notif_fd = cx.notif_fd;
+            let path = fd_path.clone();
+            async move { crate::procfs::handle_fstatfs(&notif, &path, notif_fd) }
+        });
     }
 
     // ------------------------------------------------------------------

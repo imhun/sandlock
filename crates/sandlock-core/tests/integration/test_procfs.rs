@@ -135,14 +135,18 @@ async fn test_statfs_reports_the_hosts_disk_accounting() {
 
     let script = "import os\n\
          s = os.statvfs('/')\n\
-         print(s.f_frsize, s.f_blocks, s.f_bfree, s.f_bavail)\n";
+         fd = os.open('/etc', os.O_RDONLY)\n\
+         f = os.fstatvfs(fd)\n\
+         print(s.f_frsize, s.f_blocks, s.f_bfree, s.f_bavail)\n\
+         print(f.f_frsize, f.f_blocks, f.f_bfree, f.f_bavail)\n";
     let result = policy.clone().run(&["python3", "-c", script]).await.unwrap();
     assert!(result.success(), "statvfs should succeed: {:?}", result);
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default()).into_owned();
     assert_eq!(
         stdout.trim(),
-        "4096 2621440 1572864 1572864",
-        "statfs must report the sold quota (10 GiB) and its remainder (6 GiB)"
+        "4096 2621440 1572864 1572864\n4096 2621440 1572864 1572864",
+        "statfs and its fd-based sibling fstatfs must both report the sold \
+         quota (10 GiB) and its remainder (6 GiB)"
     );
 
     // The host keeps the numbers fresh by rewriting the file; the next call
@@ -152,7 +156,7 @@ async fn test_statfs_reports_the_hosts_disk_accounting() {
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default()).into_owned();
     assert_eq!(
         stdout.trim(),
-        "4096 2621440 262144 262144",
+        "4096 2621440 262144 262144\n4096 2621440 262144 262144",
         "a refreshed accounting file must be observed by the next statfs"
     );
 }
@@ -200,15 +204,19 @@ async fn test_statfs_accounting_wins_over_the_chroot_handler() {
 
     let script = "import os\n\
          s = os.statvfs('/')\n\
-         print(s.f_frsize, s.f_blocks, s.f_bfree, s.f_bavail)\n";
+         fd = os.open('/etc', os.O_RDONLY)\n\
+         f = os.fstatvfs(fd)\n\
+         print(s.f_frsize, s.f_blocks, s.f_bfree, s.f_bavail)\n\
+         print(f.f_frsize, f.f_blocks, f.f_bfree, f.f_bavail)\n";
     let result = policy.clone().run(&["python3", "-c", script]).await.unwrap();
     assert!(result.success(), "statvfs should succeed: {:?}", result);
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default()).into_owned();
     assert_eq!(
         stdout.trim(),
-        "4096 2621440 1572864 1572864",
+        "4096 2621440 1572864 1572864\n4096 2621440 1572864 1572864",
         "the ledger must win over the chroot statfs handler: the chroot handler \
-         would report the node's volume instead"
+         would report the node's volume instead, and the fd-based sibling must \
+         answer it too"
     );
 
     // The host keeps the numbers fresh by rewriting the file; the next call
@@ -218,7 +226,7 @@ async fn test_statfs_accounting_wins_over_the_chroot_handler() {
     let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default()).into_owned();
     assert_eq!(
         stdout.trim(),
-        "4096 2621440 262144 262144",
+        "4096 2621440 262144 262144\n4096 2621440 262144 262144",
         "a refreshed accounting file must be observed by the next statfs in the \
          chroot shape too"
     );

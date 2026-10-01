@@ -491,9 +491,13 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
         nrs.push(libc::SYS_sysinfo);
     }
     // `statfs(2)` answers with the host volume's capacity; trap it when the
-    // host maintains the sandbox's own accounting file.
+    // host maintains the sandbox's own accounting file. `fstatfs(2)` is the
+    // fd-based sibling of the same question (`os.fstatvfs`, anything that
+    // stats an open handle) -- leaving it out reports the node's volume on
+    // exactly the calls a path-based trap does not cover.
     if features.disk_stats {
         nrs.push(libc::SYS_statfs);
+        nrs.push(libc::SYS_fstatfs);
     }
     if features.virtual_hostname {
         nrs.extend(&[libc::SYS_uname, libc::SYS_openat]);

@@ -19,7 +19,7 @@
 //     contents, so the seccomp_unotify TOCTOU class doesn't apply.
 
 use std::collections::{HashMap, HashSet};
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -1158,6 +1158,60 @@ pub(crate) fn handle_statfs(
     stats_path: &std::path::Path,
     notif_fd: RawFd,
 ) -> NotifAction {
+    let mut seed: libc::statfs = unsafe { std::mem::zeroed() };
+    // Seed from the kernel so f_type/f_namelen describe the real tree. The
+    // numbers reported below do not depend on the path, so a path the
+    // supervisor cannot read is not a reason to fall through.
+    let path_addr = notif.data.args[0];
+    if path_addr != 0 {
+        if let Some(text) = read_child_cstr(notif_fd, notif.id, notif.pid, path_addr, 4096) {
+            if let Ok(c_path) = std::ffi::CString::new(text) {
+                unsafe { libc::statfs(c_path.as_ptr(), &mut seed) };
+            }
+        }
+    }
+    answer_disk_stats(notif, stats_path, notif_fd, seed)
+}
+
+/// `fstatfs(2)`: the fd-based spelling of the same question.
+///
+/// `os.fstatvfs(fd)` -- and anything that stats an already-open handle instead
+/// of a path -- takes this syscall, so leaving it out reports the node's volume
+/// even while `statfs` reports the ledger (measured 2026-10-01: `statvfs("/")`
+/// answered 2621440 blocks while `fstatvfs(fd)` answered 72335360).
+///
+/// The seed comes from the child's own fd (duplicated out of it, exactly like
+/// every other on-behalf fd op) so `f_type`/`f_namelen` describe the object the
+/// handle really points at; a handle the supervisor cannot duplicate is not a
+/// reason to fall through -- the accounting does not depend on it.
+pub(crate) fn handle_fstatfs(
+    notif: &SeccompNotif,
+    stats_path: &std::path::Path,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let mut seed: libc::statfs = unsafe { std::mem::zeroed() };
+    let fd = notif.data.args[0] as i32;
+    if fd >= 0 {
+        if let Ok(dup) = crate::seccomp::notif::dup_fd_from_pid(notif.pid, fd) {
+            unsafe { libc::fstatfs(dup.as_raw_fd(), &mut seed) };
+        }
+    }
+    answer_disk_stats(notif, stats_path, notif_fd, seed)
+}
+
+/// Write the accounting answer for a `statfs`/`fstatfs` notification.
+///
+/// Both syscalls put the buffer in `args[1]` (the path/fd is `args[0]`), so the
+/// only difference between them is how `seed` was obtained. A missing or
+/// malformed accounting file falls through to the kernel -- which is the
+/// pre-option behaviour, and refusing a valid `statfs` would be worse than
+/// answering it with the host's numbers.
+fn answer_disk_stats(
+    notif: &SeccompNotif,
+    stats_path: &std::path::Path,
+    notif_fd: RawFd,
+    seed: libc::statfs,
+) -> NotifAction {
     let buf_addr = notif.data.args[1];
     if buf_addr == 0 {
         return NotifAction::Continue;
@@ -1166,18 +1220,7 @@ pub(crate) fn handle_statfs(
         return NotifAction::Continue;
     };
 
-    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
-    // Seed from the kernel so f_type/f_namelen describe the real tree. The
-    // numbers reported below do not depend on the path, so a path the
-    // supervisor cannot read is not a reason to fall through.
-    let path_addr = notif.data.args[0];
-    if path_addr != 0 {
-        if let Some(text) = read_child_cstr(notif_fd, notif.id, notif.pid, path_addr, 4096) {
-            if let Ok(c_path) = std::ffi::CString::new(text) {
-                unsafe { libc::statfs(c_path.as_ptr(), &mut buf) };
-            }
-        }
-    }
+    let mut buf = seed;
 
     const BLOCK: u64 = 4096;
     let used = used.min(total);
