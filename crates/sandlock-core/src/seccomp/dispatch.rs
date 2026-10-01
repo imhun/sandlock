@@ -594,6 +594,33 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
+    // Disk accounting for statfs(2).
+    //
+    // The sandbox's quota and its remaining space are the host's to know, so
+    // the host writes them into a file and this reports them instead of the
+    // node's volume. A missing file falls through to the kernel.
+    //
+    // Registered *before* the chroot path handlers on purpose: a handler chain
+    // stops at the first non-`Continue` result, and `handle_chroot_statfs`
+    // always answers (real numbers, or errno). With the chroot handler earlier
+    // the accounting was unreachable in every mediated shape -- measured
+    // 2026-10-01, same wheel: `chroot="/"` answered 72335360 blocks (the host
+    // XFS) where the ledger said 2621440, while the same policy without a
+    // chroot reported the ledger. The accounting is deliberately
+    // path-insensitive (see `handle_statfs`), so it is the right answer for
+    // every `statfs` the sandbox makes once a ledger is configured.
+    // ------------------------------------------------------------------
+    if let Some(ref stats_path) = policy.disk_stats_path {
+        let path = stats_path.clone();
+        table.register(libc::SYS_statfs, move |cx: &HandlerCtx| {
+            let notif = cx.notif;
+            let notif_fd = cx.notif_fd;
+            let path = path.clone();
+            async move { crate::procfs::handle_statfs(&notif, &path, notif_fd) }
+        });
+    }
+
+    // ------------------------------------------------------------------
     // Chroot path interception (before COW)
     // ------------------------------------------------------------------
     if policy.chroot_root.is_some() {
@@ -672,23 +699,6 @@ pub(crate) fn build_dispatch_table(
                 let used = resource.lock().await.mem_used;
                 crate::procfs::handle_sysinfo(&notif, policy.max_memory_bytes, used, notif_fd)
             }
-        });
-    }
-
-    // ------------------------------------------------------------------
-    // Disk accounting for statfs(2).
-    //
-    // The sandbox's quota and its remaining space are the host's to know, so
-    // the host writes them into a file and this reports them instead of the
-    // node's volume. A missing file falls through to the kernel.
-    // ------------------------------------------------------------------
-    if let Some(ref stats_path) = policy.disk_stats_path {
-        let path = stats_path.clone();
-        table.register(libc::SYS_statfs, move |cx: &HandlerCtx| {
-            let notif = cx.notif;
-            let notif_fd = cx.notif_fd;
-            let path = path.clone();
-            async move { crate::procfs::handle_statfs(&notif, &path, notif_fd) }
         });
     }
 

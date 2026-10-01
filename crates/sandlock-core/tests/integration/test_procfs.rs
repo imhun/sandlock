@@ -157,6 +157,73 @@ async fn test_statfs_reports_the_hosts_disk_accounting() {
     );
 }
 
+/// SEC-K0S-007 correction: the accounting must win in the **mediated** shapes
+/// too, not only in the bare one above.
+///
+/// Measured 2026-10-01 on the deployed route-B shape: the payload's `statfs`
+/// *was* notified (and every other notif-mediated handler -- `uname`,
+/// `/proc` synthesis, `inotify_add_watch` -- answered for it), yet the ledger
+/// was ignored and the node's numbers came back. The cause is handler
+/// precedence, not the seccomp filter: a chain stops at the first
+/// non-`Continue` result, and `register_chroot_handlers` used to register
+/// `SYS_statfs` *before* the accounting handler, so `handle_chroot_statfs`
+/// answered every call. Every deployment shape has a chroot root (the pure /
+/// synthesized root, an image rootfs, or the real root), which is why the
+/// feature was dead in production while the non-chroot case above stayed
+/// green.
+///
+/// The accounting is deliberately path-insensitive (`handle_statfs`), so it is
+/// the right answer for every `statfs` the sandbox makes once a ledger is
+/// configured -- including this one, whose path resolves through the chroot.
+#[tokio::test]
+async fn test_statfs_accounting_wins_over_the_chroot_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let stats = dir.path().join("disk-stats");
+    // 10 GiB sold, 4 GiB used -> 6 GiB free, in the handler's 4 KiB blocks.
+    std::fs::write(&stats, "10737418240 4294967296\n").unwrap();
+
+    let policy = Sandbox::builder()
+        // The pure (no image) mediated shape: the host root is the mediator's
+        // root, which is what `chroot_root = Some("/")` means here. This is the
+        // configuration in which the chroot handler used to shadow the
+        // accounting one.
+        .chroot("/")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .disk_stats_path(&stats)
+        .build()
+        .unwrap();
+
+    let script = "import os\n\
+         s = os.statvfs('/')\n\
+         print(s.f_frsize, s.f_blocks, s.f_bfree, s.f_bavail)\n";
+    let result = policy.clone().run(&["python3", "-c", script]).await.unwrap();
+    assert!(result.success(), "statvfs should succeed: {:?}", result);
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default()).into_owned();
+    assert_eq!(
+        stdout.trim(),
+        "4096 2621440 1572864 1572864",
+        "the ledger must win over the chroot statfs handler: the chroot handler \
+         would report the node's volume instead"
+    );
+
+    // The host keeps the numbers fresh by rewriting the file; the next call
+    // must reflect the new value through the same (mediated) path.
+    std::fs::write(&stats, "10737418240 9663676416\n").unwrap();
+    let result = policy.clone().run(&["python3", "-c", script]).await.unwrap();
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default()).into_owned();
+    assert_eq!(
+        stdout.trim(),
+        "4096 2621440 262144 262144",
+        "a refreshed accounting file must be observed by the next statfs in the \
+         chroot shape too"
+    );
+}
+
 /// Test that sensitive /proc paths are blocked.
 #[tokio::test]
 async fn test_sensitive_proc_blocked() {
