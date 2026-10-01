@@ -283,6 +283,18 @@ pub enum NetworkPolicy {
         /// the destination hostname carried by a synthetic DNS address
         /// (see `network::dns_synth`). Empty unless wildcard rules exist.
         wildcard_domains: Vec<(String, PortAllow)>,
+        /// Destinations refused *on top of* the allowlist (deny precedence).
+        /// Populated only when a caller supplies both `--net-allow` and
+        /// `--net-deny`; empty for a pure allowlist.
+        ///
+        /// This exists because an allowlist alone cannot bound a destination
+        /// the *resolver* picks later: `--net-allow *.example.com` is matched
+        /// against the hostname, but the address that hostname finally
+        /// resolves to is chosen at connect time. A platform that must never
+        /// be reachable (a control plane, the supervisor's own services) needs
+        /// a set that is applied to the *resolved* address regardless of how
+        /// the allowlist entry was spelled.
+        denied: DeniedDestinations,
     },
     /// Default-allow denylist: a connection is permitted unless the
     /// destination IP/port matches a deny rule. From `--net-deny`.
@@ -304,8 +316,9 @@ impl NetworkPolicy {
     /// and from a `DenyList` (both default-allow).
     pub fn denies_everything(&self) -> bool {
         match self {
-            NetworkPolicy::AllowList { per_ip, cidrs, any_ip_ports, .. } => {
-                per_ip.is_empty() && cidrs.is_empty() && any_ip_ports.is_empty()
+            NetworkPolicy::AllowList { per_ip, cidrs, any_ip_ports, denied, .. } => {
+                denied.all
+                    || (per_ip.is_empty() && cidrs.is_empty() && any_ip_ports.is_empty())
             }
             _ => false,
         }
@@ -320,7 +333,14 @@ impl NetworkPolicy {
         let ip = ip.to_canonical();
         match self {
             NetworkPolicy::Unrestricted => true,
-            NetworkPolicy::AllowList { per_ip, cidrs, any_ip_ports, .. } => {
+            NetworkPolicy::AllowList { per_ip, cidrs, any_ip_ports, denied, .. } => {
+                // Deny precedence: an entry the caller put in `--net-deny`
+                // refuses the resolved destination even when an allow rule
+                // also matches it (a wildcard-domain allow matched the name,
+                // not the address the name resolved to).
+                if denied.denies(ip, port) {
+                    return false;
+                }
                 if any_ip_ports.contains(&port) {
                     return true;
                 }
@@ -365,6 +385,55 @@ impl NetworkPolicy {
                 true
             }
         }
+    }
+}
+
+/// Destinations refused on top of an allowlist (deny precedence).
+///
+/// Mirrors the `DenyList` variant's rule shapes, but as a *filter* rather than
+/// a whole policy: an `AllowList` carrying one of these refuses the listed
+/// destinations first and only then consults its allow rules. Deny wins over
+/// allow, which is the only composition that stays fail-closed when a name is
+/// resolved after the policy was written.
+#[derive(Debug, Clone, Default)]
+pub struct DeniedDestinations {
+    /// (network, denied-ports) rules. `PortAllow::Any` denies every port to
+    /// the network; `Specific` denies only the listed ports.
+    pub cidrs: Vec<(crate::network::IpCidr, PortAllow)>,
+    /// Ports denied for any IP (the `:port` form).
+    pub any_ip_ports: HashSet<u16>,
+    /// The `:*` / `*:*` form: nothing is reachable while it is set.
+    pub all: bool,
+}
+
+impl DeniedDestinations {
+    /// True iff this set refuses nothing (the common, allowlist-only case).
+    pub fn is_empty(&self) -> bool {
+        self.cidrs.is_empty() && self.any_ip_ports.is_empty() && !self.all
+    }
+
+    /// True iff (ip, port) is refused. `ip` is expected in canonical form
+    /// (the caller canonicalizes once for the whole verdict).
+    pub fn denies(&self, ip: IpAddr, port: u16) -> bool {
+        if self.all {
+            return true;
+        }
+        if self.any_ip_ports.contains(&port) {
+            return true;
+        }
+        for (net, denied) in &self.cidrs {
+            if net.contains(ip) {
+                match denied {
+                    PortAllow::Any => return true,
+                    PortAllow::Specific(s) => {
+                        if s.contains(&port) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 }
 
@@ -763,6 +832,9 @@ pub(crate) fn dup_fd_from_pid(pid: u32, target_fd: i32) -> io::Result<OwnedFd> {
 /// Policy for the notification supervisor.
 pub struct NotifPolicy {
     pub max_memory_bytes: u64,
+    /// Host-maintained ``<total_bytes> <used_bytes>`` file for ``statfs(2)``.
+    /// `None` leaves `statfs` to the kernel.
+    pub disk_stats_path: Option<std::path::PathBuf>,
     pub max_processes: u32,
     pub has_memory_limit: bool,
     /// A **network destination policy** is active: a `net_allow` allowlist, a
@@ -3413,6 +3485,7 @@ mod tests {
             cidrs: vec![(IpCidr::parse("10.0.0.0/8").unwrap(), PortAllow::Specific(ports))],
             any_ip_ports: HashSet::new(),
             wildcard_domains: Vec::new(),
+            denied: Default::default(),
         };
         assert!(policy.allows("10.1.2.3".parse().unwrap(), 80));   // in range, port ok
         assert!(!policy.allows("10.1.2.3".parse().unwrap(), 443)); // in range, wrong port
@@ -3427,6 +3500,7 @@ mod tests {
             cidrs: vec![(IpCidr::parse("192.168.0.0/16").unwrap(), PortAllow::Any)],
             any_ip_ports: HashSet::new(),
             wildcard_domains: Vec::new(),
+            denied: Default::default(),
         };
         assert!(policy.allows("192.168.5.5".parse().unwrap(), 9999)); // any port in range
         assert!(!policy.allows("10.0.0.1".parse().unwrap(), 9999));   // out of range
@@ -3458,9 +3532,79 @@ mod tests {
             cidrs: vec![(IpCidr::parse("10.0.0.0/8").unwrap(), PortAllow::Any)],
             any_ip_ports: HashSet::new(),
             wildcard_domains: Vec::new(),
+            denied: Default::default(),
         };
         assert!(policy.allows("::ffff:1.2.3.4".parse().unwrap(), 443));
         assert!(policy.allows("::ffff:10.1.2.3".parse().unwrap(), 443));
         assert!(!policy.allows("::ffff:8.8.8.8".parse().unwrap(), 443));
+    }
+
+    #[test]
+    fn allowlist_with_denied_refuses_the_denied_destination() {
+        // Deny precedence: an IP the allowlist grants is still refused when
+        // the same policy carries a deny rule covering it. This is the
+        // composition a caller needs when the allowlist entry is a *name*
+        // and only the resolved address can be judged.
+        use crate::network::IpCidr;
+        let mut per_ip = HashMap::new();
+        per_ip.insert("10.0.0.5".parse().unwrap(), PortAllow::Any);
+        per_ip.insert("8.8.8.8".parse().unwrap(), PortAllow::Any);
+        let policy = NetworkPolicy::AllowList {
+            per_ip,
+            cidrs: Vec::new(),
+            any_ip_ports: HashSet::new(),
+            wildcard_domains: Vec::new(),
+            denied: DeniedDestinations {
+                cidrs: vec![(IpCidr::parse("10.0.0.0/8").unwrap(), PortAllow::Any)],
+                any_ip_ports: HashSet::new(),
+                all: false,
+            },
+        };
+        assert!(!policy.allows("10.0.0.5".parse().unwrap(), 443)); // allowed, then denied
+        assert!(!policy.allows("10.0.0.5".parse().unwrap(), 80));
+        assert!(policy.allows("8.8.8.8".parse().unwrap(), 443)); // allowed, not denied
+        assert!(!policy.denies_everything());
+    }
+
+    #[test]
+    fn allowlist_with_denied_honours_port_scoped_and_any_ip_denies() {
+        use crate::network::IpCidr;
+        let mut any_ip_ports = HashSet::new();
+        any_ip_ports.insert(25u16);
+        let mut per_ip = HashMap::new();
+        per_ip.insert("8.8.8.8".parse().unwrap(), PortAllow::Any);
+        let policy = NetworkPolicy::AllowList {
+            per_ip,
+            cidrs: vec![(IpCidr::parse("10.0.0.0/8").unwrap(), PortAllow::Any)],
+            any_ip_ports: HashSet::new(),
+            wildcard_domains: Vec::new(),
+            denied: DeniedDestinations {
+                cidrs: Vec::new(),
+                any_ip_ports,
+                all: false,
+            },
+        };
+        assert!(!policy.allows("8.8.8.8".parse().unwrap(), 25)); // any-IP port deny wins
+        assert!(policy.allows("8.8.8.8".parse().unwrap(), 80));
+        assert!(policy.allows("10.0.0.1".parse().unwrap(), 80));
+    }
+
+    #[test]
+    fn allowlist_with_denied_all_refuses_everything() {
+        let mut per_ip = HashMap::new();
+        per_ip.insert("8.8.8.8".parse().unwrap(), PortAllow::Any);
+        let policy = NetworkPolicy::AllowList {
+            per_ip,
+            cidrs: Vec::new(),
+            any_ip_ports: HashSet::new(),
+            wildcard_domains: Vec::new(),
+            denied: DeniedDestinations {
+                cidrs: Vec::new(),
+                any_ip_ports: HashSet::new(),
+                all: true,
+            },
+        };
+        assert!(!policy.allows("8.8.8.8".parse().unwrap(), 443));
+        assert!(policy.denies_everything());
     }
 }

@@ -643,6 +643,53 @@ pub(crate) fn build_dispatch_table(
                 crate::procfs::handle_sched_getaffinity(&notif, n, notif_fd)
             }
         });
+        // `getcpu` answers with the host CPU index; report 0 so the node's
+        // topology is not observable from inside.
+        table.register(libc::SYS_getcpu, move |cx: &HandlerCtx| {
+            let notif = cx.notif;
+            let notif_fd = cx.notif_fd;
+            async move { crate::procfs::handle_getcpu(&notif, notif_fd) }
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Memory-budget virtualization for the raw syscall behind /proc/meminfo.
+    //
+    // sysinfo(2) is not namespaced: it returns the host's totals, load average,
+    // process count and uptime. /proc/meminfo already reports the sandbox's
+    // budget, so the two must agree -- and the host's free-RAM figure is a
+    // cross-tenant side channel.
+    // ------------------------------------------------------------------
+    if policy.max_memory_bytes > 0 {
+        let policy_for_sysinfo = Arc::clone(policy);
+        let resource_for_sysinfo = Arc::clone(resource);
+        table.register(libc::SYS_sysinfo, move |cx: &HandlerCtx| {
+            let notif = cx.notif;
+            let notif_fd = cx.notif_fd;
+            let policy = Arc::clone(&policy_for_sysinfo);
+            let resource = Arc::clone(&resource_for_sysinfo);
+            async move {
+                let used = resource.lock().await.mem_used;
+                crate::procfs::handle_sysinfo(&notif, policy.max_memory_bytes, used, notif_fd)
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Disk accounting for statfs(2).
+    //
+    // The sandbox's quota and its remaining space are the host's to know, so
+    // the host writes them into a file and this reports them instead of the
+    // node's volume. A missing file falls through to the kernel.
+    // ------------------------------------------------------------------
+    if let Some(ref stats_path) = policy.disk_stats_path {
+        let path = stats_path.clone();
+        table.register(libc::SYS_statfs, move |cx: &HandlerCtx| {
+            let notif = cx.notif;
+            let notif_fd = cx.notif_fd;
+            let path = path.clone();
+            async move { crate::procfs::handle_statfs(&notif, &path, notif_fd) }
+        });
     }
 
     // ------------------------------------------------------------------
@@ -1348,6 +1395,7 @@ mod handler_tests {
             processes: Arc::new(ProcessIndex::new()),
             policy: Arc::new(NotifPolicy {
                 max_memory_bytes: 0,
+                disk_stats_path: None,
                 max_processes: 0,
                 has_memory_limit: false,
                 has_net_destination_policy: false,

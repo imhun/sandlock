@@ -643,6 +643,9 @@ pub struct Sandbox {
     pub cwd: Option<PathBuf>,
     pub fs_storage: Option<PathBuf>,
     pub max_disk: Option<ByteSize>,
+    /// Host-maintained disk accounting for ``statfs(2)``: a file holding
+    /// ``<total_bytes> <used_bytes>``. See `Builder::disk_stats_path`.
+    pub disk_stats_path: Option<PathBuf>,
     pub on_exit: BranchAction,
     pub on_error: BranchAction,
 
@@ -851,6 +854,7 @@ impl Clone for Sandbox {
             cwd: self.cwd.clone(),
             fs_storage: self.fs_storage.clone(),
             max_disk: self.max_disk,
+            disk_stats_path: self.disk_stats_path.clone(),
             on_exit: self.on_exit.clone(),
             on_error: self.on_error.clone(),
             fs_mount: self.fs_mount.clone(),
@@ -3115,6 +3119,7 @@ impl Sandbox {
             let rt_name = self.rt().name.clone();
             let notif_policy = NotifPolicy {
                 max_memory_bytes: self.max_memory.map(|m| m.0).unwrap_or(0),
+                disk_stats_path: self.disk_stats_path.clone(),
                 max_processes: self.max_processes,
                 has_memory_limit: resolved.features.memory_limit,
                 has_net_destination_policy: resolved.features.network_destination_policy,
@@ -3163,41 +3168,72 @@ impl Sandbox {
             let time_random_state = TimeRandomState::new(time_offset, random_state);
 
             let mut net_state = NetworkState::new();
-            if !self.net_deny.is_empty() {
+            let has_deny = !self.net_deny.is_empty();
+            if has_deny && self.net_allow.is_empty() {
                 let resolved_deny = network::resolve_net_deny(&self.net_deny);
                 net_state.tcp_policy = resolved_deny.tcp;
                 net_state.udp_policy = resolved_deny.udp;
                 net_state.icmp_policy = resolved_deny.icmp;
             } else {
                 let no_rules = self.net_allow.is_empty();
-                let policy_from = |resolved: &network::ResolvedNetAllow| {
+                // `--net-allow` and `--net-deny` may be combined: the deny
+                // set is then applied *on top of* the allowlist, deny
+                // precedence. An allowlist entry that names a hostname is
+                // matched against the name, so a destination the resolver
+                // picks later (a name that answers with a protected address)
+                // is only reachable if something filters the resolved
+                // address -- that is what the deny set is for.
+                let resolved_deny = if has_deny {
+                    Some(network::resolve_net_deny(&self.net_deny))
+                } else {
+                    None
+                };
+                let policy_from = |resolved: &network::ResolvedNetAllow,
+                                   deny: Option<&crate::seccomp::notif::NetworkPolicy>| {
                     if no_rules || resolved.any_ip_all_ports {
-                        crate::seccomp::notif::NetworkPolicy::Unrestricted
-                    } else {
-                        use crate::seccomp::notif::PortAllow;
-                        let per_ip = resolved
-                            .per_ip
-                            .iter()
-                            .map(|(ip, ports)| {
-                                let allow = if resolved.per_ip_all_ports.contains(ip) {
-                                    PortAllow::Any
-                                } else {
-                                    PortAllow::Specific(ports.clone())
-                                };
-                                (*ip, allow)
-                            })
-                            .collect();
-                        crate::seccomp::notif::NetworkPolicy::AllowList {
-                            per_ip,
-                            cidrs: resolved.cidrs.clone(),
-                            any_ip_ports: resolved.any_ip_ports.clone(),
-                            wildcard_domains: resolved.wildcard_domains.clone(),
-                        }
+                        // Every port on every IP is allowed by the allowlist;
+                        // with a deny set that is exactly the default-allow
+                        // denylist policy.
+                        return match deny {
+                            Some(policy) => policy.clone(),
+                            None => crate::seccomp::notif::NetworkPolicy::Unrestricted,
+                        };
+                    }
+                    use crate::seccomp::notif::PortAllow;
+                    let per_ip = resolved
+                        .per_ip
+                        .iter()
+                        .map(|(ip, ports)| {
+                            let allow = if resolved.per_ip_all_ports.contains(ip) {
+                                PortAllow::Any
+                            } else {
+                                PortAllow::Specific(ports.clone())
+                            };
+                            (*ip, allow)
+                        })
+                        .collect();
+                    crate::seccomp::notif::NetworkPolicy::AllowList {
+                        per_ip,
+                        cidrs: resolved.cidrs.clone(),
+                        any_ip_ports: resolved.any_ip_ports.clone(),
+                        wildcard_domains: resolved.wildcard_domains.clone(),
+                        denied: deny
+                            .map(network::denied_filter_from)
+                            .unwrap_or_default(),
                     }
                 };
-                net_state.tcp_policy = policy_from(&resolved_net_allow.tcp);
-                net_state.udp_policy = policy_from(&resolved_net_allow.udp);
-                net_state.icmp_policy = policy_from(&resolved_net_allow.icmp);
+                net_state.tcp_policy = policy_from(
+                    &resolved_net_allow.tcp,
+                    resolved_deny.as_ref().map(|d| &d.tcp),
+                );
+                net_state.udp_policy = policy_from(
+                    &resolved_net_allow.udp,
+                    resolved_deny.as_ref().map(|d| &d.udp),
+                );
+                net_state.icmp_policy = policy_from(
+                    &resolved_net_allow.icmp,
+                    resolved_deny.as_ref().map(|d| &d.icmp),
+                );
             }
             net_state.http_acl_addr = self.rt().http_acl_handle.as_ref().map(|h| h.addr);
             net_state.http_acl_ports = self.http_ports.iter().copied().collect();

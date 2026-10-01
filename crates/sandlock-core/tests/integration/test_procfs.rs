@@ -53,6 +53,110 @@ async fn test_meminfo_virtualization() {
     );
 }
 
+/// `sysinfo(2)` reports the sandbox's own memory budget, not the host's.
+///
+/// The syscall is not namespaced, so without mediation it answers with the
+/// host's totals, load average, process count and uptime -- contradicting the
+/// mediated `/proc/meminfo` and exposing the node (the host's `freeram` moves
+/// with a neighbour's allocations, which makes it a cross-tenant channel).
+#[tokio::test]
+async fn test_sysinfo_virtualization() {
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .num_cpus(2)
+        .max_memory(ByteSize::mib(256))
+        .build()
+        .unwrap();
+
+    let script = format!(
+        r#"
+import ctypes, json
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+libc.syscall.restype = ctypes.c_long
+class Sysinfo(ctypes.Structure):
+    _fields_ = [("uptime", ctypes.c_long), ("loads", ctypes.c_ulong * 3),
+        ("totalram", ctypes.c_ulong), ("freeram", ctypes.c_ulong),
+        ("sharedram", ctypes.c_ulong), ("bufferram", ctypes.c_ulong),
+        ("totalswap", ctypes.c_ulong), ("freeswap", ctypes.c_ulong),
+        ("procs", ctypes.c_ushort), ("pad", ctypes.c_ushort),
+        ("totalhigh", ctypes.c_ulong), ("freehigh", ctypes.c_ulong),
+        ("mem_unit", ctypes.c_uint)]
+si = Sysinfo()
+cpu = ctypes.c_uint(99); node = ctypes.c_uint(99)
+rc = libc.syscall({nr}, ctypes.byref(si))
+rc_cpu = libc.syscall({cpu_nr}, ctypes.byref(cpu), ctypes.byref(node), None)
+print(json.dumps({{"rc": rc, "total": si.totalram * si.mem_unit,
+                   "load1": si.loads[0], "procs": si.procs,
+                   "uptime": si.uptime, "rc_cpu": rc_cpu, "cpu": cpu.value}}))
+"#,
+        nr = libc::SYS_sysinfo,
+        cpu_nr = libc::SYS_getcpu
+    );
+    let result = policy.clone().run(&["python3", "-c", &script]).await.unwrap();
+    assert!(result.success(), "sysinfo should succeed: {:?}", result);
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default()).into_owned();
+    assert_eq!(
+        stdout.trim(),
+        r#"{"rc": 0, "total": 268435456, "load1": 0, "procs": 0, "uptime": 0, "rc_cpu": 0, "cpu": 0}"#,
+        "sysinfo must report the sandbox budget (256 MiB) and no host-wide state; \
+         getcpu must not name the host CPU"
+    );
+}
+
+/// `statfs(2)` reports the host's accounting for this sandbox -- its quota and
+/// what is left of it -- instead of the node's whole volume.
+///
+/// `df` and `shutil.disk_usage` go through `statfs`, which is not namespaced:
+/// without this the sandbox sees the host XFS (99.7 GiB on `/`) and the NAS
+/// aggregate for `/workspace`.
+#[tokio::test]
+async fn test_statfs_reports_the_hosts_disk_accounting() {
+    let dir = tempfile::tempdir().unwrap();
+    let stats = dir.path().join("disk-stats");
+    // 10 GiB sold, 4 GiB used -> 6 GiB free. `df` style numbers are these
+    // divided by the 4 KiB block size the handler reports.
+    std::fs::write(&stats, "10737418240 4294967296\n").unwrap();
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .disk_stats_path(&stats)
+        .build()
+        .unwrap();
+
+    let script = "import os\n\
+         s = os.statvfs('/')\n\
+         print(s.f_frsize, s.f_blocks, s.f_bfree, s.f_bavail)\n";
+    let result = policy.clone().run(&["python3", "-c", script]).await.unwrap();
+    assert!(result.success(), "statvfs should succeed: {:?}", result);
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default()).into_owned();
+    assert_eq!(
+        stdout.trim(),
+        "4096 2621440 1572864 1572864",
+        "statfs must report the sold quota (10 GiB) and its remainder (6 GiB)"
+    );
+
+    // The host keeps the numbers fresh by rewriting the file; the next call
+    // must reflect the new value without restarting the sandbox.
+    std::fs::write(&stats, "10737418240 9663676416\n").unwrap();
+    let result = policy.clone().run(&["python3", "-c", script]).await.unwrap();
+    let stdout = String::from_utf8_lossy(result.stdout.as_deref().unwrap_or_default()).into_owned();
+    assert_eq!(
+        stdout.trim(),
+        "4096 2621440 262144 262144",
+        "a refreshed accounting file must be observed by the next statfs"
+    );
+}
+
 /// Test that sensitive /proc paths are blocked.
 #[tokio::test]
 async fn test_sensitive_proc_blocked() {

@@ -128,6 +128,21 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fs_storage(
 }
 
 /// # Safety
+/// `b` must be a valid pointer; `path` a NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_disk_stats_path(
+    b: *mut SandboxBuilder,
+    path: *const c_char,
+) -> *mut SandboxBuilder {
+    if b.is_null() || path.is_null() {
+        return b;
+    }
+    let path = CStr::from_ptr(path).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.disk_stats_path(path)))
+}
+
+/// # Safety
 /// `b` must be a valid pointer. `devices` must point to `len` u32 values (or be null when len == 0).
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_gpu_devices(

@@ -1089,6 +1089,7 @@ mod tests {
     fn fake_policy(argv_safety_required: bool) -> NotifPolicy {
         NotifPolicy {
             max_memory_bytes: 0,
+            disk_stats_path: None,
             max_processes: 0,
             has_memory_limit: false,
             has_net_destination_policy: false,

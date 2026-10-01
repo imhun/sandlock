@@ -30,6 +30,9 @@ impl ResolvedSandbox {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SandboxFeatures {
     pub(crate) memory_limit: bool,
+    /// A host-maintained disk accounting file is configured, so `statfs(2)`
+    /// must be trapped and answered from it.
+    pub(crate) disk_stats: bool,
     pub(crate) network_supervision: bool,
     pub(crate) network_destination_policy: bool,
     pub(crate) bind_denylist: bool,
@@ -73,6 +76,7 @@ impl SandboxFeatures {
 
         Self {
             memory_limit: sandbox.max_memory.is_some(),
+            disk_stats: sandbox.disk_stats_path.is_some(),
             network_supervision: network_destination_policy || bind_denylist,
             network_destination_policy,
             bind_denylist,

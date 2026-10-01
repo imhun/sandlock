@@ -1053,6 +1053,167 @@ pub(crate) fn handle_uname(
     }
 }
 
+// ============================================================
+// sysinfo / getcpu virtualization
+// ============================================================
+
+/// Handle `sysinfo(2)` -- report the sandbox's own memory budget.
+///
+/// `sysinfo` is not namespaced: it answers with the **host's** total and free
+/// RAM, 1/5/15-minute load average, process count and uptime. The mediated
+/// `/proc/meminfo` already reports the sandbox's budget, so without this the
+/// two views disagree by an order of magnitude (measured: `/proc` said 1 GiB /
+/// load 0.00 / 4 procs while the raw syscall said 7.5 GiB / load 0.31 /
+/// 685 procs), and the host's free-RAM figure is a cross-tenant side channel:
+/// a neighbour's allocations move it.
+///
+/// The values mirror [`generate_meminfo`] -- same total (the sandbox's budget),
+/// same free (budget minus the usage the resource ledger tracks) -- and
+/// everything the platform does not model is zero rather than the host's real
+/// number. `mem_unit` is 1, so the byte fields are in bytes.
+pub(crate) fn handle_sysinfo(
+    notif: &SeccompNotif,
+    total_bytes: u64,
+    used_bytes: u64,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let buf_addr = notif.data.args[0];
+    if buf_addr == 0 {
+        return NotifAction::Continue;
+    }
+
+    let used = used_bytes.min(total_bytes);
+    let free = total_bytes.saturating_sub(used);
+    let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
+    info.mem_unit = 1;
+    // Uptime/load/process count are host-wide facts the sandbox has no view
+    // of; the platform does not model them, so they are zero (not the host's).
+    info.uptime = 0;
+    info.loads = [0, 0, 0];
+    info.procs = 0;
+    info.totalram = total_bytes as _;
+    info.freeram = free as _;
+    info.sharedram = 0;
+    info.bufferram = 0;
+    info.totalswap = 0;
+    info.freeswap = 0;
+    info.totalhigh = 0;
+    info.freehigh = 0;
+
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            &info as *const _ as *const u8,
+            std::mem::size_of::<libc::sysinfo>(),
+        )
+    };
+    match write_child_mem(notif_fd, notif.id, notif.pid, buf_addr, bytes) {
+        Ok(()) => NotifAction::ReturnValue(0),
+        Err(_) => NotifAction::Continue,
+    }
+}
+
+/// Handle `getcpu(2)` -- report CPU 0 instead of the host CPU the sandbox
+/// happens to be scheduled on. Either pointer may be NULL (both are optional
+/// in the kernel's contract).
+pub(crate) fn handle_getcpu(notif: &SeccompNotif, notif_fd: RawFd) -> NotifAction {
+    for arg in [notif.data.args[0], notif.data.args[1]] {
+        if arg == 0 {
+            continue;
+        }
+        let zero: u32 = 0;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(&zero as *const _ as *const u8, std::mem::size_of::<u32>())
+        };
+        if write_child_mem(notif_fd, notif.id, notif.pid, arg, bytes).is_err() {
+            return NotifAction::Continue;
+        }
+    }
+    NotifAction::ReturnValue(0)
+}
+
+/// Handle `statfs(2)` from the host-maintained disk accounting file.
+///
+/// `statfs` is not namespaced either: it reports the *host* filesystem's
+/// capacity and free space, so `df` / `shutil.disk_usage` inside a sandbox see
+/// the node's whole volume (measured: 99.7 GiB with 31.6% used on `/`, and a
+/// 10 PiB NAS figure for `/workspace`). The sandbox's own story is its quota
+/// and what is left of it, and only the host knows both -- it sold the quota
+/// and it measures the tree -- so the host writes them into a file and this
+/// handler reports them:
+///
+/// ```text
+/// <total_bytes> <used_bytes>
+/// ```
+///
+/// Read on every call, so the numbers are as fresh as the host's own refresh.
+/// A missing or malformed file falls through to the kernel: that is the
+/// pre-option behaviour, and refusing a valid `statfs` would be worse than
+/// answering it with the host's numbers.
+///
+/// `f_type`/`f_namelen` keep the real values (they describe the tree the
+/// sandbox is actually on, and tools use them to reason about the path);
+/// block counts are the accounting, at a 4 KiB block size.
+pub(crate) fn handle_statfs(
+    notif: &SeccompNotif,
+    stats_path: &std::path::Path,
+    notif_fd: RawFd,
+) -> NotifAction {
+    let buf_addr = notif.data.args[1];
+    if buf_addr == 0 {
+        return NotifAction::Continue;
+    }
+    let Some((total, used)) = read_disk_stats(stats_path) else {
+        return NotifAction::Continue;
+    };
+
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    // Seed from the kernel so f_type/f_namelen describe the real tree. The
+    // numbers reported below do not depend on the path, so a path the
+    // supervisor cannot read is not a reason to fall through.
+    let path_addr = notif.data.args[0];
+    if path_addr != 0 {
+        if let Some(text) = read_child_cstr(notif_fd, notif.id, notif.pid, path_addr, 4096) {
+            if let Ok(c_path) = std::ffi::CString::new(text) {
+                unsafe { libc::statfs(c_path.as_ptr(), &mut buf) };
+            }
+        }
+    }
+
+    const BLOCK: u64 = 4096;
+    let used = used.min(total);
+    let total_blocks = total / BLOCK;
+    let free_blocks = (total - used) / BLOCK;
+    buf.f_bsize = BLOCK as _;
+    buf.f_frsize = BLOCK as _;
+    buf.f_blocks = total_blocks as _;
+    buf.f_bfree = free_blocks as _;
+    buf.f_bavail = free_blocks as _;
+    // Inode counts are not modelled separately; scale them like the block
+    // counts so `df -i` stays self-consistent.
+    buf.f_files = total_blocks as _;
+    buf.f_ffree = free_blocks as _;
+
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            &buf as *const _ as *const u8,
+            std::mem::size_of::<libc::statfs>(),
+        )
+    };
+    match write_child_mem(notif_fd, notif.id, notif.pid, buf_addr, bytes) {
+        Ok(()) => NotifAction::ReturnValue(0),
+        Err(_) => NotifAction::Continue,
+    }
+}
+
+/// Parse the host's ``<total_bytes> <used_bytes>`` accounting file.
+fn read_disk_stats(path: &std::path::Path) -> Option<(u64, u64)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut parts = text.split_whitespace();
+    let total: u64 = parts.next()?.parse().ok()?;
+    let used: u64 = parts.next().unwrap_or("0").parse().ok()?;
+    Some((total, used))
+}
+
 /// Handle open/openat/openat2 targeting /etc/hostname — return a memfd
 /// with the virtual hostname. Path is resolved and lexically normalized
 /// via [`resolve_open_target`] so dirfd-relative and non-canonical

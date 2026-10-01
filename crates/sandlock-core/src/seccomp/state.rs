@@ -1016,6 +1016,7 @@ fn ip_only_allow_policy(
         cidrs: Vec::new(),
         any_ip_ports: HashSet::new(),
         wildcard_domains: Vec::new(),
+        denied: Default::default(),
     }
 }
 
@@ -1588,6 +1589,7 @@ mod tests {
             cidrs: Vec::new(),
             any_ip_ports: HashSet::new(),
             wildcard_domains: Vec::new(),
+            denied: Default::default(),
         }
     }
 
@@ -1675,6 +1677,7 @@ mod tests {
             cidrs: Vec::new(),
             any_ip_ports: HashSet::new(),
             wildcard_domains: Vec::new(),
+            denied: Default::default(),
         };
         let binding = tcp_allow(&["10.0.0.1"]);
         assert!(
@@ -1693,6 +1696,7 @@ mod tests {
             cidrs: Vec::new(),
             any_ip_ports: HashSet::new(),
             wildcard_domains: Vec::new(),
+            denied: Default::default(),
         };
         let narrowed = intersect_ceiling_grant(&binding, &tcp_port_scoped);
         assert!(

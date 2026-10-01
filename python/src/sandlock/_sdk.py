@@ -180,6 +180,9 @@ _b_on_exit = _builder_fn("sandlock_sandbox_builder_on_exit", ctypes.c_uint8)
 _b_on_error = _builder_fn("sandlock_sandbox_builder_on_error", ctypes.c_uint8)
 _b_max_memory = _builder_fn("sandlock_sandbox_builder_max_memory", ctypes.c_uint64)
 _b_max_disk = _builder_fn("sandlock_sandbox_builder_max_disk", ctypes.c_uint64)
+_b_disk_stats_path = _builder_fn(
+    "sandlock_sandbox_builder_disk_stats_path", ctypes.c_char_p
+)
 _b_max_processes = _builder_fn("sandlock_sandbox_builder_max_processes", ctypes.c_uint32)
 _b_max_cpu = _builder_fn("sandlock_sandbox_builder_max_cpu", ctypes.c_uint8)
 _b_notify_rate_limit = _builder_fn(
@@ -1344,7 +1347,7 @@ class _NativePolicy:
     _HANDLED_FIELDS: set[str] = {
         "fs_writable", "fs_readable", "fs_denied", "fs_storage",
         "workdir", "cwd", "chroot", "fs_mount", "on_exit", "on_error",
-        "max_memory", "max_disk", "max_processes", "max_cpu", "num_cpus",
+        "max_memory", "max_disk", "disk_stats_path", "max_processes", "max_cpu", "num_cpus",
         "cpu_cores", "gpu_devices",
         "net_allow", "net_deny", "net_allow_bind", "net_deny_bind",
         "port_remap",
@@ -1421,6 +1424,9 @@ class _NativePolicy:
             else:
                 disk_bytes = int(policy.max_disk)
             b = _b_max_disk(b, disk_bytes)
+
+        if policy.disk_stats_path is not None:
+            b = _b_disk_stats_path(b, _encode(str(policy.disk_stats_path)))
 
         if policy.max_processes != 256:
             b = _b_max_processes(b, policy.max_processes)

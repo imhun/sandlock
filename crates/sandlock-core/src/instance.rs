@@ -3097,6 +3097,7 @@ fn ip_only_allowlist(ips: &[IpAddr]) -> NetworkPolicy {
         cidrs: Vec::new(),
         any_ip_ports: HashSet::new(),
         wildcard_domains: Vec::new(),
+        denied: Default::default(),
     }
 }
 

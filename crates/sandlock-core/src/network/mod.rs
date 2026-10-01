@@ -47,8 +47,9 @@ mod verdict;
 // signatures (callers bind them by inference), which trips unused_imports.
 #[allow(unused_imports)]
 pub use rules::{
-    compose_virtual_etc_hosts, resolve_net_allow, resolve_net_deny, IpCidr, NetAllow, NetDeny,
-    NetRule, NetTarget, Protocol, ResolvedNetAllow, ResolvedNetAllowSet, ResolvedNetDenySet,
+    compose_virtual_etc_hosts, denied_filter_from, resolve_net_allow, resolve_net_deny, IpCidr,
+    NetAllow, NetDeny, NetRule, NetTarget, Protocol, ResolvedNetAllow, ResolvedNetAllowSet,
+    ResolvedNetDenySet,
 };
 
 use connect::connect_on_behalf;

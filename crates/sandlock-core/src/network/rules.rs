@@ -573,6 +573,26 @@ pub struct ResolvedNetDenySet {
     pub icmp: crate::seccomp::notif::NetworkPolicy,
 }
 
+/// The filter an allowlist carries for one protocol when the caller supplied
+/// both `--net-allow` and `--net-deny` (deny precedence).
+///
+/// `Unrestricted` means "no deny rules for this protocol", which is the empty
+/// filter. Any other arm of the resolved deny set is by construction a
+/// `DenyList`, and is copied across wholesale.
+pub fn denied_filter_from(
+    policy: &crate::seccomp::notif::NetworkPolicy,
+) -> crate::seccomp::notif::DeniedDestinations {
+    use crate::seccomp::notif::{DeniedDestinations, NetworkPolicy};
+    match policy {
+        NetworkPolicy::DenyList { cidrs, any_ip_ports, deny_all } => DeniedDestinations {
+            cidrs: cidrs.clone(),
+            any_ip_ports: any_ip_ports.clone(),
+            all: *deny_all,
+        },
+        _ => DeniedDestinations::default(),
+    }
+}
+
 /// Resolve `--net-deny` rules into per-protocol `DenyList` policies.
 /// A protocol with no deny rules stays `Unrestricted` (allow-all).
 pub fn resolve_net_deny(rules: &[NetDeny]) -> ResolvedNetDenySet {

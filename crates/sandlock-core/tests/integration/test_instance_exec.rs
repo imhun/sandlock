@@ -51,6 +51,57 @@ async fn launch_exec_session(name: &str) -> SandboxInstance {
     .expect("launch exec-capable session")
 }
 
+/// SEC-K0S-006 through the **instance** API -- the shape route B uses.
+///
+/// The fork's `Sandbox::run` test passes, so if this one does not, the trap is
+/// missing on the instance path specifically rather than in the handler.
+#[tokio::test]
+async fn test_instance_statfs_reports_the_hosts_disk_accounting() {
+    let dir = tempfile::tempdir().unwrap();
+    let stats = dir.path().join("disk-stats");
+    // 10 GiB sold, 4 GiB used -> 6 GiB free, in 4 KiB blocks.
+    std::fs::write(&stats, "10737418240 4294967296\n").unwrap();
+    let out_path = dir.path().join("probe.txt");
+
+    let policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_write(dir.path())
+        .disk_stats_path(&stats)
+        .build()
+        .unwrap()
+        .with_name("inst-statfs");
+
+    let script = format!(
+        "import os\n\
+         s = os.statvfs('/')\n\
+         open({:?}, 'w').write('%d %d %d' % (s.f_frsize, s.f_blocks, s.f_bfree))\n",
+        out_path.display().to_string()
+    );
+    // The E2B shape: a long-lived init, the probe as an *exec child* (not the
+    // init program), and the answer read back from the workspace.
+    let mut inst = SandboxInstance::launch_exec(policy, &["sh", "-c", "exec sleep 30"])
+        .await
+        .expect("launch exec-capable session");
+    let child = inst
+        .exec(&["python3", "-c", &script], ExecStdio::Piped)
+        .await
+        .expect("exec probe");
+    let status = inst.wait_child(child.child_id).await.expect("wait child");
+    assert_eq!(status, ExitStatus::Code(0), "probe must run");
+    let got = std::fs::read_to_string(&out_path).unwrap_or_default();
+    inst.shutdown().await.expect("shutdown");
+    assert_eq!(
+        got.trim(),
+        "4096 2621440 1572864",
+        "the instance path must trap statfs too"
+    );
+}
+
 /// Read exactly `len` bytes from `fd` (blocking, on a blocking thread pool so
 /// the multi-thread runtime keeps pumping the seccomp supervisor).
 fn read_exact_bytes(fd: OwnedFd, len: usize) -> Vec<u8> {

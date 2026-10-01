@@ -202,6 +202,20 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", clap(skip))]
     pub max_disk: Option<ByteSize>,
 
+    /// File the host maintains with the sandbox's disk accounting, as two
+    /// decimal byte counts separated by whitespace: ``<total> <used>``.
+    ///
+    /// When set, ``statfs(2)`` inside the sandbox reports those numbers
+    /// instead of the host filesystem's. The host is the only party that knows
+    /// the sandbox's quota (what it was sold) and its current usage (it owns
+    /// the tree and measures it), so the file is the channel rather than a
+    /// second copy of the accounting inside the sandbox. Read on each call, so
+    /// the numbers are as fresh as the host's own refresh; a missing or
+    /// unreadable file leaves ``statfs`` to the kernel (the pre-option
+    /// behaviour).
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub disk_stats_path: Option<PathBuf>,
+
     // on_exit/on_error are not exposed as CLI flags.
     #[cfg_attr(feature = "cli", clap(skip))]
     pub on_exit: Option<BranchAction>,
@@ -409,6 +423,7 @@ impl Default for SandboxBuilder {
             cwd: None,
             fs_storage: None,
             max_disk: None,
+            disk_stats_path: None,
             on_exit: None,
             on_error: None,
             fs_mount: Vec::new(),
@@ -486,6 +501,7 @@ impl Clone for SandboxBuilder {
             cwd: self.cwd.clone(),
             fs_storage: self.fs_storage.clone(),
             max_disk: self.max_disk,
+            disk_stats_path: self.disk_stats_path.clone(),
             on_exit: self.on_exit.clone(),
             on_error: self.on_error.clone(),
             fs_mount: self.fs_mount.clone(),
@@ -872,6 +888,13 @@ impl SandboxBuilder {
 
     pub fn max_disk(mut self, size: ByteSize) -> Self {
         self.max_disk = Some(size);
+        self
+    }
+
+    /// Point ``statfs(2)`` at the host-maintained disk accounting file
+    /// (``<total_bytes> <used_bytes>``); see [`Builder::disk_stats_path`].
+    pub fn disk_stats_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.disk_stats_path = Some(path.into());
         self
     }
 
@@ -1307,14 +1330,12 @@ impl SandboxBuilder {
             net_deny.extend(NetRule::parse_deny(&s)?);
         }
 
-        // --net-allow and --net-deny are mutually exclusive. Check the
-        // user-supplied allow count (the original specs), not the post-HTTP
-        // extension, so a coexisting --http-deny does not false-trigger.
-        if !net_allow.is_empty() && !net_deny.is_empty() {
-            return Err(SandboxError::Invalid(
-                "--net-allow and --net-deny are mutually exclusive".into(),
-            ));
-        }
+        // `--net-allow` and `--net-deny` **may** be combined: the deny set is
+        // applied on top of the allowlist with deny precedence (see
+        // `NetworkPolicy::AllowList::denied`). The combination is what lets a
+        // caller bound a destination that is only known after resolution --
+        // an allowlist entry may be a hostname, and the address that name
+        // finally answers with is chosen at connect time.
 
         // Expand bind port specs. --net-allow-bind (default-deny allowlist)
         // and --net-deny-bind (default-allow denylist) are contradictory.
@@ -1363,6 +1384,7 @@ impl SandboxBuilder {
             fs_writable: self.fs_writable,
             fs_readable: self.fs_readable,
             fs_readable_host: Vec::new(),
+            disk_stats_path: self.disk_stats_path,
             fs_denied: self.fs_denied,
             extra_deny_syscalls: self.extra_deny_syscalls,
             extra_allow_syscalls: self.extra_allow_syscalls,

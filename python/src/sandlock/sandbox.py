@@ -279,11 +279,17 @@ class Sandbox:
 
     net_deny: Sequence[str] = field(default_factory=list)
     """Outbound endpoint denylist: default-allow networking, block these
-    targets. The inverse of :attr:`net_allow` and **mutually exclusive**
-    with it. Same grammar as ``net_allow`` except targets must be a literal
+    targets. Same grammar as ``net_allow`` except targets must be a literal
     IP/CIDR or ``"*"`` (hostnames are rejected; use :attr:`http_deny` for
     domains), e.g. ``["10.0.0.0/8", "169.254.169.254:80", "udp://*"]``.
-    Empty = no denylist. See README "Network Model" for details."""
+    Empty = no denylist. See README "Network Model" for details.
+
+    May be combined with :attr:`net_allow`: the denylist is then applied on
+    top of the allowlist with **deny precedence** (a destination is refused
+    if either the deny set covers it or the allow set does not). That is how
+    a caller bounds a destination that is only known after resolution --
+    ``net_allow=["*.example.com"]`` matches the *name*, so only a deny rule
+    on the resolved address keeps a protected network unreachable."""
 
     no_coredump: bool = False
     """Disable core dumps and restrict /proc/pid access from other
@@ -598,6 +604,13 @@ class Sandbox:
     max_disk: str | None = None
     """Disk quota for COW storage (e.g. ``'1G'``).
     Enforced by the COW layer (returns ENOSPC)."""
+
+    disk_stats_path: str | None = None
+    """Host-maintained disk accounting for ``statfs(2)``: a file holding
+    ``<total_bytes> <used_bytes>``. When set, ``df``/``shutil.disk_usage``
+    inside the sandbox report the sandbox's quota and what is left of it
+    instead of the host filesystem's capacity. Read on every call; a missing
+    file leaves ``statfs`` to the kernel."""
 
     on_exit: BranchAction = BranchAction.COMMIT
     """Branch action on normal sandbox exit."""

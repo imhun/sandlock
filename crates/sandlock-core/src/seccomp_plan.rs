@@ -482,6 +482,18 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
     // Virtualize sched_getaffinity so nproc/sysconf agree with /proc/cpuinfo
     if features.virtual_cpu_count {
         nrs.push(libc::SYS_sched_getaffinity);
+        nrs.push(libc::SYS_getcpu);
+    }
+    // Virtualize the raw syscall behind /proc/meminfo: sysinfo(2) is not
+    // namespaced, so it would otherwise hand out the host's memory totals,
+    // load average, process count and uptime.
+    if features.memory_limit {
+        nrs.push(libc::SYS_sysinfo);
+    }
+    // `statfs(2)` answers with the host volume's capacity; trap it when the
+    // host maintains the sandbox's own accounting file.
+    if features.disk_stats {
+        nrs.push(libc::SYS_statfs);
     }
     if features.virtual_hostname {
         nrs.extend(&[libc::SYS_uname, libc::SYS_openat]);

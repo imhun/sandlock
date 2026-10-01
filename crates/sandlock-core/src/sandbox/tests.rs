@@ -371,12 +371,17 @@ fn builder_net_allow_bind_wildcard_exclusive_with_deny_bind() {
 }
 
 #[test]
-fn builder_rejects_net_allow_and_net_deny_together() {
-    let err = Sandbox::builder()
+fn builder_accepts_net_allow_and_net_deny_together() {
+    // Deny precedence: the deny set is applied on top of the allowlist, which
+    // is what lets a caller bound a destination that is only known after
+    // resolution (an allowlist entry may be a hostname).
+    let policy = Sandbox::builder()
         .net_allow("github.com:443")
         .net_deny("10.0.0.0/8")
-        .build();
-    assert!(err.is_err());
+        .build()
+        .expect("net_allow and net_deny may be combined");
+    assert!(!policy.net_allow.is_empty());
+    assert!(!policy.net_deny.is_empty());
 }
 
 #[test]

@@ -95,6 +95,7 @@ pub const POLICY_FIELDS: &[&str] = &[
     "cwd",
     "deterministic_dirs",
     "disable",
+    "disk_stats_path",
     "egress_proxy",
     "env",
     "extra_allow_syscalls",
@@ -173,6 +174,9 @@ pub struct SupervisePolicy {
     pub http_key: Option<PathBuf>,
     pub http_inject_ca: Vec<PathBuf>,
     pub http_ca_out: Option<PathBuf>,
+    /// Host-maintained ``<total_bytes> <used_bytes>`` accounting for
+    /// ``statfs(2)``; see the fork's `Builder::disk_stats_path`.
+    pub disk_stats_path: Option<PathBuf>,
     pub host_mask: Option<String>,
     pub egress_proxy: Option<EgressProxyWire>,
     pub http_inject: Vec<InjectRuleWire>,
@@ -424,6 +428,11 @@ fn apply(parsed: &ParsedPolicy) -> Result<SandboxBuilder, String> {
     if prov.contains("http_allow") {
         for rule in &p.http_allow {
             b = b.http_allow(rule);
+        }
+    }
+    if prov.contains("disk_stats_path") {
+        if let Some(path) = p.disk_stats_path.as_ref() {
+            b = b.disk_stats_path(path.clone());
         }
     }
     if prov.contains("http_deny") {
@@ -1441,6 +1450,7 @@ pub fn example_policy_json(secret_path: &Path) -> String {
         "workdir": "/workdir",
         "cwd": "/cwd",
         "fs_storage": "/storage",
+        "disk_stats_path": "/tmp/e2b-disk-stats",
         "on_exit": "abort",
         "on_error": "keep",
         "allow_degraded": ["fs-refer", "fs-truncate"],
@@ -1732,6 +1742,25 @@ mod tests {
         assert!(
             err.contains("egress_proxy"),
             "egress_proxy field drift must fail verify by name, got: {err}"
+        );
+    }
+
+    /// SEC-K0S-006: the slot's own path -- a `--policy` document through
+    /// parse/apply/build -- must land the disk accounting *and* put `statfs`
+    /// in the notify list. If this passes and the deployment shape still shows
+    /// host numbers, the gap is above the slot, not in it.
+    #[test]
+    fn disk_stats_path_lands_and_traps_statfs() {
+        let doc = br#"{"disk_stats_path": "/tmp/e2b-disk-stats"}"#;
+        let sandbox = validate(doc).expect("validate");
+        assert_eq!(
+            sandbox.disk_stats_path.as_deref(),
+            Some(std::path::Path::new("/tmp/e2b-disk-stats"))
+        );
+        let nrs = sandlock_core::context::notif_syscalls(&sandbox, None);
+        assert!(
+            nrs.contains(&(libc::SYS_statfs as u32)),
+            "SYS_statfs must be trapped when the accounting file is configured"
         );
     }
 

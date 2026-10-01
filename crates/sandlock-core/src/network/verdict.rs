@@ -208,6 +208,7 @@ mod tests {
             cidrs: Vec::new(),
             any_ip_ports: HashSet::new(),
             wildcard_domains: Vec::new(),
+            denied: Default::default(),
         }
     }
 
@@ -248,6 +249,7 @@ mod tests {
                 "example.com".to_string(),
                 PortAllow::Specific(ports.iter().copied().collect()),
             )],
+            denied: Default::default(),
         }
     }
 
@@ -272,6 +274,7 @@ mod tests {
             cidrs: Vec::new(),
             any_ip_ports: HashSet::new(),
             wildcard_domains: vec![("example.com".to_string(), PortAllow::Any)],
+            denied: Default::default(),
         };
         let synth: IpAddr = "127.0.0.2".parse().unwrap();
         assert_eq!(
