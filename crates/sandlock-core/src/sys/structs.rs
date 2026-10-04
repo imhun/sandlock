@@ -234,6 +234,40 @@ pub const SIOCGIFHWADDR: u64 = 0x8927;
 pub const SIOCGIFINDEX: u64 = 0x8933;
 pub const SIOCETHTOOL: u64 = 0x8946;
 
+// The set half of the network-interface family, mirroring the SIOCGIF* get
+// family above. Every one of these is CAP_NET_ADMIN-gated in the kernel, so
+// none of them can be reached today -- measured inside a live sandbox
+// 2026-10-04, `socket()` itself answers EPERM, so there is no fd to issue an
+// ioctl on. They are listed because the get half is: refusing to enumerate an
+// interface while leaving the fd settable would be a half-measure, and these
+// cost two BPF instructions each. Unverified at runtime for that reason -- they
+// are transcribed from uapi `linux/sockios.h`, where they are plain hex and
+// share the numbering of the entries above.
+pub const SIOCSIFADDR: u64 = 0x8916;
+pub const SIOCSIFBRDADDR: u64 = 0x891A;
+pub const SIOCSIFNETMASK: u64 = 0x891C;
+pub const SIOCSIFHWADDR: u64 = 0x8924;
+
+// Filesystem-layout ioctls (uapi `linux/fs.h`).
+//
+// These answer "where does this file physically live". Landlock's
+// `LANDLOCK_ACCESS_FS_IOCTL_DEV` is defined over *device* files, so nothing in
+// the Landlock ruleset bounds ioctl on a regular file, and nothing else in the
+// filter looked at it either. Measured inside a live sandbox 2026-10-04 on a
+// 1 MiB workspace file: `FS_IOC_FIEMAP` is implemented and answers EINVAL (the
+// workspace filesystem does not serve it), while the two block-device ioctls
+// answer ENOTTY because a regular file is not a block device -- so only FIEMAP
+// is demonstrably reachable on the file types a workload actually holds.
+//
+// A wrong request code here is not a partial gap but a silent no-op: the JEQ
+// simply never matches, so the entry would read like a control while being
+// inert. Three of the values tried from memory during that audit were wrong in
+// exactly that way (all three answered ENOTTY), so these are transcribed from
+// the header and every reachable one was confirmed against a running kernel.
+pub const FIBMAP: u64 = 0x0000_0001; // _IO(0x00, 1)
+pub const FIGETBSZ: u64 = 0x0000_0002; // _IO(0x00, 2)
+pub const FS_IOC_FIEMAP: u64 = 0xC020_660B; // _IOWR('f', 11, struct fiemap)
+
 // ============================================================
 // Dangerous prctl options
 // ============================================================
@@ -440,6 +474,34 @@ pub const DEFAULT_BLOCKLIST_SYSCALLS: &[&str] = &[
     // no gate) in the path-surface ledger.
     "statmount",
     "listmount",
+    // ---- the 6.13 "*at" metadata calls nothing here uses --------------------
+    // Measured 2026-10-04 (E2B audit STATIC-2): on the deployed 6.12 kernel all
+    // of these return ENOSYS, so the file cap's own comment about "refused by
+    // the shipped worker seccomp profile" described a *second* line of defence.
+    // The rehearsal on a 7.0 kernel showed what that second line is worth: with
+    // the outer profile widened (`seccomp=unconfined`) every one of them reached
+    // the kernel with no EPERM in sight, `fchmodat2` returned 0 and changed a
+    // file's mode, and `file_getattr` returned 0. Docker's and OCI's *default*
+    // profiles do not block `fchmodat2` either -- so "we ship a restrictive
+    // profile" was the only thing between this ledger and a live primitive.
+    //
+    // They are blocked rather than mediated because no sandbox workload needs
+    // them and glibc does not call them yet, so there is nothing to keep
+    // working. (`fchmodat2` is the exception and is mediated instead: glibc
+    // *does* use it for `chmod`, and a seccomp `EPERM` is not something glibc
+    // falls back from.)
+    //
+    // What a bypass would buy: Landlock has no xattr right and no chmod right, so
+    // an unmediated `setxattrat`/`fchmodat2` is a metadata *write* against any
+    // path the sandbox can traverse, which for a path the sandbox cannot read is
+    // still a blind write primitive. Blocking removes the dependence on the
+    // container profile entirely, which is the point.
+    "setxattrat",
+    "getxattrat",
+    "listxattrat",
+    "removexattrat",
+    "file_getattr",
+    "file_setattr",
     // ---- host/device surfaces with no sandbox use -------------------------
     // `memfd_secret` allocates pages the kernel itself cannot read back; it is
     // a hardening primitive for secrets handling, never something a sandboxed
@@ -463,6 +525,30 @@ pub const DEFAULT_BLOCKLIST_SYSCALLS: &[&str] = &[
     "move_pages",
     "migrate_pages",
     "set_mempolicy_home_node",
+    // ---- LSM introspection and mapping sealing (kernel 6.5-6.10) ----------
+    // None of these exists on the deployed kernel: they were added in 6.5
+    // (`cachestat`, `lsm_*`) and 6.10 (`mseal`), and the audit kernel is 6.12,
+    // where all five answer ENOSYS. They are listed so the blocklist is a
+    // property of the policy rather than of the kernel it happens to run on:
+    // a node upgraded into their range must not silently start answering.
+    //
+    // `cachestat` reports page-cache residency for a path, which is a
+    // side-channel about the host's memory pressure and a timing oracle on
+    // shared cache. `lsm_get_self_attr` and `lsm_list_modules` report the
+    // host's LSM stack -- which modules are loaded, and under what labels --
+    // and `lsm_set_self_attr` writes that state. `mseal` seals or unmaps
+    // memory mappings, including file-backed ones.
+    //
+    // No sandboxed workload has a use for any of them: they exist for
+    // LSM implementors, a memory allocator's hardening path, and
+    // cache-monitoring tools. Note the fork already refuses `process_madvise`
+    // and `process_mrelease`, so leaving the per-self mapping and security-
+    // attribute syscalls allowed was the inconsistency, not the design.
+    "cachestat",
+    "lsm_get_self_attr",
+    "lsm_set_self_attr",
+    "lsm_list_modules",
+    "mseal",
 ];
 
 /// Deny list for --no-supervisor mode.

@@ -2141,7 +2141,22 @@ pub(crate) async fn handle_chroot_write(
         return action;
     }
 
-    if nr == libc::SYS_fchmodat {
+    // `fchmodat2(dirfd, path, mode, flags)` takes the same first three arguments
+    // as `fchmodat`, so it shares this gate rather than getting its own.
+    //
+    // The extra `flags` word is deliberately not honoured as a follow/no-follow
+    // switch here. Resolving with `read_and_resolve` means the policy verdict is
+    // computed for the *resolved* path and `libc::chmod` then acts on that same
+    // resolved path -- check and action name one inode. Splitting them (resolve
+    // no-follow for the check, then let `chmod` follow for the action) is the
+    // pattern that turns a race into a policy bypass, and `fchownat` above is
+    // only safe because it pairs the no-follow resolve with `lchown`.
+    //
+    // The visible consequence is that `fchmodat2(..., AT_SYMLINK_NOFOLLOW)` on a
+    // symlink chmods the target here, where the kernel returns EOPNOTSUPP. Linux
+    // has no `lchmod`, so the flag's only effect is that refusal; the target was
+    // already `can_write`-checked, so this widens nothing.
+    if nr == libc::SYS_fchmodat || nr == crate::arch::SYS_FCHMODAT2 {
         let (_, host_path, vp) = match read_and_resolve(notif, notif_fd, ctx, 0, 1) {
             Ok(r) => r,
             Err(a) => return a,

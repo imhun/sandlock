@@ -12,12 +12,13 @@ use crate::sandbox::Sandbox;
 use crate::seccomp::bpf::{jump, stmt};
 use crate::sys::structs::{
     AF_INET, AF_INET6, BPF_ABS, BPF_ALU, BPF_AND, BPF_JEQ, BPF_JMP, BPF_JSET, BPF_K,
-    BPF_LD, BPF_RET, BPF_W, CLONE_NS_FLAGS, DEFAULT_BLOCKLIST_SYSCALLS, EPERM,
-    OFFSET_ARGS0_LO, OFFSET_ARGS1_LO, OFFSET_ARGS2_LO, OFFSET_ARGS3_LO, OFFSET_NR,
-    PR_SET_DUMPABLE, PR_SET_PTRACER, PR_SET_SECUREBITS, SECCOMP_RET_ALLOW,
+    BPF_LD, BPF_RET, BPF_W, CLONE_NS_FLAGS, DEFAULT_BLOCKLIST_SYSCALLS, EPERM, FIBMAP,
+    FIGETBSZ, FS_IOC_FIEMAP, OFFSET_ARGS0_LO, OFFSET_ARGS1_LO, OFFSET_ARGS2_LO, OFFSET_ARGS3_LO,
+    OFFSET_NR, PR_SET_DUMPABLE, PR_SET_PTRACER, PR_SET_SECUREBITS, SECCOMP_RET_ALLOW,
     SECCOMP_RET_ERRNO, SIOCETHTOOL, SIOCGIFADDR, SIOCGIFBRDADDR, SIOCGIFCONF,
     SIOCGIFDSTADDR, SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFNAME,
-    SIOCGIFNETMASK, SOCK_DGRAM, SOCK_RAW, SOCK_TYPE_MASK, SYSV_IPC_BLOCKLIST_SYSCALLS,
+    SIOCGIFNETMASK, SIOCSIFADDR, SIOCSIFBRDADDR, SIOCSIFHWADDR, SIOCSIFNETMASK, SIOCSIFFLAGS,
+    SOCK_DGRAM, SOCK_RAW, SOCK_TYPE_MASK, SYSV_IPC_BLOCKLIST_SYSCALLS,
     TIOCLINUX, TIOCSTI, SockFilter,
 };
 
@@ -173,6 +174,11 @@ fn cow_path_syscalls() -> Vec<i64> {
         libc::SYS_symlinkat,
         libc::SYS_linkat,
         libc::SYS_fchmodat,
+        // `fchmodat2` is mediated rather than blocklisted: glibc uses it to
+        // implement `chmod`/`fchmodat` with `AT_SYMLINK_NOFOLLOW` semantics, and a
+        // seccomp refusal is `EPERM`, which glibc does not fall back from --
+        // blocklisting it would break `chmod` inside the sandbox.
+        arch::SYS_FCHMODAT2,
         libc::SYS_fchownat,
         libc::SYS_truncate,
         libc::SYS_utimensat,
@@ -248,6 +254,11 @@ pub(crate) fn chroot_path_syscalls() -> Vec<i64> {
         libc::SYS_symlinkat,
         libc::SYS_linkat,
         libc::SYS_fchmodat,
+        // `fchmodat2` is mediated rather than blocklisted: glibc uses it to
+        // implement `chmod`/`fchmodat` with `AT_SYMLINK_NOFOLLOW` semantics, and a
+        // seccomp refusal is `EPERM`, which glibc does not fall back from --
+        // blocklisting it would break `chmod` inside the sandbox.
+        arch::SYS_FCHMODAT2,
         libc::SYS_fchownat,
         libc::SYS_truncate,
         libc::SYS_newfstatat,
@@ -601,7 +612,8 @@ pub(crate) fn blocklist_syscall_numbers(policy: &Sandbox) -> Vec<u32> {
 ///
 /// Returns a `Vec<SockFilter>` containing self-contained BPF blocks for:
 ///   - clone: block namespace creation flags
-///   - ioctl: block TIOCSTI, TIOCLINUX, SIOCGIF*, SIOCETHTOOL
+///   - ioctl: block TIOCSTI, TIOCLINUX, SIOCGIF*, SIOCSIF*, SIOCETHTOOL,
+///     FS_IOC_FIEMAP, FIBMAP, FIGETBSZ
 ///   - prctl: block PR_SET_DUMPABLE, PR_SET_SECUREBITS, PR_SET_PTRACER
 ///   - socket: block SOCK_RAW/SOCK_DGRAM on AF_INET/AF_INET6 (with type mask)
 pub(crate) fn arg_filters(policy: &Sandbox) -> Vec<SockFilter> {
@@ -672,9 +684,39 @@ pub(crate) fn arg_filters_resolved(resolved: &ResolvedSandbox) -> Vec<SockFilter
     }
 
     // --- ioctl: block dangerous commands ---
-    // Block terminal injection (TIOCSTI, TIOCLINUX) and network interface
-    // enumeration ioctls (SIOCGIF*, SIOCETHTOOL) to complement NETLINK_ROUTE
-    // virtualization.
+    // Block terminal injection (TIOCSTI, TIOCLINUX), network interface
+    // enumeration and manipulation ioctls (SIOCGIF*/SIOCSIF*/SIOCETHTOOL) to
+    // complement NETLINK_ROUTE virtualization, and the filesystem-layout
+    // ioctls (FS_IOC_FIEMAP, FIBMAP, FIGETBSZ).
+    //
+    // What is deliberately NOT here is the terminal *write* family --
+    // TCSETS/TCSETSW/TCSETSF, their TCSETS2/TCSETSW2/TCSETSF2 counterparts,
+    // TIOCSWINSZ, TIOCSETD, TIOCSIG, TCXONC, TCFLSH. Those were candidates
+    // and were dropped after measurement, because their safety does not come
+    // from this list:
+    //
+    //  * `openpty`/`posix_openpt` and every raw-mode program depend on
+    //    TCSETS/TCSETSW -- tmux, vim, ssh, less and `stty raw` all break
+    //    without them. This list is also load-bearing for the platform's own
+    //    PTY endpoint, which sets winsize via TIOCSWINSZ.
+    //  * What they could attack is not reachable. Measured 2026-10-04 in a
+    //    live sandbox: `/dev/pts` is a per-sandbox devpts instance (a
+    //    freshly allocated sandbox lists only `ptmx`; the first openpty adds
+    //    only its own `0`), so no other sandbox's ptys are in scope, and
+    //    `/dev/tty` cannot be opened at all (ENXIO), so there is no
+    //    controlling terminal to retarget. Every process in the sandbox is
+    //    the same uid, so reconfigureing a sibling's terminal is already
+    //    achievable with kill().
+    //
+    // TIOCSTI/TIOCLINUX are in this list for the opposite reason: they write
+    // into a terminal's *input* queue, so their reach is the terminal a
+    // descriptor names rather than the caller's own state.
+    //
+    // The per-sandbox devpts instance and the unopenable `/dev/tty` are the
+    // two load-bearing preconditions for leaving the write family allowed.
+    // Both are asserted by the parent repository's live-sandbox invariant
+    // test; if either stops holding, this list needs the write family back.
+    //
     // Layout: LD NR, JEQ ioctl (skip 1 + N*2), LD arg1, [JEQ cmd, RET ERRNO] * N
     let dangerous_ioctls: &[u32] = &[
         TIOCSTI as u32,
@@ -682,15 +724,32 @@ pub(crate) fn arg_filters_resolved(resolved: &ResolvedSandbox) -> Vec<SockFilter
         SIOCGIFNAME as u32,
         SIOCGIFCONF as u32,
         SIOCGIFFLAGS as u32,
+        SIOCSIFFLAGS as u32,
+        SIOCSIFADDR as u32,
         SIOCGIFADDR as u32,
+        SIOCSIFBRDADDR as u32,
         SIOCGIFDSTADDR as u32,
         SIOCGIFBRDADDR as u32,
+        SIOCSIFNETMASK as u32,
         SIOCGIFNETMASK as u32,
+        SIOCSIFHWADDR as u32,
         SIOCGIFHWADDR as u32,
         SIOCGIFINDEX as u32,
         SIOCETHTOOL as u32,
+        FS_IOC_FIEMAP as u32,
+        FIBMAP as u32,
+        FIGETBSZ as u32,
     ];
     let n_ioctls = dangerous_ioctls.len();
+    // The JEQ skip field is 8 bits wide, so the whole chain must stay under
+    // 255 instructions. Asserted rather than assumed: a longer list would
+    // truncate to a wrapped count and quietly stop matching codes late in the
+    // chain instead of failing to build.
+    assert!(
+        (1 + n_ioctls * 2) <= u8::MAX as usize,
+        "ioctl deny list too long for the 8-bit JEQ skip field: {} entries",
+        n_ioctls
+    );
     let skip_count = (1 + n_ioctls * 2) as u8;
     insns.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFFSET_NR));
     insns.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr_ioctl, 0, skip_count));

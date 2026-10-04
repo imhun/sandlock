@@ -16,6 +16,11 @@ pub const SYS_SECCOMP: i64 = Sysno::seccomp as i64;
 pub const SYS_MEMFD_CREATE: i64 = Sysno::memfd_create as i64;
 pub const SYS_PIDFD_OPEN: i64 = Sysno::pidfd_open as i64;
 pub const SYS_PIDFD_GETFD: i64 = Sysno::pidfd_getfd as i64;
+/// `fchmodat2(2)` (Linux 6.13). Resolved from the `syscalls` table rather than
+/// `libc::SYS_*` because the syscall is newer than some `libc` releases the
+/// crate still supports; `Sysno::fchmodat2` is the same number on every ABI
+/// Sandlock targets (452), which the `tests` module pins.
+pub const SYS_FCHMODAT2: i64 = Sysno::fchmodat2 as i64;
 
 #[cfg(target_arch = "x86_64")]
 mod imp {
@@ -125,6 +130,7 @@ mod tests {
             assert_eq!(SYS_PIDFD_GETFD, 438);
             assert_eq!(SYS_OPENAT2, 437);
             assert_eq!(SYS_FACCESSAT2, 439);
+            assert_eq!(SYS_FCHMODAT2, 452);
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         {
@@ -134,6 +140,7 @@ mod tests {
             assert_eq!(SYS_PIDFD_GETFD, 438);
             assert_eq!(SYS_OPENAT2, 437);
             assert_eq!(SYS_FACCESSAT2, 439);
+            assert_eq!(SYS_FCHMODAT2, 452);
         }
     }
 

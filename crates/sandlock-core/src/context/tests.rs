@@ -304,7 +304,8 @@ fn test_no_supervisor_blocklist_excludes_sysv_ipc_when_allowed() {
 #[test]
 fn test_arg_filters_has_clone_ioctl_prctl_socket() {
     use crate::sys::structs::{
-        BPF_JEQ, BPF_JSET, BPF_JMP, BPF_K,
+        BPF_JEQ, BPF_JSET, BPF_JMP, BPF_K, FIBMAP, FIGETBSZ, FS_IOC_FIEMAP, SIOCSIFADDR,
+        SIOCSIFFLAGS,
     };
     let policy = Sandbox::builder().build().unwrap();
     let filters = arg_filters(&policy);
@@ -326,6 +327,26 @@ fn test_arg_filters_has_clone_ioctl_prctl_socket() {
         && f.k == SIOCGIFCONF as u32));
     assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
         && f.k == SIOCETHTOOL as u32));
+    // The set half of the network-interface family, and the filesystem-layout
+    // ioctls. See `seccomp_plan::arg_filters` for why the terminal write
+    // family is deliberately absent from this list.
+    assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
+        && f.k == SIOCSIFFLAGS as u32));
+    assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
+        && f.k == SIOCSIFADDR as u32));
+    assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
+        && f.k == FS_IOC_FIEMAP as u32));
+    assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
+        && f.k == FIBMAP as u32));
+    assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
+        && f.k == FIGETBSZ as u32));
+    // Guard the two values that a transcription slip would make inert rather
+    // than wrong. FIBMAP is `_IO(0x00, 1)` and FIGETBSZ is `_IO(0x00, 2)` in
+    // uapi linux/fs.h -- not the 0x5401 / 0x80045427-looking encodings that a
+    // plausible guess produces, both of which answer ENOTTY.
+    assert_eq!(FIBMAP, 0x0000_0001);
+    assert_eq!(FIGETBSZ, 0x0000_0002);
+    assert_eq!(FS_IOC_FIEMAP, 0xC020_660B);
     // Should contain JEQ for prctl syscall nr
     assert!(filters.iter().any(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K)
         && f.k == libc::SYS_prctl as u32));
@@ -403,13 +424,36 @@ fn test_arg_filters_udp_denied_by_default() {
 }
 
 /// AF_INET and SOCK_DGRAM share the constant 2, so presence of the
-/// SOCK_DGRAM JEQ is observed as the JEQ-with-k==2 count: the AF_INET
-/// domain check contributes one in every socket filter, the type check
-/// contributes the second only when SOCK_DGRAM is in the blocked set.
+/// SOCK_DGRAM JEQ is observed as the JEQ-with-k==2 count -- but only within
+/// the socket block. Counting k==2 across the whole filter is no longer a valid
+/// proxy: the ioctl deny list legitimately contains `FIGETBSZ`, which is
+/// `_IO(0x00, 2)` in uapi linux/fs.h and therefore *is* another k==2 JEQ.
+///
+/// The block is located structurally rather than by index: it opens with
+/// `LD NR` + `JEQ SYS_socket` and runs to the next block's `LD NR`. Both JEQs of
+/// interest are inside -- the `AF_INET` domain test before the
+/// `AND SOCK_TYPE_MASK`, and the `SOCK_DGRAM` type test after it.
 fn count_jeq_2(filters: &[crate::sys::structs::SockFilter]) -> usize {
-    use crate::sys::structs::{BPF_JEQ, BPF_JMP, BPF_K};
-    filters.iter()
-        .filter(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K) && f.k == 2)
+    use crate::sys::structs::{BPF_ABS, BPF_JEQ, BPF_JMP, BPF_K, BPF_LD, BPF_W, OFFSET_NR, SOCK_DGRAM};
+    let opens_block = |w: &[crate::sys::structs::SockFilter]| {
+        w[0].code == (BPF_LD | BPF_W | BPF_ABS) && w[0].k == OFFSET_NR
+    };
+    let start = filters
+        .windows(2)
+        .position(|w| {
+            opens_block(w)
+                && w[1].code == (BPF_JMP | BPF_JEQ | BPF_K)
+                && w[1].k == libc::SYS_socket as u32
+        })
+        .expect("no socket block in arg filters");
+    let end = filters[start + 2..]
+        .windows(2)
+        .position(|w| opens_block(w))
+        .map(|i| start + 2 + i)
+        .unwrap_or(filters.len());
+    filters[start..end]
+        .iter()
+        .filter(|f| f.code == (BPF_JMP | BPF_JEQ | BPF_K) && f.k == SOCK_DGRAM)
         .count()
 }
 

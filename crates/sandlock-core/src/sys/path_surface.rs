@@ -75,6 +75,7 @@ pub(crate) const MEDIATED_PATH_SYSCALLS: &[&str] = &[
     "symlinkat",
     "linkat",
     "fchmodat",
+    "fchmodat2",
     "fchownat",
     "truncate",
     "newfstatat",
@@ -156,37 +157,19 @@ pub(crate) const UNMEDIATED_PATH_TAKING: &[(&str, Disposition)] = &[
     // `open_tree` without OPEN_TREE_CLONE measured to hand the sandbox an
     // O_PATH fd for a host directory, and the CLONE form is CAP_SYS_ADMIN.
     ("open_tree", Disposition::Blocked),
-    (
-        "fchmodat2",
-        Disposition::Open(
-            "at-style chmod (kernel syscall 452). The kernel implements it; what refuses it is \
-             the *shipped worker seccomp profile*, whose default action returns ENOSYS for \
-             anything not in its allow list (measured: ENOSYS under the deploy profile, EINVAL \
-             with seccomp=unconfined). So it is unreachable in the deployed shape and reachable \
-             on any host running a wider profile. Mediate it there, do not blocklist it: glibc \
-             already uses it for chmod variants, and glibc will adopt the rest of this group",
-        ),
-    ),
-    (
-        "getxattrat",
-        Disposition::Open(
-            "at-style xattr read (kernel 464). Implemented by the kernel; refused by the shipped \
-             worker seccomp profile (ENOSYS-by-default-action), reachable under a wider profile. \
-             Same disposition as fchmodat2: mediate when a deployment widens the profile",
-        ),
-    ),
-    (
-        "setxattrat",
-        Disposition::Open("at-style xattr write (kernel 463); see getxattrat for the mechanism"),
-    ),
-    (
-        "listxattrat",
-        Disposition::Open("at-style xattr list (kernel 465); see getxattrat for the mechanism"),
-    ),
-    (
-        "removexattrat",
-        Disposition::Open("at-style xattr remove (kernel 466); see getxattrat for the mechanism"),
-    ),
+    // The 6.13 "*at" metadata calls (E2B audit STATIC-2, 2026-10-04). These were
+    // the ledger's last `Open` rows: ENOSYS on the deployed kernel, so nothing
+    // measured, and the note claimed the shipped worker seccomp profile refused
+    // them. The rehearsal on a 7.0 kernel showed that claim was carrying the
+    // whole defence -- `seccomp=unconfined` let all of them through, and
+    // Docker/OCI's default profile does not block `fchmodat2`. Blocked rather
+    // than mediated because no workload uses them and glibc does not call them
+    // yet. `fchmodat2` left this table instead: glibc *does* use it, so it is
+    // mediated (see MEDIATED_PATH_SYSCALLS and seccomp_plan.rs).
+    ("getxattrat", Disposition::Blocked),
+    ("setxattrat", Disposition::Blocked),
+    ("listxattrat", Disposition::Blocked),
+    ("removexattrat", Disposition::Blocked),
     ("open_tree_attr", Disposition::Blocked),
     // `statmount`/`listmount` used to be `Open` (kernel 457/458, refused only
     // by the shipped worker profile, which is a host-dependent gate): they
@@ -195,19 +178,21 @@ pub(crate) const UNMEDIATED_PATH_TAKING: &[(&str, Disposition)] = &[
     // a sandbox process reaching the kernel for the sibling mount-API calls.
     ("statmount", Disposition::Blocked),
     ("listmount", Disposition::Blocked),
-    (
-        "file_getattr",
-        Disposition::Open(
-            "kernel 468; signature not verified. Refused by the shipped profile; review before \
-             enabling on a wider-profile host",
-        ),
-    ),
-    (
-        "file_setattr",
-        Disposition::Open(
-            "kernel 469; signature not verified; see file_getattr",
-        ),
-    ),
+    ("file_getattr", Disposition::Blocked),
+    ("file_setattr", Disposition::Blocked),
+    // These five were classified `NON_PATH_SYSCALLS`, which claimed they cannot
+    // name a filesystem object. That was wrong for `cachestat` and
+    // `lsm_get_self_attr` (both take a path) and contradicted a Blocked verdict
+    // for all five, so they were reclassified on 2026-10-04. Blocked rather
+    // than left merely ungated: none answers on the deployed 6.12 kernel
+    // (ENOSYS -- they arrived in 6.5 and 6.10), and listing them makes the
+    // refusal a property of the policy instead of a property of the kernel the
+    // node happens to run. Rationale per syscall is on the blocklist entry.
+    ("cachestat", Disposition::Blocked),
+    ("lsm_get_self_attr", Disposition::Blocked),
+    ("lsm_set_self_attr", Disposition::Blocked),
+    ("lsm_list_modules", Disposition::Blocked),
+    ("mseal", Disposition::Blocked),
     // ---- gated: measured --------------------------------------------------
     (
         "creat",
@@ -337,6 +322,11 @@ pub(crate) const PURE_GATED_ELSEWHERE: &[(&str, &str)] = &[
     ("file_setattr", "kernel 6.13+; ENOSYS on the audit kernel, signature unverified"),
     ("statmount", "blocklisted in every shape (2026-09-30): host mount metadata, no workload use"),
     ("listmount", "blocklisted in every shape (2026-09-30), see statmount"),
+    ("cachestat", "blocklisted in every shape (2026-10-04): page-cache residency side channel, ENOSYS on 6.12"),
+    ("lsm_get_self_attr", "blocklisted in every shape (2026-10-04): reports the host LSM stack, ENOSYS on 6.12"),
+    ("lsm_set_self_attr", "blocklisted in every shape (2026-10-04), see lsm_get_self_attr"),
+    ("lsm_list_modules", "blocklisted in every shape (2026-10-04), see lsm_get_self_attr"),
+    ("mseal", "blocklisted in every shape (2026-10-04): seals mappings incl. file-backed, ENOSYS on 6.12"),
     ("uselib", "obsolete, ENOSYS"),
     ("mq_open", "resolves in the mqueue filesystem, which the worker does not mount"),
     ("mq_unlink", "same as mq_open"),
@@ -462,9 +452,8 @@ pub(crate) const NON_PATH_SYSCALLS: &[&str] = &[
     "pidfd_open", "clone3", "close_range", "pidfd_getfd",
     "process_madvise", "epoll_pwait2", "quotactl_fd", "landlock_create_ruleset",
     "landlock_add_rule", "landlock_restrict_self", "memfd_secret", "process_mrelease",
-    "futex_waitv", "set_mempolicy_home_node", "cachestat", "map_shadow_stack",
-    "futex_wake", "futex_wait", "futex_requeue", "lsm_get_self_attr",
-    "lsm_set_self_attr", "lsm_list_modules", "mseal",
+    "futex_waitv", "set_mempolicy_home_node", "map_shadow_stack",
+    "futex_wake", "futex_wait", "futex_requeue",
     // The 32-bit time64 group. The `syscalls` crate's aarch64 table carries
     // these at 403..422, where the kernel implements nothing (they exist for
     // 32-bit ABIs, which have the 2038 problem for `struct timespec`); none of
@@ -611,17 +600,13 @@ mod tests {
                 );
             }
         }
+        // Empty as of 2026-10-04 (E2B audit STATIC-2): the seven "*at" metadata
+        // calls were the last `Open` rows. Six are blocked and `fchmodat2` is
+        // mediated. This is the bucket a reviewer empties, and it is empty --
+        // if a new `Open` row appears it must come with a measurement.
         assert_eq!(
             open,
-            vec![
-                "fchmodat2",
-                "getxattrat",
-                "setxattrat",
-                "listxattrat",
-                "removexattrat",
-                "file_getattr",
-                "file_setattr",
-            ],
+            Vec::<&str>::new(),
             "the open (needs-a-decision) set changed: update the ledger and this pin together"
         );
     }
