@@ -21,8 +21,59 @@ use crate::sys::structs::SeccompNotif;
 const AF_UNIX: u64 = 1;
 const AF_INET: u64 = 2;
 const AF_INET6: u64 = 10;
+const AF_KEY: u64 = 15;
 const AF_NETLINK: u64 = 16;
+const AF_RXRPC: u64 = 33;
 const NETLINK_ROUTE: u64 = 0;
+const NETLINK_XFRM: u64 = 6;
+const NETLINK_KEY: u64 = 16;
+
+/// Families that are refused **and have a named reason**.
+///
+/// This list is documentation, not the enforcement mechanism — `family_allowed`
+/// is a whitelist, so everything absent is refused regardless of whether it is
+/// named here. It exists because a whitelist's refusals are otherwise
+/// indistinguishable from an oversight: a reader cannot tell "we deliberately
+/// closed AF_RXRPC" from "nobody ever thought about AF_RXRPC", and the second
+/// reading is what produces a later patch that "helpfully" adds it.
+///
+/// Every entry was measured in a live sandbox on 2026-10-04 (k0s, arm64
+/// kernel 6.12), together with the same probe run *outside* the sandbox as a
+/// control — without the control, a refusal that also happens on the host is
+/// indistinguishable from one the sandbox made.
+///
+/// * `AF_RXRPC` — the RxRPC socket family. CVE-2026-43500 (the third
+///   "Dirty Frag" variant, alongside CVE-2026-43284 in IPsec/ESP and
+///   CVE-2026-53362 in IPv6 corking) is an unprivileged LPE in this exact
+///   subsystem, and it is in CISA's KEV catalog as confirmed-exploited.
+///   Measured: refused both in the sandbox and in the worker container, i.e.
+///   the module happens to be unavailable here — which is *not* a security
+///   property. It can be loaded by an unrelated package, so the refusal has to
+///   be structural. Named here so that it is.
+pub(crate) const REFUSED_FAMILIES: &[(u64, &str)] = &[
+    (AF_RXRPC, "CVE-2026-43500 Dirty Frag (rxrpc), KEV-confirmed-exploited LPE"),
+];
+
+/// Netlink protocols refused **and have a named reason**. Same relationship to
+/// `handle_socket` as [`REFUSED_FAMILIES`] has to `family_allowed`: the check
+/// is `protocol != NETLINK_ROUTE`, and this names the ones that matter.
+///
+/// * `NETLINK_XFRM` — IPsec state management. This is the input path for
+///   CVE-2026-43284 ("Dirty Frag", the IPsec/ESP in-place-decrypt-on-shared-
+///   pages bug, KEV-confirmed-exploited, public PoC). Exploitation needs an
+///   ESP SA to decrypt into; the kernel lets an unprivileged process add XFRM
+///   state in its own user namespace, so denying the socket is the control —
+///   there is no CAP_NET_ADMIN to check and no Landlock right that covers it.
+///   Measured: created in the worker container, refused in the sandbox.
+/// * `NETLINK_KEY` — the same keyring subsystem as `AF_KEY`, reached over
+///   AF_NETLINK instead. `add_key`/`request_key`/`keyctl` are already refused at
+///   the blocklist, so closing the socket is defence in depth for a different
+///   door onto the same subsystem. Measured: created in the worker container,
+///   refused in the sandbox.
+pub(crate) const REFUSED_NETLINK_PROTOCOLS: &[(u64, &str)] = &[
+    (NETLINK_XFRM, "CVE-2026-43284 Dirty Frag (IPsec/ESP), KEV-confirmed-exploited LPE"),
+    (NETLINK_KEY, "keyring subsystem, same as the refused add_key/request_key/keyctl"),
+];
 
 /// Socket families allowed to reach the kernel. Everything else returns
 /// EAFNOSUPPORT — the same errno the kernel itself uses for unknown
@@ -35,6 +86,9 @@ const NETLINK_ROUTE: u64 = 0;
 /// (Copy Fail / CVE-2026-31431 via AF_ALG, Dirty Pipe-adjacent splice
 /// primitives, AF_PACKET PACKET_MMAP UAFs, etc.). Closing the surface
 /// once is cheaper than chasing one CVE per family.
+///
+/// Deliberately named refusals are listed in [`REFUSED_FAMILIES`] with their
+/// reason; read that before adding a family here.
 fn family_allowed(domain: u64) -> bool {
     matches!(domain, AF_UNIX | AF_INET | AF_INET6 | AF_NETLINK)
 }
@@ -270,4 +324,71 @@ pub async fn handle_getsockname(
     let actual = (addr.len() as u32).to_ne_bytes();
     let _ = write_child_mem(notif_fd, id, pid, addrlen_ptr, &actual);
     NotifAction::ReturnValue(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The socket-domain gate. Written as a table rather than a loop over
+    /// `REFUSED_FAMILIES` so that adding a family to the whitelist is a
+    /// deliberate edit here too, not just in `family_allowed`.
+    #[test]
+    fn socket_family_gate() {
+        // The four that reach the kernel.
+        for d in [AF_UNIX, AF_INET, AF_INET6, AF_NETLINK] {
+            assert!(family_allowed(d), "family {d} must be allowed");
+        }
+        // Every family named as deliberately refused stays refused.
+        for (domain, why) in REFUSED_FAMILIES {
+            assert!(
+                !family_allowed(*domain),
+                "family {domain} is named as refused ({why}) but family_allowed accepts it",
+            );
+        }
+        // Niche families with no legitimate use in a sandbox.
+        for d in [AF_KEY, 17 /* AF_PACKET */, 38 /* AF_ALG */, 40 /* AF_VSOCK */] {
+            assert!(!family_allowed(d), "family {d} must be refused");
+        }
+        // Nothing outside the whitelist may pass: the gate is an allow list, so
+        // an unlisted family is the normal case, not the exception.
+        for d in 0..=64u64 {
+            if d == AF_UNIX || d == AF_INET || d == AF_INET6 || d == AF_NETLINK {
+                continue;
+            }
+            assert!(!family_allowed(d), "family {d} must not be allowed");
+        }
+    }
+
+    /// The protocol gate inside `handle_socket`.
+    #[test]
+    fn netlink_protocol_gate() {
+        // NETLINK_ROUTE is the one the supervisor answers synthetically.
+        assert_eq!(NETLINK_ROUTE, 0);
+        // The named refusals are not NETLINK_ROUTE, which is what makes the
+        // `protocol != NETLINK_ROUTE` check refuse them.
+        for (proto, why) in REFUSED_NETLINK_PROTOCOLS {
+            assert_ne!(
+                *proto, NETLINK_ROUTE,
+                "{why}: a listed protocol cannot be NETLINK_ROUTE or it would be answered",
+            );
+        }
+        assert_eq!(NETLINK_XFRM, 6);
+        assert_eq!(NETLINK_KEY, 16);
+        assert_eq!(AF_RXRPC, 33);
+        assert_eq!(AF_KEY, 15);
+        assert_eq!(AF_NETLINK, 16);
+    }
+
+    /// The number is only meaningful if it is the real one: a wrong family
+    /// number makes the refusal test above pass for the wrong reason.
+    #[test]
+    fn family_numbers_are_the_kernels() {
+        assert_eq!(AF_UNIX, libc::AF_UNIX as u64);
+        assert_eq!(AF_INET, libc::AF_INET as u64);
+        assert_eq!(AF_INET6, libc::AF_INET6 as u64);
+        assert_eq!(AF_NETLINK, libc::AF_NETLINK as u64);
+        assert_eq!(AF_KEY, libc::AF_KEY as u64);
+        assert_eq!(AF_RXRPC, libc::AF_RXRPC as u64);
+    }
 }
