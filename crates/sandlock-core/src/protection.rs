@@ -201,6 +201,53 @@ mod policy_tests {
         assert_eq!(pol.state(Protection::AbstractUnixSocketScope), ProtectionState::Strict);
     }
 
+    /// The deployed kernel's Landlock ABI, measured 2026-10-04 on the k0s
+    /// cluster: `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)`
+    /// answers 6 on both arm64 nodes (Rocky 10.2, kernel 6.12.0-211.34.1). The
+    /// local test lane answers 8.
+    ///
+    /// The gap is harmless today, and this test is what keeps it that way. It
+    /// is not "the newer ABI has more rights": what matters is whether any
+    /// protection the fork actually declares has a floor the *deployed* ABI
+    /// cannot meet, because an unmet floor resolves to `Unavailable` under the
+    /// default `strict_all()` policy and `build()` then refuses the sandbox --
+    /// a fail-closed outcome, but a visible one. The silent failure mode is
+    /// `Degradable`, where the mask compute drops the bit and nothing complains.
+    ///
+    /// So: adding a protection with `min_abi() > DEPLOYED_ABI` turns a sandbox
+    /// from running to refusing, and nobody would necessarily connect the two.
+    const DEPLOYED_ABI: u32 = 6;
+
+    #[test]
+    fn every_protection_is_available_on_the_deployed_abi() {
+        let pol = ProtectionPolicy::strict_all();
+        for p in Protection::all() {
+            assert_eq!(
+                ProtectionStatus::resolve(p, DEPLOYED_ABI, &pol),
+                ProtectionStatus::Active,
+                "{p:?} needs ABI >= {} but the deployed kernel offers {DEPLOYED_ABI}; \
+                 under the default strict policy that is Unavailable and build() \
+                 refuses the sandbox",
+                p.min_abi(),
+            );
+        }
+    }
+
+    /// And the corollary that matters for review: nothing is `Degradable`
+    /// either, so no access bit is being dropped quietly on the deployed ABI.
+    #[test]
+    fn no_protection_is_silently_degraded_on_the_deployed_abi() {
+        let pol = ProtectionPolicy::strict_all();
+        for p in Protection::all() {
+            assert_ne!(
+                ProtectionStatus::resolve(p, DEPLOYED_ABI, &pol),
+                ProtectionStatus::Degraded,
+                "{p:?} resolves to Degraded on the deployed ABI; Degraded is the \
+                 state that drops the mask bit without failing the build",
+            );
+        }
+    }
+
     #[test]
     fn iter_yields_every_protection_with_resolved_state() {
         let mut pol = ProtectionPolicy::strict_all();
