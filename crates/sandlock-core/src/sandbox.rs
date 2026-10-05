@@ -2135,9 +2135,6 @@ impl Sandbox {
         use std::time::Duration;
 
         self.ensure_runtime()?;
-        // Before the fork: descendants this sandbox orphans must reparent
-        // *here* to be reaped (see `ensure_child_subreaper`).
-        ensure_child_subreaper();
 
         if !matches!(self.rt().state, RuntimeState::Created) {
             return Err(SandboxRuntimeError::Child("sandbox already spawned".into()).into());
@@ -3602,31 +3599,6 @@ impl Drop for Sandbox {
 // ================================================================
 // CPU throttle
 // ================================================================
-
-/// Make this process a subreaper once, so a sandbox's orphaned descendants
-/// reparent *here* instead of to the container's PID 1.
-///
-/// Why the supervisor needs it: an exec-capable session has `sandlock-init`
-/// (itself a subreaper) to adopt and reap its subtree, but the plain M0 path
-/// does not -- there the workload *is* the direct child, so when the group
-/// sweep kills it, its forked descendants are orphaned to the nearest reaper
-/// above us, which is PID 1. Where that PID 1 is not a reaper (`docker run`
-/// without `--init`, a bare `sleep` as pid 1) they stay zombies forever, and a
-/// teardown that promises "the descendants are gone" reads false to anyone who
-/// asks with `kill(pid, 0)` (measured 2026-10-05: `state=Z ppid=1` still there
-/// twenty minutes later). Adopting them here is what lets
-/// `reap_sandbox_groups` collect them, and it is the same flag `run_init` sets
-/// for its own subtree.
-///
-/// Process-wide by nature (the flag is per-process); it only changes where
-/// orphans reparent, and every sandbox this process created is already its
-/// descendant, so the responsibility it moves is one this process can meet.
-fn ensure_child_subreaper() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| unsafe {
-        libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
-    });
-}
 
 async fn sandbox_throttle_cpu(pid: i32, cpu_pct: u8) {
     use std::time::Duration;

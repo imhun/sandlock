@@ -2524,9 +2524,6 @@ impl SandboxInstance {
         self.sweep_exec_child_groups();
         let reaped = reap_direct_child(pid).unwrap_or(ExitStatus::Killed);
         self.mark_unreported_exec_children_killed();
-        // Escalation killed init mid-collapse, so whatever it had not reaped is
-        // orphaned onto this process (see `reap_exec_child_groups`).
-        self.reap_exec_child_groups();
         reaped
     }
 
@@ -2561,28 +2558,6 @@ impl SandboxInstance {
                     libc::killpg(host_pid, libc::SIGKILL);
                 }
             }
-        }
-    }
-
-    /// Collect what an exec teardown just orphaned onto *this* process.
-    ///
-    /// The exec teardown SIGKILLs init and every registered child group, so by
-    /// the time the sweep lands init is gone and a killed child reparents to
-    /// the nearest reaper above it -- this process, a subreaper since
-    /// `ensure_child_subreaper`. Nobody else will ever reap them: PID 1 of a
-    /// plain container is not a reaper, and `waitpid` may only be called by the
-    /// parent. Group ids are the registered children's pids (`spawn` makes each
-    /// child its own group leader) plus the session leader's.
-    fn reap_exec_child_groups(&self) {
-        let mut groups: Vec<i32> = Vec::new();
-        if let Some(session) = self.exec_session.as_ref() {
-            groups.extend(session.children.values().map(|c| c.pid));
-        }
-        if let Some(leader) = self.leader_pid.or(self.child_pid) {
-            groups.push(leader);
-        }
-        if !groups.is_empty() {
-            reap_sandbox_groups(&groups);
         }
     }
 
@@ -2661,10 +2636,6 @@ impl SandboxInstance {
         // 3c. Instance-group fallback (leader group, or the direct child's
         // group without a PID namespace).
         unsafe { libc::killpg(group, libc::SIGKILL) };
-        // 3d. Collect what that just orphaned onto us: with no init in the M0
-        // path, a killed descendant is only "gone" once somebody reaps it, and
-        // PID 1 of a plain container does not (see `reap_sandbox_groups`).
-        reap_sandbox_groups(&[pid, group]);
     }
 
     /// Wait up to `grace` for the direct child to exit and be reaped.
@@ -2796,10 +2767,6 @@ impl SandboxInstance {
                 let group = self.leader_pid.unwrap_or(pid);
                 unsafe { libc::killpg(group, libc::SIGKILL) };
                 reaped = reap_direct_child(pid);
-                // A descendant the sweep killed is orphaned to this process
-                // (subreaper) and has to be collected, or "dropping the
-                // sandbox" leaves a zombie behind (see `reap_sandbox_groups`).
-                reap_sandbox_groups(&[group, pid]);
             }
             if self.tty_foreground_taken {
                 let fg_pid = self.leader_pid.unwrap_or(pid);
@@ -2868,10 +2835,6 @@ impl SandboxInstance {
                 reaped = reap_direct_child(pid);
             }
         }
-        // The per-child groups were SIGKILLed above; with init gone their
-        // members are orphaned onto this process, so collect them here or the
-        // caller's drop accumulates zombies (see `reap_exec_child_groups`).
-        self.reap_exec_child_groups();
         reaped
     }
 
@@ -3521,61 +3484,6 @@ fn reap_direct_child(pid: libc::pid_t) -> Option<ExitStatus> {
         Some(sandbox_wait_status_to_exit(status))
     } else {
         None
-    }
-}
-
-/// Deadline for the post-sweep reap ([`reap_sandbox_groups`]).
-const SWEEP_REAP_MS: u64 = 200;
-
-/// Collect the zombies a group sweep left in the sandbox's *own* groups.
-///
-/// The M0 path has no `sandlock-init`: the workload is the direct child, so a
-/// descendant the sweep kills is orphaned to the nearest reaper *above* the
-/// sandbox -- PID 1 of the container, which is not a reaper under a plain
-/// `docker run` (`state=Z ppid=1` measured still there twenty minutes later).
-/// [`ensure_child_subreaper`] makes this process that reaper, and this collects
-/// what it adopted.
-///
-/// `waitpid(-pgid)` is deliberate: it matches only *our own children whose
-/// process group is the sandbox's*, so the caller's unrelated children (and any
-/// other sandbox's) can never be stolen. Our own process group is skipped --
-/// without a pid namespace the direct child is its own group leader, but a
-/// failure before `setpgid` would otherwise point this at the caller's group.
-///
-/// Bounded: SIGKILL cannot be refused, so this normally returns on the first
-/// pass; the deadline only stops a descendant stuck in an uninterruptible sleep
-/// from holding the teardown open.
-fn reap_sandbox_groups(groups: &[i32]) {
-    let me = unsafe { libc::getpid() };
-    let my_group = unsafe { libc::getpgid(0) };
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(SWEEP_REAP_MS);
-    for &group in groups {
-        if group <= 1 || group == me || group == my_group {
-            continue;
-        }
-        loop {
-            // Drain every status this group has for us right now.
-            loop {
-                let reaped = unsafe {
-                    libc::waitpid(-group, std::ptr::null_mut(), libc::WNOHANG)
-                };
-                if reaped <= 0 {
-                    break;
-                }
-            }
-            // A zombie is still a member of its group, so an empty group is
-            // also a group whose dead members were all reaped.
-            if (unsafe { libc::killpg(group, 0) }) != 0 {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            unsafe {
-                libc::usleep(1000);
-            }
-        }
     }
 }
 
