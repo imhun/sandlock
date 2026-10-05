@@ -565,6 +565,13 @@ sandlock_builder_t *sandlock_sandbox_builder_notify_rate_limit(sandlock_builder_
  * # Safety
  * `b` must be a valid builder pointer.
  */
+sandlock_builder_t *sandlock_sandbox_builder_notify_rate_limit_stat(sandlock_builder_t *b,
+                                                                    uint32_t per_sec);
+
+/**
+ * # Safety
+ * `b` must be a valid builder pointer.
+ */
 sandlock_builder_t *sandlock_sandbox_builder_num_cpus(sandlock_builder_t *b, uint32_t n);
 
 /**

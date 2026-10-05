@@ -114,7 +114,14 @@ fn procfs_hosts_notif_syscalls() -> Vec<i64> {
     v
 }
 
-/// Syscalls gated by the PID-namespace `/proc` stat-family denial.
+/// The metadata ("stat") family: the syscalls that only *read* a path's or a
+/// file's metadata.
+///
+/// One list, two users. `pid_ns_procfs_stat_syscalls` puts these on the notif
+/// table (the `/proc` stat-family denial), and the supervisor's notification
+/// budget classifies by them so a metadata-heavy workload does not spend the
+/// general notification budget (N79). Deriving both from this function is what
+/// keeps "a stat" meaning the same thing to the budget and to the table.
 ///
 /// In a PID-namespace sandbox the shared host `/proc` mount resolves a
 /// numeric `/proc/<n>/…` path against host pid `n`, but the sandbox only
@@ -124,7 +131,7 @@ fn procfs_hosts_notif_syscalls() -> Vec<i64> {
 /// `procfs::handle_proc_stat_family`, so its syscalls must be on the notif
 /// list whenever `pid_ns` is enabled, or the kernel would `RET_ALLOW` them
 /// past the handler.
-pub(crate) fn pid_ns_procfs_stat_syscalls() -> Vec<i64> {
+pub(crate) fn stat_family_syscalls() -> Vec<i64> {
     let mut v = vec![
         libc::SYS_newfstatat,
         libc::SYS_statx,
@@ -143,6 +150,11 @@ pub(crate) fn pid_ns_procfs_stat_syscalls() -> Vec<i64> {
         .flatten(),
     );
     v
+}
+
+/// The stat family, as gated by the PID-namespace `/proc` denial.
+pub(crate) fn pid_ns_procfs_stat_syscalls() -> Vec<i64> {
+    stat_family_syscalls()
 }
 
 // Netlink virtualization (always on):

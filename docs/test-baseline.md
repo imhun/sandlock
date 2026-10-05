@@ -277,7 +277,13 @@
 # Environment note for the root phases: `test-all.sh` passes `--offline`, and
 # the repo-local cargo cache is missing `aho-corasick`, so the first
 # `--oci-root` run on a fresh machine has to warm the cache outside the script.
-core_lib = 927 # 2026-10-05: 925 -> 927, +2 for the reach-spelling tests
+core_lib = 932 # 2026-10-05: 927 -> 932, +5 for the notification-budget tests
+               # (`the_stat_family_is_the_pinned_list`,
+               # `a_stat_burst_does_not_spend_the_general_budget`,
+               # `the_stat_window_still_throttles_a_flood`,
+               # `without_a_stat_budget_every_notification_shares_one_window`,
+               # `a_zero_limit_never_throttles`) that pin N79's split budget.
+               # 2026-10-05: 925 -> 927, +2 for the reach-spelling tests
                # (`a_root_written_with_dotdot_still_covers_the_resolved_fd_path`,
                # `the_mount_arm_tests_the_child_spelling_and_the_roots_the_host_one`)
                # that pin the supervise-restore fix in `7f993ba`.
@@ -1185,7 +1191,11 @@ oci = 157     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root.
               # 56 lib + 68 bin + 15 integration.rs + 2 reaper + 3 process
               # groups = 144).
 cli_build = 0 # workspace release build gate (no test binaries; 0 = build passed)
-python = 465  # F19/SL-13 (2026-09-14): 464 -> 465, +1 in
+python = 466  # 2026-10-05: 465 -> 466, +1 in tests/test_sandbox.py
+              # (test_notify_rate_limit_stat_is_declared_handled: N79's field is
+              # registered in `_HANDLED_FIELDS`, so it is not reported as an
+              # unwired policy field).
+              # F19/SL-13 (2026-09-14): 464 -> 465, +1 in
               # tests/test_supervise_channel.py
               # (test_a_served_refusal_is_typed_and_carries_its_stable_code:
               # a real slot's served `ok:false` surfaces as SlotRefusal with

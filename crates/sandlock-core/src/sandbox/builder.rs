@@ -169,6 +169,13 @@ pub struct SandboxBuilder {
     /// (the sandbox's intercepted syscalls queue in the kernel), bounding
     /// supervisor CPU spent on a notification flood. None = unlimited.
     pub notify_rate_limit: Option<u32>,
+    /// Per-second budget for the stat family only (`newfstatat`/`statx`/
+    /// `faccessat`/`readlinkat` and the legacy spellings). Metadata-heavy work
+    /// (a `find`, a `git status`, a package manager) reaches thousands of
+    /// these per second, so without a separate budget it spends the general
+    /// window in a fraction of a second and then eats a full-window stall.
+    /// None = share `notify_rate_limit` (the behaviour before N79).
+    pub notify_rate_limit_stat: Option<u32>,
 
     #[cfg_attr(feature = "cli", arg(long = "random-seed"))]
     pub random_seed: Option<u64>,
@@ -413,6 +420,7 @@ impl Default for SandboxBuilder {
             max_file_size: None,
             max_cpu: None,
             notify_rate_limit: None,
+            notify_rate_limit_stat: None,
             random_seed: None,
             time_start: None,
             no_randomize_memory: false,
@@ -491,6 +499,7 @@ impl Clone for SandboxBuilder {
             max_file_size: self.max_file_size,
             max_cpu: self.max_cpu,
             notify_rate_limit: self.notify_rate_limit,
+            notify_rate_limit_stat: self.notify_rate_limit_stat,
             random_seed: self.random_seed,
             time_start: self.time_start,
             no_randomize_memory: self.no_randomize_memory,
@@ -838,6 +847,13 @@ impl SandboxBuilder {
     /// Limit seccomp user-notifications processed per second (0 disables).
     pub fn notify_rate_limit(mut self, per_sec: u32) -> Self {
         self.notify_rate_limit = if per_sec == 0 { None } else { Some(per_sec) };
+        self
+    }
+
+    /// Give the stat family its own per-second notification budget (N79).
+    /// 0 shares the general `notify_rate_limit` window.
+    pub fn notify_rate_limit_stat(mut self, per_sec: u32) -> Self {
+        self.notify_rate_limit_stat = if per_sec == 0 { None } else { Some(per_sec) };
         self
     }
 
@@ -1428,6 +1444,7 @@ impl SandboxBuilder {
             max_file_size: self.max_file_size,
             max_cpu: self.max_cpu,
             notify_rate_limit: self.notify_rate_limit,
+            notify_rate_limit_stat: self.notify_rate_limit_stat,
             random_seed: self.random_seed,
             time_start: self.time_start,
             no_randomize_memory: self.no_randomize_memory,

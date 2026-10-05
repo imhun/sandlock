@@ -413,6 +413,20 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_notify_rate_limit(
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_notify_rate_limit_stat(
+    b: *mut SandboxBuilder,
+    per_sec: u32,
+) -> *mut SandboxBuilder {
+    if b.is_null() {
+        return b;
+    }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.notify_rate_limit_stat(per_sec)))
+}
+
+/// # Safety
+/// `b` must be a valid builder pointer.
+#[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_num_cpus(
     b: *mut SandboxBuilder,
     n: u32,

@@ -948,6 +948,17 @@ class TestUnwiredFieldWarning:
             _policy(notify_rate_limit=1000).run(["echo", "ok"])
         assert [str(x.message) for x in w if "notify_rate_limit" in str(x.message)] == []
 
+    def test_notify_rate_limit_stat_is_declared_handled(self):
+        """`notify_rate_limit_stat` 经 FFI 生效，不得被当成未接线字段。"""
+        import warnings
+        assert "notify_rate_limit_stat" in _NativePolicy._HANDLED_FIELDS
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _policy(notify_rate_limit_stat=20000).run(["echo", "ok"])
+        assert [
+            str(x.message) for x in w if "notify_rate_limit_stat" in str(x.message)
+        ] == []
+
 
 class TestDiskQuota:
     """Tests for max_disk quota enforcement via seccomp COW.

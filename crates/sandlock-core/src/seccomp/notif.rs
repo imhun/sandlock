@@ -2663,6 +2663,99 @@ async fn handle_notification(
 // Main supervisor loop
 // ============================================================
 
+/// One second's worth of admissions for one notification class.
+///
+/// The window is lazy: it advances when a notification arrives more than a
+/// second after the window started. Going over the budget returns the duration
+/// to sleep *before* this notification may be processed; the caller awaits it,
+/// which leaves the over-budget syscalls queued in the kernel and holds the
+/// class at its per-second ceiling. Returning the wait instead of sleeping
+/// inside keeps the arithmetic testable without a clock.
+pub(crate) struct WindowBudget {
+    limit: u32,
+    start: std::time::Instant,
+    count: u32,
+}
+
+impl WindowBudget {
+    pub(crate) fn new(limit: u32, start: std::time::Instant) -> Self {
+        Self {
+            limit,
+            start,
+            count: 0,
+        }
+    }
+
+    /// Count one admission at `now`; returns the sleep it owes, if any.
+    /// A limit of 0 means "no limit" and never owes anything.
+    pub(crate) fn admit(&mut self, now: std::time::Instant) -> std::time::Duration {
+        if self.limit == 0 {
+            return std::time::Duration::ZERO;
+        }
+        if now.saturating_duration_since(self.start) >= std::time::Duration::from_secs(1) {
+            self.start = now;
+            self.count = 0;
+        }
+        self.count += 1;
+        if self.count <= self.limit {
+            return std::time::Duration::ZERO;
+        }
+        let wait = std::time::Duration::from_secs(1)
+            .saturating_sub(now.saturating_duration_since(self.start));
+        // The window restarts *after* the sleep, exactly as the single-window
+        // version did: `now + wait` is the instant the caller wakes up.
+        self.start = now + wait;
+        self.count = 0;
+        wait
+    }
+}
+
+/// The per-sandbox notification budget, split by class.
+///
+/// With no separate stat budget (`stat_limit == 0`, the default) every
+/// notification shares one window — byte-identical to the single-window
+/// behaviour this replaced. With one, the stat family gets its own window and
+/// the general window only counts everything else, so a metadata-heavy
+/// workload (`find`, `git status`, a package manager) cannot spend the budget
+/// that bounds the genuinely expensive notifications.
+pub(crate) struct NotifyBudget {
+    general: WindowBudget,
+    stat: Option<WindowBudget>,
+    stat_class: HashSet<i64>,
+}
+
+impl NotifyBudget {
+    pub(crate) fn new(general_limit: u32, stat_limit: u32, start: std::time::Instant) -> Self {
+        let stat = if stat_limit > 0 {
+            Some(WindowBudget::new(stat_limit, start))
+        } else {
+            None
+        };
+        let stat_class = if stat.is_some() {
+            crate::seccomp_plan::stat_family_syscalls()
+                .into_iter()
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        Self {
+            general: WindowBudget::new(general_limit, start),
+            stat,
+            stat_class,
+        }
+    }
+
+    /// Classify by syscall number, never by shape: the stat family is on the
+    /// notify table for the chroot shape as well as the pid-namespace one, so
+    /// the class must not depend on `pid_ns` being on.
+    pub(crate) fn admit(&mut self, nr: i64, now: std::time::Instant) -> std::time::Duration {
+        match self.stat.as_mut() {
+            Some(window) if self.stat_class.contains(&nr) => window.admit(now),
+            _ => self.general.admit(now),
+        }
+    }
+}
+
 /// Async event loop that processes seccomp notifications.
 ///
 /// Runs until the notification fd is closed (child exits or filter is removed).
@@ -2676,6 +2769,7 @@ pub async fn supervisor(
     pending_handlers: Vec<(i64, std::sync::Arc<dyn super::dispatch::Handler>)>,
     startup: tokio::sync::oneshot::Sender<io::Result<()>>,
     notify_rate_limit: Option<u32>,
+    notify_rate_limit_stat: Option<u32>,
 ) {
     // Register the notif fd with the Tokio IO driver so we can wait for
     // readiness via epoll instead of a dedicated blocking thread.
@@ -2740,14 +2834,17 @@ pub async fn supervisor(
     // processes.
     let defer_sem = Arc::new(tokio::sync::Semaphore::new(DEFER_MAX_INFLIGHT));
 
-    // Per-sandbox notification rate cap. When the window budget is exceeded
-    // the supervisor sleeps out the remainder of the second instead of
-    // draining the kernel queue at full speed; intercepted syscalls queue in
-    // the kernel (or the sandbox blocks), so a flood cannot pin the
+    // Per-sandbox notification rate cap, split into a general window and (when
+    // a stat budget is configured) a stat-family window. When a class's budget
+    // is exceeded the supervisor sleeps out the remainder of that window
+    // instead of draining the kernel queue at full speed; intercepted syscalls
+    // queue in the kernel (or the sandbox blocks), so a flood cannot pin the
     // supervisor's CPU or memory.
-    let rate_limit = notify_rate_limit.unwrap_or(0);
-    let mut rate_window_start = std::time::Instant::now();
-    let mut rate_window_count: u32 = 0;
+    let mut budget = NotifyBudget::new(
+        notify_rate_limit.unwrap_or(0),
+        notify_rate_limit_stat.unwrap_or(0),
+        std::time::Instant::now(),
+    );
 
     // Edge-triggered drain: each `readable().await` returns once per
     // epoll edge, then we drain the kernel queue via `probe_notif_fd`
@@ -2788,26 +2885,10 @@ pub async fn supervisor(
                         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
                         Err(_) => break 'outer,
                     };
-                    if rate_limit > 0 {
-                        let now = std::time::Instant::now();
-                        if now.duration_since(rate_window_start)
-                            >= std::time::Duration::from_secs(1)
-                        {
-                            rate_window_start = now;
-                            rate_window_count = 0;
-                        }
-                        rate_window_count += 1;
-                        if rate_window_count > rate_limit {
-                            let elapsed =
-                                now.saturating_duration_since(rate_window_start);
-                            let wait = std::time::Duration::from_secs(1)
-                                .saturating_sub(elapsed);
-                            if !wait.is_zero() {
-                                tokio::time::sleep(wait).await;
-                            }
-                            rate_window_start = std::time::Instant::now();
-                            rate_window_count = 0;
-                        }
+                    let wait =
+                        budget.admit(notif.data.nr as i64, std::time::Instant::now());
+                    if !wait.is_zero() {
+                        tokio::time::sleep(wait).await;
                     }
                     handle_notification(notif, &ctx, &dispatch_table, fd, &defer_sem).await;
                 }
@@ -3606,5 +3687,115 @@ mod tests {
         };
         assert!(!policy.allows("8.8.8.8".parse().unwrap(), 443));
         assert!(policy.denies_everything());
+    }
+
+    // ---- notification budget (N79) ----
+
+    /// The stat class is pinned: both the budget's membership and the pid-ns
+    /// table must come from this one list, or "a stat" would mean two things.
+    #[test]
+    fn the_stat_family_is_the_pinned_list() {
+        let mut want = vec![
+            libc::SYS_newfstatat,
+            libc::SYS_statx,
+            libc::SYS_faccessat,
+            arch::SYS_FACCESSAT2,
+            libc::SYS_readlinkat,
+        ];
+        want.extend(
+            [
+                arch::sys_stat(),
+                arch::sys_lstat(),
+                arch::sys_access(),
+                arch::sys_readlink(),
+            ]
+            .into_iter()
+            .flatten(),
+        );
+        assert_eq!(crate::seccomp_plan::stat_family_syscalls(), want);
+        assert_eq!(crate::seccomp_plan::pid_ns_procfs_stat_syscalls(), want);
+    }
+
+    /// A stat burst must not spend the general budget.
+    #[test]
+    fn a_stat_burst_does_not_spend_the_general_budget() {
+        let t0 = std::time::Instant::now();
+        // General 2/s, stat 100/s.
+        let mut budget = NotifyBudget::new(2, 100, t0);
+        let stat = crate::seccomp_plan::stat_family_syscalls()[0];
+        // Three stats: free, because the stat window holds 100.
+        for ms in 0u64..3 {
+            assert_eq!(
+                budget.admit(stat, t0 + std::time::Duration::from_millis(ms)),
+                std::time::Duration::ZERO,
+            );
+        }
+        // Two non-stats are still free: the general window is untouched at
+        // 2/s. If the stats had shared it, the first would already be over.
+        for ms in 3u64..5 {
+            assert_eq!(
+                budget.admit(libc::SYS_getpid, t0 + std::time::Duration::from_millis(ms)),
+                std::time::Duration::ZERO,
+            );
+        }
+        // The third is over budget and sleeps out the rest of the second.
+        assert_eq!(
+            budget.admit(libc::SYS_getpid, t0 + std::time::Duration::from_millis(5)),
+            std::time::Duration::from_millis(995),
+        );
+    }
+
+    /// A separate budget is still a ceiling: the stat window throttles a flood.
+    #[test]
+    fn the_stat_window_still_throttles_a_flood() {
+        let t0 = std::time::Instant::now();
+        let mut budget = NotifyBudget::new(1000, 2, t0);
+        let stat = crate::seccomp_plan::stat_family_syscalls()[0];
+        assert_eq!(budget.admit(stat, t0), std::time::Duration::ZERO);
+        assert_eq!(
+            budget.admit(stat, t0 + std::time::Duration::from_millis(1)),
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(
+            budget.admit(stat, t0 + std::time::Duration::from_millis(2)),
+            std::time::Duration::from_millis(998),
+        );
+        // ...and the general window did not pay for the stat flood.
+        assert_eq!(
+            budget.admit(libc::SYS_getpid, t0 + std::time::Duration::from_millis(3)),
+            std::time::Duration::ZERO,
+        );
+    }
+
+    /// No stat budget => one shared window, which is exactly the behaviour
+    /// this replaced (the new field is opt-in, so rollback is a config change).
+    #[test]
+    fn without_a_stat_budget_every_notification_shares_one_window() {
+        let t0 = std::time::Instant::now();
+        let mut budget = NotifyBudget::new(2, 0, t0);
+        let stat = crate::seccomp_plan::stat_family_syscalls()[0];
+        assert_eq!(budget.admit(stat, t0), std::time::Duration::ZERO);
+        assert_eq!(
+            budget.admit(stat, t0 + std::time::Duration::from_millis(1)),
+            std::time::Duration::ZERO,
+        );
+        // The two stats spent the shared budget, so the next arrival pays.
+        assert_eq!(
+            budget.admit(libc::SYS_getpid, t0 + std::time::Duration::from_millis(2)),
+            std::time::Duration::from_millis(998),
+        );
+    }
+
+    /// A limit of 0 is "no limit" (the existing convention), not "one".
+    #[test]
+    fn a_zero_limit_never_throttles() {
+        let t0 = std::time::Instant::now();
+        let mut budget = NotifyBudget::new(0, 0, t0);
+        for ms in 0u64..5 {
+            assert_eq!(
+                budget.admit(libc::SYS_getpid, t0 + std::time::Duration::from_millis(ms)),
+                std::time::Duration::ZERO,
+            );
+        }
     }
 }
