@@ -103,6 +103,46 @@ pub enum InstancePhase {
     Dead,
 }
 
+/// How a restored child ended, for the FUP-30 trace: read `/proc/<pid>/stat`
+/// until the child is a zombie (its `exit_code` field is the raw wait status --
+/// exit code in the high byte, or the signal in the low seven bits) or gone
+/// (init reaped it first), bounded at one second.
+///
+/// The field restore that motivated this (k0s acceptance, 2026-10-05) died
+/// inside that window and left no trace anywhere: its stdout/stderr were pipes
+/// the fd plan had skipped, so a Python traceback had no descriptor to land on.
+fn describe_child_fate(pid: i32) -> String {
+    for _ in 0..10 {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                // Everything after the last `)` is: state ppid pgrp ... with the
+                // kernel's field numbering starting at 3.
+                let body = stat.rsplit(')').next().unwrap_or("").trim().to_string();
+                let mut fields = body.split_whitespace();
+                let state = fields.next().unwrap_or("?").to_string();
+                if state == "Z" {
+                    // Field 52 (exit_code) = the 50th token of `body`.
+                    let raw = fields.nth(48).unwrap_or("-");
+                    let how = raw
+                        .parse::<u32>()
+                        .map(|status| {
+                            if status & 0x7f == 0 {
+                                format!("exit({})", status >> 8)
+                            } else {
+                                format!("signal({})", status & 0x7f)
+                            }
+                        })
+                        .unwrap_or_else(|_| raw.to_string());
+                    return format!("zombie {how}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(_) => return "gone (reaped before its status could be read)".to_string(),
+        }
+    }
+    "still alive after 1s".to_string()
+}
+
 /// M0 instance stats snapshot (fork-plan F2.3; the §5.6 subset expressible
 /// with one direct child).
 ///
@@ -1466,6 +1506,24 @@ impl SandboxInstance {
             crate::checkpoint::resume::note(&format!(
                 "child alive 50ms after the handshake: {alive}"
             ));
+            // FUP-30, second lens: **how** it went, not just whether it was
+            // there at +50 ms. A field restore of a CPython workload (k0s
+            // acceptance, 2026-10-05) was alive at +50 ms and gone before the
+            // next one-second sample, and nothing recorded the exit: the fd plan
+            // had skipped its stdio (pipes), so a traceback had nowhere to land.
+            // `/proc/<pid>/stat` still carries the raw wait status while the
+            // child is a zombie, whoever ends up reaping it. The poll is bounded
+            // at 1 s and stops as soon as the child is a zombie, so it costs a
+            // second of trace-mode latency only in the normal (still running)
+            // case -- and trace mode is already a debugging posture.
+            if !alive {
+                crate::checkpoint::resume::note(&format!("child {pid} fate: unreachable"));
+            } else {
+                crate::checkpoint::resume::note(&format!(
+                    "child {pid} fate: {}",
+                    describe_child_fate(pid)
+                ));
+            }
         }
         Ok(ExecHandle {
             child_id,

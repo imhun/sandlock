@@ -756,6 +756,111 @@ async fn test_a_child_restored_into_a_session_keeps_the_session_executable() {
     let _ = std::fs::remove_dir_all(&workdir);
 }
 
+/// The shape the k0s checkpoint acceptance actually restores: a **CPython**
+/// workload in a session, resumed into a fresh session after the worker that
+/// held it was replaced.
+///
+/// The fork's restore tests cover a freestanding static counter and a glibc
+/// program; `python3 -u tick.py` is neither. In the field (2026-10-05) the
+/// restored process was alive 50 ms after the handshake and gone before the next
+/// five-second sample, and the session never ticked again. This pins the shape
+/// here, where the restored child's exit status is readable.
+#[tokio::test]
+async fn test_a_restored_cpython_workload_keeps_ticking() {
+    const TICKER: &str = r#"
+import os, sys, time
+counter = sys.argv[1]
+with open(counter + ".boot", "w") as fh:
+    fh.write("pid=%d\n" % os.getpid())
+n = 0
+while True:
+    n += 1
+    tmp = counter + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(str(n))
+    os.replace(tmp, counter)
+    time.sleep(0.2)
+"#;
+    let workdir = std::env::temp_dir().join(format!(
+        "sandlock-cpython-restore-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&workdir);
+    std::fs::create_dir_all(&workdir).unwrap();
+    let script = workdir.join("tick.py");
+    std::fs::write(&script, TICKER).unwrap();
+    let counter = workdir.join("tick");
+    let script_s = script.to_str().unwrap().to_string();
+    let counter_s = counter.to_str().unwrap().to_string();
+    let read_counter = || {
+        std::fs::read_to_string(&counter)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+
+    let policy = base_policy()
+        .fs_read(&workdir)
+        .fs_write(&workdir)
+        .build()
+        .unwrap();
+
+    let mut src = SandboxInstance::launch_exec(
+        policy.clone().with_name("cpython-src"),
+        &["python3", "-u", script_s.as_str(), counter_s.as_str()],
+    )
+    .await
+    .expect("launch the CPython session");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !read_counter().is_some_and(|v| v >= 3) {
+        assert!(
+            Instant::now() < deadline,
+            "the ticker must run before the capture"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let cp = src.checkpoint().await.expect("checkpoint the CPython session");
+    let _ = src.shutdown().await;
+    std::fs::write(&counter, b"0\n").unwrap();
+
+    let mut dst = SandboxInstance::launch_exec(
+        policy.clone().with_name("cpython-dst"),
+        &["sh", "-c", "exec sleep 30"],
+    )
+    .await
+    .expect("launch the destination session");
+    let restored = bounded(
+        60,
+        "restore the CPython image",
+        dst.restore_into_session(&cp),
+    )
+    .await
+    .expect("restore the CPython image into the session");
+
+    let mut advanced = false;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if read_counter().is_some_and(|v| v > 0) {
+            advanced = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !advanced {
+        // The datum the field could not give: did the restored child die, and of
+        // what? (`wait_child` reports the session's view of its exit.)
+        match tokio::time::timeout(Duration::from_secs(10), dst.wait_child(restored.child_id))
+            .await
+        {
+            Ok(Ok(status)) => panic!("the restored CPython child exited: {status:?}"),
+            Ok(Err(e)) => panic!("the restored CPython child could not be waited for: {e}"),
+            Err(_) => panic!("the restored CPython child is still running but not ticking"),
+        }
+    }
+    let _ = dst.kill_child(restored.child_id, libc::SIGKILL);
+    let _ = dst.shutdown().await;
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
 /// The reason `checkpoint_excluding_main` exists: a **pooled** session's main
 /// child is a park, so its workload is the single child beside it.
 ///
