@@ -571,13 +571,19 @@ pub(crate) fn build_dispatch_table(
     // ------------------------------------------------------------------
     // PID-namespace stat-family gate. Registered with the /proc handlers
     // (before chroot/COW) so a numeric `/proc/<ns_pid>/…` path is denied
-    // with EACCES before any later handler — or the kernel — can resolve
-    // it against host pid n. Only active for pid_ns sandboxes; the BPF
-    // notif list is extended by `pid_ns_procfs_stat_syscalls` at the same
-    // time.
+    // with EACCES before any later handler — or the kernel — can resolve it
+    // against host pid n.
+    //
+    // N81: only where the kernel would actually answer for something that is
+    // not the sandbox's own (`stat_metadata_mediated`). With a rootfs of its
+    // own the sandbox's `/proc` is an empty directory of that root, so the
+    // numeric spelling has nothing to collide with and the whole family stays
+    // out of the notify table -- which is what takes `stat` from ~26 us back
+    // to the bare kernel cost. The predicate is computed in
+    // `resolved::stat_metadata_mediated`; no shape is left unguarded by it.
     // ------------------------------------------------------------------
-    if policy.pid_ns.is_some() {
-        for nr in crate::seccomp_plan::pid_ns_procfs_stat_syscalls() {
+    if policy.stat_metadata_mediated && policy.pid_ns.is_some() {
+        for nr in crate::seccomp_plan::stat_family_syscalls() {
             let policy_for_stat = Arc::clone(policy);
             let __sup = Arc::clone(ctx);
             table.register(nr, move |cx: &HandlerCtx| {
@@ -1173,33 +1179,38 @@ fn register_chroot_handlers(
         });
     }
 
-    // stat family
-    for &nr in &[
-        libc::SYS_newfstatat,
-        libc::SYS_faccessat,
-        arch::SYS_FACCESSAT2,
-    ] {
-        table.register(nr, chroot_handler!(policy,
-            crate::chroot::dispatch::handle_chroot_stat));
-    }
+    // stat family / legacy stat / statx. N81: only where
+    // `stat_metadata_mediated` says the kernel would answer for something that
+    // is not the sandbox's own tree; with a rootfs of its own these handlers
+    // only ever rewrote the kernel's own answer, at the price of a round trip
+    // each (measured 26 us per `stat`). `readlinkat` is a *serving* handler and
+    // stays registered below.
+    if policy.stat_metadata_mediated {
+        for &nr in &[
+            libc::SYS_newfstatat,
+            libc::SYS_faccessat,
+            arch::SYS_FACCESSAT2,
+        ] {
+            table.register(nr, chroot_handler!(policy,
+                crate::chroot::dispatch::handle_chroot_stat));
+        }
 
-    // Legacy stat
-    if let Some(nr) = arch::sys_stat() {
-        table.register(nr, chroot_handler!(policy,
-            crate::chroot::dispatch::handle_chroot_legacy_stat));
-    }
-    if let Some(nr) = arch::sys_lstat() {
-        table.register(nr, chroot_handler!(policy,
-            crate::chroot::dispatch::handle_chroot_legacy_lstat));
-    }
-    if let Some(nr) = arch::sys_access() {
-        table.register(nr, chroot_handler!(policy,
-            crate::chroot::dispatch::handle_chroot_legacy_access));
-    }
+        if let Some(nr) = arch::sys_stat() {
+            table.register(nr, chroot_handler!(policy,
+                crate::chroot::dispatch::handle_chroot_legacy_stat));
+        }
+        if let Some(nr) = arch::sys_lstat() {
+            table.register(nr, chroot_handler!(policy,
+                crate::chroot::dispatch::handle_chroot_legacy_lstat));
+        }
+        if let Some(nr) = arch::sys_access() {
+            table.register(nr, chroot_handler!(policy,
+                crate::chroot::dispatch::handle_chroot_legacy_access));
+        }
 
-    // statx
-    table.register(libc::SYS_statx, chroot_handler!(policy,
-        crate::chroot::dispatch::handle_chroot_statx));
+        table.register(libc::SYS_statx, chroot_handler!(policy,
+            crate::chroot::dispatch::handle_chroot_statx));
+    }
 
     // readlink
     table.register(libc::SYS_readlinkat, chroot_handler!(policy,
@@ -1415,6 +1426,7 @@ mod handler_tests {
             processes: Arc::new(ProcessIndex::new()),
             policy: Arc::new(NotifPolicy {
                 max_memory_bytes: 0,
+                stat_metadata_mediated: true,
                 disk_stats_path: None,
                 max_processes: 0,
                 has_memory_limit: false,

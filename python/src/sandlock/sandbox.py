@@ -420,13 +420,6 @@ class Sandbox:
     the kernel queue, bounding supervisor CPU spent on a notification
     flood."""
 
-    notify_rate_limit_stat: int | None = None
-    """Per-second notification budget for the stat family alone
-    (``newfstatat``/``statx``/``faccessat``/``readlinkat`` and the legacy
-    spellings).  Metadata-heavy work reaches thousands of these per second,
-    so without a separate budget it spends ``notify_rate_limit`` in a
-    fraction of a second.  None = share ``notify_rate_limit`` (N79)."""
-
     cpu_cores: Sequence[int] | None = None
     """CPU cores to pin the sandbox to.  When set, sched_setaffinity()
     is called in the child to restrict it to the specified cores.

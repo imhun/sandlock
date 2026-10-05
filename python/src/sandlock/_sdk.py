@@ -188,9 +188,6 @@ _b_max_cpu = _builder_fn("sandlock_sandbox_builder_max_cpu", ctypes.c_uint8)
 _b_notify_rate_limit = _builder_fn(
     "sandlock_sandbox_builder_notify_rate_limit", ctypes.c_uint32
 )
-_b_notify_rate_limit_stat = _builder_fn(
-    "sandlock_sandbox_builder_notify_rate_limit_stat", ctypes.c_uint32
-)
 _b_num_cpus = _builder_fn("sandlock_sandbox_builder_num_cpus", ctypes.c_uint32)
 _b_net_allow = _builder_fn("sandlock_sandbox_builder_net_allow", ctypes.c_char_p)
 _b_net_deny = _builder_fn("sandlock_sandbox_builder_net_deny", ctypes.c_char_p)
@@ -1363,7 +1360,6 @@ class _NativePolicy:
         "http_inject_ca", "http_ca_out", "http_inject", "host_mask",
         "egress_proxy", "uid", "gid",
         "notify_rate_limit",
-        "notify_rate_limit_stat",
         "random_seed", "time_start", "clean_env", "env",
         "extra_deny_syscalls", "extra_allow_syscalls", "max_open_files",
         "max_file_size",
@@ -1438,8 +1434,6 @@ class _NativePolicy:
             b = _b_max_cpu(b, policy.max_cpu)
         if policy.notify_rate_limit is not None:
             b = _b_notify_rate_limit(b, policy.notify_rate_limit)
-        if policy.notify_rate_limit_stat is not None:
-            b = _b_notify_rate_limit_stat(b, policy.notify_rate_limit_stat)
         if policy.num_cpus is not None:
             b = _b_num_cpus(b, policy.num_cpus)
         if policy.cpu_cores is not None:

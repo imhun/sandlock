@@ -277,7 +277,11 @@
 # Environment note for the root phases: `test-all.sh` passes `--offline`, and
 # the repo-local cargo cache is missing `aho-corasick`, so the first
 # `--oci-root` run on a fresh machine has to warm the cache outside the script.
-core_lib = 932 # 2026-10-05: 927 -> 932, +5 for the notification-budget tests
+core_lib = 934 # 2026-10-06: 932 -> 934, N81 net +2: +4 shape-gate tests in
+               # `seccomp_plan` (own root / identity root / no root / policy
+               # mount at /proc, which is where the gate predicate is pinned),
+               # -2 retired with N79's class budget in `seccomp::notif`.
+               # 2026-10-05: 927 -> 932, +5 for the notification-budget tests
                # (`the_stat_family_is_the_pinned_list`,
                # `a_stat_burst_does_not_spend_the_general_budget`,
                # `the_stat_window_still_throttles_a_flood`,
@@ -1191,10 +1195,9 @@ oci = 157     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root.
               # 56 lib + 68 bin + 15 integration.rs + 2 reaper + 3 process
               # groups = 144).
 cli_build = 0 # workspace release build gate (no test binaries; 0 = build passed)
-python = 466  # 2026-10-05: 465 -> 466, +1 in tests/test_sandbox.py
-              # (test_notify_rate_limit_stat_is_declared_handled: N79's field is
-              # registered in `_HANDLED_FIELDS`, so it is not reported as an
-              # unwired policy field).
+python = 465  # 2026-10-06: 466 -> 465 -- N79's `notify_rate_limit_stat` retired
+              # (N81 superseded it: the stat family leaves the notify table),
+              # so its wiring test went with the field.
               # F19/SL-13 (2026-09-14): 464 -> 465, +1 in
               # tests/test_supervise_channel.py
               # (test_a_served_refusal_is_typed_and_carries_its_stable_code:

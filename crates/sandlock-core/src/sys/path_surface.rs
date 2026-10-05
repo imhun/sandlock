@@ -78,10 +78,6 @@ pub(crate) const MEDIATED_PATH_SYSCALLS: &[&str] = &[
     "fchmodat2",
     "fchownat",
     "truncate",
-    "newfstatat",
-    "statx",
-    "faccessat",
-    "faccessat2",
     "readlinkat",
     "getdents64",
     "chdir",
@@ -99,9 +95,6 @@ pub(crate) const MEDIATED_PATH_SYSCALLS: &[&str] = &[
     "removexattr",
     "lremovexattr",
     "open",
-    "stat",
-    "lstat",
-    "access",
     "readlink",
     "getdents",
     "unlink",
@@ -129,9 +122,6 @@ pub(crate) const MEDIATED_PATH_SYSCALLS: &[&str] = &[
 /// out of the plan or is spelled wrong fails on the ABI it belongs to.
 pub(crate) const MEDIATED_PATH_SYSCALLS_PER_ABI: &[(&str, fn() -> Option<i64>)] = &[
     ("open", crate::arch::sys_open),
-    ("stat", crate::arch::sys_stat),
-    ("lstat", crate::arch::sys_lstat),
-    ("access", crate::arch::sys_access),
     ("readlink", crate::arch::sys_readlink),
     ("getdents", crate::arch::sys_getdents),
     ("unlink", crate::arch::sys_unlink),
@@ -251,6 +241,69 @@ pub(crate) const UNMEDIATED_PATH_TAKING: &[(&str, Disposition)] = &[
             "resolves in the mqueue filesystem like mq_open, which the worker does not mount",
         ),
     ),
+    // ---- the stat family's metadata half (N81, 2026-10-06) ----------------
+    // It was mediated for one reason: `stat` is metadata, Landlock has no
+    // access right for it, and the mediator's answer was the only thing that
+    // could refuse a path outside the readable set. With a root of the
+    // sandbox's own whose `/proc` is a plain directory of that root (every
+    // deployed shape since N14 S5) there is nothing left to refuse: the kernel
+    // resolves inside the sandbox's own tree, `/proc/<host pid>` collides with
+    // nothing, and Landlock still gates the opens that tree leads to.
+    //
+    // Measured 2026-10-06 (`deploy/scripts/acceptance/probe_n81_proc_stat_shape.py`):
+    // `stat /proc` and `stat /` share a `st_dev`, and `/proc/uptime`,
+    // `/proc/version`, `/proc/meminfo`, `/proc/cpuinfo` answer ENOENT *from the
+    // kernel* (they are non-numeric, so the mediator already `Continue`d them --
+    // that answer is the kernel's, and it proves the kernel sees an empty
+    // directory). Where the premise fails the family goes straight back on the
+    // notify list: `resolved::stat_metadata_mediated` is the predicate, and
+    // `seccomp_plan`'s tests pin all four shapes (own root / identity root /
+    // no root / a policy mount at `/proc`).
+    //
+    // `readlinkat` deliberately stays mediated: it *serves* `/proc/self/exe`
+    // and `/proc/self/fd/N` from the host procfs on the child's behalf.
+    (
+        "newfstatat",
+        Disposition::Gated(
+            "the sandbox's own rootfs: the kernel answers for its own tree; N81 gate predicate + probe_n81_proc_stat_shape.py",
+        ),
+    ),
+    (
+        "statx",
+        Disposition::Gated(
+            "metadata, same gate as newfstatat (N81): the sandbox's own rootfs answers it",
+        ),
+    ),
+    (
+        "faccessat",
+        Disposition::Gated(
+            "existence probe, same gate as newfstatat (N81): the kernel's own answer",
+        ),
+    ),
+    (
+        "faccessat2",
+        Disposition::Gated(
+            "existence probe, same gate as newfstatat (N81): the kernel's own answer",
+        ),
+    ),
+    (
+        "stat",
+        Disposition::Gated(
+            "metadata, same gate as newfstatat (N81): the sandbox's own rootfs answers it",
+        ),
+    ),
+    (
+        "lstat",
+        Disposition::Gated(
+            "metadata, same gate as newfstatat (N81): the sandbox's own rootfs answers it",
+        ),
+    ),
+    (
+        "access",
+        Disposition::Gated(
+            "existence probe, same gate as newfstatat (N81): the kernel's own answer",
+        ),
+    ),
     // ---- blocked ----------------------------------------------------------
     // The OBS-1 fallthrough: unmediated, resolved against the host root, so a
     // sandbox could chroot into a host-only directory. Blocklisted 2026-09-17;
@@ -267,7 +320,19 @@ pub(crate) const UNMEDIATED_PATH_TAKING: &[(&str, Disposition)] = &[
 /// *outside* this list to resolve on the architecture under test, so a typo in
 /// the ledger still fails -- on the ABI that does have the syscall.
 pub(crate) const UNMEDIATED_PATH_TAKING_ABI_SPECIFIC: &[&str] =
-    &["creat", "mknod", "utime", "utimes", "futimesat", "uselib"];
+    &[
+        "creat",
+        "mknod",
+        "utime",
+        "utimes",
+        "futimesat",
+        "uselib",
+        // The legacy stat spellings: x86_64 has them, the generic-ABI arches
+        // (aarch64, riscv64) do not -- they only have the `*at` forms.
+        "stat",
+        "lstat",
+        "access",
+    ];
 
 /// What confines a path-taking syscall in the **pure** (no-chroot) shape.
 ///

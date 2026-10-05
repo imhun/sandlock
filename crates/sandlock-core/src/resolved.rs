@@ -43,6 +43,8 @@ pub(crate) struct SandboxFeatures {
     pub(crate) virtual_hostname: bool,
     pub(crate) cow: bool,
     pub(crate) chroot: bool,
+    /// The stat family's metadata half still has to reach the mediator (N81).
+    pub(crate) stat_metadata_mediated: bool,
     pub(crate) fs_denies: bool,
     pub(crate) policy_fn: bool,
     pub(crate) port_remap: bool,
@@ -56,6 +58,54 @@ pub(crate) struct SandboxFeatures {
     pub(crate) net_allow_present: bool,
     pub(crate) net_deny: bool,
     pub(crate) pid_ns: bool,
+}
+
+/// Whether the stat family's metadata half still has to reach the mediator.
+///
+/// That half is a gate, not a translation. `stat` is metadata, Landlock has no
+/// access right for it, and so a call on a path outside the readable set would
+/// otherwise reach the host filesystem. The gate is unnecessary exactly when
+/// the kernel can only answer for the sandbox's own tree: a root of its own
+/// whose `/proc` is an ordinary directory of that same root.
+///
+/// Measured 2026-10-06 (`deploy/scripts/acceptance/probe_n81_proc_stat_shape.py`):
+/// with a rootfs of its own, `stat /proc` and `stat /` share a `st_dev`, and
+/// `/proc/uptime` answers ENOENT *from the kernel* -- there is no host pid
+/// space behind it to collide with.
+///
+/// Keep the gate whenever that premise fails:
+///
+/// * no `chroot` at all -- the sandbox's `/proc` is then the container's
+///   procfs, where the numeric-pid collision is real;
+/// * `<root>/proc` sits on another filesystem -- a mount (the identity shape's
+///   `/`) or a bind of something that is not this root;
+/// * a policy mount at or under `/proc`: the child makes those mounts *after*
+///   this check, so only the policy can tell us about them.
+///
+/// The metadata follows symlinks, exactly as the sandbox's own open would.
+fn stat_metadata_mediated(sandbox: &Sandbox) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+
+    let Some(root) = sandbox.chroot.as_ref() else {
+        return true;
+    };
+    if sandbox
+        .fs_mount
+        .iter()
+        .any(|(vp, _)| vp == Path::new("/proc") || vp.starts_with("/proc/"))
+    {
+        return true;
+    }
+    let Ok(root_md) = std::fs::metadata(root) else {
+        // The root is not there (yet): we cannot tell, so keep the gate.
+        return true;
+    };
+    match std::fs::metadata(root.join("proc")) {
+        Ok(proc_md) => !(proc_md.is_dir() && proc_md.dev() == root_md.dev()),
+        // No `/proc` at all: the kernel has nothing there to answer with.
+        Err(_) => false,
+    }
 }
 
 impl SandboxFeatures {
@@ -87,6 +137,7 @@ impl SandboxFeatures {
             virtual_hostname: sandbox_name.is_some(),
             cow: sandbox.workdir.is_some(),
             chroot: sandbox.chroot.is_some(),
+            stat_metadata_mediated: stat_metadata_mediated(sandbox),
             fs_denies: !sandbox.fs_denied.is_empty(),
             policy_fn: sandbox.policy_fn.is_some(),
             port_remap: sandbox.port_remap,

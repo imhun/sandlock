@@ -117,20 +117,18 @@ fn procfs_hosts_notif_syscalls() -> Vec<i64> {
 /// The metadata ("stat") family: the syscalls that only *read* a path's or a
 /// file's metadata.
 ///
-/// One list, two users. `pid_ns_procfs_stat_syscalls` puts these on the notif
-/// table (the `/proc` stat-family denial), and the supervisor's notification
-/// budget classifies by them so a metadata-heavy workload does not spend the
-/// general notification budget (N79). Deriving both from this function is what
-/// keeps "a stat" meaning the same thing to the budget and to the table.
+/// `readlinkat` and the legacy `readlink` are not metadata in the mediator's
+/// sense -- they are *served* on the child's behalf -- but they share the
+/// argument shape and the `/proc` gate, so they travel in this list and
+/// `build_notif_list` decides who gets it.
 ///
-/// In a PID-namespace sandbox the shared host `/proc` mount resolves a
-/// numeric `/proc/<n>/…` path against host pid `n`, but the sandbox only
-/// knows namespace pids (1, 2, …) — a direct collision leaks host process
-/// metadata. The open and getdents families are virtualized (translated /
-/// renumbered); the stat family is denied outright (EACCES) by
-/// `procfs::handle_proc_stat_family`, so its syscalls must be on the notif
-/// list whenever `pid_ns` is enabled, or the kernel would `RET_ALLOW` them
-/// past the handler.
+/// Since N81 this list is a **gate**, not a translation: it reaches the notify
+/// table only when `stat_metadata_mediated` says the kernel would otherwise
+/// answer for something that is not the sandbox's own (no root of its own, or
+/// a `/proc` that is a separate mount). The shape that originally needed it --
+/// a PID-namespace sandbox whose `/proc` was the host's, so `/proc/<n>` hit
+/// host pid `n` -- is exactly what that predicate still detects and keeps the
+/// gate for; it is simply no longer a shape the deployed roots have.
 pub(crate) fn stat_family_syscalls() -> Vec<i64> {
     let mut v = vec![
         libc::SYS_newfstatat,
@@ -150,11 +148,6 @@ pub(crate) fn stat_family_syscalls() -> Vec<i64> {
         .flatten(),
     );
     v
-}
-
-/// The stat family, as gated by the PID-namespace `/proc` denial.
-pub(crate) fn pid_ns_procfs_stat_syscalls() -> Vec<i64> {
-    stat_family_syscalls()
 }
 
 // Netlink virtualization (always on):
@@ -273,10 +266,17 @@ pub(crate) fn chroot_path_syscalls() -> Vec<i64> {
         arch::SYS_FCHMODAT2,
         libc::SYS_fchownat,
         libc::SYS_truncate,
-        libc::SYS_newfstatat,
-        libc::SYS_statx,
-        libc::SYS_faccessat,
-        arch::SYS_FACCESSAT2,
+        // N81: the *metadata* half of the stat family is deliberately absent
+        // here. It is a gate, not a translation: with a root of the sandbox's
+        // own the kernel resolves the same path inside the sandbox's own tree,
+        // and Landlock already refuses the opens that path could lead to. See
+        // `stat_metadata_mediated` -- the gate comes back for the shapes where
+        // that premise fails (no root at all, or `/proc` as a separate mount),
+        // and it is re-added to this list by `build_notif_list` there.
+        //
+        // `readlinkat` stays: it is a *serving* path (the mediator reads
+        // `/proc/self/exe`, `/proc/self/fd/N` and friends on the child's
+        // behalf from the host procfs, gated per pid), not a deny.
         libc::SYS_readlinkat,
         libc::SYS_getdents64,
         libc::SYS_chdir,
@@ -308,9 +308,6 @@ pub(crate) fn chroot_path_syscalls() -> Vec<i64> {
     v.extend(
         [
             arch::sys_open(),
-            arch::sys_stat(),
-            arch::sys_lstat(),
-            arch::sys_access(),
             arch::sys_readlink(),
             arch::sys_getdents(),
             arch::sys_unlink(),
@@ -539,6 +536,16 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
         nrs.extend(&file_size_limit_syscalls());
     }
 
+    // N81: the stat family is a *gate*, not a translation, so it only needs to
+    // be on the notify table where the kernel would answer for something that
+    // is not the sandbox's own. `stat_metadata_mediated` is that predicate.
+    // Where it is false these syscalls leave the table entirely and the kernel
+    // answers (see the N81 plan; measured by
+    // `deploy/scripts/acceptance/probe_n81_proc_stat_shape.py`).
+    if features.stat_metadata_mediated && (features.chroot || features.pid_ns) {
+        nrs.extend(&stat_family_syscalls());
+    }
+
     // Explicit deny-paths need path-bearing syscalls intercepted.
     if features.fs_denies {
         nrs.extend(&fs_denied_path_syscalls());
@@ -561,12 +568,6 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
         nrs.push_optional(arch::sys_poll());
         nrs.push_optional(arch::sys_epoll_wait());
         nrs.push_optional(arch::sys_accept());
-    }
-
-    // PID-namespace sandbox: numeric /proc/<n>/… stat-family paths must
-    // never reach the kernel (host pid collision); gate them.
-    if features.pid_ns {
-        nrs.extend(&pid_ns_procfs_stat_syscalls());
     }
 
     nrs.finish()
@@ -878,4 +879,78 @@ pub(crate) fn arg_filters_resolved(resolved: &ResolvedSandbox) -> Vec<SockFilter
     }
 
     insns
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    /// Is the stat family's metadata half on the notify list for this policy?
+    fn metadata_gated(policy: &Sandbox) -> bool {
+        let family: BTreeSet<u32> = stat_family_syscalls()
+            .into_iter()
+            .map(|n| n as u32)
+            .collect();
+        let planned: BTreeSet<u32> = notif_syscalls(policy, None).into_iter().collect();
+        family.is_subset(&planned)
+    }
+
+    fn own_root(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("sandlock-n81-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("proc")).unwrap();
+        root
+    }
+
+    /// N81: a root of the sandbox's own, whose `/proc` is a plain directory of
+    /// that same root, is the shape where the kernel answers for the sandbox's
+    /// own tree -- so the stat gate leaves the notify table (that is the whole
+    /// point: 26 us -> the bare kernel cost).
+    #[test]
+    fn an_own_root_with_a_plain_proc_drops_the_stat_gate() {
+        let root = own_root("plain");
+        let policy = Sandbox::builder()
+            .chroot(root.clone())
+            .pid_ns(true)
+            .build()
+            .unwrap();
+        assert!(!metadata_gated(&policy), "gate should be gone for {root:?}");
+    }
+
+    /// The identity root (`chroot("/")`) is the shape the gate exists for: its
+    /// `/proc` is a real mount, so a numeric path would reach the host table.
+    #[test]
+    fn the_identity_root_keeps_the_stat_gate() {
+        let policy = Sandbox::builder()
+            .chroot("/")
+            .pid_ns(true)
+            .build()
+            .unwrap();
+        assert!(metadata_gated(&policy));
+    }
+
+    /// No root at all: the sandbox's `/proc` is the container's procfs. This is
+    /// the E5.1 / library shape, and it keeps today's interception.
+    #[test]
+    fn no_root_at_all_keeps_the_stat_gate() {
+        let policy = Sandbox::builder().pid_ns(true).build().unwrap();
+        assert!(metadata_gated(&policy));
+    }
+
+    /// A policy mount at or under `/proc` is made by the child *after* the
+    /// filesystem check, so the policy alone can keep the gate.
+    #[test]
+    fn a_policy_mount_at_proc_keeps_the_stat_gate() {
+        let root = own_root("mount");
+        let policy = Sandbox::builder()
+            .chroot(root)
+            .pid_ns(true)
+            .fs_mount("/proc", "/etc")
+            .build()
+            .unwrap();
+        assert!(metadata_gated(&policy));
+    }
 }

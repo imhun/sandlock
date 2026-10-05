@@ -622,10 +622,6 @@ pub struct Sandbox {
     /// Max seccomp user-notifications processed per second (see builder).
     #[serde(skip)]
     pub notify_rate_limit: Option<u32>,
-    /// Per-second budget for the stat family alone (see builder); None shares
-    /// the general window.
-    #[serde(skip)]
-    pub notify_rate_limit_stat: Option<u32>,
 
     // Reproducibility
     pub random_seed: Option<u64>,
@@ -845,7 +841,6 @@ impl Clone for Sandbox {
             max_file_size: self.max_file_size,
             max_cpu: self.max_cpu,
             notify_rate_limit: self.notify_rate_limit,
-            notify_rate_limit_stat: self.notify_rate_limit_stat,
             random_seed: self.random_seed,
             time_start: self.time_start,
             no_randomize_memory: self.no_randomize_memory,
@@ -3154,6 +3149,7 @@ impl Sandbox {
             let rt_name = self.rt().name.clone();
             let notif_policy = NotifPolicy {
                 max_memory_bytes: self.max_memory.map(|m| m.0).unwrap_or(0),
+                stat_metadata_mediated: resolved.features.stat_metadata_mediated,
                 disk_stats_path: self.disk_stats_path.clone(),
                 max_processes: self.max_processes,
                 has_memory_limit: resolved.features.memory_limit,
@@ -3432,7 +3428,6 @@ impl Sandbox {
                     handlers,
                     startup_tx,
                     self.notify_rate_limit,
-                    self.notify_rate_limit_stat,
                 ),
             ));
             // Wait for the supervisor to register the notif fd with the IO

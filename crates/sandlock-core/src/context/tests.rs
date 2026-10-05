@@ -143,19 +143,25 @@ fn test_notif_syscalls_sandbox_name_enables_hostname_virtualization() {
     assert!(nrs.contains(&(libc::SYS_openat as u32)));
 }
 
-/// SYS_faccessat2 (439) must be in the notification filter for both
-/// chroot and COW modes; glibc 2.33+ uses it instead of faccessat.
+/// SYS_faccessat2 (439) must be in the notification filter wherever the
+/// mediator is the one answering (glibc 2.33+ uses it instead of faccessat):
+/// the identity root, whose `/proc` is a real mount, and COW mode.
+///
+/// N81 (2026-10-06): a root of the sandbox's own whose `/proc` is a plain
+/// directory of that root deliberately drops the metadata half --
+/// `seccomp_plan::tests` pins all four shapes and the N81 plan carries the
+/// measurement.
 #[test]
 fn test_notif_syscalls_faccessat2() {
-    // Chroot mode
+    // Identity root: `/proc` is a separate mount, so the gate stays.
     let policy = Sandbox::builder()
-        .chroot("/tmp")
+        .chroot("/")
         .build()
         .unwrap();
     let nrs = notif_syscalls(&policy, None);
     assert!(nrs.contains(&(libc::SYS_faccessat as u32)));
     assert!(nrs.contains(&(arch::SYS_FACCESSAT2 as u32)),
-            "chroot notif filter must include SYS_faccessat2 (439)");
+            "the identity-root notif filter must include SYS_faccessat2 (439)");
 
     // COW mode
     let policy = Sandbox::builder()

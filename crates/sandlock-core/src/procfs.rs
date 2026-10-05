@@ -915,8 +915,11 @@ pub(crate) async fn handle_proc_open(
 /// translated to the host pid and serves only the whitelisted read-only
 /// files above).
 ///
-/// Registered only for pid_ns sandboxes; the syscalls are added to the BPF
-/// notif list by [`crate::seccomp_plan::pid_ns_procfs_stat_syscalls`].
+/// Registered only for the shapes where the kernel would answer for something
+/// that is not the sandbox's own tree (`resolved::stat_metadata_mediated`):
+/// no root of its own, or a `/proc` that is a separate mount. The syscalls are
+/// added to the BPF notif list by
+/// [`crate::seccomp_plan::stat_family_syscalls`] under the same predicate.
 pub(crate) async fn handle_proc_stat_family(
     notif: &SeccompNotif,
     processes: &Arc<ProcessIndex>,
