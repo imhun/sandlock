@@ -239,19 +239,39 @@
 #     alone 20/20 green (0.13 s), the deliberately reverted flavor red in
 #     0.13 s with the named message, `core_integ` 570/0 in 89.5 s.
 #
-#     Unrelated reds in the same local runs -- `test_popen_group_killed_on_drop`,
+#     Three more reds in the same local runs -- `test_popen_group_killed_on_drop`,
 #     `test_shutdown_group_sweep_after_compliant_grace_exit`,
-#     `test_max_lifetime_forces_shutdown_with_live_child` -- are the local
-#     runner's missing `--init`: their `kill(pid, 0)` criterion counts a
-#     killed-but-unreaped descendant as alive, and the probe container's PID 1
-#     (`sh`, or a bare `sleep`) reaps nothing. With `--init` the same image and
-#     command is 3/3 green in 0.55 s; `deploy/scripts/fork-gate.sh` (E2B repo)
-#     now passes it.
+#     `test_max_lifetime_forces_shutdown_with_live_child` -- asked the same
+#     question ("the swept descendant is gone") with `kill(pid, 0)`, which counts
+#     a zombie as alive. Diagnosis first: the descendant *is* killed, and what
+#     the assertion measures is who reaps it. In init's shape that was a real
+#     gap and is fixed (fork `3277067`): SL-6 makes init the subreaper of the
+#     subtree it SIGKILLs, so those dead children are its own -- and it used to
+#     `_exit` without waiting for them. It now drains them first, bounded, with
+#     "every group is ESRCH" as the proof of completion (a zombie is still a
+#     group member, and SIGKILL lands asynchronously).
+#
+#     The M0 shape (`popen` / `launch`) has **no init at all** -- verified by
+#     dumping the process tree during a run -- so its orphans go to whoever owns
+#     PID 1 by construction, and no sandbox can reap another process's children
+#     from the outside. A probe container whose PID 1 was a bare `sleep` made
+#     that look like a product bug, and `docker run --init` made it look fixed;
+#     under the canonical gate PID 1 is `dash` running `scripts/test-all.sh`,
+#     whose `wait3(-1)` sweep already reaps adopted orphans, which is why these
+#     three are green there. An attempt to make the supervisor a subreaper was
+#     **reverted** (`b20c0b8`) after `seccomp::state::tests::pgid_entry_survives_leader_exit_with_live_member`
+#     went red: a subreaper takes over reaping for *every* orphan its
+#     descendants produce, including a plain `fork()` in unrelated code, and a
+#     library cannot honour that without stealing statuses from its caller.
 #
 # Environment note for the root phases: `test-all.sh` passes `--offline`, and
 # the repo-local cargo cache is missing `aho-corasick`, so the first
 # `--oci-root` run on a fresh machine has to warm the cache outside the script.
-core_lib = 925 # 2026-10-05: 922 -> 925, +3 for the fd-reach screening tests
+core_lib = 927 # 2026-10-05: 925 -> 927, +2 for the reach-spelling tests
+               # (`a_root_written_with_dotdot_still_covers_the_resolved_fd_path`,
+               # `the_mount_arm_tests_the_child_spelling_and_the_roots_the_host_one`)
+               # that pin the supervise-restore fix in `7f993ba`.
+               # 2026-10-05: 922 -> 925, +3 for the fd-reach screening tests
                # (`an_fd_outside_the_granted_roots_is_not_handed_to_the_stub`,
                # `an_empty_readable_set_means_no_read_restriction`,
                # `a_mount_point_is_reachable_regardless_of_the_sets`).
