@@ -216,9 +216,19 @@
 #     fd-reopen failures carry their cause (128+errno / 192+fd). Verified:
 #     `core_integ` 569/0 in the exact shape that used to be red, `core_lib`
 #     925/0 (+3 screening tests), ffi green, python 465/0. The one victim that
-#     did not reproduce afterwards is
-#     `test_the_session_parent_can_write_into_an_init_spawned_child`
-#     (`/proc/<pid>/maps` racing the child) -- it stays on the list.
+#     did not reproduce afterwards was
+#     `test_the_session_parent_can_write_into_an_init_spawned_child`; it is off
+#     the list now (fork `3d128d6`). The race was the probe's, not the engine's:
+#     `exec` reports the pid at **fork** time and the test poked a mapping out of
+#     `/proc/<pid>/maps` immediately, so an `execve` landing in that few-
+#     microsecond window either left the maps read with nothing to pick (mid
+#     teardown) or unmapped the address the write was about to use --
+#     `process_vm_writev` -> `EFAULT`, and "one full run red, the next green".
+#     It now waits for `/proc/<pid>/exe` to be the program it asked for (`sleep`;
+#     the switch happens inside `exec_mmap` and nothing remaps afterwards), and
+#     asserts the maps it read name that program -- the assertion is what makes
+#     the barrier load-bearing: with the barrier disabled it failed 3/3, naming
+#     the init binary once and `/usr/bin/dash` the other two times.
 #
 #     **The hang itself is now root-caused and fixed** (fork `5288752`, same
 #     day). It was never in the engine: the two restore cases were the only
