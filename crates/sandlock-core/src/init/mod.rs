@@ -865,6 +865,69 @@ fn try_reap_one() -> Option<(i32, Option<i32>, Option<i32>)> {
     Some((pid, code, signal))
 }
 
+/// Deadline for the post-teardown reap sweep ([`reap_collapsed_children`]).
+const TEARDOWN_REAP_MS: u64 = 500;
+
+/// Reap the children a teardown signal just killed, bounded.
+///
+/// SL-6 makes init the subreaper, so an orphaned descendant reparents *here* to
+/// be reaped. Both teardown paths, though, used to `killpg(SIGKILL)` and
+/// `_exit` in the same breath, leaving the descendants they had just killed to
+/// the container's PID 1: where that PID 1 is not a reaper (`docker run`
+/// without `--init`, or a bare `sleep` as pid 1) they stay zombies forever, and
+/// "the descendant is gone" reads false to anyone who asks with
+/// `kill(pid, 0)` -- which is exactly what the teardown acceptance tests ask
+/// (measured 2026-10-05: `state=Z ppid=1` still there twenty minutes later,
+/// 3/3 red in a container whose PID 1 reaps nothing and 3/3 green with
+/// `--init`). Reaping here makes "no defunct left behind" a property of the
+/// sandbox instead of a property of whoever owns PID 1.
+///
+/// Bounded on purpose: SIGKILL cannot be refused, so this is normally a couple
+/// of `waitpid` round-trips, but a descendant stuck in an uninterruptible sleep
+/// must not hold the container open.
+fn reap_collapsed_children(children: &mut HashMap<i32, Child>, dead_groups: &HashSet<i32>) {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(TEARDOWN_REAP_MS);
+    loop {
+        let mut reaped = 0usize;
+        while let Some((pid, _, _)) = try_reap_one() {
+            reaped += 1;
+            // The group is being torn down: the entry goes away with the child
+            // (nothing is left to signal), and its pidfd is no longer needed.
+            if let Some(child) = children.remove(&pid) {
+                if child.pidfd >= 0 {
+                    unsafe {
+                        libc::close(child.pidfd);
+                    }
+                }
+            }
+        }
+        // "Done" is not "the table is empty": a SIGKILL is delivered
+        // asynchronously, so a group can still hold a member (or a zombie of
+        // one) that init is its subreaper for. Every group in play must be
+        // empty *and* nothing may have been reapable in this pass -- an
+        // adopted orphan is in no table, so the reap result is the only
+        // evidence there is nothing left.
+        let groups_empty = unique_signal_pgids(children, dead_groups).iter().all(|pgid| {
+            (unsafe { libc::killpg(*pgid, 0) }) != 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        });
+        if reaped == 0 && children.is_empty() && groups_empty {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        if reaped == 0 {
+            // A SIGKILL to a process that is inside a syscall can take a
+            // moment to land; do not spin on the deadline.
+            unsafe {
+                libc::usleep(1000);
+            }
+        }
+    }
+}
+
 /// Kind of a child init spawned, deciding what (if anything) is reported when
 /// the child is reaped.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1137,6 +1200,10 @@ pub fn run_init() {
                                 // child group, so no descendant or exec'd
                                 // sibling survives the container.
                                 signal_all_children(supervisor_session, &children, &mut dead_groups, libc::SIGKILL);
+                                // ...and reap what that just killed, so the
+                                // container leaves no defunct behind (see
+                                // `reap_collapsed_children`).
+                                reap_collapsed_children(&mut children, &dead_groups);
                                 // _exit rather than std::process::exit: this
                                 // is a fork of the supervisor, so atexit
                                 // handlers would run inherited (tokio/glibc)
@@ -1478,6 +1545,11 @@ pub fn run_init() {
             send(ctl, &reply);
         }
         if shutdown {
+            // The Shutdown arm SIGKILLed every registered child group. Reap
+            // what that just killed before leaving: the reply is already out,
+            // and a container whose PID 1 does not reap would otherwise keep
+            // those descendants as zombies (see `reap_collapsed_children`).
+            reap_collapsed_children(&mut children, &dead_groups);
             break;
         }
     }
