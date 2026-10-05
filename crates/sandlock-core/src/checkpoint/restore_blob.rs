@@ -300,27 +300,81 @@ pub(crate) struct FdReach<'a> {
     pub mounts: &'a [(PathBuf, PathBuf)],
 }
 
+/// Resolve a **host-space** path for the reach test.
+///
+/// The two sides of that test come from different places and are spelled
+/// differently by construction: a captured fd's path is read out of
+/// `/proc/<pid>/fd`, so the kernel has already resolved it (`..` collapsed,
+/// symlinks followed), while a policy root is whatever the caller typed --
+/// `sandlock-supervise`'s own suite hands in
+/// `/src/crates/sandlock-supervise/../../tmp/supervise-restore-<pid>`. A lexical
+/// `starts_with` then says "outside the granted roots" about a file the sandbox
+/// can open perfectly well, the fd is dropped from the plan, and the resumed
+/// process loses it (measured 2026-10-05: the workload's counter fd vanished,
+/// so the restored generation came up `Exited` and the slot said
+/// `restore_skipped: [..., clock.cnt]`).
+///
+/// Resolve both sides. A root that does not exist yet cannot be canonicalized,
+/// so fall back to a lexical resolution (collapse `.`/`..` segments) -- the
+/// same answer a shell gives, and the only one available without the file.
+fn reach_host_path(path: &Path) -> PathBuf {
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return resolved;
+    }
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                // Never climb above the root.
+                if !out.pop() {
+                    out.push("/");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push("/");
+    }
+    out
+}
+
 impl FdReach<'_> {
     /// Mirrors the mediator's `can_read`/`can_write`: an empty readable set
     /// means "no read restriction", and a path under a mount point is served by
     /// that mount. The fd's own flags decide which side to test.
-    pub(crate) fn covers(&self, path: &Path, flags: i32) -> bool {
+    ///
+    /// Two spellings, because the two halves of the question live in two
+    /// namespaces. The **roots** are host paths (Landlock judges a file by its
+    /// real path whether or not a chroot renamed it), so they are compared
+    /// against `host_path` -- both resolved, see [`reach_host_path`]. The
+    /// **mounts** are declared as (virtual, host) pairs and the stub opens the
+    /// *virtual* spelling, so that arm is compared against `child_path`.
+    pub(crate) fn covers(&self, host_path: &Path, child_path: &Path, flags: i32) -> bool {
         if self
             .mounts
             .iter()
-            .any(|(virtual_path, _)| path.starts_with(virtual_path))
+            .any(|(virtual_path, _)| child_path.starts_with(virtual_path))
         {
             return true;
         }
+        let host = reach_host_path(host_path);
         if flags & libc::O_ACCMODE != libc::O_RDONLY {
-            return self.writable.iter().any(|p| path.starts_with(p));
+            return self
+                .writable
+                .iter()
+                .any(|p| host.starts_with(reach_host_path(p)));
         }
         self.readable.is_empty()
+            || self.readable.iter().any(|p| {
+                let p = reach_host_path(p);
+                host.starts_with(&p) || p.starts_with(&host)
+            })
             || self
-                .readable
+                .writable
                 .iter()
-                .any(|p| path.starts_with(p) || p.starts_with(path))
-            || self.writable.iter().any(|p| path.starts_with(p))
+                .any(|p| host.starts_with(reach_host_path(p)))
     }
 }
 
@@ -828,7 +882,7 @@ pub(crate) fn plan(
         // policy does not cover the path, the reopen can only fail with EACCES
         // and take the whole restored process with it. Report it as skipped
         // instead -- that is what the skipped-fd contract is for.
-        if !reach.covers(Path::new(&child_path), f.flags) {
+        if !reach.covers(Path::new(&f.path), Path::new(&child_path), f.flags) {
             skipped.push(SkippedFd { fd: f.fd, path: child_path });
             continue;
         }
@@ -916,20 +970,78 @@ mod tests {
         let reach = FdReach { readable: &readable, writable: &writable, mounts: &mounts };
 
         assert!(
-            !reach.covers(Path::new("/src/tmp/suite.log"), libc::O_WRONLY),
+            !reach.covers(Path::new("/src/tmp/suite.log"), Path::new("/src/tmp/suite.log"), libc::O_WRONLY),
             "a log file outside the granted roots must be skipped, not reopened"
         );
         assert!(
-            reach.covers(Path::new("/tmp/run-1/clock.cnt"), libc::O_WRONLY),
+            reach.covers(Path::new("/tmp/run-1/clock.cnt"), Path::new("/tmp/run-1/clock.cnt"), libc::O_WRONLY),
             "the workload's own file under a granted root is still reopened"
         );
         assert!(
-            reach.covers(Path::new("/usr/lib/libc.so.6"), libc::O_RDONLY),
+            reach.covers(Path::new("/usr/lib/libc.so.6"), Path::new("/usr/lib/libc.so.6"), libc::O_RDONLY),
             "the readable set covers a read-only reopen"
         );
         assert!(
-            !reach.covers(Path::new("/usr/lib/libc.so.6"), libc::O_RDWR),
+            !reach.covers(Path::new("/usr/lib/libc.so.6"), Path::new("/usr/lib/libc.so.6"), libc::O_RDWR),
             "readable does not imply writable"
+        );
+    }
+
+    /// The spelling trap that cost `sandlock-supervise`'s restore suite its
+    /// resumed process (2026-10-05): a policy root is whatever the caller wrote
+    /// -- its own suite hands in `<manifest>/../../tmp/supervise-restore-<pid>`
+    /// -- while a captured fd's path comes out of `/proc/<pid>/fd`, already
+    /// resolved by the kernel. A lexical prefix test calls a file the sandbox can
+    /// open perfectly well "outside the roots", drops the fd, and the workload
+    /// wakes up without its own file and exits. Pin the resolved comparison.
+    #[test]
+    fn a_root_written_with_dotdot_still_covers_the_resolved_fd_path() {
+        let readable: Vec<PathBuf> = Vec::new();
+        let writable: Vec<PathBuf> = vec![PathBuf::from(
+            "/src/crates/sandlock-supervise/../../tmp/supervise-restore-7",
+        )];
+        let mounts: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let reach = FdReach { readable: &readable, writable: &writable, mounts: &mounts };
+        let counter = Path::new("/src/tmp/supervise-restore-7/clock.cnt");
+        assert!(
+            reach.covers(counter, counter, libc::O_WRONLY),
+            "the workload's own file must survive the restore, whatever spelling \
+             the policy used for the root that grants it"
+        );
+        let sibling = Path::new("/src/tmp/supervise-restore-8/clock.cnt");
+        assert!(
+            !reach.covers(sibling, sibling, libc::O_WRONLY),
+            "resolving the root must not widen the grant to a sibling directory"
+        );
+    }
+
+    /// The two arms of `covers` live in two namespaces and are tested in their
+    /// own: a **root** is a host path (Landlock judges a file by its real path,
+    /// chroot or not), a **mount** is declared (virtual, host) and the stub
+    /// opens the virtual spelling inside the sandbox.
+    #[test]
+    fn the_mount_arm_tests_the_child_spelling_and_the_roots_the_host_one() {
+        let readable: Vec<PathBuf> = vec![PathBuf::from("/host/rootfs/usr")];
+        let writable: Vec<PathBuf> = Vec::new();
+        let mounts: Vec<(PathBuf, PathBuf)> =
+            vec![(PathBuf::from("/etc/resolv.conf"), PathBuf::from("/host/resolv.conf"))];
+        let reach = FdReach { readable: &readable, writable: &writable, mounts: &mounts };
+        assert!(
+            reach.covers(
+                Path::new("/host/rootfs/etc/resolv.conf"),
+                Path::new("/etc/resolv.conf"),
+                libc::O_RDONLY
+            ),
+            "the mount arm compares the spelling the child will open"
+        );
+        assert!(
+            !reach.covers(
+                Path::new("/host/resolv.conf"),
+                Path::new("/host/resolv.conf"),
+                libc::O_RDONLY
+            ),
+            "a host path that no root covers and that is not the mount's virtual \
+             spelling is genuinely unreachable"
         );
     }
 
@@ -940,8 +1052,8 @@ mod tests {
         let mounts: Vec<(PathBuf, PathBuf)> = Vec::new();
         let writable: Vec<PathBuf> = Vec::new();
         let reach = FdReach { readable: &[], writable: &writable, mounts: &mounts };
-        assert!(reach.covers(Path::new("/anywhere/at/all"), libc::O_RDONLY));
-        assert!(!reach.covers(Path::new("/anywhere/at/all"), libc::O_WRONLY));
+        assert!(reach.covers(Path::new("/anywhere/at/all"), Path::new("/anywhere/at/all"), libc::O_RDONLY));
+        assert!(!reach.covers(Path::new("/anywhere/at/all"), Path::new("/anywhere/at/all"), libc::O_WRONLY));
     }
 
     /// A mount point is served by the mount, regardless of the sets.
@@ -952,7 +1064,7 @@ mod tests {
         let readable: Vec<PathBuf> = vec![PathBuf::from("/usr")];
         let writable: Vec<PathBuf> = Vec::new();
         let reach = FdReach { readable: &readable, writable: &writable, mounts: &mounts };
-        assert!(reach.covers(Path::new("/etc/resolv.conf"), libc::O_RDONLY));
+        assert!(reach.covers(Path::new("/etc/resolv.conf"), Path::new("/etc/resolv.conf"), libc::O_RDONLY));
     }
 
     #[test]
