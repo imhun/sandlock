@@ -102,9 +102,29 @@ async fn test_instance_statfs_reports_the_hosts_disk_accounting() {
     );
 }
 
-/// Read exactly `len` bytes from `fd` (blocking, on a blocking thread pool so
-/// the multi-thread runtime keeps pumping the seccomp supervisor).
+/// Read exactly `len` bytes from `fd`.
+///
+/// **Blocking on purpose, and only legal on a multi-threaded runtime.** The
+/// sandbox's seccomp-notify supervisor is a task *in the caller's* runtime
+/// (`sandbox.rs` says so in `Sandbox::popen`), so a synchronous read that owns
+/// the only executor thread stops answering the child's mediated syscalls: the
+/// child parks inside its next traced call (a `close` in the stdio wiring, in
+/// the run that was caught), never reaches `execve`, and the read waits for
+/// output that can no longer be produced. That is FUP-29's wedge, and it cost a
+/// 20-minute hang in a full-suite run on 2026-10-05 because a new test used the
+/// default current-thread `#[tokio::test]`. Assert the flavor here so the next
+/// one fails in one line instead of hanging the gate.
 fn read_exact_bytes(fd: OwnedFd, len: usize) -> Vec<u8> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        assert_ne!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::CurrentThread,
+            "read_exact_bytes blocks the executor thread; a current-thread runtime \
+             would starve the sandbox's notification supervisor and wedge the child \
+             (see this test's FUP-29 note). Use \
+             #[tokio::test(flavor = \"multi_thread\", worker_threads = 2)]."
+        );
+    }
     let mut file = std::fs::File::from(fd);
     let mut out = Vec::with_capacity(len);
     let mut chunk = [0u8; 4096];
@@ -660,7 +680,16 @@ async fn test_the_session_parent_can_write_into_an_init_spawned_child() {
 /// 2. the session **still serves `exec`** afterwards -- the entire point;
 /// 3. the resumed child is a session child: `children_live` counts it, so
 ///    `wait_child`/`kill_child`/shutdown see it like any other exec.
-#[tokio::test]
+///
+/// **Multi-threaded runtime on purpose** (the FUP-29 rule above, which this
+/// test originally broke). Step 2 blocks the calling thread in
+/// `read_exact_bytes`, and the supervisor that answers the session's mediated
+/// syscalls is a task in this same runtime. On the default current-thread
+/// runtime the read owns the only thread, the exec'd child parks inside
+/// `close()` while wiring its stdio, and the read waits forever -- measured
+/// 2026-10-05: the child's `__seccomp_filter` frame at `close(9)`, no
+/// `execve`, and the reader released the instant that child was killed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_a_child_restored_into_a_session_keeps_the_session_executable() {
     let helper = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/rootfs-helper")
@@ -765,7 +794,12 @@ async fn test_a_child_restored_into_a_session_keeps_the_session_executable() {
 /// restored process was alive 50 ms after the handshake and gone before the next
 /// five-second sample, and the session never ticked again. This pins the shape
 /// here, where the restored child's exit status is readable.
-#[tokio::test]
+///
+/// **Multi-threaded runtime on purpose**: the CPython child keeps issuing
+/// mediated `openat`/`close` for every tick, so the supervisor has to keep
+/// running while this test waits on the counter (same rule as the FUP-29 note:
+/// the supervisor is a task in the caller's runtime).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_a_restored_cpython_workload_keeps_ticking() {
     const TICKER: &str = r#"
 import os, sys, time
