@@ -772,6 +772,9 @@ int main(int argc, char **argv) {{
         let state = stat.split_whitespace().nth(2).unwrap_or("?").to_string();
         let exit_code = stat.split_whitespace().nth(51).unwrap_or("-").to_string();
         eprintln!("libcr {tag}: advanced={advanced} state={state} exit_code={exit_code}");
+        // The leader's exit code is the restore stub's, so a restore that
+        // "succeeded" but left a dead process is visible here (`proc(5)`
+        // `exit_code` = 128+errno / 192+fd for the stub's reopen failures).
         let _ = sb2.kill();
         let _ = sb2.wait().await;
         (advanced, state)

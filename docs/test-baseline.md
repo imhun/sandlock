@@ -202,10 +202,32 @@
 #     should loop the whole suite and, on the first failure, dump
 #     `/proc/<pid>/{maps,stat,stack}` for the child tree.
 #
+#     **Later the same day: three of those victims were root-caused and fixed.**
+#     The fd plan (`build_fd_plan` + the blob's fd table) handed the stub paths
+#     the destination sandbox cannot reopen -- most commonly the *caller's own
+#     redirected stdout/stderr* -- and the stub, running inside the sandbox,
+#     could only fail with EACCES (`die(10)`), leaving the resumed process dead
+#     while `restore_*` reported success. It looked random because fd 1/2 are
+#     *pipes* under the gate's `| tee` (already skipped) and *files* under any
+#     `> log` redirect: the same code, two harness shapes. The plan now screens
+#     planned fds against the destination's readable/writable roots and mounts
+#     (`FdReach`) and reports the unreachable ones through `restore_skipped`;
+#     the blob header's `n_fds` counts what was actually written; and the stub's
+#     fd-reopen failures carry their cause (128+errno / 192+fd). Verified:
+#     `core_integ` 569/0 in the exact shape that used to be red, `core_lib`
+#     925/0 (+3 screening tests), ffi green, python 465/0. The one victim that
+#     did not reproduce afterwards is
+#     `test_the_session_parent_can_write_into_an_init_spawned_child`
+#     (`/proc/<pid>/maps` racing the child) -- it stays on the list.
+#
 # Environment note for the root phases: `test-all.sh` passes `--offline`, and
 # the repo-local cargo cache is missing `aho-corasick`, so the first
 # `--oci-root` run on a fresh machine has to warm the cache outside the script.
-core_lib = 922 # (see the 2026-10-05 note above: was 913, stale; 912 -> 913 was
+core_lib = 925 # 2026-10-05: 922 -> 925, +3 for the fd-reach screening tests
+               # (`an_fd_outside_the_granted_roots_is_not_handed_to_the_stub`,
+               # `an_empty_readable_set_means_no_read_restriction`,
+               # `a_mount_point_is_reachable_regardless_of_the_sets`).
+               # (see the 2026-10-05 note above: was 913, stale; 912 -> 913 was
                # 2026-09-26: +1 and it is the pure shape's root:
                # `network::rules::tests::compose_root_slash_is_not_an_image_and_leaks_no_host_entry`
                # -- composing the synthetic /etc/hosts under root "/" used to read

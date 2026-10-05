@@ -1434,7 +1434,14 @@ impl Sandbox {
         // pinned by `test_restore_resumes_inside_a_chroot_root`, which runs the
         // emulated and the real root. This paragraph is kept (corrected) because
         // it is the reason the delivery route looks the way it does.
-        let plan = restore_blob::plan(cp, chroot_root.as_deref(), &mounts)
+        // The stub reopens the checkpoint's fds *inside* this sandbox, so the
+        // plan has to know what this sandbox can reach (see `FdReach`).
+        let reach = restore_blob::FdReach {
+            readable: &self.fs_readable,
+            writable: &self.fs_writable,
+            mounts: &mounts,
+        };
+        let plan = restore_blob::plan(cp, chroot_root.as_deref(), &mounts, &reach)
             .map_err(SandboxRuntimeError::Child)?;
 
         let channel = resume::StubChannel::new(&plan.blob)

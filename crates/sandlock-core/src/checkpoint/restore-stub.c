@@ -53,6 +53,12 @@
  * region, 5 open region file, 6 ready write, 7 go read, 8 mprotect, 9 vdso
  * mremap, 10 fd reopen, 12 sweep entry overlapping the stub's own image,
  * 13 arch_prctl (x86_64 only). rt_sigreturn does not return; if it does, exit 11.
+ *
+ * The two fd-reopen failures carry their cause, because "10" alone cost an
+ * afternoon on 2026-10-05 (a reopen of a path the sandbox's own policy denies
+ * looked exactly like a reopen of a missing file): a failed openat exits
+ * 128 + errno, and a failed dup-to-the-checkpointed-number exits 192 + fd.
+ * The host prints whatever it sees (`exited with restore-stub code N`).
  */
 #define CTRL_FD 3
 #define READY_FD 4
@@ -579,14 +585,16 @@ static void _start_c(u64 *sp) {
     for (i = 0; i < h->n_fds; i++) {
         struct blob_fd *f = &fds[i];
         i64 fd = SC4(SYS_openat, AT_FDCWD, strings + f->path_off, f->flags, 0);
-        if (fd < 0) die(10);
+        /* Encode the cause (see the header table): openat failure -> 128 + errno,
+         * dup failure -> 192 + the target fd number. */
+        if (fd < 0) die(128 + (int)((-fd) & 0x3f));
         if ((u32)fd != f->fd) {
 #if (defined(__riscv) && __riscv_xlen == 64) || defined(__aarch64__)
             /* Neither riscv64 nor aarch64 has SYS_dup2 — use dup3 with
              * flags=0. */
-            if (SC3(SYS_dup3, fd, f->fd, 0) != (i64)f->fd) die(10);
+            if (SC3(SYS_dup3, fd, f->fd, 0) != (i64)f->fd) die(192 + (f->fd & 0x3f));
 #else
-            if (SC2(SYS_dup2, fd, f->fd) != (i64)f->fd) die(10);
+            if (SC2(SYS_dup2, fd, f->fd) != (i64)f->fd) die(192 + (f->fd & 0x3f));
 #endif
             SC1(SYS_close, fd);
         }

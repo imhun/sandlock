@@ -584,7 +584,7 @@ mod tests {
             app_state: None,
         };
 
-        let plan = restore_blob::plan(&cp, None, &[]).expect("plan");
+        let plan = restore_blob::plan(&cp, None, &[], &restore_blob::FdReach::everything()).expect("plan");
         let channel = StubChannel::new(&plan.blob).expect("channel");
 
         // Build the exec path before fork: CString::new allocates, and
@@ -733,7 +733,7 @@ mod tests {
             app_state: None,
         };
 
-        let plan = restore_blob::plan(&cp, None, &[]).expect("plan");
+        let plan = restore_blob::plan(&cp, None, &[], &restore_blob::FdReach::everything()).expect("plan");
         let channel = StubChannel::new(&plan.blob).expect("channel");
 
         let stub_path = std::ffi::CString::new(stub.to_str().unwrap()).unwrap();
@@ -910,7 +910,7 @@ mod tests {
             app_state: None,
         };
 
-        let plan = restore_blob::plan(&cp, None, &[]).expect("plan");
+        let plan = restore_blob::plan(&cp, None, &[], &restore_blob::FdReach::everything()).expect("plan");
         let channel = StubChannel::new(&plan.blob).expect("channel");
 
         let stub_path = std::ffi::CString::new(stub.to_str().unwrap()).unwrap();

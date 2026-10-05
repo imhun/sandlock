@@ -265,6 +265,79 @@ fn is_restorable_file_path(path: &str) -> bool {
         && !path.starts_with("/dev/")
 }
 
+/// The destination sandbox's file access, in the child's own path space.
+///
+/// The restore stub runs *inside* the sandbox -- that is the point: the resumed
+/// process must land in the same confinement -- so handing it a path the
+/// destination's policy does not grant makes its reopen fail with EACCES and
+/// the stub dies (`die(10)`, see `restore-stub.c`). The restore then reports
+/// success while the resumed process is already gone, which is the worst of
+/// both worlds: silent and unexplained.
+///
+/// Measured 2026-10-05: any harness that sends the suite's output to a *file*
+/// (rather than a pipe) leaves `fd=1`/`fd=2` pointing at that log path, the plan
+/// classified them as ordinary reopenable files, and all three
+/// `test_restore::*` cases went red with stub exit `128+13` (EACCES) -- while
+/// the gate's `| tee` (pipes -> already skipped) stayed green. The same shape
+/// appears for any inherited fd outside the granted roots.
+///
+/// Only fds are screened this way, never file-backed *mappings*: a skipped fd
+/// keeps the documented contract ("fds that could not be transparently restored
+/// are reported"), whereas a skipped mapping would silently corrupt the process
+/// image, so that case keeps failing loudly in the stub (`die(5)`).
+///
+/// Honest limit: this sees the policy's roots and mounts, not its explicit deny
+/// list or read-only mounts, so a path can pass here and still be refused inside
+/// the sandbox. That case is unchanged from before -- the stub fails, and its
+/// exit code now carries the errno -- it is just not screened out early.
+pub(crate) struct FdReach<'a> {
+    /// The policy's readable roots, in the child's (virtual) path space.
+    pub readable: &'a [PathBuf],
+    /// The policy's writable roots, in the child's (virtual) path space.
+    pub writable: &'a [PathBuf],
+    /// `(virtual, host)` mount points: the mount serves the path regardless of
+    /// the readable/writable sets.
+    pub mounts: &'a [(PathBuf, PathBuf)],
+}
+
+impl FdReach<'_> {
+    /// Mirrors the mediator's `can_read`/`can_write`: an empty readable set
+    /// means "no read restriction", and a path under a mount point is served by
+    /// that mount. The fd's own flags decide which side to test.
+    pub(crate) fn covers(&self, path: &Path, flags: i32) -> bool {
+        if self
+            .mounts
+            .iter()
+            .any(|(virtual_path, _)| path.starts_with(virtual_path))
+        {
+            return true;
+        }
+        if flags & libc::O_ACCMODE != libc::O_RDONLY {
+            return self.writable.iter().any(|p| path.starts_with(p));
+        }
+        self.readable.is_empty()
+            || self
+                .readable
+                .iter()
+                .any(|p| path.starts_with(p) || p.starts_with(path))
+            || self.writable.iter().any(|p| path.starts_with(p))
+    }
+}
+
+impl FdReach<'static> {
+    /// A reach that covers every path (a `/` mount). For callers with no policy
+    /// to screen against -- the plan then behaves exactly as it did before the
+    /// screening existed, which is what the structural plan tests want.
+    pub(crate) fn everything() -> Self {
+        static MOUNTS: std::sync::OnceLock<Vec<(PathBuf, PathBuf)>> = std::sync::OnceLock::new();
+        FdReach {
+            readable: &[],
+            writable: &[],
+            mounts: MOUNTS.get_or_init(|| vec![(PathBuf::from("/"), PathBuf::from("/"))]),
+        }
+    }
+}
+
 /// Split the saved fd table into transparently restorable regular files and a
 /// list of skipped non-regular fds (sockets, pipes, eventfd, ...). The skipped
 /// list is surfaced to the caller; those resources fall to the app_state hatch.
@@ -664,6 +737,7 @@ pub(crate) fn plan(
     cp: &Checkpoint,
     chroot_root: Option<&Path>,
     mounts: &[(PathBuf, PathBuf)],
+    reach: &FdReach<'_>,
 ) -> Result<RestorePlan, String> {
     let ps = &cp.process_state;
     let regions = build_memory_plan(&ps.memory_maps, &ps.memory_data);
@@ -682,7 +756,7 @@ pub(crate) fn plan(
         }
     }
 
-    let (restorable_fds, skipped) = build_fd_plan(&cp.fd_table);
+    let (restorable_fds, mut skipped) = build_fd_plan(&cp.fd_table);
     let vdso = plan_vdso_moves(&ps.memory_maps);
 
     let mut regs = ps.regs.clone();
@@ -749,7 +823,16 @@ pub(crate) fn plan(
 
     let mut fd_tbl = Vec::with_capacity(restorable_fds.len() * FD_ENTRY_LEN);
     for f in &restorable_fds {
-        let path_off = strings.intern(&to_child_path(&f.path, chroot_root, mounts))?;
+        let child_path = to_child_path(&f.path, chroot_root, mounts);
+        // The stub reopens this inside the sandbox: if the destination's own
+        // policy does not cover the path, the reopen can only fail with EACCES
+        // and take the whole restored process with it. Report it as skipped
+        // instead -- that is what the skipped-fd contract is for.
+        if !reach.covers(Path::new(&child_path), f.flags) {
+            skipped.push(SkippedFd { fd: f.fd, path: child_path });
+            continue;
+        }
+        let path_off = strings.intern(&child_path)?;
         // Mask creation/truncation flags so the reopen cannot create, truncate,
         // or fail-exclusive on the workload's real file. The kernel strips these
         // in fdinfo, but mask defensively since O_TRUNC would be destructive.
@@ -777,7 +860,11 @@ pub(crate) fn plan(
     out.extend_from_slice(&BLOB_MAGIC.to_le_bytes());
     out.extend_from_slice(&BLOB_VERSION.to_le_bytes());
     out.extend_from_slice(&(regions.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(restorable_fds.len() as u32).to_le_bytes());
+    // The count must be what actually landed in `fd_tbl`: screening above can
+    // drop entries, and the stub walks exactly `n_fds` of them (a stale count
+    // makes it read past the table into the vdso/register bytes and reopen
+    // garbage -- measured 2026-10-05 as `openat` -> EFAULT, stub exit 142).
+    out.extend_from_slice(&((fd_tbl.len() / FD_ENTRY_LEN) as u32).to_le_bytes());
     out.extend_from_slice(&(regs_off as u64).to_le_bytes());
     out.extend_from_slice(&((regs.len() * 8) as u32).to_le_bytes());
     out.extend_from_slice(&(fpstate.len() as u32).to_le_bytes());
@@ -814,6 +901,58 @@ mod tests {
 
     fn map(start: u64, end: u64, path: Option<&str>) -> MemoryMap {
         MemoryMap { start, end, perms: "rw-p".into(), offset: 0, path: path.map(Into::into) }
+    }
+
+    /// The shape that broke on 2026-10-05: `fd=1`/`fd=2` pointed at the suite's
+    /// log file whenever a harness redirects output to a file instead of a pipe,
+    /// the plan called them reopenable, and the stub -- which runs *inside* the
+    /// sandbox -- could only fail with EACCES, taking the resumed process with
+    /// it while `restore_*` still reported success.
+    #[test]
+    fn an_fd_outside_the_granted_roots_is_not_handed_to_the_stub() {
+        let readable = vec![PathBuf::from("/usr"), PathBuf::from("/tmp/run-1")];
+        let writable = vec![PathBuf::from("/tmp/run-1")];
+        let mounts: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let reach = FdReach { readable: &readable, writable: &writable, mounts: &mounts };
+
+        assert!(
+            !reach.covers(Path::new("/src/tmp/suite.log"), libc::O_WRONLY),
+            "a log file outside the granted roots must be skipped, not reopened"
+        );
+        assert!(
+            reach.covers(Path::new("/tmp/run-1/clock.cnt"), libc::O_WRONLY),
+            "the workload's own file under a granted root is still reopened"
+        );
+        assert!(
+            reach.covers(Path::new("/usr/lib/libc.so.6"), libc::O_RDONLY),
+            "the readable set covers a read-only reopen"
+        );
+        assert!(
+            !reach.covers(Path::new("/usr/lib/libc.so.6"), libc::O_RDWR),
+            "readable does not imply writable"
+        );
+    }
+
+    /// Mirrors the mediator's `can_read`: an empty readable set means "no read
+    /// restriction", so a read-only fd is never screened out by reach.
+    #[test]
+    fn an_empty_readable_set_means_no_read_restriction() {
+        let mounts: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let writable: Vec<PathBuf> = Vec::new();
+        let reach = FdReach { readable: &[], writable: &writable, mounts: &mounts };
+        assert!(reach.covers(Path::new("/anywhere/at/all"), libc::O_RDONLY));
+        assert!(!reach.covers(Path::new("/anywhere/at/all"), libc::O_WRONLY));
+    }
+
+    /// A mount point is served by the mount, regardless of the sets.
+    #[test]
+    fn a_mount_point_is_reachable_regardless_of_the_sets() {
+        let mounts =
+            vec![(PathBuf::from("/etc/resolv.conf"), PathBuf::from("/host/resolv.conf"))];
+        let readable: Vec<PathBuf> = vec![PathBuf::from("/usr")];
+        let writable: Vec<PathBuf> = Vec::new();
+        let reach = FdReach { readable: &readable, writable: &writable, mounts: &mounts };
+        assert!(reach.covers(Path::new("/etc/resolv.conf"), libc::O_RDONLY));
     }
 
     #[test]
@@ -1048,7 +1187,8 @@ mod tests {
             }],
             vec![MemorySegment { start: START, data: vec![0xC7u8; 0x1000] }],
         );
-        let p = plan(&cp, None, &[]).expect("plan");
+        // A root grant keeps the fd screening out of these two structural tests.
+        let p = plan(&cp, None, &[], &FdReach::everything()).expect("plan");
         let blob = &p.blob;
 
         assert_eq!(u32::from_le_bytes(blob[0..4].try_into().unwrap()), BLOB_MAGIC);
@@ -1090,7 +1230,7 @@ mod tests {
             ],
             Vec::new(),
         );
-        let blob = plan(&cp, None, &[]).expect("plan").blob;
+        let blob = plan(&cp, None, &[], &FdReach::everything()).expect("plan").blob;
         let off0 = u32::from_le_bytes(blob[HEADER_LEN + 32..HEADER_LEN + 36].try_into().unwrap());
         let off1 = u32::from_le_bytes(
             blob[HEADER_LEN + REGION_ENTRY_LEN + 32..HEADER_LEN + REGION_ENTRY_LEN + 36]
@@ -1111,7 +1251,7 @@ mod tests {
             }],
             vec![MemorySegment { start: STUB_BASE, data: vec![0u8; 0x1000] }],
         );
-        let err = plan(&cp, None, &[]).expect_err("must refuse to clobber the running stub");
+        let err = plan(&cp, None, &[], &FdReach::everything()).expect_err("must refuse to clobber the running stub");
         assert!(err.contains("restore-stub"), "error should name the stub window: {err}");
     }
 
@@ -1316,14 +1456,14 @@ mod tests {
     fn aarch64_a_fp_capture_of_the_wrong_size_is_refused() {
         let mut cp = tiny_checkpoint(Vec::new(), Vec::new());
         cp.process_state.fpregs = vec![0u8; 512]; // one 16-byte lane short
-        let err = plan(&cp, None, &[]).expect_err("512 bytes is not a fpsimd state");
+        let err = plan(&cp, None, &[], &FdReach::everything()).expect_err("512 bytes is not a fpsimd state");
         assert!(
             err.contains("512") && err.contains("528"),
             "says what it got and what it wanted: {err}",
         );
 
         cp.process_state.fpregs = vec![0u8; 528];
-        assert!(plan(&cp, None, &[]).is_ok(), "the measured size is accepted");
+        assert!(plan(&cp, None, &[], &FdReach::everything()).is_ok(), "the measured size is accepted");
     }
 
     /// Every aarch64 checkpoint carries FP bytes (capture always reads
@@ -1337,7 +1477,7 @@ mod tests {
         let mut cp = tiny_checkpoint(Vec::new(), Vec::new());
         cp.process_state.fpregs = Vec::new();
 
-        let err = plan(&cp, None, &[]).expect_err("a frame with no FP record is EINVAL");
+        let err = plan(&cp, None, &[], &FdReach::everything()).expect_err("a frame with no FP record is EINVAL");
         assert!(
             err.contains("0 bytes") && err.contains("528"),
             "says what it got and what the frame needs: {err}",
@@ -1354,7 +1494,8 @@ mod tests {
         let mut cp = tiny_checkpoint(Vec::new(), Vec::new());
         cp.process_state.tls = Some(0xdead_beef_0000_1000);
 
-        let p = plan(&cp, None, &[]).expect("plan");
+        // A root grant keeps the fd screening out of these two structural tests.
+        let p = plan(&cp, None, &[], &FdReach::everything()).expect("plan");
         let tls = u64::from_le_bytes(p.blob[64..72].try_into().unwrap());
         let has_tls = u32::from_le_bytes(p.blob[72..76].try_into().unwrap());
 
@@ -1371,12 +1512,12 @@ mod tests {
 
         #[cfg(target_arch = "aarch64")]
         {
-            let err = plan(&cp, None, &[]).expect_err("TPIDR_EL0 cannot be invented");
+            let err = plan(&cp, None, &[], &FdReach::everything()).expect_err("TPIDR_EL0 cannot be invented");
             assert!(err.contains("TPIDR_EL0"), "names the register: {err}");
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
-            let p = plan(&cp, None, &[]).expect("this architecture's regs carry tp");
+            let p = plan(&cp, None, &[], &FdReach::everything()).expect("this architecture's regs carry tp");
             assert_eq!(u32::from_le_bytes(p.blob[72..76].try_into().unwrap()), 0, "has_tls");
             assert_eq!(u64::from_le_bytes(p.blob[64..72].try_into().unwrap()), 0, "tls");
         }

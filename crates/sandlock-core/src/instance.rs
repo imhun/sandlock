@@ -1313,8 +1313,22 @@ impl SandboxInstance {
 
         let chroot_root = crate::chroot::resolve::resolve_chroot_root(policy.chroot.as_deref())?;
         let mounts = crate::chroot::resolve::resolve_chroot_mounts(&policy.fs_mount);
-        let plan = crate::checkpoint::restore_blob::plan(cp, chroot_root.as_deref(), &mounts)
-            .map_err(SandboxRuntimeError::Child)?;
+        // Same screening as the in-process restore path: the stub reopens the
+        // checkpoint's fds inside this sandbox, so a path the sandbox's own
+        // policy does not grant must be reported as skipped rather than handed
+        // to the stub (where it can only fail with EACCES and kill the resume).
+        let reach = crate::checkpoint::restore_blob::FdReach {
+            readable: &policy.fs_readable,
+            writable: &policy.fs_writable,
+            mounts: &mounts,
+        };
+        let plan = crate::checkpoint::restore_blob::plan(
+            cp,
+            chroot_root.as_deref(),
+            &mounts,
+            &reach,
+        )
+        .map_err(SandboxRuntimeError::Child)?;
         crate::checkpoint::resume::note(&format!(
             "restore: image pid={} maps={} fds={} -> plan maps={} blob={}B skipped={}",
             cp.process_state.pid,
