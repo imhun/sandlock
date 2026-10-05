@@ -2137,6 +2137,29 @@ impl Sandbox {
             return Err(SandboxRuntimeError::Child("empty command".into()).into());
         }
 
+        // N14 S5 (2026-10-04): the **emulated root is retired**. A `chroot`
+        // root without `real_root` used to be served by translating every path
+        // the mediator saw (`chroot/dispatch.rs`); that emulation is gone, so
+        // this combination has no implementation left. Refusing here -- before
+        // any fork or confinement work -- is the only honest answer: letting it
+        // through would run every workload verb in a child whose kernel root is
+        // the host's, with nothing left to translate it.
+        //
+        // Every creation path reaches this function (the FFI clones the policy
+        // straight into the Sandbox, and `sandlock-supervise` builds one from
+        // the policy document), which is why the check lives here rather than
+        // in `validate()` alone.
+        if self.chroot.is_some() && !self.real_root {
+            return Err(SandboxRuntimeError::Child(
+                "a chroot root without real_root is refused: the emulated root is retired \
+                 (N14 S5) and the real root is the only shape. Set real_root (CLI \
+                 --real-root, FFI sandlock_sandbox_builder_real_root, policy \
+                 \"real_root\": true)."
+                    .into(),
+            )
+            .into());
+        }
+
         // fd_inject_connect is a seccomp-supervisor feature: the supervisor
         // performs the host connect and ADDFD injection on its side. With
         // no_supervisor there is no listener to intercept connect(), so the

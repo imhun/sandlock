@@ -718,7 +718,16 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         // instead, which needs no privilege (rootless-container pattern).
         let self_map =
             sandbox.userns_self_map && !remap && sandbox.user.is_some() && real_uid != 0;
-        let userns_needed = sandbox.net_isolation || remap || self_map;
+        // N14 S5 (2026-10-04): a real root needs a mount namespace, and a mount
+        // namespace needs a user namespace to hold CAP_SYS_ADMIN -- so the real
+        // root asks for one too. Unlike the optional self-map below, this one
+        // is *required*: without it `realroot::build` cannot even call
+        // `unshare(CLONE_NEWNS)`, so a node that cannot create unprivileged
+        // user namespaces fails the create here rather than half-way through
+        // the root build.
+        let real_root_needs_userns = sandbox.real_root;
+        let userns_needed =
+            sandbox.net_isolation || remap || self_map || real_root_needs_userns;
 
         if userns_needed {
             // The self-map is the only *optional* namespace: if the kernel or
@@ -729,7 +738,9 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
             // Every other case needs its namespace or the identity/netns
             // contract would silently be a lie.
             let unshared = unsafe { libc::unshare(libc::CLONE_NEWUSER) } == 0;
-            if !unshared && !(self_map && !sandbox.net_isolation && !remap) {
+            if !unshared
+                && !(self_map && !real_root_needs_userns && !sandbox.net_isolation && !remap)
+            {
                 fail!("unshare(CLONE_NEWUSER)");
             }
             match sandbox.user {

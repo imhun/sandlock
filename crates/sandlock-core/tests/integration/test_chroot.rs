@@ -17,13 +17,22 @@ fn helper_binary() -> PathBuf {
 }
 
 /// Minimal fs_readable set needed to run rootfs-helper under chroot.
+///
+/// N14 S5 (2026-10-04): the real root is the only chroot shape now (the
+/// emulated one is refused at create), and an unprivileged mediator needs the
+/// sandbox to have a user namespace of its own for the mount namespace the real
+/// root builds -- that is what `userns_self_map` provides here, exactly as
+/// `test_getcwd_under_a_real_root_is_the_kernels_answer` spells it.
 fn minimal_exec_policy(rootfs: &PathBuf) -> sandlock_core::SandboxBuilder {
-    Sandbox::builder()
+    let mut builder = Sandbox::builder()
         .chroot(rootfs)
+        .real_root(true)
         .fs_read("/usr")
         .fs_read("/bin")
         .fs_read("/proc")
-        .fs_read("/dev")
+        .fs_read("/dev");
+    builder.userns_self_map = true;
+    builder
 }
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -93,6 +102,26 @@ fn build_test_rootfs(name: &str) -> PathBuf {
     // Set /tmp sticky
     let _ = fs::set_permissions(rootfs.join("tmp"), fs::Permissions::from_mode(0o1777));
 
+    // N14 S5: the real root binds the policy's `fs_mount` entries *inside* the
+    // rootfs, and `realroot::build` refuses a target that does not exist there
+    // ("mount point … does not exist inside the rootfs"). The emulated shape
+    // never needed the mount points to exist (it translated paths in the
+    // mediator), so the fixture has to materialize the ones the policies in
+    // this file bind: `minimal_dev`'s six nodes and the `/tmp` write mount.
+    for node in [
+        "dev/ptmx",
+        "dev/null",
+        "dev/urandom",
+        "dev/zero",
+        "dev/tty",
+    ] {
+        let path = rootfs.join(node);
+        if !path.exists() {
+            fs::write(&path, b"").expect("materialize a /dev mount target");
+        }
+    }
+    let _ = fs::create_dir_all(rootfs.join("dev/pts"));
+
     // Hard-link the helper binary (atomic, avoids ETXTBSY races from copy).
     let dest = rootfs.join("usr/bin/rootfs-helper");
     fs::hard_link(&helper, &dest)
@@ -148,7 +177,7 @@ async fn test_chroot_ls_root() {
             assert!(stdout.contains("bin"), "should list bin, got: {}", stdout);
             assert!(stdout.contains("etc"), "should list etc, got: {}", stdout);
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -261,7 +290,7 @@ async fn test_chroot_no_escape() {
                 stdout
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -293,7 +322,7 @@ async fn test_chroot_getcwd() {
             let stdout = r.stdout_str().unwrap_or("").trim().to_string();
             assert_eq!(stdout, "/", "pwd should return /, got: {}", stdout);
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -318,7 +347,7 @@ async fn test_chroot_chdir_short_path() {
             );
             assert_eq!(r.stdout_str().unwrap_or("").trim(), "OK /tmp");
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -341,7 +370,7 @@ async fn test_chroot_chdir_virtual_root() {
             );
             assert_eq!(r.stdout_str().unwrap_or("").trim(), "OK /");
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -374,7 +403,7 @@ async fn test_chroot_relative_open_follows_chdir() {
                 r.stdout_str().unwrap_or("")
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -384,6 +413,18 @@ async fn test_chroot_relative_open_follows_chdir() {
 /// has to observe this spelling too. Chained after a chdir, which is where the
 /// supervisor's own notion takes over: miss the fchdir and that notion goes
 /// stale, sending the following relative open back to the chdir's directory.
+///
+/// N14 S5 (2026-10-04): under the real root the `open("/etc")` behind the
+/// `fchdir` is answered with a *mediator-injected* descriptor, and that
+/// descriptor lives on the mediator's mount rather than on the sandbox's own
+/// root. The cwd it leaves behind therefore renders as a **host** path, and the
+/// supervisor's bookkeeping has to map it back (N43's rule, applied to the cwd
+/// rather than to a dirfd: map when it maps, and only take the report as the
+/// sandbox's own spelling when there is nothing to map). Without that, the
+/// tracked cwd became the rootfs's host path and every later relative open was
+/// denied as "outside the grants" -- measured here, and the reason this case is
+/// asserted through `;` rather than `&&`: the relative read has to be reached
+/// even when an earlier step in the chain reports a failure.
 #[tokio::test]
 async fn test_chroot_relative_open_follows_fchdir() {
     let rootfs = build_test_rootfs("fchdir-relative");
@@ -402,29 +443,38 @@ async fn test_chroot_relative_open_follows_fchdir() {
             "rootfs-helper",
             "sh",
             "-c",
-            "chdir /tmp && fchdir /etc && cat marker.txt",
+            "chdir /tmp; fchdir /etc; cat marker.txt",
         ])
         .await
     {
         Ok(r) => {
-            assert!(
-                r.success(),
-                "relative cat after fchdir should succeed, stderr: {}",
-                r.stderr_str().unwrap_or("")
-            );
             let stdout = r.stdout_str().unwrap_or("").to_string();
             assert!(
                 stdout.contains("from-etc"),
-                "relative open should have read /etc/marker.txt, got: {}",
-                stdout
+                "relative open should have read /etc/marker.txt, got stdout: {:?} stderr: {:?}",
+                stdout,
+                r.stderr_str()
             );
             assert!(
                 !stdout.contains("from-tmp"),
                 "relative open resolved against the earlier chdir, got: {}",
                 stdout
             );
+            // The cwd the fchdir landed on must be named the way the sandbox
+            // names it, not the way the mediator's mount does.
+            assert!(
+                stdout.contains("OK /etc"),
+                "the cwd must come back as the sandbox's own spelling, got: {:?}",
+                stdout
+            );
+            assert!(
+                r.stderr_str().unwrap_or("").is_empty(),
+                "the chain must run clean, got stdout: {:?} stderr: {:?}",
+                stdout,
+                r.stderr_str()
+            );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -460,7 +510,7 @@ async fn test_chroot_proc_self_cwd_link_follows_chdir() {
                 stdout
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -502,7 +552,7 @@ async fn test_chroot_open_through_proc_self_cwd() {
                 r.stdout_str().unwrap_or("")
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -539,7 +589,7 @@ async fn test_chroot_proc_self_cwd_never_leaks_a_host_path() {
                 stdout
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -569,7 +619,7 @@ async fn test_chroot_unlink_removes_the_symlink_not_its_target() {
                 "rm of a symlink left the link in place"
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -599,7 +649,7 @@ async fn test_chroot_lstat_describes_the_symlink() {
                 stdout
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -632,7 +682,7 @@ async fn test_chroot_rename_moves_the_symlink_not_its_target() {
                 "the moved entry should still be a symlink"
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -663,7 +713,7 @@ async fn test_chroot_lstat_of_proc_self_cwd_is_a_link() {
                 stdout
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -699,7 +749,7 @@ async fn test_chroot_readlink_of_a_foreign_pid_is_refused() {
                 r.stdout_str().unwrap_or("")
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -739,13 +789,26 @@ async fn test_chroot_fd_link_does_not_leak_a_host_path() {
             }
             let _ = child.wait().await;
             let link = out.trim().to_string();
+            // N14 S5: under the real root the kernel names the file the fd
+            // actually holds, spelled in the sandbox's own tree -- `/dev/null`
+            // here, which is a path the sandbox may see. What must never appear
+            // is the *host* path behind the mount (the fixture's rootfs, or any
+            // mediator-side directory), because that is the leak this pins.
+            let host_root = rootfs.to_string_lossy().to_string();
             assert!(
-                !link.starts_with('/'),
-                "fd link named a path the sandbox cannot reach: {}",
+                !link.contains(&host_root),
+                "fd link named the host path behind the mount: {}",
                 link
             );
+            if link.starts_with('/') {
+                assert!(
+                    link == "/dev/null",
+                    "the only absolute target this probe's policy can name is its own \
+                     /dev/null, got: {link}"
+                );
+            }
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -779,7 +842,7 @@ async fn test_chroot_openat2_resolves_inside_the_rootfs() {
                 r.stdout_str().unwrap_or("")
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -811,7 +874,7 @@ async fn test_chroot_openat2_relative_follows_chdir() {
                 r.stdout_str().unwrap_or("")
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -852,7 +915,7 @@ async fn test_chroot_openat2_honors_resolve_no_symlinks() {
                 r.stderr_str().unwrap_or("")
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -890,7 +953,7 @@ async fn test_chroot_chdir_proc_readonly_buffer() {
             let cwd = r.stdout_str().unwrap_or("").trim().trim_end_matches('/').to_string();
             assert_eq!(cwd, "OK /proc", "cwd after chdir should be /proc");
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -934,7 +997,7 @@ async fn test_chroot_chdir_proc_self_resolves_to_child() {
                 out
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -960,17 +1023,18 @@ async fn test_chroot_chdir_proc_self_resolves_to_child() {
 /// tools were dead in production sandboxes while every absolute spelling
 /// worked.
 ///
-/// All three roots the deployment builds are asserted against the same
-/// expected bytes, because only one of them was broken: the emulated root
-/// mapped the host report back all along, and the pure shape's root is the
-/// host root itself (N15: no image rootfs, identity translation), where the
-/// mapping is the identity -- so the real root has to answer exactly what those
-/// two answer. The fixture is also the shape the tools use, not just the
-/// syscalls: the descriptor is opened on a directory that is a *mount point*
-/// and the name under it is a symlink, so the mapped base has to survive the
-/// mount table and the link has to be followed through it.
+/// N14 S5: the shape is asserted against the expected bytes on the only root
+/// there is. This case used to compare three (the emulated root, the real root
+/// and the pure shape's identity root) because only one of them was broken --
+/// the emulated root mapped the host report back all along. The other two are
+/// retired: the emulated root is refused at create, and the identity root is
+/// the `E2B_PURE_ROOTFS=off` lever, refused by name at startup. The fixture is
+/// also the shape the tools use, not just the syscalls: the descriptor is
+/// opened on a directory that is a *mount point* and the name under it is a
+/// symlink, so the mapped base has to survive the mount table and the link has
+/// to be followed through it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_dirfd_relative_reads_resolve_in_both_chroot_shapes() {
+async fn test_dirfd_relative_reads_resolve_under_the_real_root() {
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };
     // `stdout_str` trims the trailing newline only; the four lines themselves
@@ -993,119 +1057,35 @@ async fn test_dirfd_relative_reads_resolve_in_both_chroot_shapes() {
     fs::write(ws.join("seed.bin"), vec![b'x'; 3000]).expect("seed the workspace file");
     std::os::unix::fs::symlink("seed.bin", ws.join("link")).expect("seed the symlink");
 
-    // The identity root's grants are compared against the path the *kernel*
-    // resolved, while a grant declared under a symlinked directory keeps the
-    // spelling it was written with. This lane's `target` is exactly such a
-    // symlink, so the pure-shape fixture has to sit somewhere plain: the
-    // repo's own `tmp/`. (The chroot shapes are unaffected -- their mount
-    // sources are canonicalized when the policy is built, which is why the
-    // workspace can stay under `CARGO_TARGET_TMPDIR` for them.)
-    // Canonicalized, like a deployment's own paths: a grant is compared
-    // against the path the kernel resolved, so a spelling still carrying `..`
-    // or a symlink is a spelling that never matches.
-    let plain = fs::canonicalize(env!("CARGO_MANIFEST_DIR"))
-        .expect("canonicalize the crate directory")
-        .join("../..")
-        .join("tmp")
-        .join(format!("n43-dirfd-identity-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&plain);
-    fs::create_dir_all(&plain).expect("create the symlink-free workspace");
-    let plain = fs::canonicalize(&plain).expect("canonicalize the plain workspace");
-    fs::copy(&helper, plain.join("rootfs-helper")).expect("install rootfs-helper (plain)");
-    fs::write(plain.join("seed.bin"), vec![b'x'; 3000]).expect("seed the plain file");
-    std::os::unix::fs::symlink("seed.bin", plain.join("link")).expect("seed the plain symlink");
-    let plain_str = plain.to_str().expect("workspace path is UTF-8").to_string();
-
-    // (label, chroot root, real root, cwd, argv[0], the dirfd the probe opens)
-    let host_root = PathBuf::from("/");
-    let shapes = [
-        (
-            "emulated chroot",
-            &rootfs,
-            false,
-            "/work".to_string(),
-            "rootfs-helper".to_string(),
-            "/work".to_string(),
-        ),
-        (
-            "real root",
-            &rootfs,
-            true,
-            "/work".to_string(),
-            "rootfs-helper".to_string(),
-            "/work".to_string(),
-        ),
-        (
-            "identity root (the pure shape's mediated root)",
-            &host_root,
-            false,
-            plain_str.clone(),
-            plain.join("rootfs-helper").to_string_lossy().into_owned(),
-            plain_str.clone(),
-        ),
-    ];
-
-    // Every shape is run before anything is asserted, so a red run names what
-    // each root answered rather than stopping at the first one.
-    let mut observed: Vec<(String, String, String)> = Vec::new();
-    for (label, chroot_root, real_root, cwd, argv0, dir) in shapes {
-        // The second half of the fixture: for the chroot shapes `/work` is a
-        // *mount point* (declared below) whose host side is the workspace, and
-        // it has to exist inside the rootfs before the pivot -- the real root
-        // installs the policy's own binds, and a missing mount point is an
-        // error there rather than a silently absent path (realroot.rs). The
-        // identity root has no mount table: the workspace is reachable by its
-        // host spelling, which is the sandbox's own cwd in that shape, and the
-        // policy is the pure shape's -- the system directories readable and the
-        // workspace writable. The readable list is deliberately not empty (the
-        // fixture's own helper runs out of the workspace, so it is readable
-        // too): `can_read` short-circuits to "allow" on an empty allow-list,
-        // and a case that only ever saw that path would not say anything about
-        // how the workspace is looked up.
-        let is_identity = chroot_root.as_path() == std::path::Path::new("/");
-        let mut builder = Sandbox::builder()
-            .chroot(chroot_root)
-            .real_root(real_root)
-            .user(euid, egid)
-            .cwd(&cwd);
-        builder = if is_identity {
-            builder
-                .fs_read("/usr")
-                .fs_read("/lib")
-                .fs_read("/bin")
-                .fs_read("/opt")
-                .fs_read(&plain)
-                .fs_write(&plain)
-        } else {
-            builder
-                .fs_read("/usr")
-                .fs_mount("/work", &ws)
-                .fs_write("/work")
-        };
-        builder.userns_self_map = true;
-        let policy = builder.build().unwrap_or_else(|e| panic!("{label}: the policy builds: {e}"));
-
-        let r = policy
-            .clone()
-            .run(&[&argv0, "dirfd-probe", &dir, "link"])
-            .await
-            .unwrap_or_else(|e| panic!("{label}: the probe must run: {e}"));
-        observed.push((
-            label.to_string(),
-            r.stdout_str().unwrap_or("<no stdout>").to_string(),
-            r.stderr_str().unwrap_or("<no stderr>").to_string(),
-        ));
-    }
-    let want: Vec<(String, String, String)> = observed
-        .iter()
-        .map(|(label, _, _)| (label.clone(), expected.to_string(), String::new()))
-        .collect();
+    // `/work` is a *mount point* (declared below) whose host side is the
+    // workspace, and it has to exist inside the rootfs before the pivot: the
+    // real root installs the policy's own binds, and a missing mount point is
+    // an error there rather than a silently absent path (`realroot.rs`).
+    let mut builder = Sandbox::builder()
+        .chroot(&rootfs)
+        .user(euid, egid)
+        .cwd("/work")
+        .fs_read("/usr")
+        .fs_mount("/work", &ws)
+        .fs_write("/work");
+    builder.userns_self_map = true;
+    let policy = builder
+        .build()
+        .unwrap_or_else(|e| panic!("the real-root policy builds: {e}"));
+    let r = policy
+        .clone()
+        .run(&["rootfs-helper", "dirfd-probe", "/work", "link"])
+        .await
+        .unwrap_or_else(|e| panic!("the probe must run: {e}"));
     assert_eq!(
-        observed, want,
-        "a dirfd-relative name must resolve exactly like its absolute spelling, in every root shape"
+        r.stdout_str().unwrap_or("<no stdout>"),
+        expected,
+        "a dirfd-relative name must resolve exactly like its absolute spelling \
+         (stderr: {})",
+        r.stderr_str().unwrap_or("")
     );
+    assert_eq!(r.stderr_str().unwrap_or(""), "", "the probe must be silent");
 
-    let _ = fs::remove_dir_all(&plain);
     cleanup_rootfs(&rootfs);
 }
 
@@ -1140,7 +1120,7 @@ async fn test_chroot_proc_dirfd_relative_is_virtualized() {
                 out
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -1185,7 +1165,7 @@ async fn test_chroot_magic_fd_symlink_resolves_to_child_fd() {
                 r.stderr_str()
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -1273,7 +1253,7 @@ async fn test_chroot_write_file() {
                 real_path.display()
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -1326,7 +1306,7 @@ async fn test_chroot_cow_directory_open_stays_in_rootfs() {
                 stdout
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     let _ = fs::remove_file(&host_marker);
@@ -1370,7 +1350,7 @@ async fn test_chroot_with_cow() {
                 cow_file.display()
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -1424,7 +1404,7 @@ async fn test_chroot_cow_read_deleted_file_is_enoent() {
                 stdout
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -1460,7 +1440,7 @@ async fn test_chroot_proc_self_root() {
                 stdout
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -1488,7 +1468,7 @@ async fn test_chroot_write_denied_without_fs_write() {
                 "write should fail without fs_write, but got exit=0"
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -1523,7 +1503,7 @@ async fn test_chroot_exec_with_root_readable() {
                 stdout
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -1552,7 +1532,7 @@ async fn test_chroot_fs_deny_blocks_virtual_path() {
                 r.stdout_str().unwrap_or("")
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -1581,7 +1561,7 @@ async fn test_chroot_read_denied_without_fs_read() {
                 r.stdout_str().unwrap_or("")
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -1676,7 +1656,7 @@ async fn test_chroot_etc_hosts_seeded_from_image() {
                 "v6 loopback should be injected for the image: {stdout}"
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -1716,20 +1696,23 @@ async fn test_chroot_etc_hosts_no_duplicate_loopback() {
             );
             assert!(stdout.contains("10.0.0.5 svc.local"), "image entry missing: {stdout}");
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
 }
 
-/// `max_open_files` under `chroot`: the cap applies as usual, but a value too
-/// low to start the process does *not* surface as `EMFILE`. Under `chroot` the
-/// exec fd is injected by the supervisor, and an injection the guest's
-/// descriptor limit refuses is answered `EIO`, so the run exits 127 with
-/// "Input/output error". The documentation promises that errno for this mode;
-/// this test is what keeps it honest.
+/// `max_open_files` under `chroot`: the cap applies as usual, and the *startup
+/// floor* the emulated shape had is gone with it.
+///
+/// N14 S5 (2026-10-04): under the emulated root the supervisor had to inject
+/// the exec fd above the guest's own table, so a cap too low to hold that
+/// injection answered `EIO` and exited 127 -- a floor the caller could not see
+/// in the policy. The real root hands the exec to the kernel, so the only floor
+/// left is the sandbox's own. Both halves are pinned here: a workable cap
+/// changes nothing, and a cap of three descriptors no longer fails the exec.
 #[tokio::test]
-async fn test_max_open_files_chroot_exec_error_is_eio() {
+async fn test_max_open_files_chroot_has_no_injected_exec_fd_floor() {
     let rootfs = build_test_rootfs("max-open-files");
 
     // A workable cap changes nothing about the run.
@@ -1738,22 +1721,22 @@ async fn test_max_open_files_chroot_exec_error_is_eio() {
         .build()
         .unwrap()
         .run(&["rootfs-helper", "true"])
-        .await;
-    match ok {
-        Ok(r) => assert!(
-            r.success(),
-            "a 64-descriptor cap should still run under chroot, stderr: {}",
-            r.stderr_str().unwrap_or("")
-        ),
-        Err(e) => {
-            eprintln!("Chroot test skipped: {}", e);
-            cleanup_rootfs(&rootfs);
-            return;
-        }
-    }
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the chroot sandbox must be creatable (N14 S5: the real root is \
+                 the only shape): {e}"
+            )
+        });
+    assert!(
+        ok.success(),
+        "a 64-descriptor cap should still run under chroot, stderr: {}",
+        ok.stderr_str().unwrap_or("")
+    );
 
-    // Too low to install the injected exec fd: the guest never reaches `main`.
-    let too_low = minimal_exec_policy(&rootfs)
+    // Three descriptors: enough to exec through the kernel (the old shape
+    // needed an injected fd above this, and answered EIO without one).
+    let tiny = minimal_exec_policy(&rootfs)
         .max_open_files(3)
         .build()
         .unwrap()
@@ -1761,16 +1744,12 @@ async fn test_max_open_files_chroot_exec_error_is_eio() {
         .await
         .unwrap();
     assert_eq!(
-        too_low.code(),
-        Some(127),
-        "a cap below the chroot startup floor must fail the exec, stderr: {}",
-        too_low.stderr_str().unwrap_or("")
+        tiny.code(),
+        Some(0),
+        "the real root injects no exec fd, so a 3-descriptor cap must run, stderr: {}",
+        tiny.stderr_str().unwrap_or("")
     );
-    let stderr = too_low.stderr_str().unwrap_or("").to_string();
-    assert!(
-        stderr.contains("Input/output error") || stderr.contains("os error 5"),
-        "the chroot exec failure is reported as EIO, not EMFILE, got: {stderr}"
-    );
+    assert_eq!(tiny.stderr_str().unwrap_or(""), "", "nothing on stderr");
 
     cleanup_rootfs(&rootfs);
 }
@@ -1806,7 +1785,7 @@ async fn test_max_open_files_chroot_ignores_parent_fd_density() {
              more fds than the cap, stderr: {}",
             r.stderr_str().unwrap_or("")
         ),
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -1847,10 +1826,9 @@ async fn test_chroot_hardlink_follow_cannot_reach_a_host_file() {
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Chroot test skipped: {}", e);
             cleanup_rootfs(&rootfs);
             let _ = fs::remove_dir_all(&host_dir);
-            return;
+            panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}");
         }
     };
     // A symlink is just a string, so planting it is allowed; the target is
@@ -1955,9 +1933,8 @@ async fn test_chroot_hardlink_follow_links_the_target_inode() {
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Chroot test skipped: {}", e);
             cleanup_rootfs(&rootfs);
-            return;
+            panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}");
         }
     };
     assert!(
@@ -2034,11 +2011,10 @@ async fn test_chroot_hardlink_cannot_escalate_read_only_mount() {
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Chroot test skipped: {}", e);
             cleanup_rootfs(&rootfs);
             let _ = fs::remove_dir_all(&ro_dir);
             let _ = fs::remove_dir_all(&rw_dir);
-            return;
+            panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}");
         }
     };
     // Baseline: the policy grants no write on the source name. Without this
@@ -2117,10 +2093,9 @@ async fn test_chroot_hardlink_cannot_alias_denied_path() {
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Chroot test skipped: {}", e);
             cleanup_rootfs(&rootfs);
             let _ = fs::remove_dir_all(&work_dir);
-            return;
+            panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}");
         }
     };
     // Baseline: fs_deny wins over the surrounding writable mount.
@@ -2204,10 +2179,9 @@ async fn test_chroot_hardlink_allowed_when_both_sides_writable() {
     // then has to launch, or this test would be the one place where an
     // over-denying gate could ship unnoticed.
     if let Err(e) = policy.clone().run(&["rootfs-helper", "true"]).await {
-        eprintln!("Chroot test skipped: {}", e);
         cleanup_rootfs(&rootfs);
         let _ = fs::remove_dir_all(&work_dir);
-        return;
+        panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}");
     }
 
     let linked = policy
@@ -2263,10 +2237,9 @@ async fn test_chroot_hardlink_follow_cannot_alias_a_denied_path_under_a_mount() 
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Chroot test skipped: {}", e);
             cleanup_rootfs(&rootfs);
             let _ = fs::remove_dir_all(&work_dir);
-            return;
+            panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}");
         }
     };
     // fs_deny covers the file, not the name of a symlink beside it, so
@@ -2382,7 +2355,7 @@ async fn test_chroot_hardlink_into_a_branch_is_refused() {
                 "the branch was aborted, yet the link landed in the workdir itself"
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -2440,7 +2413,7 @@ async fn test_chroot_hardlink_out_of_a_branch_is_refused() {
                 "the aborted branch still edited the file it was staging over"
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -2496,7 +2469,7 @@ async fn test_chroot_hardlink_within_a_branch_stays_in_the_branch() {
                 "the aborted branch left its second name in the workdir"
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);
@@ -2551,7 +2524,7 @@ async fn test_chroot_hardlink_to_a_file_deleted_in_the_branch_is_enoent() {
                 "the pre-delete inode came back under a second name in the workdir"
             );
         }
-        Err(e) => eprintln!("Chroot test skipped: {}", e),
+        Err(e) => panic!("the chroot sandbox must be creatable (N14 S5: the real root is the only shape): {e}"),
     }
 
     cleanup_rootfs(&rootfs);

@@ -1818,6 +1818,45 @@ fn instance_policy_with_file_size(evidence_dir: &str, ceiling: &str) -> String {
     .to_string()
 }
 
+/// The skeleton root every `chroot`-shaped policy in this file runs on.
+///
+/// N14 S5 (2026-10-04): the deployment's chroot shape is the **real** root.
+/// The pure identity shape (`chroot: "/"`) these fixtures used is retired --
+/// `E2B_PURE_ROOTFS=off` is refused by name at startup -- and a real root
+/// cannot re-enter `/` anyway (`pivot_root(".", ".")` on `/` is EBUSY, measured
+/// in `docs/n14-retire-the-emulation.md` §5). So the fixture builds the shape
+/// the deployment builds: a skeleton root with the host's system directories,
+/// `/dev` and `/tmp` bound into it. Binding the host's `/tmp` at `/tmp` keeps
+/// every case's absolute path meaningful on both sides of the boundary.
+///
+/// It lives inside the caller's workdir so the existing cleanup removes it.
+fn chroot_rootfs(workdir: &std::path::Path) -> std::path::PathBuf {
+    let rootfs = workdir.join("rootfs");
+    for sub in ["usr", "lib", "bin", "etc", "proc", "dev", "tmp"] {
+        std::fs::create_dir_all(rootfs.join(sub)).expect("create the skeleton dir");
+    }
+    if std::path::Path::new("/lib64").exists() {
+        std::fs::create_dir_all(rootfs.join("lib64")).expect("create lib64");
+    }
+    rootfs
+}
+
+/// The mounts that make a `chroot_rootfs` skeleton usable (see its doc).
+fn chroot_mounts() -> Vec<String> {
+    let mut mounts = vec![
+        "/usr:/usr:ro".to_string(),
+        "/lib:/lib:ro".to_string(),
+        "/bin:/bin:ro".to_string(),
+        "/etc:/etc:ro".to_string(),
+        "/dev:/dev".to_string(),
+        "/tmp:/tmp".to_string(),
+    ];
+    if std::path::Path::new("/lib64").exists() {
+        mounts.push("/lib64:/lib64:ro".to_string());
+    }
+    mounts
+}
+
 /// The same policy, in the **chroot** shape (`chroot: "/"`, so virtual paths
 /// and host paths are the same string but the path handlers are live).
 ///
@@ -1832,11 +1871,13 @@ fn instance_policy_with_file_size(evidence_dir: &str, ceiling: &str) -> String {
 /// workload that writes happily to `/tmp` writes nothing at all under a
 /// deeply nested repo path, with its diagnostics going to the M0 child's
 /// `/dev/null`). `/tmp` keeps the test independent of where the repo lives.
-fn instance_policy_chrooted(writable: &str) -> String {
+fn instance_policy_chrooted(rootfs: &std::path::Path, writable: &str) -> String {
     let mut readable = base_read_paths();
     readable.push(writable.to_string());
     serde_json::json!({
-        "chroot": "/",
+        "chroot": rootfs,
+        "real_root": true,
+        "fs_mount": chroot_mounts(),
         "fs_readable": readable,
         "fs_writable": [writable],
     })
@@ -1849,11 +1890,17 @@ fn instance_policy_chrooted(writable: &str) -> String {
 /// mediator trap `openat` (and therefore see the descriptors a writer holds),
 /// and the ceiling is what installs the ignored `SIGXFSZ` that turns a
 /// past-the-limit write into `EFBIG` instead of a killed process.
-fn instance_policy_chrooted_with_file_size(writable: &str, ceiling: &str) -> String {
+fn instance_policy_chrooted_with_file_size(
+    rootfs: &std::path::Path,
+    writable: &str,
+    ceiling: &str,
+) -> String {
     let mut readable = base_read_paths();
     readable.push(writable.to_string());
     serde_json::json!({
-        "chroot": "/",
+        "chroot": rootfs,
+        "real_root": true,
+        "fs_mount": chroot_mounts(),
         "fs_readable": readable,
         "fs_writable": [writable],
         "max_file_size": ceiling,
@@ -1872,11 +1919,13 @@ fn instance_policy_chrooted_with_file_size(writable: &str, ceiling: &str) -> Str
 /// while a writer was busy, no pushed appends, and a 1024 MiB budget exceeded
 /// by 124 MiB. Without this fixture the whole unit suite passes while the
 /// feature is dead in production.
-fn instance_policy_chrooted_pid_ns(writable: &str) -> String {
+fn instance_policy_chrooted_pid_ns(rootfs: &std::path::Path, writable: &str) -> String {
     let mut readable = base_read_paths();
     readable.push(writable.to_string());
     serde_json::json!({
-        "chroot": "/",
+        "chroot": rootfs,
+        "real_root": true,
+        "fs_mount": chroot_mounts(),
         "fs_readable": readable,
         "fs_writable": [writable],
         "pid_ns": true,
@@ -1907,11 +1956,17 @@ fn instance_policy_chrooted_pid_ns(writable: &str) -> String {
 /// notification pid something the mediator has to translate before it can read
 /// the descriptor -- so this is the fixture under which "the bytes a file has
 /// already written" has to survive that translation.
-fn instance_policy_chrooted_pid_ns_with_file_size(writable: &str, ceiling: &str) -> String {
+fn instance_policy_chrooted_pid_ns_with_file_size(
+    rootfs: &std::path::Path,
+    writable: &str,
+    ceiling: &str,
+) -> String {
     let mut readable = base_read_paths();
     readable.push(writable.to_string());
     serde_json::json!({
-        "chroot": "/",
+        "chroot": rootfs,
+        "real_root": true,
+        "fs_mount": chroot_mounts(),
         "fs_readable": readable,
         "fs_writable": [writable],
         "max_file_size": ceiling,
@@ -1920,7 +1975,11 @@ fn instance_policy_chrooted_pid_ns_with_file_size(writable: &str, ceiling: &str)
     .to_string()
 }
 
-fn instance_policy_chrooted_pid_ns_self_userns(writable: &str, uid: u32) -> String {
+fn instance_policy_chrooted_pid_ns_self_userns(
+    rootfs: &std::path::Path,
+    writable: &str,
+    uid: u32,
+) -> String {
     let mut readable = base_read_paths();
     readable.push(writable.to_string());
     // "Himself" means the real uid *and* the real gid: naming the uid twice
@@ -1928,7 +1987,9 @@ fn instance_policy_chrooted_pid_ns_self_userns(writable: &str, uid: u32) -> Stri
     // (see `egid`). The shape under test is the *self* user namespace, so the
     // policy must say what self actually is.
     serde_json::json!({
-        "chroot": "/",
+        "chroot": rootfs,
+        "real_root": true,
+        "fs_mount": chroot_mounts(),
         "fs_readable": readable,
         "fs_writable": [writable],
         "pid_ns": true,
@@ -1948,7 +2009,11 @@ fn test_dirty_dirs_reports_the_directory_a_write_landed_in() {
     let workdir =
         std::path::PathBuf::from(format!("/tmp/sandlock-dirty-{}", std::process::id()));
     std::fs::create_dir_all(&workdir).expect("create dirty workdir");
-    let policy = write_policy("dirty-verb", &instance_policy_chrooted("/tmp"));
+    let rootfs = chroot_rootfs(&workdir);
+    let policy = write_policy(
+        "dirty-verb",
+        &instance_policy_chrooted(&rootfs, "/tmp"),
+    );
     let script = format!(
         "mkdir -p {0}/sub && printf hi > {0}/sub/blob.bin && exec sleep 30",
         workdir.display()
@@ -2017,13 +2082,14 @@ fn test_events_fd_reports_a_running_writers_growth() {
         std::path::PathBuf::from(format!("/tmp/sandlock-events-{}", std::process::id()));
     std::fs::create_dir_all(&workdir).expect("create events workdir");
     let blob = workdir.join("blob.bin");
+    let rootfs = chroot_rootfs(&workdir);
     let policy = write_policy(
         "events-append",
         // `pid_ns` + the user namespace on purpose: this is the test that has
         // to fail when the watch is handed namespace pids it cannot read, or
         // when the PID-namespace identity is lost to a refused read while the
         // leader starts (see the fixtures).
-        &instance_policy_chrooted_pid_ns_self_userns("/tmp", euid()),
+        &instance_policy_chrooted_pid_ns_self_userns(&rootfs, "/tmp", euid()),
     );
     // One descriptor, held open across eight 1 MiB appends 150 ms apart:
     // the shape this signal exists for (a writer filling a file), and one
@@ -2128,9 +2194,10 @@ fn test_over_budget_blocks_writes_but_not_deletes() {
     let filled = workdir.join("filled.bin");
     let refused = workdir.join("refused.bin");
     let refused_dir = workdir.join("refused-dir");
+    let rootfs = chroot_rootfs(&workdir);
     let policy = write_policy(
         "over-budget-limit",
-        &instance_policy_chrooted_pid_ns_with_file_size("/tmp", "512M"),
+        &instance_policy_chrooted_pid_ns_with_file_size(&rootfs, "/tmp", "512M"),
     );
     let script = format!(
         "exec 3>>{filled}; i=0; while [ $i -lt 40 ]; do \
@@ -2272,9 +2339,10 @@ fn test_the_entry_cap_refuses_new_names_and_not_deletes() {
     let second = workdir.join("second.txt");
     let third = workdir.join("third.txt");
     let fourth = workdir.join("fourth.txt");
+    let rootfs = chroot_rootfs(&workdir);
     let policy = write_policy(
         "entry-cap",
-        &instance_policy_chrooted_pid_ns_with_file_size("/tmp", "512M"),
+        &instance_policy_chrooted_pid_ns_with_file_size(&rootfs, "/tmp", "512M"),
     );
     let script = format!(
         "echo a > {first}; sleep 6; \
@@ -2372,12 +2440,13 @@ fn test_a_tightening_does_not_cut_off_the_file_that_caused_it() {
     ));
     std::fs::create_dir_all(&workdir).expect("create tail workdir");
     let blob = workdir.join("tail.bin");
+    let rootfs = chroot_rootfs(&workdir);
     let policy = write_policy(
         "tail-limit",
         // The deployment's shape: the ceiling *and* the pid namespace. Without
         // the namespace the watch key is already the host pid, so the
         // translation this exercises is a no-op and the bug is invisible.
-        &instance_policy_chrooted_pid_ns_with_file_size("/tmp", "512M"),
+        &instance_policy_chrooted_pid_ns_with_file_size(&rootfs, "/tmp", "512M"),
     );
     let script = format!(
         "exec 3>>{}; i=0; while [ $i -lt 400 ]; do          dd if=/dev/zero bs=1M count=1 status=none >&3;          i=$((i+1)); sleep 0.06; done",
@@ -2452,9 +2521,10 @@ fn test_the_remaining_budget_is_handed_out_once_per_open() {
     std::fs::create_dir_all(&workdir).expect("create pool workdir");
     let first = workdir.join("first.bin");
     let second = workdir.join("second.bin");
+    let rootfs = chroot_rootfs(&workdir);
     let policy = write_policy(
         "pool-limit",
-        &instance_policy_chrooted_pid_ns_with_file_size("/tmp", "512M"),
+        &instance_policy_chrooted_pid_ns_with_file_size(&rootfs, "/tmp", "512M"),
     );
     // A long-running writer on `first`, then a fresh process opening `second`
     // -- the shape `for i in 1 2 3; do dd of=part$i.bin; done` has.

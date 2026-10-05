@@ -186,21 +186,39 @@ async fn test_statfs_accounting_wins_over_the_chroot_handler() {
     // 10 GiB sold, 4 GiB used -> 6 GiB free, in the handler's 4 KiB blocks.
     std::fs::write(&stats, "10737418240 4294967296\n").unwrap();
 
-    let policy = Sandbox::builder()
-        // The pure (no image) mediated shape: the host root is the mediator's
-        // root, which is what `chroot_root = Some("/")` means here. This is the
-        // configuration in which the chroot handler used to shadow the
-        // accounting one.
-        .chroot("/")
+    // N14 S5 (2026-10-04): the pure shape's *identity* root -- `chroot("/")`,
+    // the mediator's root being the host's -- is retired (the `E2B_PURE_ROOTFS=
+    // off` lever, refused by name at startup), and the real root cannot pivot
+    // into `/` at all (S2 measured EBUSY). The surviving pure shape is the
+    // synthesized one: a skeleton root with the host's system directories bound
+    // into it, which is what the deployment builds and what this case now
+    // uses. The subject is unchanged -- the chroot handler used to shadow the
+    // accounting one, and the ledger has to win in *every* mediated shape.
+    let rootfs = dir.path().join("rootfs");
+    for sub in ["usr", "lib", "bin", "etc", "proc", "tmp", "dev"] {
+        std::fs::create_dir_all(rootfs.join(sub)).expect("create the skeleton dir");
+    }
+    let mut builder = Sandbox::builder()
+        .chroot(&rootfs)
+        // The mounts make the host's system directories *exist* inside the real
+        // root; the read grants are what carry the EXECUTE right the workload
+        // needs to run `python3` out of them.
         .fs_read("/usr")
         .fs_read("/lib")
-        .fs_read_if_exists("/lib64")
         .fs_read("/bin")
         .fs_read("/etc")
         .fs_read("/proc")
-        .disk_stats_path(&stats)
-        .build()
-        .unwrap();
+        .fs_mount_ro("/usr", "/usr")
+        .fs_mount_ro("/lib", "/lib")
+        .fs_mount_ro("/bin", "/bin")
+        .fs_mount_ro("/etc", "/etc")
+        .fs_mount_ro("/proc", "/proc")
+        .disk_stats_path(&stats);
+    if std::path::Path::new("/lib64").exists() {
+        std::fs::create_dir_all(rootfs.join("lib64")).expect("create lib64");
+        builder = builder.fs_mount_ro("/lib64", "/lib64");
+    }
+    let policy = builder.build().unwrap();
 
     let script = "import os\n\
          s = os.statvfs('/')\n\

@@ -43,6 +43,18 @@ def rootfs(tmp_path):
         if not link.exists():
             os.symlink(f"usr/{name}", link)
 
+    # N14 S5 (2026-10-04): the real root installs the policy's mounts inside
+    # the rootfs and refuses a target that is missing there, so the fixture has
+    # to materialize the mount points these cases use: `/work` (the fs_mount
+    # target; the "mount shadows a rootfs directory" case makes its own decoy
+    # below) and the six nodes `minimal_dev()` binds.
+    (tmp_path / "work").mkdir(exist_ok=True)
+    (tmp_path / "dev" / "pts").mkdir(exist_ok=True)
+    for node in ("ptmx", "null", "urandom", "zero", "tty"):
+        path = tmp_path / "dev" / node
+        if not path.exists():
+            path.write_bytes(b"")
+
     os.chmod(tmp_path / "tmp", 0o1777)
     return tmp_path
 

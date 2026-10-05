@@ -69,6 +69,22 @@ fn build_test_rootfs(name: &str) -> PathBuf {
     for dir in ["usr/bin", "usr/sbin", "etc", "proc", "dev", "tmp", "workspace", "home/user"] {
         let _ = std::fs::create_dir_all(rootfs.join(dir));
     }
+    // N14 S5: the real root binds the policy's `fs_mount` entries *inside* the
+    // rootfs, and `realroot::build` refuses a target that does not exist there
+    // ("mount point … does not exist inside the rootfs"). The emulated shape
+    // never needed the mount points to exist, so the fixture has to
+    // materialize the ones these policies bind: the alias submount the
+    // `/workspace` vs `/home/user` cases share, and `minimal_dev`'s nodes.
+    for dir in ["workspace/mnt/data", "home/user/mnt/data", "dev/pts"] {
+        std::fs::create_dir_all(rootfs.join(dir))
+            .unwrap_or_else(|e| panic!("materialize {dir} inside {}: {e}", rootfs.display()));
+    }
+    for node in ["dev/ptmx", "dev/null", "dev/urandom", "dev/zero", "dev/tty"] {
+        let path = rootfs.join(node);
+        if !path.exists() {
+            std::fs::write(&path, b"").expect("materialize a /dev mount target");
+        }
+    }
     let _ = std::fs::set_permissions(rootfs.join("tmp"), std::fs::Permissions::from_mode(0o1777));
 
     let dest = rootfs.join("usr/bin/rootfs-helper");
@@ -188,6 +204,12 @@ async fn test_relative_open_from_second_workspace_alias_resolves_the_submount() 
     let ws = base.join("workspace");
     let vol = base.join("vol");
     std::fs::create_dir_all(&ws).expect("create workspace host dir");
+    // N14 S5: `/workspace/mnt/data` is a mount point *under* `/workspace`, and
+    // the real root installs the mounts in policy order inside one namespace --
+    // so by the time it resolves the submount's target, the `/workspace` bind
+    // is already in place and the name has to exist on the *source* side (the
+    // host workspace), the way a deployment's own tree carries its submounts.
+    std::fs::create_dir_all(ws.join("mnt/data")).expect("create the submount target");
     std::fs::create_dir_all(&vol).expect("create volume host dir");
     std::fs::write(vol.join("data.txt"), "hello\n").expect("seed volume file");
 
@@ -643,6 +665,12 @@ async fn test_deny_declared_under_one_alias_covers_the_other_alias() {
     let ws = base.join("workspace");
     let vol = base.join("vol");
     std::fs::create_dir_all(&ws).expect("create workspace host dir");
+    // N14 S5: `/workspace/mnt/data` is a mount point *under* `/workspace`, and
+    // the real root installs the mounts in policy order inside one namespace --
+    // so by the time it resolves the submount's target, the `/workspace` bind
+    // is already in place and the name has to exist on the *source* side (the
+    // host workspace), the way a deployment's own tree carries its submounts.
+    std::fs::create_dir_all(ws.join("mnt/data")).expect("create the submount target");
     std::fs::create_dir_all(&vol).expect("create volume host dir");
     std::fs::write(vol.join("data.txt"), "hello\n").expect("seed volume file");
 
@@ -718,6 +746,12 @@ async fn test_read_only_declared_under_one_alias_covers_the_other_alias() {
     let ws = base.join("workspace");
     let vol = base.join("vol");
     std::fs::create_dir_all(&ws).expect("create workspace host dir");
+    // N14 S5: `/workspace/mnt/data` is a mount point *under* `/workspace`, and
+    // the real root installs the mounts in policy order inside one namespace --
+    // so by the time it resolves the submount's target, the `/workspace` bind
+    // is already in place and the name has to exist on the *source* side (the
+    // host workspace), the way a deployment's own tree carries its submounts.
+    std::fs::create_dir_all(ws.join("mnt/data")).expect("create the submount target");
     std::fs::create_dir_all(&vol).expect("create volume host dir");
     std::fs::write(vol.join("data.txt"), "hello\n").expect("seed volume file");
 

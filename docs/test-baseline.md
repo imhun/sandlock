@@ -115,7 +115,33 @@
 # and core_integ (534 -> 539) move, by the A1/A2 test cases registered below;
 # ffi / cli / supervise / supervise_cost / cli_build / python / oci /
 # supervise_root / mediation_2uid are unchanged.
-core_lib = 913 # 2026-09-26: 912 -> 913, +1 and it is the pure shape's root:
+# ---------------------------------------------------------------------------
+# 2026-10-05 (E2B N14 S5 Task 3 -- the emulated root is deleted):
+#
+# This table was **already stale before that change**: on the pinned commit
+# (`da90921`, verified by stashing the working tree) the gate stops at the first
+# phase with `core_lib: baseline says 913 passed, run produced 922`, so the
+# count has been wrong since the sessions that added those nine cases. Two
+# entries are refreshed below because they were re-measured green in this
+# environment, twice, before and after Task 3's test conversions:
+#
+#   * `core_lib`     913 -> 922  (nine cases added by earlier work)
+#   * `supervise`     56 -> 57   (one case added by earlier work)
+#
+# Task 3 itself does not move either number again: it deletes one
+# emulated-shape case (`test_a_static_workload_resumes_into_a_session_under_an
+# _emulated_chroot`) and converts the chroot fixtures to the real root, which
+# leaves every remaining suite at its measured count.
+#
+# Deliberately **not** refreshed here (they need a canonical `sandlock-dev`
+# image and a root phase, neither of which this machine can provide):
+# `core_integ` (564 -> 569 cases; the local image cannot run the CLI-dependent
+# `test_control` cases), `cli` (98 -> 40 in this image, which suggests targets
+# this image does not build), `python` (465 -> 465; measured 457 passed / 8
+# environment failures after Task 3, against 446 / 19 on the pinned commit --
+# Task 3 fixes the eleven `test_fs_mount` cases), and the three root phases.
+core_lib = 922 # (see the 2026-10-05 note above: was 913, stale; 912 -> 913 was
+               # 2026-09-26: +1 and it is the pure shape's root:
                # `network::rules::tests::compose_root_slash_is_not_an_image_and_leaks_no_host_entry`
                # -- composing the synthetic /etc/hosts under root "/" used to read
                # the **host's** file, which turns a wildcard-rule name into a
@@ -753,7 +779,9 @@ cli = 98      # 2026-09-23: 97 -> 98, +1
               # after F0.4 wiring (cli suite includes net_bind_map tests);
               # F5.1 updates the no-supervisor default validation to
               # DEFAULT_MAX_PROCESSES (256), no count change
-supervise = 56 # 2026-09-26: 55 -> 56, +1: the checkpoint reply names the captured program
+supervise = 57 # (2026-10-05: 56 -> 57, one case added by earlier work; see the
+               # stale-table note at the top of this file)
+               # 2026-09-26: 55 -> 56, +1: the checkpoint reply names the captured program
                # (`test_the_checkpoint_reply_names_the_captured_program`) —— FUP-30 的教训是
                # "抓到了谁"必须由引擎说出来，而不是靠映射数量猜：`exe` 是 `/proc/<pid>/exe`
                # 的 realpath、`argv` 是 `/proc/<pid>/cmdline`，精确相等断言（`/bin` -> `/usr/bin`

@@ -910,6 +910,12 @@ impl SandboxBuilder {
 
     pub fn chroot(mut self, path: impl Into<PathBuf>) -> Self {
         self.chroot = Some(path.into());
+        // N14 S5 (2026-10-04): the emulated root is retired, so a chroot root
+        // *is* a real root. The field stays (the policy document, the FFI and
+        // `sandlock-supervise` all carry it as a bool), but no builder can ask
+        // for the emulated shape any more -- and `real_root(false)` on a chroot
+        // is refused at create (`Sandbox::do_create_stdio`).
+        self.real_root = true;
         self
     }
 

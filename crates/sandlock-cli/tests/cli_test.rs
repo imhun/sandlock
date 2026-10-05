@@ -792,10 +792,14 @@ fn test_fs_mount_flag_wired_end_to_end_single_file() {
     let host_file = host_dir.join("resolv.conf");
     let content = "nameserver 127.0.0.11\n";
     std::fs::write(&host_file, content).expect("write host file");
-    assert!(
-        !rootfs.join("etc/resolv.conf").exists(),
-        "test rootfs must not shadow the mounted file"
-    );
+    // N14 S5 (2026-10-04): the real root installs the policy's mounts itself,
+    // and `realroot::build` refuses a target that does not exist inside the
+    // rootfs -- so the fixture materializes the mount point, the way a
+    // deployment's own tree does (E2B's `_ensure_chroot_mount_points`). A
+    // *decoy* is written there so the assertion below still proves the mount
+    // wins over the rootfs's own file rather than that the file was absent.
+    std::fs::write(rootfs.join("etc/resolv.conf"), "nameserver 0.0.0.0\n")
+        .expect("materialize the mount point with a decoy");
 
     let mount_spec = format!("/etc/resolv.conf:{}", host_file.display());
     let output = sandlock_bin()

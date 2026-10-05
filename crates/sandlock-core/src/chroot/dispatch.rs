@@ -379,6 +379,23 @@ impl ChrootCtx<'_> {
         }
         self.host_to_virtual(path)
     }
+
+    /// The virtual spelling of a path the kernel reported *about a descriptor
+    /// or a cwd*: map when it maps, and take the report as the sandbox's own
+    /// spelling only when there is nothing to map.
+    ///
+    /// N43 measured this for `/proc/<pid>/fd/N`: a descriptor the mediator
+    /// opened on the host and injected renders its *host* path even in a
+    /// pivoted child, so "the child has a real root, therefore its reports are
+    /// virtual" holds for a mediated `chdir` and fails for an injected
+    /// directory descriptor -- which is exactly what a `fchdir` to such a
+    /// descriptor leaves as the cwd (measured 2026-10-05: the tracked cwd
+    /// became the rootfs's host path, and every later relative open was then
+    /// denied as "outside the grants").
+    fn reported_path_virtual(&self, pid: u32, reported: &Path) -> Option<PathBuf> {
+        self.host_to_virtual(reported)
+            .or_else(|| self.reported_to_virtual(pid, reported))
+    }
 }
 
 // ============================================================
@@ -482,7 +499,7 @@ fn virtual_cwd_of(notif: &SeccompNotif, ctx: &ChrootCtx<'_>) -> Option<PathBuf> 
         }
     }
     let host_cwd = std::fs::read_link(format!("/proc/{}/cwd", notif.pid)).ok()?;
-    ctx.reported_to_virtual(notif.pid, &host_cwd)
+    ctx.reported_path_virtual(notif.pid, &host_cwd)
 }
 
 /// Record the calling task's new virtual cwd.
@@ -2853,7 +2870,7 @@ pub(crate) async fn handle_chroot_fchdir(
     // Only follow a target that is really a directory: anything else fails
     // the kernel's fchdir, and recording it would desync the tracked cwd.
     if let Some(host) = target.filter(|t| t.is_dir()) {
-        if let Some(virtual_cwd) = ctx.reported_to_virtual(notif.pid, &host) {
+        if let Some(virtual_cwd) = ctx.reported_path_virtual(notif.pid, &host) {
             set_virtual_cwd(notif, ctx, virtual_cwd);
         }
     }

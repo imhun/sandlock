@@ -407,6 +407,23 @@ fn build_single_node_policy(
     let mut b = sandlock_sandbox_builder_new();
     assert!(!b.is_null(), "builder_new returned null");
 
+    // N14 S5: the real root installs the policy's mounts *inside* the rootfs,
+    // and `realroot::build` refuses a target that does not exist there ("mount
+    // point … does not exist inside the rootfs"). The emulated shape let a
+    // single-file mount name a leaf whose parents the rootfs never had, so the
+    // fixture materializes the target the way a deployment's own tree does.
+    let target = rootfs.join(virtual_path.trim_start_matches('/'));
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).expect("materialize the mount target's parents");
+    }
+    if !target.exists() {
+        if host_path.is_dir() {
+            fs::create_dir_all(&target).expect("materialize a directory mount target");
+        } else {
+            fs::write(&target, b"").expect("materialize a file mount target");
+        }
+    }
+
     let root = cstr(rootfs.to_str().unwrap());
     b = unsafe { sandlock_sandbox_builder_chroot(b, root.as_ptr()) };
     // Execution grants for the static rootfs-helper; the mounted node needs
@@ -771,19 +788,24 @@ fn test_directory_mount_point_rmdir_is_refused() {
     let _ = fs::remove_dir_all(&host_dir);
 }
 
-/// A single-file mount leaf resolves through the mount before the rootfs, so
-/// a virtual parent chain missing from the rootfs does not block a direct
-/// open of the mounted node (I2/P5 review pin: no parent precreate mechanism
-/// exists or is needed for direct leaf opens).
+/// A single-file mount leaf resolves through the mount before the rootfs, so a
+/// direct open of the mounted node works -- and since N14 S5 (2026-10-04) its
+/// *parents* have to exist inside the rootfs, because the real root installs
+/// the mounts itself and `realroot::build` refuses a target that is missing
+/// ("the policy's fs_mount destination has to be created before the sandbox
+/// starts"). The emulated shape tolerated the absent chain; a deployment
+/// materializes its mount points (E2B does, in `_ensure_chroot_mount_points`),
+/// and so does this fixture.
 #[test]
-fn test_single_file_leaf_opens_without_rootfs_parents() {
+fn test_single_file_mount_opens_once_its_rootfs_parents_exist() {
     let rootfs = build_test_rootfs("absent-parent-leaf");
-    // The rootfs has neither /opt nor /opt/app; only the mount provides the
-    // name /opt/app/config.yaml.
+    // The rootfs has neither /opt nor /opt/app until the fixture creates them
+    // below; the mount then provides the leaf's content.
     assert!(
         !rootfs.join("opt").exists(),
-        "test rootfs must not pre-create the virtual parents"
+        "the base fixture must not pre-create the virtual parents"
     );
+    fs::create_dir_all(rootfs.join("opt/app")).unwrap();
 
     let host_dir = temp_dir("absent-parent-leaf-host");
     let host_file = host_dir.join("config.yaml");

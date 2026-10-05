@@ -198,7 +198,11 @@ async fn test_restore_resumes_inside_a_chroot_root() {
         return;
     }
     let helper = helper_binary();
-    for (label, real_root) in [("emulated chroot", false), ("real root", true)] {
+    // N14 S5 (2026-10-04): one shape. This case used to run the emulated chroot
+    // and the real root side by side; the emulated root is refused at create now
+    // (`Sandbox::do_create_stdio`), so what is left -- and what the deployment
+    // runs -- is the real root.
+    for (label, real_root) in [("real root", true)] {
         let tmp = std::env::temp_dir().join(format!(
             "sandlock-chroot-restore-{}-{real_root}",
             std::process::id()
