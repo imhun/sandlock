@@ -15,7 +15,7 @@
 //!    `InjectFdSend` — the kernel does not re-read the path string at all.
 //!    TOCTOU-safe.
 //!
-//! 2. **On-behalf result writes** (stat/statx/readlink/getcwd/statfs):
+//! 2. **On-behalf result writes** (stat/statx/readlink/statfs):
 //!    the supervisor performs the underlying syscall against the
 //!    chroot-resolved host path and writes the result into the child's
 //!    output buffer. The decision returned is `ReturnValue`/`Errno`,
@@ -27,13 +27,11 @@
 //!    EFAULT/-style error to the child. No security decision was made
 //!    on contents we couldn't read, so this is safe.
 //!
-//! 4. **Path-rewrite-then-Continue** (handle_chroot_exec): the supervisor
-//!    rewrites `path_ptr` to `/proc/self/fd/N` and returns `Continue`
-//!    because the kernel must run the syscall itself — execve replaces
-//!    the address space. The TOCTOU window is real here: a racing sibling
-//!    thread can substitute a different path string between our write and
-//!    the kernel's read. The bound is Landlock, since a racing path is
-//!    still subject to `landlock_restrict_self`.
+//! 4. **Continue-where-the-kernel-is-right** (exec, chdir, getcwd): a child
+//!    with a real root owns its tree, so these three hand the syscall back
+//!    instead of rewriting anything — which is also why the exec TOCTOU the
+//!    emulated shape had to bound with Landlock is simply gone (there is no
+//!    path rewrite left to race).
 //!
 //! A `Continue` on a *healthy* path syscall would be a bug in this module,
 //! not merely a race: the kernel resolves the path it is given against the
@@ -1466,134 +1464,6 @@ fn resolve_self_fd_magic(ctx: &ChrootCtx<'_>, child_pid: u32, virtual_path: &str
 }
 
 // ============================================================
-// ELF PT_INTERP helpers
-// ============================================================
-
-/// Read PT_INTERP from an ELF binary fd. Returns the interpreter path and its
-/// file offset + length so we can patch it in a memfd copy.
-fn read_pt_interp(fd: RawFd) -> Option<(String, u64, usize)> {
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mut header = [0u8; 64]; // ELF64 header is 64 bytes
-    if file.read_exact(&mut header).is_err() {
-        std::mem::forget(file); // don't close the fd
-        return None;
-    }
-
-    // Verify ELF magic
-    if &header[..4] != b"\x7fELF" {
-        std::mem::forget(file);
-        return None;
-    }
-
-    // ELF64: e_phoff at offset 32 (8 bytes), e_phentsize at 54 (2 bytes), e_phnum at 56 (2 bytes)
-    let e_phoff = u64::from_le_bytes(header[32..40].try_into().ok()?);
-    let e_phentsize = u16::from_le_bytes(header[54..56].try_into().ok()?) as u64;
-    let e_phnum = u16::from_le_bytes(header[56..58].try_into().ok()?) as usize;
-
-    // Scan program headers for PT_INTERP (type 3)
-    const PT_INTERP: u32 = 3;
-    for i in 0..e_phnum {
-        let ph_offset = e_phoff + (i as u64) * e_phentsize;
-        let mut phdr = [0u8; 56]; // ELF64 Phdr is 56 bytes
-        if file.seek(SeekFrom::Start(ph_offset)).is_err() {
-            break;
-        }
-        if file.read_exact(&mut phdr).is_err() {
-            break;
-        }
-        let p_type = u32::from_le_bytes(phdr[0..4].try_into().ok()?);
-        if p_type != PT_INTERP {
-            continue;
-        }
-        let p_offset = u64::from_le_bytes(phdr[8..16].try_into().ok()?);
-        let p_filesz = u64::from_le_bytes(phdr[32..40].try_into().ok()?) as usize;
-        if p_filesz == 0 || p_filesz > 256 {
-            break;
-        }
-
-        // Read the interpreter path string
-        let mut buf = vec![0u8; p_filesz];
-        if file.seek(SeekFrom::Start(p_offset)).is_err() {
-            break;
-        }
-        if file.read_exact(&mut buf).is_err() {
-            break;
-        }
-        let nul = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        let interp = String::from_utf8_lossy(&buf[..nul]).to_string();
-
-        std::mem::forget(file);
-        return Some((interp, p_offset, p_filesz));
-    }
-
-    std::mem::forget(file);
-    None
-}
-
-/// Create a memfd copy of `src_fd` with PT_INTERP patched to `new_interp`.
-/// Uses sendfile for efficient kernel-to-kernel copy, then patches the
-/// interpreter path in place.
-fn memfd_with_patched_interp(
-    src_fd: RawFd,
-    new_interp: &str,
-    interp_offset: u64,
-    interp_capacity: usize,
-) -> Option<OwnedFd> {
-    // Get file size
-    let size = {
-        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(src_fd, &mut stat) } < 0 {
-            return None;
-        }
-        stat.st_size as usize
-    };
-
-    // Create memfd
-    let memfd = crate::sys::syscall::memfd_create("sandlock-exec", 0).ok()?;
-    let mfd = memfd.as_raw_fd();
-
-    // Set size
-    if unsafe { libc::ftruncate(mfd, size as libc::off_t) } < 0 {
-        return None;
-    }
-
-    // sendfile: kernel-to-kernel copy, no userspace buffer
-    let mut offset: libc::off_t = 0;
-    let mut remaining = size;
-    while remaining > 0 {
-        let n = unsafe {
-            libc::sendfile(mfd, src_fd, &mut offset, remaining)
-        };
-        if n <= 0 {
-            return None;
-        }
-        remaining -= n as usize;
-    }
-
-    // Patch PT_INTERP in the memfd
-    let new_bytes = new_interp.as_bytes();
-    if new_bytes.len() >= interp_capacity {
-        return None; // new path too long for the PT_INTERP field
-    }
-    let mut patch = vec![0u8; interp_capacity];
-    patch[..new_bytes.len()].copy_from_slice(new_bytes);
-    // NUL-fill the rest (already zeroed)
-
-    let mut mfd_file = unsafe { std::fs::File::from_raw_fd(mfd) };
-    if mfd_file.seek(SeekFrom::Start(interp_offset)).is_err() {
-        std::mem::forget(mfd_file);
-        return None;
-    }
-    if mfd_file.write_all(&patch).is_err() {
-        std::mem::forget(mfd_file);
-        return None;
-    }
-    std::mem::forget(mfd_file); // don't close — OwnedFd owns it
-
-    Some(memfd)
-}
-
-// ============================================================
 // execve/execveat handler
 // ============================================================
 
@@ -1688,142 +1558,14 @@ pub(crate) async fn handle_chroot_exec(
         return NotifAction::Continue;
     }
 
-    // Open the binary directly via openat2(RESOLVE_IN_ROOT). Single atomic
-    // open confined to the chroot root (or mount target) — no resolve-then-reopen TOCTOU gap.
-    let (exec_root, exec_path) = if let Some((mt, sub)) = ctx.mount_target(&virtual_path) {
-        (mt.to_path_buf(), sub)
-    } else {
-        (ctx.root.to_path_buf(), virtual_path.to_string_lossy().to_string())
-    };
-    let src_fd = match openat2_in_root(
-        &exec_root,
-        &exec_path,
-        libc::O_RDONLY | libc::O_CLOEXEC,
-        0,
-    ) {
-        Ok(fd) => fd,
-        // FUP-26: hand the child the kernel's own errno. Collapsing every
-        // failure into ENOENT made a *retryable* `EAGAIN` (openat2(2):
-        // RESOLVE_IN_ROOT could not prove a `..` did not escape) look exactly
-        // like "no such file": `execvp` reports "not found", init exits 127
-        // and the operator sees a workload that produced no output at all.
-        // The chdir path below has always worked this way; the exec path is
-        // what every dynamically linked binary's PT_INTERP goes through, so
-        // it is the one that has to be diagnosable.
-        Err(errno) => return NotifAction::Errno(errno),
-    };
-
-    // Read PT_INTERP from the binary. If it has one, open the image's
-    // interpreter and create a memfd copy with PT_INTERP patched to
-    // point at the injected interpreter fd. This ensures the kernel loads
-    // the image's ld-linux (not the host's), avoiding glibc version
-    // mismatches between ld.so and libc.so.
-    let exec_fd = if let Some((interp_path, interp_offset, interp_cap)) = read_pt_interp(src_fd) {
-        // Open the image's interpreter from the chroot root (intentionally
-        // NOT mount-aware ��� the dynamic linker should come from the base
-        // image, not from workspace mounts).
-        let interp_src = match openat2_in_root(
-            ctx.root,
-            &interp_path,
-            libc::O_RDONLY | libc::O_CLOEXEC,
-            0,
-        ) {
-            Ok(fd) => fd,
-            // Same rule as the binary open above: the interpreter is opened by
-            // the supervisor on the child's behalf, and its errno is the only
-            // thing that can tell "the image has no ld-linux" (ENOENT) from
-            // "the kernel could not guarantee this `..`" (EAGAIN).
-            Err(errno) => {
-                unsafe { libc::close(src_fd) };
-                return NotifAction::Errno(errno);
-            }
-        };
-
-        // Inject the interpreter fd into the child (must survive exec)
-        let addfd_interp = SeccompNotifAddfd {
-            id: notif.id,
-            flags: 0,
-            srcfd: interp_src as u32,
-            newfd: 0,
-            newfd_flags: 0,
-        };
-        let child_interp_fd = unsafe {
-            libc::ioctl(
-                notif_fd,
-                SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong,
-                &addfd_interp as *const _,
-            )
-        };
-        unsafe { libc::close(interp_src) };
-
-        if child_interp_fd < 0 {
-            unsafe { libc::close(src_fd) };
-            return NotifAction::Errno(libc::EIO);
-        }
-
-        // Create a memfd copy with PT_INTERP patched to /proc/self/fd/<interp_fd>
-        let new_interp = format!("/proc/self/fd/{}", child_interp_fd);
-        match memfd_with_patched_interp(src_fd, &new_interp, interp_offset, interp_cap) {
-            Some(memfd) => {
-                unsafe { libc::close(src_fd) };
-                memfd
-            }
-            None => {
-                // Patching failed (e.g., new path too long) — fall back to
-                // original binary. Host ld-linux will be used; this is the
-                // pre-existing behavior and may work if versions are compatible.
-                unsafe { OwnedFd::from_raw_fd(src_fd) }
-            }
-        }
-    } else {
-        // Statically linked or not ELF — use the binary directly.
-        unsafe { OwnedFd::from_raw_fd(src_fd) }
-    };
-
-    // Record the virtual exe path so /proc/self/exe queries return the
-    // correct path (memfd-backed binaries would otherwise show the memfd path).
-    {
-        let mut cs = chroot_state.lock().await;
-        cs.chroot_exe = Some(virtual_path.clone());
-    }
-
-    // Inject the (possibly patched) binary fd into the child and rewrite
-    // the path to /proc/self/fd/N so the kernel loads it.
-    let addfd = SeccompNotifAddfd {
-        id: notif.id,
-        flags: 0,
-        srcfd: exec_fd.as_raw_fd() as u32,
-        newfd: 0,
-        newfd_flags: 0, // no O_CLOEXEC — must survive exec
-    };
-    let child_fd = unsafe {
-        libc::ioctl(
-            notif_fd,
-            SECCOMP_IOCTL_NOTIF_ADDFD as libc::c_ulong,
-            &addfd as *const _,
-        )
-    };
-    drop(exec_fd);
-
-    if child_fd < 0 {
-        return NotifAction::Errno(libc::EIO);
-    }
-
-    // Rewrite the path to /proc/self/fd/N, relocating argv[0] when it aliases
-    // the path buffer (see rewrite_exec_path_to_fd). Force-writes past
-    // read-only page protections: the child commonly passes a .rodata path
-    // literal to execve, which process_vm_writev can't overwrite. No length
-    // guard needed — execve replaces the address space on success, so a write
-    // past the original buffer is harmless.
-    if crate::seccomp::notif::rewrite_exec_path_to_fd(
-        notif_fd, notif.id, notif.pid, path_ptr, argv_ptr, envp_ptr, child_fd,
-    )
-    .is_err()
-    {
-        return NotifAction::Errno(libc::EFAULT);
-    }
-
-    NotifAction::Continue
+    // N14 S5 (2026-10-04): the emulated root is retired, so a non-pivoted
+    // mediated child has no answer here at all. This branch used to open the
+    // target itself, patch PT_INTERP into a memfd copy and rewrite the caller's
+    // path to `/proc/self/fd/N`; `Sandbox::do_create_stdio` refuses a chroot
+    // root without `real_root`, so no shape builds a child that reaches it.
+    // Refuse rather than let the kernel resolve the caller's path in a root the
+    // sandbox does not own.
+    NotifAction::Errno(libc::EACCES)
 }
 
 // ============================================================
@@ -2837,16 +2579,15 @@ pub(crate) async fn handle_chroot_chdir(
     // /proc/<pid>/mem that permanently corrupted a .rodata path literal.
     set_virtual_cwd(notif, ctx, confined);
     // A child with a real root (crate::realroot) has to have the kernel move its
-    // cwd too: the resolutions the mediator never sees -- its `execve` of a
-    // relative path above all -- read the task's own `fs_struct`, not this
-    // bookkeeping. The emulated shape cannot do that (the recorded path is
-    // virtual while the kernel's view is the host's, and rewriting the buffer
-    // does not fit the short ones -- issue #178); inside a real root the guest's
-    // spelling is already the right one, so the kernel can just run the syscall.
-    if ctx.child_is_pivoted(notif.pid) {
-        return NotifAction::Continue;
-    }
-    NotifAction::ReturnValue(0)
+    // cwd: the resolutions the mediator never sees -- its `execve` of a relative
+    // path above all -- read the task's own `fs_struct`, not this bookkeeping,
+    // and inside a real root the guest's spelling is already the right one, so
+    // the kernel can just run the syscall. The emulated shape could not do that
+    // (the recorded path is virtual while the kernel's view is the host's, and
+    // rewriting the buffer does not fit the short ones -- issue #178) and is
+    // retired: `do_create_stdio` refuses a chroot root without `real_root`, so
+    // a mediated child is always pivoted.
+    NotifAction::Continue
 }
 
 // ============================================================
@@ -2898,30 +2639,11 @@ pub(crate) async fn handle_chroot_getcwd(
     // because its length check is against the spelling the mediator recorded
     // rather than against the path the kernel would return.
     //
-    // The emulated shape keeps the rewrite: there the kernel would report a
-    // host path, which no sandbox may ever see.
-    if ctx.child_is_pivoted(notif.pid) {
-        return NotifAction::Continue;
-    }
-
-    let buf_addr = notif.data.args[0];
-    let buf_size = (notif.data.args[1] & 0xFFFFFFFF) as usize;
-
-    let virtual_cwd = virtual_cwd_of(notif, ctx).unwrap_or_else(|| PathBuf::from("/"));
-    let cwd_str = virtual_cwd.to_string_lossy();
-    let cwd_bytes = cwd_str.as_bytes();
-
-    if cwd_bytes.len() + 1 > buf_size {
-        return NotifAction::Errno(libc::ERANGE);
-    }
-
-    let mut write_buf = cwd_bytes.to_vec();
-    write_buf.push(0);
-
-    if write_child_mem(notif_fd, notif.id, notif.pid, buf_addr, &write_buf).is_err() {
-        return NotifAction::Continue;
-    }
-    NotifAction::ReturnValue(write_buf.len() as i64)
+    // The emulated shape's half of this handler (write the supervisor's tracked
+    // cwd into the caller's buffer, with its own ERANGE window) is gone with
+    // that shape: `do_create_stdio` refuses a chroot root without `real_root`,
+    // so every mediated child answers for itself.
+    NotifAction::Continue
 }
 
 // ============================================================

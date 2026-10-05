@@ -494,8 +494,10 @@ pub(crate) fn build_ruleset(
     // paths by prepending the chroot root.  Skip paths that don't exist in
     // the rootfs.  Only chroot-translated paths are added — host paths are
     // NOT added, so any seccomp fallthrough is blocked by Landlock (fail-closed).
-    // The PT_INTERP patching in handle_chroot_exec ensures the kernel loads
-    // the image's ELF interpreter via an injected fd, not a host path.
+    // A real-root child lets the kernel resolve the image's ELF interpreter
+    // itself, inside its own tree (the emulated shape's PT_INTERP patching,
+    // which needed this rule set to cover the injected fd, went with the
+    // emulated shape -- N14 S5).
     let chroot_root = policy.chroot.as_deref();
     // Intersect the per-path write mask with the resolved handled set so
     // every installed rule is a subset of `handled_access_fs` by
