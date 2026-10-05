@@ -578,8 +578,42 @@ async fn test_the_session_parent_can_write_into_an_init_spawned_child() {
     let pid = handle.pid;
     assert!(pid > 0, "the session must report the child's host pid");
 
-    // A writable anonymous mapping to poke at.
+    // Barrier: the `exec` reply names the pid at **fork** time, and an `execve`
+    // replaces the entire address space. Poking before the child has become its
+    // program is a race with two shapes, both measured on 2026-10-05: the maps
+    // read can find no writable anonymous mapping at all (the old image is
+    // being torn down), or the mapping it picked is gone by the time the write
+    // lands and `process_vm_writev` answers `EFAULT` (errno 14) with the payload
+    // unmoved -- which is how this case went red in one full-suite run and green
+    // in the next. `/proc/<pid>/exe` is switched inside the kernel's
+    // `exec_mmap`, and nothing remaps the address space after the final exec, so
+    // waiting for it makes the probe deterministic. The maps assertion below is
+    // the pin that keeps this barrier from being dropped again.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap_or_default();
+        if exe.file_name().is_some_and(|name| name == "sleep") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the exec'd child never became the program it was asked to run \
+             (…/exe still {exe:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // A writable anonymous mapping to poke at. The maps must belong to the
+    // program: a pre-exec image would name the *init binary* in its file-backed
+    // rows, so this row is also the pin that keeps the barrier above from being
+    // removed (without it the probe runs microseconds after the fork reply, and
+    // this assertion is what notices).
     let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).expect("read child maps");
+    assert!(
+        maps.lines()
+            .any(|line| line.split_whitespace().nth(5).is_some_and(|p| p.ends_with("/sleep"))),
+        "the child's maps must be the exec'd program's, not the forked init copy: {maps}"
+    );
     let (start, end) = maps
         .lines()
         .filter_map(|line| {
