@@ -177,8 +177,30 @@
 #     every suite (`timeout`, per-label budgets), the restore awaits in
 #     `test_instance_exec.rs` / `test_restore.rs` are bounded by a `bounded()`
 #     helper that names the step, and the python suite has a per-test watchdog
-#     (`faulthandler`, dumping to a file the gate prints). The flaky hang itself
-#     is still unexplained and is the open question at this tip.
+#     (`faulthandler`, dumping to a file the gate prints), so a stall fails by
+#     name instead of hanging.
+#
+#     **The same-day pressure test widened the picture** (all in the canonical
+#     image, all at this tip):
+#       * the single case that hung, run alone 100 times: **100/100 green** (0.15 s
+#         each) -- so it is not the case itself; it needs the full suite's
+#         accumulated state;
+#       * full `core_integ` x4: **one green, three red, and a different victim
+#         each time** -- `test_restore::test_libc_workloads_resume_after_restore`
+#         (the `static-control` arm once and the `libc-malloc` arm once:
+#         `advanced=false state=Z exit_code=2560`, and 2560>>8 = 10 = SIGUSR1, i.e.
+#         the workload was carried off by a signal) and
+#         `test_instance_exec::test_the_session_parent_can_write_into_an_init_spawned_child`
+#         (`expect("the child has a writable anonymous mapping")` -- reading
+#         `/proc/<pid>/maps` raced the child's state);
+#       * the fourth run **hung**, with the identical signature (test binary in
+#         `futex_wait`, `restore-stub` in `nanosleep`, two `sandlock-init` in
+#         poll/seccomp).
+#     => the flake belongs to the session/exec/restore family as a whole (many
+#     cases, several signatures), not to one test, and the mechanism is still
+#     unknown. Bounding it is not the same as explaining it: the next attempt
+#     should loop the whole suite and, on the first failure, dump
+#     `/proc/<pid>/{maps,stat,stack}` for the child tree.
 #
 # Environment note for the root phases: `test-all.sh` passes `--offline`, and
 # the repo-local cargo cache is missing `aho-corasick`, so the first
