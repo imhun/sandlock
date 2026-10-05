@@ -144,13 +144,20 @@
 #     connect-time-denylist work landed. It is now
 #     `test_net_allow_and_net_deny_reach_build_together` and pins both halves:
 #     the destination pair is accepted, the *bind* pair is still refused.
-#   * `python`      465 in total, but **one case stays red and it is not an
-#     environment failure**: `test_restore_resumes_counter` raises
-#     "checkpoint restore failed" (reproduced 2026-10-05 in the canonical
-#     image; its Rust `test_restore` twin is green). The other former failure,
-#     `test_net_allow_and_net_deny_mutually_exclusive`, was the same stale
-#     contract as the CLI one and is now a deny-precedence test
-#     (`test_net_deny_takes_precedence_over_net_allow`).
+#   * `python`      465/0 -- but the first refresh run reported 464/1, and that
+#     failure was **a stale build artifact, not a product defect**.
+#     `test_restore_resumes_counter` raised "checkpoint restore failed" while the
+#     suite was loading a `libsandlock_ffi.so` that predated the tree; after
+#     `cargo build -p sandlock-ffi` the same case passed 5/5 and the suite went to
+#     465/0 with **no source change**. The pre-S5 pin (`da90921`) fails that case
+#     against the same stale artifact, so it was never an S5 regression either.
+#     `python/tests/conftest.py` now refuses to run when the loaded .so is older
+#     than the newest Rust source, which is what made this invisible for hours
+#     (the FFI returns NULL for every error, so the caller only ever saw
+#     "checkpoint restore failed"; `sandlock_restore_interactive` now prints the
+#     real error). The other former failure,
+#     `test_net_allow_and_net_deny_mutually_exclusive`, was a stale *contract*
+#     and is now the deny-precedence test.
 #   * root phases   `oci` 157/0 **only after a compile fix**: the oci test
 #     target had stopped compiling -- `Req::RunPlacedExec` was never classified
 #     in `init_signal_surface`'s exhaustive match
@@ -165,11 +172,13 @@
 #     `/proc` showed the test binary blocked in `futex_wait`, the `restore-stub`
 #     child parked in `hrtimer_nanosleep`, and no progress -- a restore handshake
 #     that never completes, not a slow test. The same case had passed in an
-#     earlier standalone `core_integ` run (569/0, 88.7 s), so it is *flaky*, and
-#     `test-all.sh` has no per-test timeout: a restore hang blocks the whole gate
-#     indefinitely. Together with the deterministic
-#     `test_restore_resumes_counter` failure above, the restore-into-session path
-#     is the open question at this tip.
+#     earlier standalone `core_integ` run (569/0, 88.7 s) and at the pre-S5 pin,
+#     so it is *flaky*. It no longer blocks the gate: `test-all.sh` now bounds
+#     every suite (`timeout`, per-label budgets), the restore awaits in
+#     `test_instance_exec.rs` / `test_restore.rs` are bounded by a `bounded()`
+#     helper that names the step, and the python suite has a per-test watchdog
+#     (`faulthandler`, dumping to a file the gate prints). The flaky hang itself
+#     is still unexplained and is the open question at this tip.
 #
 # Environment note for the root phases: `test-all.sh` passes `--offline`, and
 # the repo-local cargo cache is missing `aho-corasick`, so the first

@@ -25,6 +25,18 @@ const STUB_BASE: u64 = 0x30_0000_0000;
 const STUB_BASE: u64 = 0;
 const STUB_SPAN: u64 = 0x40_0000;
 
+/// Bound an await so a wedged restore fails *by name* instead of hanging the
+/// suite (see the twin helper in `test_instance_exec.rs`: on 2026-10-05 a
+/// session-restore case blocked for ~35 minutes with no timeout anywhere in the
+/// harness). `cargo test` has no per-test timeout, so each restore step carries
+/// its own; `scripts/test-all.sh` bounds every suite as the outer belt.
+async fn bounded<F: std::future::Future>(secs: u64, what: &str, fut: F) -> F::Output {
+    match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
+        Ok(v) => v,
+        Err(_) => panic!("{what} did not finish within {secs}s"),
+    }
+}
+
 /// Parse `/proc/<pid>/maps` into `(start, end, path)` triples.
 fn read_maps(pid: i32) -> Vec<(u64, u64, String)> {
     std::fs::read_to_string(format!("/proc/{pid}/maps"))
@@ -108,7 +120,9 @@ async fn test_restore_glibc_vdso_program_resumes() {
     std::fs::write(&counter, b"0\n").unwrap();
 
     let mut sb2 = policy.clone().with_name("vdso-dst");
-    let _ = sb2.restore_interactive(&cp).await.unwrap();
+    let _ = bounded(60, "restore_interactive (vdso dst)", sb2.restore_interactive(&cp))
+        .await
+        .unwrap();
     eprintln!("restore skipped fds: {:?}", sb2.restore_skipped());
 
     // Poll up to ~3s for the restored process to resume and advance the counter
@@ -248,8 +262,7 @@ async fn test_restore_resumes_inside_a_chroot_root() {
         std::fs::write(&counter, b"0\n").unwrap();
 
         let mut sb2 = policy.clone().with_name("chroot-dst");
-        let _restored = sb2
-            .restore_interactive(&cp)
+        let _restored = bounded(60, "restore_interactive (chroot dst)", sb2.restore_interactive(&cp))
             .await
             .unwrap_or_else(|e| panic!("{label}: restore must work with a chroot root: {e}"));
         let skipped = sb2.restore_skipped().to_vec();
@@ -736,8 +749,7 @@ int main(int argc, char **argv) {{
         let _ = sb.kill();
         let _ = sb.wait().await;
         let mut sb2 = policy.clone().with_name(&format!("libcr-{tag}-dst"));
-        let _ = sb2
-            .restore_interactive(&cp)
+        let _ = bounded(60, "restore_interactive (libc-restore dst)", sb2.restore_interactive(&cp))
             .await
             .unwrap_or_else(|e| panic!("{tag}: restore: {e}"));
         let pid = sb2.pid().unwrap_or(0);

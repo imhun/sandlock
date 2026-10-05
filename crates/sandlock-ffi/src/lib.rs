@@ -3126,10 +3126,22 @@ pub unsafe extern "C" fn sandlock_restore_interactive(
     // does not, so let it drop and move `sb` into the handle (the process
     // keeps running; the Sandbox owns it). Skipped fds live on the Sandbox.
     let cp_ref = &(*cp)._private;
-    let restored = matches!(
-        block_on_runtime(&rt, async { sb.restore_interactive(cp_ref).await.map(|_| ()) }),
-        Some(Ok(()))
-    );
+    let restored = match block_on_runtime(
+        &rt,
+        async { sb.restore_interactive(cp_ref).await.map(|_| ()) },
+    ) {
+        Some(Ok(())) => true,
+        // This entry point's only error channel is "returned NULL", so without
+        // this line every failure reaches the caller as a bare
+        // "checkpoint restore failed" -- which is how the 2026-10-05 python
+        // failure read while the actual error (visible in the Rust twins) stayed
+        // invisible. Print it where a human will see it; the return value and
+        // the handle ownership below are unchanged.
+        other => {
+            eprintln!("sandlock_restore_interactive: restore failed: {other:?}");
+            false
+        }
+    };
     if !restored {
         // Dropping `sb` reaps any half-built child left by a failed restore.
         return ptr::null_mut();

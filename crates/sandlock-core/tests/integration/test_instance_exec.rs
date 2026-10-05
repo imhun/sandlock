@@ -152,6 +152,20 @@ async fn poll_until(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
     }
 }
 
+/// Bound an await so a wedged step fails *by name* in tens of seconds.
+///
+/// 2026-10-05: this file's session-restore case blocked for ~35 minutes (test
+/// binary in `futex_wait`, the `restore-stub` child parked in `nanosleep`, log
+/// frozen) because the restore handshake never completed and nothing bounded the
+/// await. `cargo test` has no per-test timeout, so the step itself has to carry
+/// one; `scripts/test-all.sh` also bounds every suite as the outer belt.
+async fn bounded<F: std::future::Future>(secs: u64, what: &str, fut: F) -> F::Output {
+    match tokio::time::timeout(Duration::from_secs(secs), fut).await {
+        Ok(v) => v,
+        Err(_) => panic!("{what} did not finish within {secs}s"),
+    }
+}
+
 /// True when `pid` no longer exists or is a zombie (`/proc/<pid>/stat` state
 /// `Z`): a process init collapsed but never reaped sits as a zombie until the
 /// outer reaper collects it, so "collapsed" must accept the zombie state.
@@ -704,8 +718,7 @@ async fn test_a_child_restored_into_a_session_keeps_the_session_executable() {
     )
     .await
     .expect("launch the session that resumes");
-    let resumed = dst
-        .restore_into_session(&cp)
+    let resumed = bounded(60, "restore into the session", dst.restore_into_session(&cp))
         .await
         .expect("restore into the session");
 
@@ -1141,10 +1154,13 @@ async fn test_a_dynamic_workload_resumes_into_a_session() {
     )
     .await
     .expect("launch the destination session");
-    let resumed = dst
-        .restore_into_session(&cp)
-        .await
-        .expect("restore the python workload into the session");
+    let resumed = bounded(
+        60,
+        "restore the python workload into the session",
+        dst.restore_into_session(&cp),
+    )
+    .await
+    .expect("restore the python workload into the session");
 
     let deadline = Instant::now() + Duration::from_secs(20);
     while !read_counter().is_some_and(|v| v > 0) {
@@ -1296,10 +1312,13 @@ async fn test_a_dynamic_workload_resumes_into_a_session_under_a_real_root() {
     )
     .await
     .expect("launch the destination session");
-    let resumed = dst
-        .restore_into_session(&cp)
-        .await
-        .expect("restore the python workload into the session");
+    let resumed = bounded(
+        60,
+        "restore the python workload into the session",
+        dst.restore_into_session(&cp),
+    )
+    .await
+    .expect("restore the python workload into the session");
 
     let deadline = Instant::now() + Duration::from_secs(20);
     while !read_counter().is_some_and(|v| v > 0) {
@@ -1449,8 +1468,7 @@ async fn test_a_session_launched_without_the_stub_grant_refuses_a_restore_by_nam
     // while the grant is still missing, which is the whole point of this case.
     std::fs::write(&absent, b"not a real stub").unwrap();
     let named = absent.canonicalize().unwrap_or_else(|_| absent.clone());
-    let err = dst
-        .restore_into_session(&cp)
+    let err = bounded(60, "restore into a session without the stub grant", dst.restore_into_session(&cp))
         .await
         .expect_err("a session without the stub's grant must refuse, not fail inside the sandbox");
     assert_eq!(

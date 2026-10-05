@@ -74,6 +74,34 @@ fi
 expect() {  # exact expected pass count for a suite label
     sed -n "s|^$1[[:space:]]*=[[:space:]]*\([0-9]\+\).*|\1|p" "$BASELINE" | head -1
 }
+# Hard per-suite budgets, in seconds. A suite that overruns is a *hang*, not
+# slowness: on 2026-10-05 `core_integ` stopped inside
+# `test_instance_exec::test_a_child_restored_into_a_session_keeps_the_session_executable`
+# and sat there for ~35 minutes (test binary blocked in `futex_wait`, the
+# `restore-stub` child parked in `nanosleep`, the log frozen) -- this script had
+# no timeout at all, so the gate could hang forever. The budgets are ~10x the
+# measured warm runtimes, which leaves room for a cold target directory on a slow
+# host; override every label with `SANLOCK_SUITE_TIMEOUT_S=<seconds>`.
+suite_timeout() {
+    if [ -n "${SANLOCK_SUITE_TIMEOUT_S:-}" ]; then
+        printf '%s' "$SANLOCK_SUITE_TIMEOUT_S"
+        return
+    fi
+    case "$1" in
+        core_lib)       printf 1200 ;;  # ~4 s warm, but the lib is built here
+        core_integ)     printf 1800 ;;  # ~90 s warm (--test-threads=1)
+        ffi)            printf 900 ;;
+        cli)            printf 900 ;;
+        supervise)      printf 900 ;;
+        supervise_cost) printf 2400 ;;  # release build + the cost cases
+        cli_build)      printf 2400 ;;  # release workspace build
+        python)         printf 900 ;;
+        oci)            printf 1200 ;;
+        supervise_root) printf 600 ;;
+        mediation_2uid) printf 900 ;;
+        *)              printf 1200 ;;
+    esac
+}
 rust_count() {  # sum "test result: ok. N passed" across all targets of a suite
     sed -n "s/.*test result: ok\. \([0-9]\+\) passed.*/\1/p" "$1" | awk '{s+=$1} END {print s+0}'
 }
@@ -105,12 +133,41 @@ run() {  # run <label> <command...>
     # restore fd plan) while the exact bytes still land in the log file. POSIX
     # sh cannot read a pipeline's first command status, so the suite records it
     # in a temp file before the pipe closes.
+    budget="$(suite_timeout "$label")"
     rm -f "$rcfile"
-    { "$@" 2>&1; echo "$?" >"$rcfile"; } | tee "$log" >/dev/null
+    # The python suite's per-test watchdog writes its stack dump here (pytest's
+    # fd capture would swallow a dump written to stderr), so clear it and print
+    # it on any failure below.
+    if [ -n "${SANLOCK_TEST_TIMEOUT_LOG:-}" ]; then
+        rm -f "$SANLOCK_TEST_TIMEOUT_LOG"
+    fi
+    # `|| rc_cmd=$?` is load-bearing: this script runs under `set -e`, and a bare
+    # failing command inside the brace group terminated the group *before* the
+    # status was written -- the rcfile was always missing, the fallback below
+    # reported `1`, and every failure (including a timeout) read as a plain
+    # FAILED. Putting the command in a `||` list exempts it from errexit.
+    rc_cmd=0
+    { timeout --signal=TERM --kill-after=15 "$budget" "$@" 2>&1 || rc_cmd=$?; \
+        printf '%s' "$rc_cmd" >"$rcfile"; } | tee "$log" >/dev/null
     rc="$(cat "$rcfile" 2>/dev/null || echo 1)"
     rm -f "$rcfile"
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+        printf '%s: suite TIMED OUT after %ss -- treat it as a hang, not slowness (see %s)\n' \
+            "$label" "$budget" "$log"
+        if [ -n "${SANLOCK_TEST_TIMEOUT_LOG:-}" ] && [ -s "$SANLOCK_TEST_TIMEOUT_LOG" ]; then
+            printf '    per-test watchdog dump (%s):\n' "$SANLOCK_TEST_TIMEOUT_LOG"
+            tail -60 "$SANLOCK_TEST_TIMEOUT_LOG"
+        fi
+        tail -40 "$log"
+        exit 1
+    fi
     if [ "$rc" -ne 0 ]; then
-        printf '%s: suite FAILED (see %s)\n' "$label" "$log"; tail -40 "$log"; exit 1
+        printf '%s: suite FAILED (see %s)\n' "$label" "$log"
+        if [ -n "${SANLOCK_TEST_TIMEOUT_LOG:-}" ] && [ -s "$SANLOCK_TEST_TIMEOUT_LOG" ]; then
+            printf '    per-test watchdog dump (%s):\n' "$SANLOCK_TEST_TIMEOUT_LOG"
+            tail -60 "$SANLOCK_TEST_TIMEOUT_LOG"
+        fi
+        tail -40 "$log"; exit 1
     fi
     want="$(expect "$label")"
     if [ -z "$want" ]; then
@@ -237,6 +294,8 @@ run cli_build  cargo build --release --workspace --locked
 # (F0.3-proven path) instead of `pip install -e .`.
 export PYTHONPATH="$PWD/python/src${PYTHONPATH:+:$PYTHONPATH}"
 export LD_LIBRARY_PATH="$PWD/target-linux/debug${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+SANLOCK_TEST_TIMEOUT_LOG="$PWD/tmp/pytest-timeout.log"
+export SANLOCK_TEST_TIMEOUT_LOG
 run python python3 -m pytest -p no:cacheprovider python/tests -q
 
 printf '%s\n' \
