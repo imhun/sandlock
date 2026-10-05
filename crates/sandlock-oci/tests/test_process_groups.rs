@@ -636,7 +636,15 @@ fn supervisor_signal_surface(cmd: SupervisorCmd) {
 /// compile).
 fn init_signal_surface(req: &Req) {
     match req {
-        Req::RunMain { .. } | Req::RunExec { .. } | Req::Shutdown => {}
+        // 2026-10-05: `RunPlacedExec` is the restore-into-session request (the
+        // program arrives as a descriptor); it names no signal either, so it
+        // belongs with the other non-signal verbs. The arm is explicit on
+        // purpose -- this match is the pin that makes a *per-pid* signal verb
+        // fail to compile, so every new `Req` variant has to be classified here.
+        Req::RunMain { .. }
+        | Req::RunExec { .. }
+        | Req::RunPlacedExec { .. }
+        | Req::Shutdown => {}
         Req::Signal { signum } => {
             let _ = signum;
         }

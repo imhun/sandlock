@@ -133,13 +133,47 @@
 # _emulated_chroot`) and converts the chroot fixtures to the real root, which
 # leaves every remaining suite at its measured count.
 #
-# Deliberately **not** refreshed here (they need a canonical `sandlock-dev`
-# image and a root phase, neither of which this machine can provide):
-# `core_integ` (564 -> 569 cases; the local image cannot run the CLI-dependent
-# `test_control` cases), `cli` (98 -> 40 in this image, which suggests targets
-# this image does not build), `python` (465 -> 465; measured 457 passed / 8
-# environment failures after Task 3, against 446 / 19 on the pinned commit --
-# Task 3 fixes the eleven `test_fs_mount` cases), and the three root phases.
+# **Refreshed 2026-10-05, in the canonical `sandlock-dev:latest`** (all four
+# phases, as this table's own procedure asks). What the refresh turned up:
+#
+#   * `core_integ`  564 -> 569 (measured green, 569/0).
+#   * `cli`         98 unchanged -- but only after fixing a stale assertion.
+#     `test_net_allow_and_net_deny_are_mutually_exclusive` still demanded the
+#     old refusal, while the *destination* pair has been a supported
+#     combination (deny precedence over the allowlist) since the
+#     connect-time-denylist work landed. It is now
+#     `test_net_allow_and_net_deny_reach_build_together` and pins both halves:
+#     the destination pair is accepted, the *bind* pair is still refused.
+#   * `python`      465 in total, but **one case stays red and it is not an
+#     environment failure**: `test_restore_resumes_counter` raises
+#     "checkpoint restore failed" (reproduced 2026-10-05 in the canonical
+#     image; its Rust `test_restore` twin is green). The other former failure,
+#     `test_net_allow_and_net_deny_mutually_exclusive`, was the same stale
+#     contract as the CLI one and is now a deny-precedence test
+#     (`test_net_deny_takes_precedence_over_net_allow`).
+#   * root phases   `oci` 157/0 **only after a compile fix**: the oci test
+#     target had stopped compiling -- `Req::RunPlacedExec` was never classified
+#     in `init_signal_surface`'s exhaustive match
+#     (`crates/sandlock-oci/tests/test_process_groups.rs`), and the oci phase is
+#     the only place that target is built, so the break was invisible to every
+#     other suite. `supervise_root` 4/0 and `mediation_2uid` 9/0 unchanged.
+#
+#   * **the same refresh run then hung**, and the hang is part of the record:
+#     `core_integ` stopped inside
+#     `test_instance_exec::test_a_child_restored_into_a_session_keeps_the_session_executable`
+#     and sat there for ~35 minutes with the log frozen (`tmp/core_integ-hang-20261005.log`).
+#     `/proc` showed the test binary blocked in `futex_wait`, the `restore-stub`
+#     child parked in `hrtimer_nanosleep`, and no progress -- a restore handshake
+#     that never completes, not a slow test. The same case had passed in an
+#     earlier standalone `core_integ` run (569/0, 88.7 s), so it is *flaky*, and
+#     `test-all.sh` has no per-test timeout: a restore hang blocks the whole gate
+#     indefinitely. Together with the deterministic
+#     `test_restore_resumes_counter` failure above, the restore-into-session path
+#     is the open question at this tip.
+#
+# Environment note for the root phases: `test-all.sh` passes `--offline`, and
+# the repo-local cargo cache is missing `aho-corasick`, so the first
+# `--oci-root` run on a fresh machine has to warm the cache outside the script.
 core_lib = 922 # (see the 2026-10-05 note above: was 913, stale; 912 -> 913 was
                # 2026-09-26: +1 and it is the pure shape's root:
                # `network::rules::tests::compose_root_slash_is_not_an_image_and_leaks_no_host_entry`
@@ -359,7 +393,10 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 564 # 2026-09-26 (N16): 563 -> 564, +1: the pure shape's synthesized
+core_integ = 569 # 2026-10-05: 564 -> 569, measured green in sandlock-dev:latest
+               # (the note above lists what the canonical-image refresh found;
+               # the count had been stale since the cases below landed).
+               # 2026-09-26 (N16): 563 -> 564, +1: the pure shape's synthesized
                  # root -- a *plain directory* the sandbox binds the host's
                  # system directories into, not an extracted image and not a
                  # tmpfs, pivoted by `real_root(true)`

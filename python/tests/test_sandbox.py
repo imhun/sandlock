@@ -262,7 +262,8 @@ class TestNetAllowDenyAll:
 
 class TestNetDeny:
     """`net_deny` wired through the FFI: default-allow networking with an
-    IP/CIDR/port denylist, mutually exclusive with `net_allow`."""
+    IP/CIDR/port denylist. It may be combined with `net_allow`; the deny set is
+    applied on top of the allowlist with deny precedence."""
 
     def test_net_deny_builds_and_runs(self):
         result = _policy(
@@ -271,11 +272,52 @@ class TestNetDeny:
         assert result.success
         assert result.stdout.strip() == b"ok"
 
-    def test_net_allow_and_net_deny_mutually_exclusive(self):
-        with pytest.raises(RuntimeError, match="mutually exclusive"):
-            _policy(
-                net_allow=["github.com:443"], net_deny=["10.0.0.0/8"]
-            ).run(["echo", "ok"])
+    def test_net_deny_takes_precedence_over_net_allow(self):
+        """The combination is supported; the deny set wins on overlap.
+
+        This case used to assert the opposite -- that `net_allow` + `net_deny`
+        raised "mutually exclusive". The pairing is the supported way to bound a
+        destination whose address is only known at connect time (an allowlist
+        entry may be a hostname), so the contract worth pinning is the
+        precedence.
+
+        The assertion compares against a *control* rather than a hard-coded
+        errno: `deny-only` on the same live listener and `allow + deny-same`
+        must be indistinguishable, while `allow-only` must get through. (The
+        denylist path answers 111 here; the `net_allow=[]` describe-deny-all
+        path answers 13 via Landlock -- pinning either literal would be pinning
+        the mechanism, not the precedence.)
+        """
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        port = listener.getsockname()[1]
+        script = (
+            "import socket\n"
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+            "s.settimeout(3)\n"
+            "try:\n"
+            f"    s.connect(('127.0.0.1', {port}))\n"
+            "    print('ALLOWED')\n"
+            "except OSError as e:\n"
+            "    print('ERR', e.errno)\n"
+        )
+        try:
+            def outcome(**kw):
+                result = _policy(**kw).run([sys.executable, "-c", script])
+                assert result.success, result.code()
+                return result.stdout.strip()
+
+            allowed = outcome(net_allow=[f"127.0.0.1:{port}"])
+            denied = outcome(net_deny=[f"127.0.0.1:{port}"])
+            both = outcome(
+                net_allow=[f"127.0.0.1:{port}"], net_deny=[f"127.0.0.1:{port}"]
+            )
+            assert allowed == b"ALLOWED", allowed
+            assert denied != b"ALLOWED", denied
+            assert both == denied, (both, denied)
+        finally:
+            listener.close()
 
 
 class TestNetDenyBind:

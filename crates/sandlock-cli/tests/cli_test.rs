@@ -195,16 +195,35 @@ fn test_no_supervisor_rejects_net_deny() {
 }
 
 #[test]
-fn test_net_allow_and_net_deny_are_mutually_exclusive() {
-    // Also guards the CLI wiring: --net-deny must reach build(), otherwise
-    // the exclusivity check never fires and the flag is silently dropped.
-    let output = sandlock_bin()
+fn test_net_allow_and_net_deny_reach_build_together() {
+    // 2026-10-05: the *destination* pair is legal to combine -- the deny set is
+    // applied on top of the allowlist with deny precedence, which is how a
+    // caller bounds a name whose address is only known at connect time. The
+    // refusal this test used to demand belongs to the *bind* pair, which is
+    // genuinely contradictory. Pinning both halves keeps the CLI wiring honest:
+    // `--net-deny` still reaches build() (no stale "mutually exclusive"), and
+    // the pair that must be refused still is.
+    let combined = sandlock_bin()
         .args(["run", "--net-allow", "github.com:443", "--net-deny", "10.0.0.0/8", "--", "/bin/true"])
         .output()
         .expect("failed to run");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("mutually exclusive"), "stderr: {}", stderr);
+    let stderr = String::from_utf8_lossy(&combined.stderr);
+    assert!(
+        !stderr.contains("mutually exclusive"),
+        "destination allow+deny is a supported combination now; stderr: {}",
+        stderr
+    );
+
+    let bind_pair = sandlock_bin()
+        .args(["run", "--net-allow-bind", "8080", "--net-deny-bind", "9090", "--", "/bin/true"])
+        .output()
+        .expect("failed to run");
+    let stderr = String::from_utf8_lossy(&bind_pair.stderr);
+    assert!(
+        !bind_pair.status.success() && stderr.contains("mutually exclusive"),
+        "the bind pair must still be refused; stderr: {}",
+        stderr
+    );
 }
 
 #[test]
