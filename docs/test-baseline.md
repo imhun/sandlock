@@ -220,6 +220,34 @@
 #     `test_the_session_parent_can_write_into_an_init_spawned_child`
 #     (`/proc/<pid>/maps` racing the child) -- it stays on the list.
 #
+#     **The hang itself is now root-caused and fixed** (fork `5288752`, same
+#     day). It was never in the engine: the two restore cases were the only
+#     tests in this file that read the exec'd child's piped stdout on the
+#     *default current-thread* `#[tokio::test]`. The sandbox's seccomp-notify
+#     supervisor is a task in the caller's runtime, so that blocking read owns
+#     the only executor thread; the exec'd child then parks inside its next
+#     traced syscall (a `close` in the stdio wiring -- `close` is always
+#     notified) and never reaches `execve`, so the bytes the test waits for are
+#     never written. Evidence from the frozen tree: no `tokio-runtime-worker`
+#     threads in the test binary, the runtime thread in `anon_pipe_read` on the
+#     stdout read end, the exec'd child still the test binary's own image in
+#     `__seccomp_filter` at `close(9)`, and the reader released the instant that
+#     child was killed (into "child stdout reached EOF before 12 bytes were
+#     read"). Both cases now use `flavor = "multi_thread"` like every other
+#     case here that reads piped output, and `read_exact_bytes` asserts the
+#     runtime flavor, so the next one fails in 0.1 s by name. Measured: the case
+#     alone 20/20 green (0.13 s), the deliberately reverted flavor red in
+#     0.13 s with the named message, `core_integ` 570/0 in 89.5 s.
+#
+#     Unrelated reds in the same local runs -- `test_popen_group_killed_on_drop`,
+#     `test_shutdown_group_sweep_after_compliant_grace_exit`,
+#     `test_max_lifetime_forces_shutdown_with_live_child` -- are the local
+#     runner's missing `--init`: their `kill(pid, 0)` criterion counts a
+#     killed-but-unreaped descendant as alive, and the probe container's PID 1
+#     (`sh`, or a bare `sleep`) reaps nothing. With `--init` the same image and
+#     command is 3/3 green in 0.55 s; `deploy/scripts/fork-gate.sh` (E2B repo)
+#     now passes it.
+#
 # Environment note for the root phases: `test-all.sh` passes `--offline`, and
 # the repo-local cargo cache is missing `aho-corasick`, so the first
 # `--oci-root` run on a fresh machine has to warm the cache outside the script.
@@ -446,7 +474,12 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 569 # 2026-10-05: 564 -> 569, measured green in sandlock-dev:latest
+core_integ = 570 # 2026-10-05: 569 -> 570, +1 for
+               # `test_instance_exec::test_a_restored_cpython_workload_keeps_ticking`
+               # (landed in `bd2b8ff` without a baseline bump) -- and the whole
+               # target measured 570/0 again after the multi-thread-runtime fix
+               # for the session/restore hang (see the 2026-10-05 hang note above).
+               # 2026-10-05: 564 -> 569, measured green in sandlock-dev:latest
                # (the note above lists what the canonical-image refresh found;
                # the count had been stale since the cases below landed).
                # 2026-09-26 (N16): 563 -> 564, +1: the pure shape's synthesized
