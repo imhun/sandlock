@@ -277,7 +277,12 @@
 # Environment note for the root phases: `test-all.sh` passes `--offline`, and
 # the repo-local cargo cache is missing `aho-corasick`, so the first
 # `--oci-root` run on a fresh machine has to warm the cache outside the script.
-core_lib = 934 # 2026-10-06: 932 -> 934, N81 net +2: +4 shape-gate tests in
+core_lib = 935 # 2026-10-06: 934 -> 935, +1 `both_views_of_the_root_agree`
+               # (N81's predicate is evaluated by the launcher *and* by the
+               # confined child, which sees the same root as `/`; the two must
+               # not disagree -- they did, and the family kept notifying with
+               # no handler behind it).
+               # 2026-10-06: 932 -> 934, N81 net +2: +4 shape-gate tests in
                # `seccomp_plan` (own root / identity root / no root / policy
                # mount at /proc, which is where the gate predicate is pinned),
                # -2 retired with N79's class budget in `seccomp::notif`.

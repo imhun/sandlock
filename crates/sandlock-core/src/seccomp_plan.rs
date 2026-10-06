@@ -953,4 +953,28 @@ mod tests {
             .unwrap();
         assert!(metadata_gated(&policy));
     }
+
+    /// The predicate is evaluated in two processes -- the launcher (host path
+    /// visible) and the confined child (already pivoted, so the root is `/`) --
+    /// and both have to walk the same code and reach the same answer. A
+    /// disagreement puts the family on the notify list while the supervisor has
+    /// no handler for it: measured on the cluster (2026-10-06) as a 5000/s
+    /// ceiling with ~940 ms stalls and *nothing* behind the round trip.
+    #[test]
+    fn both_views_of_the_root_agree() {
+        let root = own_root("views");
+        let policy = Sandbox::builder()
+            .chroot(root.clone())
+            .pid_ns(true)
+            .build()
+            .unwrap();
+        // The launcher's view: the root at its host path.
+        assert!(!metadata_gated(&policy), "host-path view should drop the gate");
+        // The same root, spelled as the confined child would spell it (the
+        // child's `/` is this directory). Same answer required.
+        assert!(
+            !crate::resolved::stat_metadata_mediated_at(&policy, &root),
+            "an explicit view of the same root must agree with the host path"
+        );
+    }
 }

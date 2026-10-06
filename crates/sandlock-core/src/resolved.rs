@@ -82,8 +82,39 @@ pub(crate) struct SandboxFeatures {
 /// * a policy mount at or under `/proc`: the child makes those mounts *after*
 ///   this check, so only the policy can tell us about them.
 ///
+/// **The two views of the same root must agree.** This function is evaluated in
+/// two processes: the launcher (and the supervisor) see the root at its host
+/// path, while the confined child has already pivoted and sees it at `/`. Both
+/// must reach the same answer, because the filter is assembled by the child
+/// from this predicate while the *handlers* are registered by the supervisor
+/// from the same value -- and if they disagree the family still notifies with
+/// nothing behind it, which costs a round trip per call and spends the
+/// notification budget for no benefit (measured 2026-10-06: 5000/s ceiling and
+/// ~940 ms stalls with no handler registered). So when the host spelling is not
+/// visible we evaluate the caller's own root instead: in the child that is `/`,
+/// which is the same directory the launcher was asking about.
+///
 /// The metadata follows symlinks, exactly as the sandbox's own open would.
-fn stat_metadata_mediated(sandbox: &Sandbox) -> bool {
+pub(crate) fn stat_metadata_mediated(sandbox: &Sandbox) -> bool {
+    use std::path::Path;
+
+    // The launcher (and the supervisor) see the root at its host path; the
+    // confined child, already pivoted, sees it at `/`. Pick the view this
+    // caller actually has -- see `stat_metadata_mediated_at` for why the two
+    // must walk the same code.
+    let view: &Path = match sandbox.chroot.as_ref() {
+        Some(root) if std::fs::metadata(root).is_ok() => root,
+        Some(_) => Path::new("/"),
+        None => return true,
+    };
+    stat_metadata_mediated_at(sandbox, view)
+}
+
+/// `stat_metadata_mediated` for an explicit view of the root.
+///
+/// Split out so the two-view rule can be pinned: the launcher passes the host
+/// path, the confined child passes `/`, and both must walk the same code.
+pub(crate) fn stat_metadata_mediated_at(sandbox: &Sandbox, view: &std::path::Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
@@ -97,11 +128,11 @@ fn stat_metadata_mediated(sandbox: &Sandbox) -> bool {
     {
         return true;
     }
-    let Ok(root_md) = std::fs::metadata(root) else {
-        // The root is not there (yet): we cannot tell, so keep the gate.
+    let Ok(root_md) = std::fs::metadata(view) else {
+        // We cannot tell: keep the gate.
         return true;
     };
-    match std::fs::metadata(root.join("proc")) {
+    match std::fs::metadata(view.join("proc")) {
         Ok(proc_md) => !(proc_md.is_dir() && proc_md.dev() == root_md.dev()),
         // No `/proc` at all: the kernel has nothing there to answer with.
         Err(_) => false,

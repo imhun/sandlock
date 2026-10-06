@@ -247,6 +247,15 @@ impl DispatchTable {
                 }
             }
         }
+        // No chain for a syscall that the filter trapped is a *planning* bug:
+        // the syscall pays a round trip and spends the notification budget, and
+        // nothing decides anything. It happened for real (N81, 2026-10-06):
+        // the filter was assembled by the confined child from a filesystem
+        // predicate while the table was built by the supervisor from the same
+        // predicate evaluated in a different view of the same root -- see
+        // `resolved::stat_metadata_mediated`. The predicate is view-independent
+        // now; if this fallthrough is ever reached for a trapped syscall again,
+        // look for a second view somewhere.
         NotifAction::Continue
     }
 }
