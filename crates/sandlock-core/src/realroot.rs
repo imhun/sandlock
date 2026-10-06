@@ -210,25 +210,35 @@ pub fn enter_guest_cwd(path: &Path) -> Result<(), String> {
 ///
 /// `root` is the host path of the image rootfs; `mounts` are the policy's
 /// (virtual, host) pairs, the same shape `Sandbox::fs_mount` carries.
-pub fn real_root(root: &Path, mounts: &[(PathBuf, PathBuf)]) -> Result<(), String> {
-    let outcome = build(root, mounts);
+///
+/// `mount_ns_ready` says the calling process already lives in its own mount
+/// namespace — a PID-namespace sandbox gets one from the same `clone3` call
+/// that created it — so `build` only unshares for the other shapes.
+pub fn real_root(
+    root: &Path,
+    mounts: &[(PathBuf, PathBuf)],
+    mount_ns_ready: bool,
+) -> Result<(), String> {
+    let outcome = build(root, mounts, mount_ns_ready);
     if let Err(ref e) = outcome {
         record_failure(e);
     }
     outcome
 }
 
-fn build(root: &Path, mounts: &[(PathBuf, PathBuf)]) -> Result<(), String> {
+fn build(root: &Path, mounts: &[(PathBuf, PathBuf)], mount_ns_ready: bool) -> Result<(), String> {
     // 1. Our own mount namespace, owned by our own user namespace: every mount
     //    below is invisible to the host and dies with this process, and no
     //    propagation can leak them outward.
-    if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+    if !mount_ns_ready && unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
         return Err(format!(
             "unshare(CLONE_NEWNS): {}",
             std::io::Error::last_os_error()
         ));
     }
-    note("unshare(CLONE_NEWNS)");
+    if !mount_ns_ready {
+        note("unshare(CLONE_NEWNS)");
+    }
     // 2. Nothing propagates into (or out of) the host's mount tree.
     mount(None, Path::new("/"), None, MS_REC | MS_PRIVATE, None)?;
     note("make-private");

@@ -2514,11 +2514,20 @@ impl Sandbox {
         // restriction does not apply. Without a PID namespace the plain fork
         // is unchanged.
         let pid = if self.pid_ns {
+            // One call creates every namespace the sandbox needs: user and PID
+            // always, mount when there is a real root to build, network when
+            // the sandbox gets its own netns. The leader starts inside all of
+            // them, so `confine_child` never has to unshare.
+            let mut flags =
+                crate::sys::structs::CLONE_NEWUSER | crate::sys::structs::CLONE_NEWPID;
+            if self.real_root {
+                flags |= crate::sys::structs::CLONE_NEWNS;
+            }
+            if self.net_isolation {
+                flags |= crate::sys::structs::CLONE_NEWNET;
+            }
             match unsafe {
-                clone3_new_namespaces(
-                    (libc::CLONE_NEWUSER as u64) | crate::sys::structs::CLONE_NEWPID,
-                    libc::SIGCHLD as u64,
-                )
+                clone3_new_namespaces(flags, libc::SIGCHLD as u64)
             } {
                 Ok(pid) => pid,
                 Err(e) => return Err(SandboxRuntimeError::Fork(e).into()),
@@ -3644,6 +3653,49 @@ unsafe fn clone3_new_namespaces(flags: u64, exit_signal: u64) -> std::io::Result
         return Err(err);
     }
     Ok(pid as libc::pid_t)
+}
+
+/// Does an unprivileged process here get a usable user namespace?
+///
+/// Route B restores "root inside the sandbox, host uid outside" by having the
+/// confined child self-map `0 -> its own euid` (see `Sandbox::userns_self_map`),
+/// which needs an unprivileged user namespace *and* a map write. Kernels and
+/// LSMs differ (`kernel.apparmor_restrict_unprivileged_userns=1` on Ubuntu
+/// 24.04 makes the namespace appear and the map write fail), so probe once in
+/// a throwaway child and run the generation with whichever shape actually
+/// works -- reported through `stats.guest_uid` so the worker can log it.
+///
+/// The probe uses `clone3`, the same call the spawn path uses. An
+/// `unshare(CLONE_NEWUSER)` probe would answer a question the deployment no
+/// longer asks, and the worker's seccomp profile now denies `unshare` outright.
+pub fn probe_userns_self_map() -> bool {
+    let euid = unsafe { libc::geteuid() };
+    if euid == 0 {
+        // A privileged mediator needs none of this: it writes the child's maps
+        // itself.
+        return false;
+    }
+    let pid = match unsafe {
+        clone3_new_namespaces(
+            crate::sys::structs::CLONE_NEWUSER,
+            libc::SIGCHLD as u64,
+        )
+    } {
+        Ok(pid) => pid,
+        Err(_) => return false,
+    };
+    if pid == 0 {
+        // The probe child exits; it never returns into the supervisor.
+        let ok = std::fs::write("/proc/self/uid_map", format!("0 {euid} 1\n")).is_ok()
+            && std::fs::write("/proc/self/setgroups", "deny\n").is_ok()
+            && std::fs::write("/proc/self/gid_map", format!("0 {euid} 1\n")).is_ok();
+        unsafe { libc::_exit(i32::from(!ok)) };
+    }
+    let mut status: libc::c_int = 0;
+    if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+        return false;
+    }
+    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
 }
 
 // ================================================================

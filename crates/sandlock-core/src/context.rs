@@ -795,9 +795,10 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
 
     // 5b. Per-sandbox network namespace isolation (S2.2).
     //
-    // Runs after the user namespace (created above, or by the pid-ns
-    // intermediate): unshare(CLONE_NEWNET) puts the sandbox in a fresh netns
-    // owned by its own userns, so the sandbox has CAP_NET_ADMIN there with no
+    // Runs after the user namespace (created above, or by the clone3 call that
+    // made a pid-ns leader): in the pid-ns shape the netns came from that same
+    // call, and only the other shapes unshare here. Either way it is owned by
+    // the sandbox's userns, so the sandbox has CAP_NET_ADMIN there with no
     // privilege in the parent namespace. The fresh netns contains only
     // loopback; bring lo up from inside the userns. Must run before
     // Landlock/seccomp: the interface ioctls are only needed at setup and the
@@ -806,7 +807,9 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     // (S2.3), so the sandbox never depends on shared-netns supervisor
     // services.
     if sandbox.net_isolation {
-        if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
+        // A PID-namespace sandbox got its netns from the one clone3 call that
+        // created this process; only the non-pid-ns path unshares here.
+        if !pid_ns && unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
             fail!("unshare(CLONE_NEWNET)");
         }
         if let Err(e) = bring_loopback_up() {
@@ -880,7 +883,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         };
         crate::realroot::note("real_root: begin");
         let mounts = crate::chroot::resolve::resolve_chroot_mounts(&sandbox.fs_mount);
-        if let Err(e) = crate::realroot::real_root(chroot_root, &mounts) {
+        if let Err(e) = crate::realroot::real_root(chroot_root, &mounts, pid_ns) {
             fail!(format!("real root: {}", e));
         }
         crate::realroot::note("real_root: pivoted");
