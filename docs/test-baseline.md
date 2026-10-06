@@ -519,11 +519,11 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 570 # 2026-10-05: 569 -> 570, +1 for
-               # `test_instance_exec::test_a_restored_cpython_workload_keeps_ticking`
-               # (landed in `bd2b8ff` without a baseline bump) -- and the whole
-               # target measured 570/0 again after the multi-thread-runtime fix
-               # for the session/restore hang (see the 2026-10-05 hang note above).
+core_integ = 573 # 2026-10-06: 570 -> 573, +3 for N80's clone3 shape
+                 # (`pid_ns_leader_is_the_direct_child_of_the_spawner`,
+                 # `pid_ns_exit_status_survives_the_leader_becoming_the_direct_child`,
+                 # `pid_ns_leader_dies_when_its_spawner_dies`). The 2026-10-05
+                 # note above still explains the previous 569 -> 570.
                # 2026-10-05: 564 -> 569, measured green in sandlock-dev:latest
                # (the note above lists what the canonical-image refresh found;
                # the count had been stale since the cases below landed).

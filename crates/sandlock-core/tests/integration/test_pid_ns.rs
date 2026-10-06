@@ -1074,3 +1074,170 @@ async fn pid_ns_default_off_keeps_host_pid_view() {
         "default sandbox /proc lists its own process under its host pid:\n{output}"
     );
 }
+
+/// Host parent pid from `/proc/<pid>/stat` (field after the comm and state).
+fn proc_ppid(pid: i32) -> i32 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .unwrap_or_else(|e| panic!("read /proc/{pid}/stat: {e}"));
+    let after = stat.rsplit_once(") ").expect("stat has comm and fields").1;
+    let mut fields = after.split_whitespace();
+    let _state = fields.next();
+    fields
+        .next()
+        .expect("ppid field")
+        .parse()
+        .expect("ppid is numeric")
+}
+
+fn sleep_probe() {
+    unsafe { libc::sleep(30) };
+}
+
+/// N80: with `clone3` the leader is created directly inside its own user and
+/// PID namespaces, so the spawner *is* its host parent. Today an intermediate
+/// process (the single-threaded one that can call `unshare(CLONE_NEWUSER)`)
+/// sits between them, and this reads that process's pid instead.
+///
+/// The multi-threaded runtime is the point: the whole reason the intermediate
+/// exists is that `unshare(CLONE_NEWUSER)` refuses a threaded caller, while
+/// `clone3` does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pid_ns_leader_is_the_direct_child_of_the_spawner() {
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    let mut sb = exec_base_policy()
+        .user(euid, egid)
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+    // The shape `sandlock-supervise` sets for every route-B slot.
+    sb.userns_self_map = true;
+    sb.create_with_in_child_main("n80-parent-probe", vec![], sleep_probe)
+        .await
+        .unwrap();
+    sb.start().unwrap();
+
+    let leader = sb.pid().expect("leader host pid");
+    assert_eq!(
+        proc_ppid(leader),
+        std::process::id() as i32,
+        "the leader's host parent must be the spawner itself, not an intermediate process"
+    );
+    unsafe { libc::kill(leader, libc::SIGKILL) };
+}
+
+/// The exit contract must not drift when the intermediate relay goes away.
+///
+/// `sh -c 'exit 7'` was `Code(7)` before and stays `Code(7)`: that is the
+/// value the deleted relay used to carry, and losing it would be the quiet
+/// regression this test exists to catch.
+///
+/// The signal half is deliberately pinned to the *observed* behaviour: a
+/// workload that kills itself is reaped by `sandlock-init`, which reports the
+/// run as `Code(0)` — measured on the pre-change tree too
+/// (`tmp/n80/task1-exit-baseline.log`), so it is an init-shape property and
+/// not something the relay ever influenced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pid_ns_exit_status_survives_the_leader_becoming_the_direct_child() {
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    let mut plain = exec_base_policy()
+        .user(euid, egid)
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+    plain.userns_self_map = true;
+
+    let code = plain.run(&["sh", "-c", "exit 7"]).await.unwrap();
+    assert_eq!(
+        code.exit_status,
+        sandlock_core::result::ExitStatus::Code(7),
+        "a plain exit code must survive unchanged"
+    );
+
+    let mut signalled = exec_base_policy()
+        .user(euid, egid)
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+    signalled.userns_self_map = true;
+    let killed = signalled.run(&["sh", "-c", "kill -9 $$"]).await.unwrap();
+    assert_eq!(
+        killed.exit_status,
+        sandlock_core::result::ExitStatus::Code(0),
+        "a self-killed workload is normalised by sandlock-init, same as before"
+    );
+}
+
+/// Review Focus 1: the leader must die with the process that created it.
+///
+/// The pre-fork `getppid() != parent_pid` check covered this for the
+/// intermediate process. The leader is PID 1 in its own namespace, where
+/// `getppid()` is 0, so the spawner's death has to arrive as
+/// `PR_SET_PDEATHSIG` or as the ready-pipe EOF inside `confine_child`.
+///
+/// The test forks a spawner, lets it build a sandbox, kills it, and requires
+/// the leader to disappear — the same two-step death the deployment relies on
+/// when a worker pod dies.
+#[test]
+fn pid_ns_leader_dies_when_its_spawner_dies() {
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let (read_end, write_end) = (fds[0], fds[1]);
+
+    let spawner = unsafe { libc::fork() };
+    assert!(spawner >= 0, "fork the spawner");
+    if spawner == 0 {
+        // This process plays "A": build the sandbox, report the leader pid,
+        // then park until the test kills it. It must not die any other way —
+        // a Drop of the sandbox would kill the leader itself and the test
+        // would pass for the wrong reason.
+        unsafe { libc::close(read_end) };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let leader = rt.block_on(async {
+            let euid = unsafe { libc::geteuid() };
+            let egid = unsafe { libc::getegid() };
+            let mut sb = exec_base_policy()
+                .user(euid, egid)
+                .fs_write("/tmp")
+                .build()
+                .unwrap();
+            sb.userns_self_map = true;
+            sb.create_with_in_child_main("n80-orphan-probe", vec![], sleep_probe)
+                .await
+                .unwrap();
+            sb.start().unwrap();
+            let pid = sb.pid().expect("leader host pid");
+            std::mem::forget(sb);
+            pid
+        });
+        let buf = leader.to_le_bytes();
+        unsafe { libc::write(write_end, buf.as_ptr() as *const _, 4) };
+        unsafe { libc::close(write_end) };
+        loop {
+            unsafe { libc::pause() };
+        }
+    }
+
+    unsafe { libc::close(write_end) };
+    let mut buf = [0u8; 4];
+    let n = unsafe { libc::read(read_end, buf.as_mut_ptr() as *mut _, 4) };
+    assert_eq!(n, 4, "the spawner must report the leader pid");
+    let leader = i32::from_le_bytes(buf);
+
+    unsafe { libc::kill(spawner, libc::SIGKILL) };
+    let mut status = 0;
+    unsafe { libc::waitpid(spawner, &mut status, 0) };
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::path::Path::new(&format!("/proc/{leader}")).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "leader {leader} outlived its spawner"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

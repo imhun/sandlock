@@ -2506,7 +2506,26 @@ impl Sandbox {
             .into());
         }
 
-        let pid = unsafe { libc::fork() };
+        // PID namespace: `clone3` creates the leader directly inside the new
+        // user and PID namespaces. The calling thread must not enter a user
+        // namespace itself — `unshare(CLONE_NEWUSER)` refuses a threaded
+        // caller, and this supervisor owns a multi-threaded runtime — while
+        // clone3 puts only the *child* in the new namespaces, so the
+        // restriction does not apply. Without a PID namespace the plain fork
+        // is unchanged.
+        let pid = if self.pid_ns {
+            match unsafe {
+                clone3_new_namespaces(
+                    (libc::CLONE_NEWUSER as u64) | crate::sys::structs::CLONE_NEWPID,
+                    libc::SIGCHLD as u64,
+                )
+            } {
+                Ok(pid) => pid,
+                Err(e) => return Err(SandboxRuntimeError::Fork(e).into()),
+            }
+        } else {
+            unsafe { libc::fork() }
+        };
         if pid < 0 {
             return Err(SandboxRuntimeError::Fork(std::io::Error::last_os_error()).into());
         }
@@ -2527,34 +2546,24 @@ impl Sandbox {
             };
 
             if self.pid_ns {
-                // === Intermediate process: create the PID namespace ===
+                // === PID-namespace leader ===
                 //
-                // An unprivileged process cannot create a PID namespace
-                // directly (that needs CAP_SYS_ADMIN in the current user
-                // namespace). The unprivileged route is: unshare a user
-                // namespace first (granting full caps inside it), write the
-                // uid/gid mapping (parent-written when the supervisor is
-                // privileged, self-written otherwise), then unshare
-                // CLONE_NEWPID and fork the final child. The intermediate
-                // process stays alive as the final child's parent: it relays
-                // the leader's host pid to the supervisor, waits for the
-                // leader, and exits with its status, so the supervisor only
-                // ever waits/reaps its own direct child.
+                // `clone3_new_namespaces` created this process directly inside
+                // the new user and PID namespaces, so there is no intermediate
+                // process any more: the identity mapping is written here,
+                // before anything else runs.
+                //
+                // `real_uid`/`real_gid` come from the pre-clone capture in
+                // `do_spawn`: inside the namespace `getuid()` already reports
+                // the overflow id, and the single-entry map must name the
+                // *host* identity.
+                //
+                // The pre-fork parent-death check is deliberately absent here:
+                // this process is PID 1 in its own namespace and `getppid()`
+                // is 0 there (the spawner lives outside it). PR_SET_PDEATHSIG
+                // below plus the ready-pipe EOF inside `confine_child` carry
+                // that case instead.
                 unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
-                if unsafe { libc::getppid() } != parent_pid {
-                    unsafe { libc::_exit(127) };
-                }
-
-                let real_uid = unsafe { libc::getuid() };
-                let real_gid = unsafe { libc::getgid() };
-                if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "sandlock child: unshare(CLONE_NEWUSER) for pid namespace: {}",
-                        std::io::Error::last_os_error(),
-                    );
-                    unsafe { libc::_exit(127) };
-                }
                 // The same three shapes `confine_child` chooses between
                 // (`context.rs`, step 5) -- this process writes the maps for
                 // the whole generation on the unprivileged path, so it must
@@ -2630,77 +2639,6 @@ impl Sandbox {
                     );
                     unsafe { libc::_exit(127) };
                 }
-                if unsafe { libc::unshare(crate::sys::structs::CLONE_NEWPID as libc::c_int) } != 0 {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "sandlock child: unshare(CLONE_NEWPID): {}",
-                        std::io::Error::last_os_error(),
-                    );
-                    unsafe { libc::_exit(127) };
-                }
-                let leader = unsafe { libc::fork() };
-                if leader < 0 {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "sandlock child: final fork for pid namespace: {}",
-                        std::io::Error::last_os_error(),
-                    );
-                    unsafe { libc::_exit(127) };
-                }
-                if leader > 0 {
-                    // === Intermediate relay ===
-                    // Report the leader's host pid (the sandbox leader is
-                    // pid 1 inside the new namespace) over the *dedicated*
-                    // leader-pid pipe, then wait for the leader and relay
-                    // its exit status. The leader pid must not share the
-                    // notif pipe with the leader's own notif-fd write: two
-                    // writers on one pipe have no ordering guarantee, and
-                    // the parent would read the two 4-byte values swapped
-                    // if the leader wrote first. One writer per pipe keeps
-                    // each message unambiguous. Close every pipe end we
-                    // inherited but the leader no longer needs so the
-                    // parent sees EOF once the leader exits, and a piped
-                    // stdin EOF reaches the leader when the parent drops
-                    // its write end.
-                    if crate::context::write_u32_fd(pipes.leader_pid_w.as_raw_fd(), leader as u32).is_err() {
-                        unsafe { libc::_exit(127) };
-                    }
-                    unsafe { libc::close(pipes.notif_w.as_raw_fd()) };
-                    unsafe { libc::close(pipes.notif_r.as_raw_fd()) };
-                    unsafe { libc::close(pipes.ready_r.as_raw_fd()) };
-                    unsafe { libc::close(pipes.ready_w.as_raw_fd()) };
-                    unsafe { libc::close(pipes.leader_pid_r.as_raw_fd()) };
-                    unsafe { libc::close(pipes.leader_pid_w.as_raw_fd()) };
-                    unsafe { libc::close(pipes.dns_r.as_raw_fd()) };
-                    unsafe { libc::close(pipes.dns_w.as_raw_fd()) };
-                    if let Some((r, w)) = stdin_p.as_ref() {
-                        unsafe { libc::close(r.as_raw_fd()) };
-                        unsafe { libc::close(w.as_raw_fd()) };
-                    }
-                    if let Some((r, w)) = stdout_p.as_ref() {
-                        unsafe { libc::close(r.as_raw_fd()) };
-                        unsafe { libc::close(w.as_raw_fd()) };
-                    }
-                    if let Some((r, w)) = stderr_p.as_ref() {
-                        unsafe { libc::close(r.as_raw_fd()) };
-                        unsafe { libc::close(w.as_raw_fd()) };
-                    }
-                    for &(_target, source_fd) in &self.rt().extra_fds {
-                        unsafe { libc::close(source_fd) };
-                    }
-                    let mut status: i32 = 0;
-                    unsafe { libc::waitpid(leader, &mut status, 0) };
-                    let code = if libc::WIFEXITED(status) {
-                        libc::WEXITSTATUS(status)
-                    } else if libc::WIFSIGNALED(status) {
-                        128 + libc::WTERMSIG(status)
-                    } else {
-                        1
-                    };
-                    unsafe { libc::_exit(code) };
-                }
-                // leader == 0: fall through into the normal confined-child
-                // path below; this process is pid 1 in the new namespace.
             }
 
             let io_overrides = self.rt().io_overrides;
@@ -2790,7 +2728,7 @@ impl Sandbox {
                 (None, None) => context::ChildEntry::Exec(&c_cmd),
             };
             // In a PID namespace the confined process's real parent (the
-            // intermediate) lives outside the namespace, so the kernel
+            // spawner) lives outside the namespace, so the kernel
             // reports `getppid()` as 0 there; pass 0 as the expected
             // parent so the death-check stays vacuous-but-true.
             let child_parent_pid = if self.pid_ns { 0 } else { parent_pid };
@@ -2813,26 +2751,21 @@ impl Sandbox {
         // ===== PARENT PROCESS =====
         drop(pipes.notif_w);
         drop(pipes.ready_r);
-        // The intermediate holds the only other write end of the leader-pid
-        // pipe; the parent never writes to it.
-        drop(pipes.leader_pid_w);
         // The gateway address was written to the dns pipe before forking; the
         // parent only reads the child's fd number back on `dns_r`.
         drop(pipes.dns_w);
 
-        // Privileged `--user` remap: wait for the child to unshare its user
+        // Privileged `--user` remap: wait for the child to enter its user
         // namespace, write the `0 -> host_uid` maps, then release it. Must
         // complete before the notif-fd read below — the child blocks on the
         // map-done pipe until the maps are written. On failure the child is
-        // SIGKILL'd directly (the pid-ns intermediate has not setpgid'd yet,
-        // so killpg could hit the supervisor's own group) and the error is
-        // returned. `child_pid` is only registered after this handshake, so
-        // Drop's killpg+waitpid cannot reap this child — it is reaped
-        // explicitly below instead (a SIGKILLed child would otherwise linger
-        // as a zombie until the supervisor exits). On the pid-ns path the
-        // intermediate has not forked the leader yet (the map handshake
-        // precedes the final fork), so waiting for the direct child is
-        // sufficient.
+        // SIGKILL'd directly (it has not setpgid'd yet, so killpg could hit
+        // the supervisor's own group) and the error is returned. `child_pid`
+        // is only registered after this handshake, so Drop's killpg+waitpid
+        // cannot reap this child — it is reaped explicitly below instead (a
+        // SIGKILLed child would otherwise linger as a zombie until the
+        // supervisor exits). The child is the leader in every shape now, so
+        // waiting for it is sufficient.
         if let Some((ready, done)) = map_pipes {
             let ready_r = ready.0;
             let done_w = done.1;
@@ -2869,16 +2802,14 @@ impl Sandbox {
         // Read the seccomp notif fd number first: the leader writes it only
         // after its confinement (including setpgid) is installed, so an
         // error return from anything after this point is safe for Drop's
-        // killpg+waitpid reaping. Only then read the leader's host pid from
-        // its dedicated pipe (already buffered by the intermediate).
+        // killpg+waitpid reaping.
         let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
             .map_err(|e| SandboxRuntimeError::Child(format!("read notif fd from child: {}", e)))?;
 
         if self.pid_ns {
-            let leader_pid = read_u32_fd(pipes.leader_pid_r.as_raw_fd())
-                .map_err(|e| SandboxRuntimeError::Child(format!("read leader pid from child: {}", e)))?
-                as i32;
-            self.rt_mut().leader_pid = Some(leader_pid);
+            // clone3 created the leader itself, so the direct child *is* the
+            // leader: its host pid is known here without a pipe hand-off.
+            self.rt_mut().leader_pid = Some(pid);
         }
 
         let pidfd = match syscall::pidfd_open(pid as u32, 0) {
@@ -3660,6 +3591,59 @@ fn sandbox_validate_name(name: String) -> Result<String, crate::error::SandlockE
         return Err(SandboxRuntimeError::Child("sandbox name must not be '.' or '..'".into()).into());
     }
     Ok(name)
+}
+
+/// `clone3`'s argument block (`struct clone_args`): eleven `u64` fields.
+#[repr(C)]
+#[derive(Default)]
+struct CloneArgs {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+    set_tid: u64,
+    set_tid_size: u64,
+    cgroup: u64,
+}
+
+/// Create a child directly inside fresh namespaces with `clone3`.
+///
+/// The child returns 0 to its caller, exactly like `fork(2)`: with no
+/// `CLONE_VM` a zero `stack` means the child gets a copy of the caller's
+/// stack. `exit_signal` travels in its own field — the legacy `clone(2)`
+/// packs it into the low byte of `flags`, where zero silently produces a
+/// child the parent can never reap.
+///
+/// # Safety
+/// Must be called exactly like `fork`: the caller handles both return paths,
+/// and the child must not return into the parent's control flow.
+unsafe fn clone3_new_namespaces(flags: u64, exit_signal: u64) -> std::io::Result<libc::pid_t> {
+    let args = CloneArgs {
+        flags,
+        exit_signal,
+        ..Default::default()
+    };
+    let pid = libc::syscall(
+        libc::SYS_clone3,
+        &args as *const CloneArgs,
+        std::mem::size_of::<CloneArgs>(),
+    );
+    if pid < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ENOSYS) {
+            return Err(std::io::Error::new(
+                err.kind(),
+                "clone3 is not available on this kernel; the PID-namespace sandbox \
+                 needs it to create the leader inside its own namespaces",
+            ));
+        }
+        return Err(err);
+    }
+    Ok(pid as libc::pid_t)
 }
 
 // ================================================================

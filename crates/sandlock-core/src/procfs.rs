@@ -59,8 +59,8 @@ fn parent_pid_of(pid: i32) -> Option<i32> {
 /// as their namespace pids (1, 2, …). It translates ns pid ↔ host pid for
 /// that renumbering and for `/proc/<ns_pid>/…` opens.
 ///
-/// The leader's host pid is known at spawn time (the intermediate process
-/// relays it through the spawn pipe; its ns pid is always 1). Every other
+/// The leader's host pid is known at spawn time (it is the value `clone3`
+/// returned to the spawner; its ns pid is always 1). Every other
 /// process is discovered by scanning `/proc` for tasks whose PID namespace
 /// inode matches the sandbox's and reading the last `NSpid:` entry (the pid
 /// in the task's own namespace). Entries are re-verified against

@@ -8,16 +8,12 @@ fn test_pipe_pair_creation() {
     assert!(pipes.notif_w.as_raw_fd() >= 0);
     assert!(pipes.ready_r.as_raw_fd() >= 0);
     assert!(pipes.ready_w.as_raw_fd() >= 0);
-    assert!(pipes.leader_pid_r.as_raw_fd() >= 0);
-    assert!(pipes.leader_pid_w.as_raw_fd() >= 0);
-    // All six fds should be distinct
+    // All four fds should be distinct
     let fds = [
         pipes.notif_r.as_raw_fd(),
         pipes.notif_w.as_raw_fd(),
         pipes.ready_r.as_raw_fd(),
         pipes.ready_w.as_raw_fd(),
-        pipes.leader_pid_r.as_raw_fd(),
-        pipes.leader_pid_w.as_raw_fd(),
     ];
     for i in 0..fds.len() {
         for j in (i + 1)..fds.len() {
