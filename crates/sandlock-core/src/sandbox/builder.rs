@@ -170,6 +170,13 @@ pub struct SandboxBuilder {
     /// supervisor CPU spent on a notification flood. None = unlimited.
     pub notify_rate_limit: Option<u32>,
 
+    /// The deployment enforces this sandbox's memory and task budgets in the
+    /// **kernel** (a per-sandbox cgroup v2), so the mediator retires the
+    /// notifications that exist only for its own ledger. See
+    /// `Sandbox::kernel_enforced_limits` for exactly which family goes, and why
+    /// the clone family does not.
+    pub kernel_enforced_limits: bool,
+
     #[cfg_attr(feature = "cli", arg(long = "random-seed"))]
     pub random_seed: Option<u64>,
 
@@ -413,6 +420,7 @@ impl Default for SandboxBuilder {
             max_file_size: None,
             max_cpu: None,
             notify_rate_limit: None,
+            kernel_enforced_limits: false,
             random_seed: None,
             time_start: None,
             no_randomize_memory: false,
@@ -491,6 +499,7 @@ impl Clone for SandboxBuilder {
             max_file_size: self.max_file_size,
             max_cpu: self.max_cpu,
             notify_rate_limit: self.notify_rate_limit,
+            kernel_enforced_limits: self.kernel_enforced_limits,
             random_seed: self.random_seed,
             time_start: self.time_start,
             no_randomize_memory: self.no_randomize_memory,
@@ -838,6 +847,14 @@ impl SandboxBuilder {
     /// Limit seccomp user-notifications processed per second (0 disables).
     pub fn notify_rate_limit(mut self, per_sec: u32) -> Self {
         self.notify_rate_limit = if per_sec == 0 { None } else { Some(per_sec) };
+        self
+    }
+
+    /// Declare that this deployment's **kernel** enforces the sandbox's memory
+    /// and task budgets, so the mediator can retire its own ledger's
+    /// notifications. See `Sandbox::kernel_enforced_limits`.
+    pub fn kernel_enforced_limits(mut self, yes: bool) -> Self {
+        self.kernel_enforced_limits = yes;
         self
     }
 
@@ -1428,6 +1445,7 @@ impl SandboxBuilder {
             max_file_size: self.max_file_size,
             max_cpu: self.max_cpu,
             notify_rate_limit: self.notify_rate_limit,
+            kernel_enforced_limits: self.kernel_enforced_limits,
             random_seed: self.random_seed,
             time_start: self.time_start,
             no_randomize_memory: self.no_randomize_memory,

@@ -66,18 +66,35 @@ const BASE_NOTIF_SYSCALLS: &[i64] = &[
     libc::SYS_waitid,
 ];
 
-const MEMORY_NOTIF_SYSCALLS: &[i64] = &[
+// The address-space accounting family: the syscalls the mediator traps so its
+// own byte ledger can follow a sandbox's memory (`resource::handle_memory`).
+//
+// N83 phase 2 (D7): a deployment whose **kernel** enforces the memory budget
+// (a cgroup v2 `memory.high`/`memory.max` on the sandbox's own `sbx_<id>`)
+// retires exactly this family -- it is the ledger, not an enforcement point.
+// See `Sandbox::kernel_enforced_limits` and `notif_syscalls_resolved`.
+//
+// `shmget` is the SysV spelling of the same allocation and travels with them,
+// but it joins the table only where `sysv_ipc` is *allowed* (below): outside
+// that it is answered by the kernel blocklist, and notifying on a blocklisted
+// syscall would bypass that deny.
+const ADDRESS_SPACE_ACCOUNTING_SYSCALLS: &[i64] = &[
     libc::SYS_mmap,
     libc::SYS_munmap,
     libc::SYS_brk,
     libc::SYS_mremap,
-    // exec destroys the address space and the kernel picks a fresh
-    // randomized brk base, so brk accounting must observe it to drop the
-    // old image's base; otherwise the new image's first brk is charged the
-    // ASLR distance between the two heaps.
-    libc::SYS_execve,
-    libc::SYS_execveat,
 ];
+
+// exec destroys the address space and the kernel picks a fresh randomized brk
+// base, so brk accounting must observe it to drop the old image's base;
+// otherwise the new image's first brk is charged the ASLR distance between the
+// two heaps.
+//
+// These two stay on the table even where the ledger is retired: every deployed
+// shape carries them anyway for the chroot/COW/deny/policy_fn mediators, and
+// they are cold next to `mmap`, so retiring them would buy nothing while
+// putting a hole in whichever of those shapes does *not* add them back.
+const EXEC_ADDRESS_SPACE_RESET_SYSCALLS: &[i64] = &[libc::SYS_execve, libc::SYS_execveat];
 
 const NETWORK_POLICY_SYSCALLS: &[i64] = &[
     libc::SYS_connect,
@@ -464,15 +481,28 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
     }
 
     if features.memory_limit {
-        nrs.extend(MEMORY_NOTIF_SYSCALLS);
+        // N83 phase 2 (D7): where the kernel enforces the memory budget, the
+        // address-space accounting family leaves the table -- the ledger it
+        // feeds is exactly what the kernel's `memory.max` replaced, so every
+        // notification it buys is pure cost (one round trip per `mmap`/
+        // `munmap`/`brk`, and N82 measured the hot ones sharing the 5000/s
+        // notification budget at ~2600 op/s). The **clone** family stays
+        // either way: `handle_fork` is the only enforcement point for
+        // `clone3`'s namespace-creation ban and the checkpoint fork hold, so
+        // retiring it would trade a security control for latency (Task 4's
+        // ruling; see `Sandbox::kernel_enforced_limits`).
+        if !features.kernel_enforced_limits {
+            nrs.extend(ADDRESS_SPACE_ACCOUNTING_SYSCALLS);
+        }
         // shmget is in notif only when SysV IPC is allowed. The BPF
         // layout puts notif JEQs before deny JEQs, so a syscall on
         // both lists would notify (RET_USER_NOTIF) and silently
         // bypass the kernel-level deny. When extra_allow_syscalls does not contain "sysv_ipc",
         // shmget belongs only on the blocklist.
-        if features.sysv_ipc_allowed {
+        if features.sysv_ipc_allowed && !features.kernel_enforced_limits {
             nrs.push(libc::SYS_shmget);
         }
+        nrs.extend(EXEC_ADDRESS_SPACE_RESET_SYSCALLS);
     }
 
     if features.network_supervision {
@@ -976,5 +1006,127 @@ mod tests {
             !crate::resolved::stat_metadata_mediated_at(&policy, &root),
             "an explicit view of the same root must agree with the host path"
         );
+    }
+
+    // ------------------------------------------------------- N83 phase 2 / T4
+
+    /// The **address-space accounting** family: the syscalls whose only reason
+    /// to be on the notify table is the mediator's own byte ledger of a
+    /// sandbox's memory (`resource::handle_memory`). `shmget` travels with
+    /// them -- it is the SysV spelling of the same allocation, on the table
+    /// for the same ledger.
+    fn address_space_family() -> Vec<u32> {
+        let mut nrs: Vec<u32> = [
+            libc::SYS_mmap,
+            libc::SYS_munmap,
+            libc::SYS_brk,
+            libc::SYS_mremap,
+            libc::SYS_shmget,
+        ]
+        .iter()
+        .map(|&n| n as u32)
+        .collect();
+        nrs.sort_unstable();
+        nrs
+    }
+
+    /// A memory-limited sandbox with SysV IPC allowed -- so `shmget` is a real
+    /// member of the family -- and the kernel lane switched either way.
+    /// `sysv_ipc` goes in `extra_allow_syscalls` because outside it `shmget` is
+    /// on the blocklist and never reaches the notify table at all.
+    fn accounting_lane(kernel_enforced: bool) -> Sandbox {
+        Sandbox::builder()
+            .max_memory(crate::sandbox::ByteSize::mib(256))
+            .extra_allow_syscalls(vec!["sysv_ipc".into()])
+            .kernel_enforced_limits(kernel_enforced)
+            .build()
+            .unwrap()
+    }
+
+    fn traced(policy: &Sandbox) -> BTreeSet<u32> {
+        notif_syscalls(policy, None).into_iter().collect()
+    }
+
+    /// N83 phase 2 (Task 4, D7): where the kernel enforces the memory budget,
+    /// the address-space accounting family leaves the table -- **exactly** it,
+    /// and nothing else. Both directions are asserted, so a future change that
+    /// quietly drops a fifth syscall (or takes one of its neighbours with it)
+    /// fails here by name.
+    #[test]
+    fn the_kernel_lane_retires_exactly_the_address_space_accounting_family() {
+        let off = traced(&accounting_lane(false));
+        let on = traced(&accounting_lane(true));
+
+        let retired: Vec<u32> = off.difference(&on).copied().collect();
+        assert_eq!(
+            retired,
+            address_space_family(),
+            "the kernel lane must retire the address-space accounting family \
+             and nothing else"
+        );
+        let added: Vec<u32> = on.difference(&off).copied().collect();
+        assert!(
+            added.is_empty(),
+            "the kernel lane must not add notify-table members: {added:?}"
+        );
+    }
+
+    /// The other half of the ruling: the **clone family stays**, kernel lane or
+    /// not. `resource::handle_fork` is this fork's only enforcement point for
+    /// the namespace-creation ban on `clone3` -- the cBPF arg filter can read
+    /// `clone`'s `args[0]`, but `clone_args` sits behind a user pointer cBPF
+    /// cannot follow, and `clone3` is not on the default blocklist -- and it is
+    /// also what parks forks (`hold_forks`) across a checkpoint. Retiring those
+    /// entries would trade a security control for latency.
+    #[test]
+    fn the_kernel_lane_keeps_the_whole_clone_family() {
+        let on = traced(&accounting_lane(true));
+        for nr in arch::fork_like_syscalls() {
+            // Bare `fork(2)` is the one exception, and it has nothing to do
+            // with the ledger: it reaches the table only when argv safety is
+            // required (see `notif_syscalls`), which this policy does not ask
+            // for.
+            if Some(nr) == arch::sys_fork() {
+                continue;
+            }
+            assert!(
+                on.contains(&(nr as u32)),
+                "fork-class syscall {nr} must stay on the notify table: \
+                 handle_fork is the only clone3 namespace-creation ban"
+            );
+        }
+        for nr in [libc::SYS_wait4, libc::SYS_waitid] {
+            assert!(
+                on.contains(&(nr as u32)),
+                "wait-family syscall {nr} must stay: proc_count's release path \
+                 is lazy without argv safety"
+            );
+        }
+    }
+
+    /// `off` is byte-for-byte today: a policy that never mentions the field at
+    /// all and the same policy spelling it `false` plan the **same** table,
+    /// with the whole accounting family on it. The field's absence has to mean
+    /// the old behaviour -- that is what every deployment which has not
+    /// switched lanes looks like.
+    #[test]
+    fn the_default_lane_keeps_todays_table() {
+        let unspecified = Sandbox::builder()
+            .max_memory(crate::sandbox::ByteSize::mib(256))
+            .extra_allow_syscalls(vec!["sysv_ipc".into()])
+            .build()
+            .unwrap();
+        let explicit_off = traced(&accounting_lane(false));
+        assert_eq!(
+            traced(&unspecified),
+            explicit_off,
+            "an unset field must plan exactly what an explicit `false` plans"
+        );
+        for nr in address_space_family() {
+            assert!(
+                explicit_off.contains(&nr),
+                "syscall {nr} belongs on the default lane's notify table"
+            );
+        }
     }
 }

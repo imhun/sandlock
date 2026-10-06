@@ -30,6 +30,10 @@ impl ResolvedSandbox {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SandboxFeatures {
     pub(crate) memory_limit: bool,
+    /// The kernel enforces this sandbox's memory and task budgets, so the
+    /// notifications that exist only for the mediator's own ledger are
+    /// retired (N83 phase 2, D7). See `Sandbox::kernel_enforced_limits`.
+    pub(crate) kernel_enforced_limits: bool,
     /// A host-maintained disk accounting file is configured, so `statfs(2)`
     /// must be trapped and answered from it.
     pub(crate) disk_stats: bool,
@@ -157,6 +161,7 @@ impl SandboxFeatures {
 
         Self {
             memory_limit: sandbox.max_memory.is_some(),
+            kernel_enforced_limits: sandbox.kernel_enforced_limits,
             disk_stats: sandbox.disk_stats_path.is_some(),
             network_supervision: network_destination_policy || bind_denylist,
             network_destination_policy,

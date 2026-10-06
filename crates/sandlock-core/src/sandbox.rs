@@ -622,6 +622,27 @@ pub struct Sandbox {
     /// Max seccomp user-notifications processed per second (see builder).
     #[serde(skip)]
     pub notify_rate_limit: Option<u32>,
+    /// The **kernel** is the enforcer of this sandbox's memory and task
+    /// budgets (cgroup v2: `memory.high`/`memory.max`/`pids.max` on the
+    /// sandbox's own `sbx_<id>`), so the notifications that exist only to keep
+    /// the mediator's own ledger can be retired (N83 phase 2, D7).
+    ///
+    /// Today that retires the **address-space accounting** family -- `mmap`,
+    /// `munmap`, `brk`, `mremap`, and the `shmget` that travels with them (see
+    /// `seccomp_plan::address_space_family`). The **clone family stays
+    /// whichever way this is set**: `resource::handle_fork` is this fork's
+    /// only enforcement point for the namespace-creation ban on `clone3` (a
+    /// cBPF arg filter can read `clone`'s `args[0]`, but `clone_args` lives
+    /// behind a user pointer cBPF cannot follow, and `clone3` is not on the
+    /// default blocklist), and it is also what parks forks across a
+    /// checkpoint. Retiring those entries would trade a security control for
+    /// latency, so only the half that can go goes.
+    ///
+    /// Default `false`, and `#[serde(default)]` so a checkpoint written before
+    /// this field existed restores onto today's table: a deployment that has
+    /// not switched lanes plans exactly the table it planned before.
+    #[serde(default)]
+    pub kernel_enforced_limits: bool,
 
     // Reproducibility
     pub random_seed: Option<u64>,
@@ -841,6 +862,7 @@ impl Clone for Sandbox {
             max_file_size: self.max_file_size,
             max_cpu: self.max_cpu,
             notify_rate_limit: self.notify_rate_limit,
+            kernel_enforced_limits: self.kernel_enforced_limits,
             random_seed: self.random_seed,
             time_start: self.time_start,
             no_randomize_memory: self.no_randomize_memory,

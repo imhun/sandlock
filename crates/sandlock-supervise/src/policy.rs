@@ -117,6 +117,7 @@ pub const POLICY_FIELDS: &[&str] = &[
     "http_inject_ca",
     "http_key",
     "http_ports",
+    "kernel_enforced_limits",
     "max_cpu",
     "max_disk",
     "max_file_size",
@@ -189,6 +190,12 @@ pub struct SupervisePolicy {
     pub max_cpu: Option<u8>,
     pub max_disk: Option<ByteSpec>,
     pub notify_rate_limit: Option<u32>,
+    /// The deployment enforces this sandbox's memory and task budgets in the
+    /// kernel (a per-sandbox cgroup v2), so the mediator retires the
+    /// notifications that exist only for its own ledger. See
+    /// `Sandbox::kernel_enforced_limits`.
+    #[serde(default)]
+    pub kernel_enforced_limits: bool,
     pub cpu_cores: Option<Vec<u32>>,
     pub num_cpus: Option<u32>,
     pub gpu_devices: Option<Vec<u32>>,
@@ -551,6 +558,9 @@ fn apply(parsed: &ParsedPolicy) -> Result<SandboxBuilder, String> {
         if let Some(n) = p.notify_rate_limit {
             b = b.notify_rate_limit(n);
         }
+    }
+    if prov.contains("kernel_enforced_limits") {
+        b = b.kernel_enforced_limits(p.kernel_enforced_limits);
     }
     if prov.contains("cpu_cores") {
         if let Some(cores) = &p.cpu_cores {
@@ -1205,6 +1215,13 @@ fn verify(sandbox: &Sandbox, parsed: &ParsedPolicy) -> Result<(), String> {
             &sandbox.notify_rate_limit
         );
     }
+    if prov.contains("kernel_enforced_limits") {
+        check!(
+            "kernel_enforced_limits",
+            &p.kernel_enforced_limits,
+            &sandbox.kernel_enforced_limits
+        );
+    }
     if prov.contains("cpu_cores") {
         check!("cpu_cores", &p.cpu_cores, &sandbox.cpu_cores);
     }
@@ -1419,6 +1436,7 @@ pub fn example_policy_json(secret_path: &Path) -> String {
         "max_cpu": 42,
         "max_disk": "64M",
         "notify_rate_limit": 1000,
+        "kernel_enforced_limits": true,
         "cpu_cores": [0, 2],
         "num_cpus": 4,
         "gpu_devices": [0],
@@ -1520,6 +1538,11 @@ mod tests {
             sandbox.notify_rate_limit,
             Some(1000),
             "notify_rate_limit read-back"
+        );
+        assert_eq!(
+            sandbox.kernel_enforced_limits,
+            true,
+            "kernel_enforced_limits read-back"
         );
         assert_eq!(sandbox.pid_ns, true);
         assert_eq!(sandbox.net_isolation, true);
