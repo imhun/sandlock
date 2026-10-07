@@ -928,7 +928,18 @@ ffi = 104 # B3 (2026-09-11, SL-1 hard delete): 106 -> 104 — the whole
          # compiles the regenerated sandlock.h against the cdylib (still 1);
          # header regeneration also picks up pre-existing drift at HEAD
          # (missing sandlock_sandbox_builder_notify_rate_limit declaration).
-cli = 98      # 2026-09-23: 97 -> 98, +1
+cli = 100     # 2026-10-07: 98 -> 100, +2 for N87's nails
+              # (`test_kernel_enforced_limits_flag_reaches_runtime_policy`,
+              # `test_notify_rate_limit_flag_is_named_and_optional`). The phase
+              # itself was **red** before the fix -- 5 passed / 4 failed, the four
+              # being clap debug-assert panics on the positional
+              # `kernel_enforced_limits` -- and is green now, 100/0 across its five
+              # test binaries. `test_ps_lists_running_sandbox` (cli_test) is flaky
+              # *in this container only* when the whole file runs: it can miss its
+              # 15 s window for the runtime dir ("did not appear in ps output
+              # within 15s"), and passes in 0.53 s when run alone (FUP-09: both
+              # readings kept).
+              # 2026-09-23: 97 -> 98, +1
               # `net_bind_map_tests::test_real_root_flag_reaches_runtime_policy`.
               # The N35 realroot work added `SandboxBuilder::real_root` without
               # an `arg(...)`/`clap(skip)` attribute, so clap derived a
