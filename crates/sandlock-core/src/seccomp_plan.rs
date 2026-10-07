@@ -528,6 +528,25 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
     nrs.extend(&procfs_hosts_notif_syscalls());
     nrs.extend(NETLINK_NOTIF_SYSCALLS);
 
+    // N88: `close` was one table member shared by three subsystems. The netlink
+    // cookie set validates itself against procfs at use time now (N82 candidate
+    // ①, so it no longer needs the notification), but two others still tear down
+    // *on* it:
+    //
+    //   * the inbound port mapping drops its host listener when the sandbox
+    //     closes the mapped listening socket (`network::inbound` -- its own
+    //     comment: "close() drops the mapping (closing the host listener)"), and
+    //   * the readiness synthesis clears its `(pid, fd)` registrations
+    //     (`network::readiness`).
+    //
+    // Both registrations live under `if policy.inbound_port_map` (one path: a
+    // host listener plus the poll/epoll synthesis that serves it), so the member
+    // comes back for exactly those shapes -- and a sandbox with no mapped port
+    // pays no notification for close at all.
+    if features.inbound_port_map {
+        nrs.push(libc::SYS_close);
+    }
+
     // Virtualize sched_getaffinity so nproc/sysconf agree with /proc/cpuinfo
     if features.virtual_cpu_count {
         nrs.push(libc::SYS_sched_getaffinity);
@@ -967,6 +986,36 @@ mod tests {
     fn no_root_at_all_keeps_the_stat_gate() {
         let policy = Sandbox::builder().pid_ns(true).build().unwrap();
         assert!(metadata_gated(&policy));
+    }
+
+    /// N88: `close` is not a general table member any more -- it is there for
+    /// exactly the shapes that tear something down on it. The inbound port
+    /// mapping drops its host listener when the sandbox closes the mapped
+    /// listening socket, and the readiness synthesis clears its `(pid, fd)`
+    /// registrations; both live under `inbound_port_map`. A sandbox without a
+    /// mapped port must not pay a notification for `close` (that is N82
+    /// candidate ①'s win, and it is what the netlink cookie set now does for
+    /// itself).
+    #[test]
+    fn close_is_in_the_table_only_where_something_tears_down_on_it() {
+        let plain = Sandbox::builder().pid_ns(true).build().unwrap();
+        assert!(
+            !notif_syscalls(&plain, None).contains(&(libc::SYS_close as u32)),
+            "a sandbox without a mapped port must not pay a close notification"
+        );
+
+        let mapped = Sandbox::builder()
+            .pid_ns(true)
+            // The mapping needs the sandbox to own its loopback-only netns (the
+            // builder refuses `net_bind_map` without it).
+            .net_isolation(true)
+            .net_bind_map(50005, 8080)
+            .build()
+            .unwrap();
+        assert!(
+            notif_syscalls(&mapped, None).contains(&(libc::SYS_close as u32)),
+            "the inbound mapping path tears its host listener down on close"
+        );
     }
 
     /// A policy mount at or under `/proc` is made by the child *after* the
