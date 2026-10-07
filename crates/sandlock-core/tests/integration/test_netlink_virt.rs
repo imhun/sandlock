@@ -340,6 +340,88 @@ async fn non_route_netlink_still_blocked() {
     assert!(result.success());
 }
 
+/// An fd number that *was* a netlink cookie must not be virtualized once it has
+/// been closed and reused for something else.
+///
+/// The cookie set is keyed by `(tgid, fd)` (`netlink/state.rs`), and today the
+/// only thing keeping it honest is the **`close` notification** -- which is the
+/// sole reason `close` sits in `NETLINK_NOTIF_SYSCALLS` at all. Drop that
+/// notification without replacing the invariant and the set goes stale:
+/// `getsockname` on a *regular file* that inherited the cookie's fd number would
+/// be answered with a synthesized `sockaddr_nl` instead of the kernel's
+/// `ENOTSOCK`.
+///
+/// Both halves are asserted in one run, so the nail cannot pass by never
+/// virtualizing anything: the netlink socket must answer with the synthesized
+/// `nl_pid` (the sandbox tgid, non-zero), and the reused fd must be answered by
+/// the kernel (`ENOTSOCK`). `reused` is asserted too: if the fd number was not
+/// actually handed back, the second half would be vacuously true.
+#[tokio::test]
+async fn a_reused_fd_number_is_not_virtualized() {
+    let out = temp_out("netlink-fd-reuse");
+    let script = format!(concat!(
+        "import os, socket\n",
+        "NETLINK_ROUTE = 0\n",
+        "nl = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_ROUTE)\n",
+        "fd = nl.fileno()\n",
+        "virtualized = nl.getsockname()\n",
+        "nl.close()\n",
+        // (in the sandbox's Python) a raw getsockname(2) on the *closed* fd
+        // number: if the cookie entry is still there the supervisor synthesizes
+        // (rc 0); if it was cleaned up the kernel answers EBADF(9).
+        "import ctypes\n",
+        "# raw getsockname on the closed fd number\n",
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+        "cbuf = ctypes.create_string_buffer(12)\n",
+        "clen = ctypes.c_uint(12)\n",
+        "ctypes.set_errno(0)\n",
+        "rc_closed = libc.getsockname(ctypes.c_int(fd), cbuf, ctypes.byref(clen))\n",
+        "closed = 'rc=%d errno=%d' % (rc_closed, ctypes.get_errno())\n",
+        "f = os.open('/etc/os-release', os.O_RDONLY)\n",
+        "reused = (f == fd)\n",
+        "try:\n",
+        "  answer = socket.socket(fileno=f).getsockname()\n",
+        "  verdict = 'VIRTUALIZED:' + repr(answer)\n",
+        "except OSError as e:\n",
+        "  verdict = 'KERNEL:' + str(e.errno)\n",
+        "open('{out}', 'w').write(repr({{'fd': fd, 'closed': closed, 'reused': reused, \
+         'virtualized': virtualized, 'verdict': verdict}}))\n",
+    ), out = out.display());
+
+    let policy = base_policy().build().unwrap();
+    let result = policy.clone().run_interactive(&["python3", "-c", &script])
+        .await.unwrap();
+
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert!(result.success(), "sandbox run failed: {:?}", result);
+    // The cookie itself: `handle_getsockname` synthesizes `nl_pid = tgid`, and
+    // Python reports AF_NETLINK as `(nl_pid, nl_groups)`. A *non*-virtualized
+    // netlink socket answers `(0, 0)` here (nothing binds it), so a non-zero
+    // first element is the virtualization actually happening.
+    assert!(
+        contents.contains("'virtualized': (") && !contents.contains("'virtualized': (0, "),
+        "the netlink cookie was not virtualized: {}", contents
+    );
+    assert!(
+        contents.contains("'reused': True"),
+        "the fd number was not handed back -- the nail would be vacuous: {}",
+        contents
+    );
+    // EBADF (9): the kernel's answer for a closed fd. `rc=0` here would mean the
+    // supervisor answered for a fd that no longer is the cookie.
+    assert!(
+        contents.contains("'closed': 'rc=-1 errno=9'"),
+        "a closed cookie fd was still answered by the cookie path: {}", contents
+    );
+    // ENOTSOCK (88): the kernel's answer for a regular file, i.e. *not* answered
+    // by the supervisor's cookie path.
+    assert!(
+        contents.contains("'verdict': 'KERNEL:88'"),
+        "a reused fd number was answered by the cookie path: {}", contents
+    );
+}
+
 /// `/etc/hosts` is always virtualized, independent of whatever the host's
 /// on-disk file says: the sandbox sees a fixed loopback-only view. The
 /// loopback base (`127.0.0.1 localhost` / `::1 localhost`) is always

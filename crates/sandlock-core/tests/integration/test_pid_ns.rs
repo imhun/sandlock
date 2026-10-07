@@ -659,13 +659,17 @@ async fn pid_ns_procfs_view_is_renumbered() {
         output
     );
     assert_eq!(proc_has_host_pid.as_deref(), Some("false"));
-    // The translated /proc/1/status must be the leader's: its Pid: equals
-    // the leader's host pid and its Name: is the in-process entry's comm.
-    let leader_str = sb.pid().expect("leader pid").to_string();
+    // The translated /proc/1/status must be the leader's: its Pid: is the
+    // **sandbox's** number for it (1) and its Name: is the in-process entry's
+    // comm. Until N85 the pid fields were forwarded verbatim from the host
+    // file, so this assertion used to demand the leader's *host* pid -- it
+    // pinned the leak as if it were the contract. `PPid`/`Tgid`/`NSpid` and
+    // `stat`'s pid fields go the same way; the full set is pinned by
+    // `proc_status_and_stat_report_the_sandbox_numbering`.
     assert_eq!(
         proc1_status_pid.as_deref(),
-        Some(leader_str.as_str()),
-        "status Pid: must equal the sandbox leader's host pid:\n{}",
+        Some("1"),
+        "status Pid: must be the sandbox's own numbering (1):\n{}",
         output
     );
     assert_eq!(
@@ -1240,4 +1244,69 @@ fn pid_ns_leader_dies_when_its_spawner_dies() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// N85: `/proc/<own pid>/status` and `/proc/<own pid>/stat` must answer with the
+/// **sandbox's** numbering. They are served on the supervisor's behalf
+/// (`ON_BEHALF_READABLE_METADATA`, narrowed to the caller's process group), and
+/// that read used to forward the host file verbatim -- so the child could read
+/// its host pid out of `Pid:`/`Tgid:`/`NSpid:` and out of `stat`'s first field,
+/// which is exactly what the pid namespace exists to hide.
+///
+/// The one-shot leader is PID 1 inside its namespace and its parent lives
+/// outside it, so every field is exactly `1` except `PPid`, which the kernel
+/// (and the rewrite) reports as `0`.
+#[tokio::test]
+async fn proc_status_and_stat_report_the_sandbox_numbering() {
+    let out = std::env::temp_dir().join(format!(
+        "sandlock-pidns-procstatus-{}", std::process::id()
+    ));
+    let script = format!(concat!(
+        "import os\n",
+        "pid = os.getpid()\n",
+        "fields = {{}}\n",
+        "for line in open('/proc/%d/status' % pid):\n",
+        "  key, _, value = line.partition(':')\n",
+        "  fields[key] = value.strip()\n",
+        "stat = open('/proc/%d/stat' % pid).read().split()\n",
+        "answer = dict(\n",
+        "  pid=pid, Pid=fields.get('Pid'), Tgid=fields.get('Tgid'),\n",
+        "  PPid=fields.get('PPid'), NSpid=fields.get('NSpid'),\n",
+        "  stat_pid=stat[0], stat_ppid=stat[3],\n",
+        ")\n",
+        "open('{out}', 'w').write(repr(answer))\n",
+    ), out = out.display());
+
+    let policy = exec_base_policy().build().unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    let contents = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert!(
+        result.success(),
+        "sandbox run failed: {:?}\nanswer: {}",
+        result.exit_status,
+        contents
+    );
+    // The payload is the namespace's PID 1: every pid field must be the sandbox's
+    // own number, never the host's (a host pid would be a four-digit number here).
+    for field in ["'pid': 1", "'Pid': '1'", "'Tgid': '1'", "'NSpid': '1'"] {
+        assert!(
+            contents.contains(field),
+            "expected {field} in the sandbox's own numbering, got: {contents}"
+        );
+    }
+    assert!(
+        contents.contains("'stat_pid': '1'"),
+        "stat's first field must be the sandbox pid, got: {contents}"
+    );
+    // The parent is outside the namespace for a one-shot leader: both spellings
+    // report 0.
+    assert!(
+        contents.contains("'PPid': '0'") && contents.contains("'stat_ppid': '0'"),
+        "a parent outside the namespace must read as 0, got: {contents}"
+    );
 }

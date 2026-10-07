@@ -275,18 +275,6 @@ pub async fn handle_bind(
 
 /// Remove `(tgid, fd)` from the cookie set when the child closes a
 /// tracked netlink socket.  Lets the kernel actually close the fd too.
-pub async fn handle_close(
-    notif: &SeccompNotif,
-    state: &Arc<NetlinkState>,
-) -> NotifAction {
-    let fd = notif.data.args[0] as i32;
-    let tgid = tgid_of(notif.pid as i32);
-    if state.is_cookie(tgid, fd) {
-        state.unregister(tgid, fd);
-    }
-    NotifAction::Continue
-}
-
 pub async fn handle_getsockname(
     notif: &SeccompNotif,
     state: &Arc<NetlinkState>,

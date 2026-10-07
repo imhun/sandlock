@@ -667,6 +667,88 @@ fn parse_proc_net_tcp_port(line: &str) -> Option<u16> {
 /// On memfd allocation failure we fall through to `Continue` (let the real
 /// open proceed) rather than `Errno`, preserving this module's long-standing
 /// behavior: a failure to synthesise /proc content is not a denial.
+/// Rewrite the pid numbers of an on-behalf `status`/`stat` read into the
+/// **sandbox's** numbering (N85).
+///
+/// Those two files are the only whitelisted metadata whose *content* carries
+/// pids, and hiding the host numbering is the whole point of the pid namespace:
+/// served by an on-behalf fd they hand the child its host pid (`Pid:`/`Tgid:`/
+/// `PPid:`/`NSpid:` in `status`, the first and third fields of `stat`) -- the
+/// class of leak N79/N81 kept out of `/proc` by denying the stat family. Both
+/// files are small, so their content goes through a memfd (`inject_memfd`)
+/// instead of being forwarded.
+///
+/// A host pid that is not in this sandbox's map (a parent outside the
+/// namespace, the host's own init) is written as `0` -- which is what the
+/// kernel shows a process whose parent lives outside its namespace.
+fn rewrite_pid_numbers(
+    content: &str,
+    component: &str,
+    ns_of: &dyn Fn(i32) -> Option<u32>,
+) -> String {
+    if component == "stat" {
+        rewrite_stat_pids(content, ns_of)
+    } else {
+        rewrite_status_pids(content, ns_of)
+    }
+}
+
+fn rewrite_status_pids(content: &str, ns_of: &dyn Fn(i32) -> Option<u32>) -> String {
+    let mut out = String::with_capacity(content.len());
+    for line in content.lines() {
+        match line.split_once(':') {
+            Some((key @ ("Pid" | "Tgid" | "PPid"), value)) => {
+                let host = value.trim().parse::<i32>().unwrap_or(0);
+                out.push_str(&format!("{}:\t{}", key, ns_of(host).unwrap_or(0)));
+            }
+            Some(("NSpid", value)) => {
+                // The reader is *inside* the sandbox, so exactly one level of
+                // the namespace stack is visible to it.
+                let inner = value.split_whitespace().last().unwrap_or("0");
+                out.push_str(&format!("NSpid:\t{}", inner));
+            }
+            _ => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn rewrite_stat_pids(content: &str, ns_of: &dyn Fn(i32) -> Option<u32>) -> String {
+    // "1234 (comm) S 5678 ..." -- `comm` may contain spaces and parentheses, so
+    // the pid is what precedes the first '(' and the remaining fields start
+    // after the *last* ')'.
+    let (Some(open), Some(close)) = (content.find('('), content.rfind(')')) else {
+        return content.to_string();
+    };
+    let pid = content[..open].trim().parse::<i32>().unwrap_or(0);
+    let comm = &content[open + 1..close];
+    let fields: Vec<&str> = content[close + 1..].split_whitespace().collect();
+    // After the comm: fields[0] is the state, then ppid, pgrp, session, tty_nr,
+    // tpgid. Every one of those that carries a pid carries the *host's* pid, so
+    // they all get the same treatment as PPid -- and a value that is not a
+    // positive pid (0, or tpgid's -1 for "no tty") is left exactly as it is.
+    const PID_FIELDS: [usize; 4] = [1, 2, 3, 5];
+    if fields.get(1).is_none() {
+        return content.to_string();
+    }
+    let mut out = format!("{} ({})", ns_of(pid).unwrap_or(0), comm);
+    for (index, field) in fields.iter().enumerate() {
+        out.push(' ');
+        let host = PID_FIELDS
+            .contains(&index)
+            .then(|| field.parse::<i32>().ok())
+            .flatten()
+            .filter(|value| *value > 0);
+        match host {
+            Some(value) => out.push_str(&ns_of(value).unwrap_or(0).to_string()),
+            None => out.push_str(field),
+        }
+    }
+    out.push('\n');
+    out
+}
+
 fn inject_memfd(content: &[u8]) -> NotifAction {
     match content_memfd(content, true) {
         Ok(fd) => NotifAction::InjectFdSend { srcfd: fd, newfd_flags: libc::O_CLOEXEC as u32 },
@@ -797,6 +879,20 @@ pub(crate) async fn handle_proc_open(
             let component = rest.strip_prefix('/').unwrap_or(rest);
             if rest.is_empty() || !ON_BEHALF_READABLE_METADATA.contains(&component) {
                 return NotifAction::Errno(EACCES);
+            }
+            // `status`/`stat` carry this process's pids *as the host sees
+            // them*; rewrite them into the sandbox's numbering instead of
+            // forwarding the host file (N85). An unreadable file is left to
+            // the kernel's answer for the sandbox-namespace path rather than
+            // forwarded as-is -- the one outcome that must not happen is
+            // handing the child host numbering.
+            if component == "status" || component == "stat" {
+                let host_path = format!("/proc/{}{}", host_pid, rest);
+                let Ok(raw) = std::fs::read_to_string(&host_path) else {
+                    return NotifAction::Continue;
+                };
+                let rewritten = rewrite_pid_numbers(&raw, component, &|host| map.ns_pid_of(host));
+                return inject_memfd(rewritten.as_bytes());
             }
             let host_path = format!("/proc/{}{}", host_pid, rest);
             let c_path = match std::ffi::CString::new(host_path) {
@@ -1821,6 +1917,63 @@ pub(crate) async fn handle_getdents(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// N85: the two whitelisted metadata files whose content carries pids are
+    /// rewritten into the sandbox's numbering. The host pids here are the ones
+    /// the on-behalf read really produced on the local lane (`Pid: 46`,
+    /// `PPid: 42`, `NSpid: 46 3` for a process the sandbox knows as pid 3).
+    #[test]
+    fn status_pid_fields_are_rewritten_into_the_sandbox_numbering() {
+        let raw = concat!(
+            "Name:\tpython3\n",
+            "Pid:\t46\n",
+            "PPid:\t42\n",
+            "Tgid:\t46\n",
+            "NSpid:\t46\t3\n",
+            "Uid:\t10000\t10000\t10000\t10000\n",
+        );
+        let ns_of = |host: i32| match host {
+            46 => Some(3),
+            42 => Some(1),
+            _ => None,
+        };
+        assert_eq!(
+            rewrite_pid_numbers(raw, "status", &ns_of),
+            concat!(
+                "Name:\tpython3\n",
+                "Pid:\t3\n",
+                "PPid:\t1\n",
+                "Tgid:\t3\n",
+                "NSpid:\t3\n",
+                "Uid:\t10000\t10000\t10000\t10000\n",
+            )
+        );
+    }
+
+    /// A parent outside the namespace reads as 0, which is the kernel's own
+    /// answer for that shape.
+    #[test]
+    fn a_pid_outside_the_sandbox_is_rewritten_to_zero() {
+        let raw = "Pid:\t46\nPPid:\t1\n";
+        let ns_of = |host: i32| (host == 46).then_some(3);
+        assert_eq!(rewrite_pid_numbers(raw, "status", &ns_of), "Pid:\t3\nPPid:\t0\n");
+    }
+
+    /// `stat` is one line, and `comm` may contain spaces and parentheses -- the
+    /// rewrite must not be confused by them.
+    #[test]
+    fn stat_pid_and_ppid_are_rewritten_with_a_hostile_comm() {
+        let raw = "46 (py ) thing) S 42 46 46 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0\n";
+        let ns_of = |host: i32| match host {
+            46 => Some(3),
+            42 => Some(1),
+            _ => None,
+        };
+        assert_eq!(
+            rewrite_pid_numbers(raw, "stat", &ns_of),
+            "3 (py ) thing) S 1 3 3 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0\n"
+        );
+    }
 
     /// Kernel-behavior probe backing `Sandbox::pid_ns`: after
     /// `unshare(CLONE_NEWUSER)` (required for unprivileged PID namespace

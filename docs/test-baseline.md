@@ -277,7 +277,14 @@
 # Environment note for the root phases: `test-all.sh` passes `--offline`, and
 # the repo-local cargo cache is missing `aho-corasick`, so the first
 # `--oci-root` run on a fresh machine has to warm the cache outside the script.
-core_lib = 935 # 2026-10-06: 934 -> 935, +1 `both_views_of_the_root_agree`
+core_lib = 941 # 2026-10-07: 935 -> 941. Measured, not assumed: with this change
+               # stashed the phase already produced **938** (the 935 entry was
+               # three behind HEAD), so this change is +3 -- the N85 rewrite
+               # cases in `procfs::tests`
+               # (`status_pid_fields_are_rewritten_into_the_sandbox_numbering`,
+               # `a_pid_outside_the_sandbox_is_rewritten_to_zero`,
+               # `stat_pid_and_ppid_are_rewritten_with_a_hostile_comm`).
+               # 2026-10-06: 934 -> 935, +1 `both_views_of_the_root_agree`
                # (N81's predicate is evaluated by the launcher *and* by the
                # confined child, which sees the same root as `/`; the two must
                # not disagree -- they did, and the family kept notifying with
@@ -519,7 +526,12 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 573 # 2026-10-06: 570 -> 573, +3 for N80's clone3 shape
+core_integ = 575 # 2026-10-07: 573 -> 575, +2: the fd-reuse nail
+                # (`test_netlink_virt::a_reused_fd_number_is_not_virtualized`,
+                # which reddens when `close` leaves the notify table without the
+                # cookie set validating itself) and the N85 nail
+                # (`test_pid_ns::proc_status_and_stat_report_the_sandbox_numbering`).
+                # 2026-10-06: 570 -> 573, +3 for N80's clone3 shape
                  # (`pid_ns_leader_is_the_direct_child_of_the_spawner`,
                  # `pid_ns_exit_status_survives_the_leader_becoming_the_direct_child`,
                  # `pid_ns_leader_dies_when_its_spawner_dies`). The 2026-10-05

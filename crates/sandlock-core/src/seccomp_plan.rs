@@ -181,7 +181,6 @@ const NETLINK_NOTIF_SYSCALLS: &[i64] = &[
     libc::SYS_getsockname,
     libc::SYS_recvfrom,
     libc::SYS_recvmsg,
-    libc::SYS_close,
 ];
 
 fn cow_path_syscalls() -> Vec<i64> {
