@@ -907,10 +907,10 @@ pub(crate) fn build_dispatch_table(
     // Inbound port mapping (S2.5): listen() on a mapped sandbox port makes
     // the supervisor create a host-side listener on the mapped host port;
     // accept()/accept4() on that socket are served from the host listener
-    // with the accepted fd injected into the sandbox. close() drops the
-    // mapping (closing the host listener) when the listening socket closes.
-    // Registered after the netlink close handler so netlink-cookie cleanup
-    // still runs first on close.
+    // with the accepted fd injected into the sandbox. `close` is deliberately
+    // NOT trapped (N88 ②): the mapping outlives the listener's close and is
+    // replaced on re-listen or dropped with the sandbox, which is what keeps
+    // the hottest syscall in the sandbox off the notification table.
     // ------------------------------------------------------------------
     if policy.inbound_port_map {
         let __sup = Arc::clone(ctx);
@@ -942,12 +942,6 @@ pub(crate) fn build_dispatch_table(
                 }
             });
         }
-        let __sup = Arc::clone(ctx);
-        table.register(libc::SYS_close, move |cx: &HandlerCtx| {
-            let notif = cx.notif;
-            let sup = Arc::clone(&__sup);
-            async move { crate::network::inbound::handle_inbound_close(&notif, &sup).await }
-        });
         // E7.1: poll/epoll readiness synthesis so event-loop servers accept
         // host-side queued connections on mapped ports (see readiness.rs).
         if let Some(poll_nr) = arch::sys_poll() {
@@ -970,15 +964,6 @@ pub(crate) fn build_dispatch_table(
                 crate::network::readiness::handle_ppoll(&notif, &sup, notif_fd).await
             }
         });
-        let __sup = Arc::clone(ctx);
-        table.register(libc::SYS_epoll_ctl, move |cx: &HandlerCtx| {
-            let notif = cx.notif;
-            let sup = Arc::clone(&__sup);
-            let notif_fd = cx.notif_fd;
-            async move {
-                crate::network::readiness::handle_epoll_ctl(&notif, &sup, notif_fd).await
-            }
-        });
         if let Some(epoll_wait_nr) = arch::sys_epoll_wait() {
             let __sup = Arc::clone(ctx);
             table.register(epoll_wait_nr, move |cx: &HandlerCtx| {
@@ -998,12 +983,6 @@ pub(crate) fn build_dispatch_table(
             async move {
                 crate::network::readiness::handle_epoll_pwait(&notif, &sup, notif_fd).await
             }
-        });
-        let __sup = Arc::clone(ctx);
-        table.register(libc::SYS_close, move |cx: &HandlerCtx| {
-            let notif = cx.notif;
-            let sup = Arc::clone(&__sup);
-            async move { crate::network::readiness::handle_epoll_close(&notif, &sup).await }
         });
     }
 

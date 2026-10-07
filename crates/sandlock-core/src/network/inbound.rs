@@ -17,9 +17,21 @@
 //      the data plane is the injected socket (kernel-direct, no user-space
 //      copy).
 //
-// Lifecycle: the mapping lives in `NetworkState`; the `close` handler drops
-// it when the listening socket closes, and sandbox teardown drops
-// `NetworkState`, closing every host listener.
+// N88 ②(a) -- who tears the mapping down, and when. `close` is no longer in
+// the notification table at all (it is the hottest syscall in the sandbox, and
+// the netlink cookie set plus this module now each stand on their own), so the
+// mapping outlives the sandbox closing its listening socket. It is released at
+// sandbox teardown, and *replaced* when a later socket listens on the same
+// mapped port (`handle_listen`). The host port is the platform's own
+// allocation for this sandbox (`50005+`), so living a little longer than the
+// listener costs nothing that is contended -- and the alternative was a
+// supervisor round trip on every `close` in every sandbox (measured: the whole
+// `openclose` ladder halving).
+//
+// The entries are keyed by the sandbox listening socket's inode, which the
+// kernel recycles, so every use re-validates: the entry is only live while the
+// socket behind the caller's fd is still bound to the port the mapping was
+// created for ([`live_sandbox_port`]). A mismatch evicts the entry.
 //
 // Each mapped listener gets a dedicated blocking worker (a `spawn_blocking`
 // thread) that polls BOTH the host listener and the sandbox's own accept
@@ -97,7 +109,7 @@ pub(crate) fn socket_ino(fd: RawFd) -> Option<u64> {
 /// when it is not bound to an IP port. Called on the supervisor's dup of the
 /// sandbox socket, which lives in the sandbox's netns — so it reports the
 /// sandbox-side port.
-fn local_port(fd: RawFd) -> Option<u16> {
+pub(crate) fn local_port(fd: RawFd) -> Option<u16> {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     let ret = unsafe {
@@ -120,6 +132,19 @@ fn local_port(fd: RawFd) -> Option<u16> {
         }
         _ => None,
     }
+}
+
+/// The port the *sandbox* thinks the socket is bound to.
+///
+/// `local_port` reports the real port, which `port_remap` may have moved: a
+/// re-`bind()` of a port something else in the sandbox netns still holds
+/// (notably this module's own eager-accept worker, which duplicates the
+/// sandbox's listening socket) is retried with port 0, and the kernel's answer
+/// is recorded as a virtual→real mapping. The inbound mapping is configured on
+/// the port the app asked for, so the lookup has to translate back.
+pub(crate) fn live_sandbox_port(ns: &crate::seccomp::state::NetworkState, fd: RawFd) -> Option<u16> {
+    let real = local_port(fd)?;
+    Some(ns.port_map.get_virtual(real).unwrap_or(real))
 }
 
 /// Create a host-netns listener on 127.0.0.1:host_port with the given
@@ -312,29 +337,25 @@ pub(crate) async fn handle_listen(
         }
     }
 
-    // The sandbox must have bound the socket already; an unbound listen is
-    // left to the kernel (it returns EINVAL exactly as it would without us).
-    let sandbox_port = match local_port(dup_fd.as_raw_fd()) {
-        Some(p) => p,
-        None => return NotifAction::Continue,
-    };
-    let host_port = {
-        let ns = ctx.network.lock().await;
-        ns.inbound_map.get(&sandbox_port).copied()
-    };
-    let Some(host_port) = host_port else {
-        return NotifAction::Continue;
-    };
-
-    // Re-listen on an already-mapped socket: keep the existing host listener
-    // and worker, just re-run the sandbox-side listen (kernel semantics).
     let ino = match socket_ino(dup_fd.as_raw_fd()) {
         Some(i) => i,
         None => return NotifAction::Errno(libc::EIO),
     };
-    {
+    // The sandbox must have bound the socket already; an unbound listen is
+    // left to the kernel (it returns EINVAL exactly as it would without us).
+    // The mapping is configured on the port the *app* asked for, which
+    // `port_remap` may have moved underneath it.
+    let (sandbox_port, host_port, stale) = {
         let ns = ctx.network.lock().await;
+        let Some(port) = live_sandbox_port(&ns, dup_fd.as_raw_fd()) else {
+            return NotifAction::Continue;
+        };
+        let Some(host_port) = ns.inbound_map.get(&port).copied() else {
+            return NotifAction::Continue;
+        };
         if ns.inbound.contains_key(&ino) {
+            // Re-listen on an already-mapped socket: keep the existing host
+            // listener and worker, just re-run the sandbox-side listen.
             let ret = unsafe { libc::listen(dup_fd.as_raw_fd(), backlog) };
             return if ret == 0 {
                 NotifAction::ReturnValue(0)
@@ -342,31 +363,78 @@ pub(crate) async fn handle_listen(
                 NotifAction::Errno(unsafe { *libc::__errno_location() })
             };
         }
+        // Any other entry for this sandbox port belongs to a socket the
+        // sandbox has already closed (option ②(a): `close` no longer tears
+        // the mapping down). It is replaced below.
+        let stale: Vec<u64> = ns
+            .inbound
+            .iter()
+            .filter(|(k, l)| l.sandbox_port == port && **k != ino)
+            .map(|(k, _)| *k)
+            .collect();
+        (port, host_port, stale)
+    };
+    if !stale.is_empty() {
+        for key in &stale {
+            ctx.network.lock().await.inbound.remove(key);
+        }
+        // The replaced listener's eager-accept worker holds a duplicate of the
+        // old host listener for up to one poll slice, so the rebind can see
+        // EADDRINUSE for a moment. Do the wait off the notification loop.
+        let ctx = Arc::clone(ctx);
+        return NotifAction::defer(async move {
+            install_mapping(&ctx, dup_fd, ino, sandbox_port, host_port, backlog, true).await
+        });
     }
+    install_mapping(ctx, dup_fd, ino, sandbox_port, host_port, backlog, false).await
+}
 
-    // Host listener first: if the host port cannot be bound, fail the
-    // sandbox's listen() closed (the mapping is the point of this listen).
-    let host_listener = match create_host_listener(host_port, backlog) {
-        Ok(l) => l,
-        Err(errno) => return NotifAction::Errno(errno),
+/// Create the host listener for a mapped sandbox port, run the sandbox-side
+/// `listen()`, and record the mapping under the listening socket's inode.
+///
+/// `retry_port` is for the lazy-replacement path, where the previous mapping's
+/// worker may still hold the host port for one poll slice; the plain first
+/// listen keeps the original fail-closed behavior (a host port another sandbox
+/// owns fails this `listen()` rather than running unmapped).
+async fn install_mapping(
+    ctx: &Arc<SupervisorCtx>,
+    dup_fd: OwnedFd,
+    ino: u64,
+    sandbox_port: u16,
+    host_port: u16,
+    backlog: i32,
+    retry_port: bool,
+) -> NotifAction {
+    let host_listener = if retry_port {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match create_host_listener(host_port, backlog) {
+                Ok(l) => break l,
+                Err(errno) if errno == libc::EADDRINUSE && std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(errno) => return NotifAction::Errno(errno),
+            }
+        }
+    } else {
+        match create_host_listener(host_port, backlog) {
+            Ok(l) => l,
+            Err(errno) => return NotifAction::Errno(errno),
+        }
     };
     let ret = unsafe { libc::listen(dup_fd.as_raw_fd(), backlog) };
     if ret != 0 {
         return NotifAction::Errno(unsafe { *libc::__errno_location() });
     }
-
     let cancel = Arc::new(AtomicBool::new(false));
-    let (rx, worker, pending) = match spawn_inbound_worker(
-        host_listener.as_raw_fd(),
-        dup_fd.as_raw_fd(),
-        Arc::clone(&cancel),
-    ) {
-        Ok(w) => w,
-        Err(errno) => return NotifAction::Errno(errno),
-    };
+    let (rx, worker, pending) =
+        match spawn_inbound_worker(host_listener.as_raw_fd(), dup_fd.as_raw_fd(), Arc::clone(&cancel))
+        {
+            Ok(w) => w,
+            Err(errno) => return NotifAction::Errno(errno),
+        };
     let conns = Arc::new(tokio::sync::Mutex::new(rx));
-    let mut ns = ctx.network.lock().await;
-    ns.inbound.insert(
+    ctx.network.lock().await.inbound.insert(
         ino,
         InboundListener {
             host_listener,
@@ -378,7 +446,6 @@ pub(crate) async fn handle_listen(
             cancel,
         },
     );
-    drop(ns);
     NotifAction::ReturnValue(0)
 }
 
@@ -421,11 +488,21 @@ async fn handle_accept_impl(
         None => return NotifAction::Errno(libc::EIO),
     };
     // Snapshot the shared queue while holding the network lock briefly; the
-    // accept itself (queued-pop or deferred wait) happens outside it.
+    // accept itself (queued-pop or deferred wait) happens outside it. The
+    // entry is validated against the live socket before it is used: the inode
+    // key can be recycled, and the mapping outlives the sandbox closing its
+    // listener (option ②(a)), so an entry with no live socket behind it must
+    // not serve this accept.
     let (conns, pending) = {
-        let ns = ctx.network.lock().await;
+        let mut ns = ctx.network.lock().await;
         match ns.inbound.get(&ino) {
-            Some(l) => (Arc::clone(&l.conns), Arc::clone(&l.pending)),
+            Some(l) if live_sandbox_port(&ns, dup_fd.as_raw_fd()) == Some(l.sandbox_port) => {
+                (Arc::clone(&l.conns), Arc::clone(&l.pending))
+            }
+            Some(_) => {
+                ns.inbound.remove(&ino);
+                return NotifAction::Continue;
+            }
             None => return NotifAction::Continue,
         }
     };
@@ -583,24 +660,4 @@ fn write_peer_addr(
         &(bytes.len() as u32).to_ne_bytes(),
     )
     .map_err(|_| libc::EFAULT)
-}
-
-/// `handle_inbound_close` — when the sandbox closes a mapped listening
-/// socket, drop the mapping (closing the host listener and stopping the
-/// worker). Always `Continue`: the kernel performs the close itself, and the
-/// netlink close handler runs earlier in the chain for netlink-cookie fds.
-pub(crate) async fn handle_inbound_close(
-    notif: &SeccompNotif,
-    ctx: &Arc<SupervisorCtx>,
-) -> NotifAction {
-    let sockfd = notif.data.args[0] as i32;
-    let dup_fd = match crate::seccomp::notif::dup_fd_from_pid(notif.pid, sockfd) {
-        Ok(fd) => fd,
-        Err(_) => return NotifAction::Continue,
-    };
-    if let Some(ino) = socket_ino(dup_fd.as_raw_fd()) {
-        let mut ns = ctx.network.lock().await;
-        ns.inbound.remove(&ino);
-    }
-    NotifAction::Continue
 }

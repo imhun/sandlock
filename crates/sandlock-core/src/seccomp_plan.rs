@@ -438,12 +438,13 @@ const PORT_REMAP_SYSCALLS: &[i64] = &[
 /// S2.5 inbound port mapping: `listen` triggers host-listener creation for a
 /// mapped sandbox port, and `accept4` (plus legacy `accept` where the ABI has
 /// it) is served from that host listener with the accepted fd injected into
-/// the sandbox. `close` is already on the notif list via the netlink block,
-/// so the close handler chain can drop the mapping when the listener closes.
+/// the sandbox. `close` is deliberately absent (N88 ②): the mapping outlives
+/// the listener's close, so nothing on this path tears down on it.
 // E7.1: besides listen/accept, event-loop servers (uvicorn/asyncio, Node,
 // Go) need poll/epoll readiness synthesis so a host-side queued connection
-// wakes their accept(); `epoll_ctl` tracking tells `epoll_wait` which fds
-// are mapped listeners. `poll`/`epoll_wait` exist only on the legacy ABI
+// wakes their accept(); the synthesis reads the registrations from the
+// kernel's own `/proc/<pid>/fdinfo/<epfd>`, so `epoll_ctl` is not trapped
+// (N88 ②). `poll`/`epoll_wait` exist only on the legacy ABI
 // (x86_64); the generic ABI (aarch64/riscv64) has only `ppoll`/
 // `epoll_pwait`, which glibc's `poll()`/`epoll_wait()` wrappers call — so
 // intercepting the generic pair covers both. All are trapped only when the
@@ -452,7 +453,6 @@ const INBOUND_MAPPING_SYSCALLS: &[i64] = &[
     libc::SYS_listen,
     libc::SYS_accept4,
     libc::SYS_ppoll,
-    libc::SYS_epoll_ctl,
     libc::SYS_epoll_pwait,
 ];
 
@@ -527,25 +527,6 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
 
     nrs.extend(&procfs_hosts_notif_syscalls());
     nrs.extend(NETLINK_NOTIF_SYSCALLS);
-
-    // N88: `close` was one table member shared by three subsystems. The netlink
-    // cookie set validates itself against procfs at use time now (N82 candidate
-    // ①, so it no longer needs the notification), but two others still tear down
-    // *on* it:
-    //
-    //   * the inbound port mapping drops its host listener when the sandbox
-    //     closes the mapped listening socket (`network::inbound` -- its own
-    //     comment: "close() drops the mapping (closing the host listener)"), and
-    //   * the readiness synthesis clears its `(pid, fd)` registrations
-    //     (`network::readiness`).
-    //
-    // Both registrations live under `if policy.inbound_port_map` (one path: a
-    // host listener plus the poll/epoll synthesis that serves it), so the member
-    // comes back for exactly those shapes -- and a sandbox with no mapped port
-    // pays no notification for close at all.
-    if features.inbound_port_map {
-        nrs.push(libc::SYS_close);
-    }
 
     // Virtualize sched_getaffinity so nproc/sysconf agree with /proc/cpuinfo
     if features.virtual_cpu_count {
@@ -988,16 +969,17 @@ mod tests {
         assert!(metadata_gated(&policy));
     }
 
-    /// N88: `close` is not a general table member any more -- it is there for
-    /// exactly the shapes that tear something down on it. The inbound port
-    /// mapping drops its host listener when the sandbox closes the mapped
-    /// listening socket, and the readiness synthesis clears its `(pid, fd)`
-    /// registrations; both live under `inbound_port_map`. A sandbox without a
-    /// mapped port must not pay a notification for `close` (that is N82
-    /// candidate ①'s win, and it is what the netlink cookie set now does for
-    /// itself).
+    /// N88 ②: nothing tears down on `close` any more, so no shape pays for it.
+    /// The netlink cookie set validates itself against procfs at use time (N82
+    /// candidate ①), the inbound mapping outlives the listener's close
+    /// (`network::inbound`, option ②(a)), and the readiness synthesis reads the
+    /// kernel's own `/proc/<pid>/fdinfo/<epfd>` instead of tracking
+    /// `epoll_ctl` -- which is why `epoll_ctl` is gone from the table too. The
+    /// mapped shape is the one that used to carry the member (option ①), so it
+    /// is pinned explicitly: a regression that re-adds `close` shows up here
+    /// before it shows up as a ladder reading.
     #[test]
-    fn close_is_in_the_table_only_where_something_tears_down_on_it() {
+    fn close_is_not_in_the_table_for_any_shape() {
         let plain = Sandbox::builder().pid_ns(true).build().unwrap();
         assert!(
             !notif_syscalls(&plain, None).contains(&(libc::SYS_close as u32)),
@@ -1012,9 +994,14 @@ mod tests {
             .net_bind_map(50005, 8080)
             .build()
             .unwrap();
+        let mapped_nrs = notif_syscalls(&mapped, None);
         assert!(
-            notif_syscalls(&mapped, None).contains(&(libc::SYS_close as u32)),
-            "the inbound mapping path tears its host listener down on close"
+            !mapped_nrs.contains(&(libc::SYS_close as u32)),
+            "the inbound mapping no longer tears its host listener down on close"
+        );
+        assert!(
+            !mapped_nrs.contains(&(libc::SYS_epoll_ctl as u32)),
+            "the readiness synthesis reads fdinfo, so epoll_ctl is not trapped"
         );
     }
 

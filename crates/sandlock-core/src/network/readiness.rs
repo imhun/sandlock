@@ -7,12 +7,18 @@
 // host listener lives in the supervisor's netns), so the sandbox's listener fd
 // never becomes readable on its own — the event loop parks forever and the
 // MCP gateway never serves. These handlers trap `poll`/`ppoll`/
-// `epoll_wait`/`epoll_pwait` (plus `epoll_ctl` to track registrations) only
-// when the `inbound_port_map` feature is active, duplicate the watched fds
-// from the blocked child (sharing file descriptions, so readiness is real),
+// `epoll_wait`/`epoll_pwait` only when the `inbound_port_map` feature is
+// active, duplicate the watched fds from the blocked child (sharing file
+// descriptions, so readiness is real),
 // poll them supervisor-side in small slices, OR in synthetic POLLIN/EPOLLIN
 // for mapped listeners with queued connections, and write the combined events
 // back into the child's memory before responding with the event count.
+//
+// `epoll_wait` reads the registrations from the kernel's own
+// `/proc/<pid>/fdinfo/<epfd>` rather than tracking `epoll_ctl`: the kernel
+// already keeps that table, and a supervisor-side copy had to be told about
+// `close` (so `close` sat in the notification table) and could answer from a
+// stale entry after an fd number was reused (N88 ②).
 //
 // Syscalls without a mapped listener are returned to the kernel (`Continue`),
 // so sandboxes without inbound mappings never take this path. Epoll wakeups
@@ -32,7 +38,7 @@ use crate::seccomp::notif::{
 };
 use crate::sys::structs::SeccompNotif;
 
-use super::inbound::socket_ino;
+use super::inbound::{live_sandbox_port, socket_ino};
 
 /// `struct pollfd` on every sandlock target: `{ int fd; short events;
 /// short revents; }` — 8 bytes on LP64.
@@ -54,19 +60,6 @@ const EPOLL_EVENT_DATA_OFFSET: usize = std::mem::offset_of!(libc::epoll_event, u
 /// (child died) terminates.
 const POLL_SLICE_MS: i32 = 20;
 
-/// Decode one `struct epoll_event` from the child's memory. `bytes` is exactly
-/// [`EPOLL_EVENT_SIZE`] long; the padding a non-`x86_64` ABI leaves between
-/// `events` and `data` is skipped rather than interpreted.
-fn parse_epoll_event(bytes: &[u8]) -> (u32, u64) {
-    let events = u32::from_ne_bytes(bytes[0..4].try_into().unwrap());
-    let data = u64::from_ne_bytes(
-        bytes[EPOLL_EVENT_DATA_OFFSET..EPOLL_EVENT_DATA_OFFSET + 8]
-            .try_into()
-            .unwrap(),
-    );
-    (events, data)
-}
-
 /// Encode `(data, events)` pairs into the array layout the child reads back
 /// from `epoll_wait`.
 fn encode_epoll_events(ready: &[(u64, u32)]) -> Vec<u8> {
@@ -80,16 +73,72 @@ fn encode_epoll_events(ready: &[(u64, u32)]) -> Vec<u8> {
     buf
 }
 
-/// One epoll registration tracked for a sandbox epoll fd (E7.1).
+/// One registration the kernel reports for a sandbox epoll fd, read from
+/// `/proc/<pid>/fdinfo/<epfd>`. `target_ino` is the watched file's inode as
+/// the kernel reports it (`None` on kernels whose fdinfo omits it), used to
+/// spot inbound-mapped listeners without duplicating every watched fd.
 #[derive(Clone, Copy, Debug)]
-pub struct EpollRegistration {
-    /// The child's registered interest mask (EPOLLIN/EPOLLOUT/...).
-    pub events: u32,
-    /// The child's registered `data` payload, echoed back in epoll_wait.
-    pub data: u64,
-    /// The inode of the registered fd when it is an inbound-mapped listener
-    /// (`Some`), so epoll_wait can synthesize readiness for it.
-    pub mapped_ino: Option<u64>,
+struct EpollRegistration {
+    fd: i32,
+    events: u32,
+    data: u64,
+    target_ino: Option<u64>,
+}
+
+/// Read the child's epoll registrations from the kernel's own fdinfo.
+///
+/// This replaced a supervisor-side `epoll_ctl` ADD/MOD/DEL bookkeeping map
+/// (N88 ②). That map had to be told about `close` — which meant trapping the
+/// hottest syscall in the sandbox — and when the notification was gone an fd
+/// number that came back as something else was answered from the stale entry
+/// (measured: `epoll_wait` on a reused number returned a synthesized `0`
+/// where the kernel must say `EINVAL`). The kernel already keeps exactly this
+/// table per epoll fd; reading it has no state to go stale, so `close` and
+/// `epoll_ctl` both leave the notification table.
+///
+/// Format, stable since 2.6.28 (`pos:`/`ino:`/`sdev:` were appended later):
+///   `tfd: %8d events: %8x data: %16llx  pos:%lli ino:%lx sdev:%x`
+fn read_epoll_registrations(pid: u32, epfd: i32) -> Option<Vec<EpollRegistration>> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{epfd}")).ok()?;
+    Some(parse_epoll_fdinfo(&text))
+}
+
+/// Parse the `tfd:` lines out of an epoll fdinfo body. Split out from the read
+/// so the format assumption above is unit-tested against the kernel's literal
+/// spelling (both the modern line and the pre-`ino:` one) instead of only
+/// against whatever the running kernel happens to print.
+fn parse_epoll_fdinfo(text: &str) -> Vec<EpollRegistration> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut tok = line.split_whitespace();
+        if tok.next() != Some("tfd:") {
+            continue;
+        }
+        let Some(fd) = tok.next().and_then(|t| t.parse::<i32>().ok()) else {
+            continue;
+        };
+        if tok.next() != Some("events:") {
+            continue;
+        }
+        let Some(events) = tok.next().and_then(|t| u32::from_str_radix(t, 16).ok()) else {
+            continue;
+        };
+        if tok.next() != Some("data:") {
+            continue;
+        }
+        let Some(data) = tok.next().and_then(|t| u64::from_str_radix(t, 16).ok()) else {
+            continue;
+        };
+        let target_ino =
+            tok.find_map(|t| t.strip_prefix("ino:").and_then(|h| u64::from_str_radix(h, 16).ok()));
+        out.push(EpollRegistration {
+            fd,
+            events,
+            data,
+            target_ino,
+        });
+    }
+    out
 }
 
 /// One entry of the child's `pollfd` array, with the mapped-listener marker.
@@ -110,17 +159,28 @@ fn mapped_listener_pending(ctx: &Arc<SupervisorCtx>, ino: u64) -> bool {
     }
 }
 
-/// Resolve `fd` to its socket inode when it is an inbound-mapped listener.
+/// Resolve `fd` to its socket inode when it is a *live* inbound-mapped
+/// listener.
+///
+/// The mapping is keyed by socket inode and the kernel recycles inodes, so
+/// the entry is only accepted while the socket behind `fd` is still bound to
+/// the port the mapping was created for (see `network::inbound`); a mismatch
+/// evicts the stale entry and treats the fd as ordinary.
 async fn mapped_listener_ino(pid: u32, fd: i32, ctx: &Arc<SupervisorCtx>) -> Option<u64> {
     if fd < 0 {
         return None;
     }
     let dup = dup_fd_from_pid(pid, fd).ok()?;
     let ino = socket_ino(dup.as_raw_fd())?;
-    let ns = ctx.network.lock().await;
-    if ns.inbound.contains_key(&ino) {
+    let mut ns = ctx.network.lock().await;
+    let live = match ns.inbound.get(&ino) {
+        Some(l) => live_sandbox_port(&ns, dup.as_raw_fd()) == Some(l.sandbox_port),
+        None => return None,
+    };
+    if live {
         Some(ino)
     } else {
+        ns.inbound.remove(&ino);
         None
     }
 }
@@ -328,63 +388,6 @@ async fn run_poll_wait(
     }
 }
 
-/// `epoll_ctl(epfd, op, fd, event)` — track registrations for synthesis.
-pub(crate) async fn handle_epoll_ctl(
-    notif: &SeccompNotif,
-    ctx: &Arc<SupervisorCtx>,
-    notif_fd: RawFd,
-) -> NotifAction {
-    let epfd = notif.data.args[0] as i32;
-    let op = notif.data.args[1] as i32;
-    let fd = notif.data.args[2] as i32;
-    let event_ptr = notif.data.args[3];
-    match op {
-        libc::EPOLL_CTL_ADD | libc::EPOLL_CTL_MOD => {
-            let raw = match read_child_mem(notif_fd, notif.id, notif.pid, event_ptr, EPOLL_EVENT_SIZE)
-            {
-                Ok(b) if b.len() == EPOLL_EVENT_SIZE => b,
-                _ => return NotifAction::Continue, // kernel returns EFAULT
-            };
-            let (events, data) = parse_epoll_event(&raw);
-            let mapped_ino = mapped_listener_ino(notif.pid, fd, ctx).await;
-            let mut ns = ctx.network.lock().await;
-            ns.epoll_registrations
-                .entry((notif.pid, epfd))
-                .or_default()
-                .insert(
-                    fd,
-                    EpollRegistration {
-                        events,
-                        data,
-                        mapped_ino,
-                    },
-                );
-        }
-        libc::EPOLL_CTL_DEL => {
-            let mut ns = ctx.network.lock().await;
-            if let Some(regs) = ns.epoll_registrations.get_mut(&(notif.pid, epfd)) {
-                regs.remove(&fd);
-                if regs.is_empty() {
-                    ns.epoll_registrations.remove(&(notif.pid, epfd));
-                }
-            }
-        }
-        _ => {}
-    }
-    NotifAction::Continue
-}
-
-/// Drop epoll tracking when the sandbox closes the epoll fd.
-pub(crate) async fn handle_epoll_close(
-    notif: &SeccompNotif,
-    ctx: &Arc<SupervisorCtx>,
-) -> NotifAction {
-    let fd = notif.data.args[0] as i32;
-    let mut ns = ctx.network.lock().await;
-    ns.epoll_registrations.remove(&(notif.pid, fd));
-    NotifAction::Continue
-}
-
 /// `epoll_wait(epfd, events, maxevents, timeout)`.
 pub(crate) async fn handle_epoll_wait(
     notif: &SeccompNotif,
@@ -435,17 +438,20 @@ async fn handle_epoll_wait_impl(
         // Kernel semantics (EFAULT / EINVAL) need no synthesis.
         return NotifAction::Continue;
     }
-    let snapshot = {
-        let ns = ctx.network.lock().await;
-        ns.epoll_registrations.get(&(notif.pid, epfd)).cloned()
-    };
-    let Some(regs) = snapshot else {
+    // The kernel's own table for this epoll fd: a closed fd (fdinfo gone) or
+    // an fd that is not an epoll instance (no `tfd:` lines) leaves the
+    // syscall to the kernel, which answers EBADF/EINVAL exactly as it should.
+    let Some(regs) = read_epoll_registrations(notif.pid, epfd) else {
         return NotifAction::Continue;
     };
-    if !regs.values().any(|r| r.mapped_ino.is_some()) {
+    let any_candidate = {
+        let ns = ctx.network.lock().await;
+        regs.iter()
+            .any(|r| r.target_ino.map_or(true, |ino| ns.inbound.contains_key(&ino)))
+    };
+    if !any_candidate {
         return NotifAction::Continue;
     }
-    let regs: Vec<(i32, EpollRegistration)> = regs.into_iter().collect();
     let ctx = Arc::clone(ctx);
     let notif_owned = *notif;
     NotifAction::defer(async move {
@@ -493,22 +499,60 @@ async fn run_epoll_wait(
     events_ptr: u64,
     maxevents: i32,
     timeout_ms: i64,
-    regs: Vec<(i32, EpollRegistration)>,
+    regs: Vec<EpollRegistration>,
 ) -> NotifAction {
     let id = notif.id;
     let pid = notif.pid;
+    // Which of the kernel's registrations point at a *live* inbound-mapped
+    // listener? Only the candidates are duplicated here (their fdinfo inode
+    // is a current mapping key, or the kernel did not report one); the
+    // validation re-reads the socket's own port so a recycled inode cannot
+    // inherit a mapping that belonged to a socket the sandbox already closed.
+    let mut resolved: Vec<(i32, u32, u64, Option<u64>)> = Vec::with_capacity(regs.len());
+    {
+        let mut ns = ctx.network.lock().await;
+        let mut stale: Vec<u64> = Vec::new();
+        for r in &regs {
+            let candidate = r.target_ino.map_or(true, |ino| ns.inbound.contains_key(&ino));
+            let mut mapped_ino = None;
+            if candidate {
+                if let Ok(dup) = dup_fd_from_pid(pid, r.fd) {
+                    if let Some(ino) = socket_ino(dup.as_raw_fd()) {
+                        match ns.inbound.get(&ino) {
+                            Some(l)
+                                if live_sandbox_port(&ns, dup.as_raw_fd())
+                                    == Some(l.sandbox_port) =>
+                            {
+                                mapped_ino = Some(ino);
+                            }
+                            Some(_) => stale.push(ino),
+                            None => {}
+                        }
+                    }
+                }
+            }
+            resolved.push((r.fd, r.events, r.data, mapped_ino));
+        }
+        for ino in stale {
+            ns.inbound.remove(&ino);
+        }
+    }
+    if !resolved.iter().any(|(_, _, _, ino)| ino.is_some()) {
+        // Nothing mapped is registered: the kernel's own wait is the answer.
+        return NotifAction::Continue;
+    }
     let deadline = if timeout_ms < 0 {
         None
     } else {
         Some(Instant::now() + Duration::from_millis(timeout_ms as u64))
     };
     let spawned = tokio::task::spawn_blocking(move || {
-        let mut dups: Vec<Option<OwnedFd>> = Vec::with_capacity(regs.len());
-        let mut pollfds: Vec<libc::pollfd> = Vec::with_capacity(regs.len());
-        for (fd, reg) in &regs {
+        let mut dups: Vec<Option<OwnedFd>> = Vec::with_capacity(resolved.len());
+        let mut pollfds: Vec<libc::pollfd> = Vec::with_capacity(resolved.len());
+        for (fd, events, _, _) in &resolved {
             match dup_fd_from_pid(pid, *fd) {
                 Ok(dup) => {
-                    let events = ((reg.events & (libc::EPOLLIN as u32 | libc::EPOLLOUT as u32
+                    let events = ((*events & (libc::EPOLLIN as u32 | libc::EPOLLOUT as u32
                         | libc::EPOLLPRI as u32 | libc::EPOLLRDHUP as u32)) as i16)
                         & (libc::POLLIN as i16
                             | libc::POLLOUT as i16
@@ -554,15 +598,15 @@ async fn run_epoll_wait(
             }
 
             let mut ready: Vec<(u64, u32)> = Vec::new();
-            for (i, (_, reg)) in regs.iter().enumerate() {
-                let mut ep_events = poll_events_to_epoll(pollfds[i].revents, reg.events);
-                if let Some(ino) = reg.mapped_ino {
-                    if mapped_listener_pending(&ctx, ino) {
+            for (i, (_, events, data, mapped_ino)) in resolved.iter().enumerate() {
+                let mut ep_events = poll_events_to_epoll(pollfds[i].revents, *events);
+                if let Some(ino) = mapped_ino {
+                    if mapped_listener_pending(&ctx, *ino) {
                         ep_events |= libc::EPOLLIN as u32;
                     }
                 }
                 if ep_events != 0 {
-                    ready.push((reg.data, ep_events));
+                    ready.push((*data, ep_events));
                 }
             }
             if !ready.is_empty() {
@@ -634,36 +678,22 @@ mod tests {
         }
     }
 
-    /// The child hands the supervisor a `struct epoll_event` and reads back an
-    /// array of them, so both directions have to be in *the ABI's* layout, not
-    /// in x86_64's. The record below is built from `libc::epoll_event` itself,
-    /// which is where the packed/natural distinction lives, so this asserts
-    /// against the syscall ABI rather than against a number this file picked.
+    /// The child reads back an array of `struct epoll_event`, so the bytes the
+    /// supervisor writes have to be in *the ABI's* layout, not in x86_64's.
+    /// The record is compared through `libc::epoll_event` itself, which is
+    /// where the packed/natural distinction lives, so this asserts against the
+    /// syscall ABI rather than against a number this file picked. (Since N88 ②
+    /// the decode direction is gone: registrations are read from the kernel's
+    /// own fdinfo, never parsed out of the child's array.)
     ///
     /// Only the two *fields* are compared. A non-x86_64 ABI leaves four bytes
     /// of padding between them, and that padding is not part of the ABI: the
     /// kernel copies a `struct epoll_event` whose padding holds whatever its
     /// stack did, and no reader may depend on it.
     #[test]
-    fn epoll_event_records_round_trip_in_the_arch_layout() {
-        let mut child: libc::epoll_event = unsafe { std::mem::zeroed() };
-        child.events = libc::EPOLLIN as u32 | libc::EPOLLOUT as u32;
-        child.u64 = 0x0f0e_0d0c_0b0a_0908;
-        // Copied out first: `libc::epoll_event` is `repr(packed)` on x86_64,
-        // and `assert_eq!` borrows its arguments (E0793 on a packed field).
-        let child_events: u32 = child.events;
-        let child_data: u64 = child.u64;
-
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                (&child as *const libc::epoll_event).cast::<u8>(),
-                std::mem::size_of::<libc::epoll_event>(),
-            )
-        };
-        let (events, data) = parse_epoll_event(bytes);
-        assert_eq!(events, child_events);
-        assert_eq!(data, child_data);
-
+    fn encoded_epoll_events_land_in_the_arch_layout() {
+        let events = libc::EPOLLIN as u32 | libc::EPOLLOUT as u32;
+        let data: u64 = 0x0f0e_0d0c_0b0a_0908;
         let encoded = encode_epoll_events(&[(data, events)]);
         assert_eq!(encoded.len(), EPOLL_EVENT_SIZE);
         let mut decoded: libc::epoll_event = unsafe { std::mem::zeroed() };
@@ -676,7 +706,69 @@ mod tests {
         }
         let decoded_events: u32 = decoded.events;
         let decoded_data: u64 = decoded.u64;
-        assert_eq!(decoded_events, child_events);
-        assert_eq!(decoded_data, child_data);
+        assert_eq!(decoded_events, events);
+        assert_eq!(decoded_data, data);
+    }
+
+    /// The registrations come from the kernel's fdinfo spelling, so pin both
+    /// shapes that spelling has taken: the modern line (`pos:`/`ino:`/`sdev:`
+    /// appended) and the pre-`ino:` one. `data` is hex; a decimal read of the
+    /// modern line would be a wildly different number, which is the mistake
+    /// this test exists to catch.
+    #[test]
+    fn epoll_fdinfo_parses_the_kernels_tfd_lines() {
+        let modern = "pos:\t0\nflags:\t02000002\nmnt_id:\t18\nino:\t3087\n\
+                      tfd:        5 events: 80000019 data:     7ffc00000005  pos:0 ino:8648e8 sdev:a\n\
+                      tfd:        9 events:        1 data:               2a\n";
+        let parsed = parse_epoll_fdinfo(modern);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].fd, 5);
+        assert_eq!(parsed[0].events, 0x8000_0019);
+        assert_eq!(parsed[0].data, 0x7ffc_0000_0005);
+        assert_eq!(parsed[0].target_ino, Some(0x8648_e8));
+        assert_eq!(parsed[1].fd, 9);
+        assert_eq!(parsed[1].events, 1);
+        assert_eq!(parsed[1].data, 0x2a);
+        assert_eq!(parsed[1].target_ino, None);
+
+        // A non-epoll fd's fdinfo has no `tfd:` line at all, which is what
+        // makes a reused fd number fall through to the kernel (N88 nail).
+        assert!(parse_epoll_fdinfo("pos:\t0\nflags:\t02100000\nmnt_id:\t2917\nino:\t5\n").is_empty());
+    }
+
+    /// Live check of the assumption itself: the kernel prints the registrations
+    /// this file reads, for a real epoll fd of the running process.
+    #[test]
+    fn the_kernel_reports_a_live_epoll_fds_registrations() {
+        let epfd = unsafe { libc::epoll_create1(0) };
+        assert!(epfd >= 0, "epoll_create1 failed");
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) }, 0);
+        let watched = fds[0];
+        let mut ev: libc::epoll_event = unsafe { std::mem::zeroed() };
+        ev.events = libc::EPOLLIN as u32;
+        ev.u64 = 0x0123_4567_89ab_cdef;
+        assert_eq!(unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, watched, &mut ev) }, 0);
+
+        let regs = read_epoll_registrations(std::process::id(), epfd)
+            .expect("the kernel must expose this process's own fdinfo");
+        assert_eq!(regs.len(), 1, "one registered fd, got {regs:?}");
+        assert_eq!(regs[0].fd, watched);
+        assert_eq!(regs[0].data, 0x0123_4567_89ab_cdef);
+        assert!(
+            regs[0].events & libc::EPOLLIN as u32 != 0,
+            "the registered read interest must survive the round trip: {:#x}",
+            regs[0].events
+        );
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(watched, &mut st) }, 0);
+        assert_eq!(
+            regs[0].target_ino,
+            Some(st.st_ino),
+            "fdinfo's ino is the watched file's inode"
+        );
+        unsafe { libc::close(fds[1]) };
+        unsafe { libc::close(watched) };
+        unsafe { libc::close(epfd) };
     }
 }

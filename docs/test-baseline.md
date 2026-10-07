@@ -277,7 +277,19 @@
 # Environment note for the root phases: `test-all.sh` passes `--offline`, and
 # the repo-local cargo cache is missing `aho-corasick`, so the first
 # `--oci-root` run on a fresh machine has to warm the cache outside the script.
-core_lib = 941 # 2026-10-07: 935 -> 941. Measured, not assumed: with this change
+core_lib = 944 # 2026-10-07 (N88 ②): 941 -> 944, +2 net. +2 new readiness tests
+               # (`epoll_fdinfo_parses_the_kernels_tfd_lines` pins both spellings
+               # of the kernel's `tfd:` line, modern and pre-`ino:`; and
+               # `the_kernel_reports_a_live_epoll_fds_registrations` reads a real
+               # epoll fd of the test process through `/proc/self/fdinfo`, which
+               # is the assumption the whole synthesis now rests on), -1 for
+               # `parse_epoll_event`'s decode half (registrations are no longer
+               # parsed out of the child's array), +1 `close_is_in_the_table...`
+               # became `close_is_not_in_the_table_for_any_shape`. **The recorded
+               # 941 was itself one behind HEAD**: N88 ① (`5eda94d`) added the
+               # membership nail without touching this file, so the tree at
+               # `5eda94d` already collects 942.
+               # 2026-10-07: 935 -> 941. Measured, not assumed: with this change
                # stashed the phase already produced **938** (the 935 entry was
                # three behind HEAD), so this change is +3 -- the N85 rewrite
                # cases in `procfs::tests`
@@ -526,7 +538,15 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 575 # 2026-10-07: 573 -> 575, +2: the fd-reuse nail
+core_integ = 577 # 2026-10-07 (N88 ②): 575 -> 577, +2 -- the two N88 semantic
+                 # nails (`test_net_isolate::n88_a_reused_epoll_fd_number_is_not_synthesized`,
+                 # which reddens when `close` leaves the notify table with the
+                 # readiness registrations still tracked supervisor-side; and
+                 # `test_net_isolate::n88_the_mapping_outlives_close_and_serves_a_relistened_socket`,
+                 # which pins option ②(a): the host listener survives the
+                 # sandbox listener's close and is rebuilt for a socket that
+                 # re-binds the mapped port).
+                 # 2026-10-07: 573 -> 575, +2: the fd-reuse nail
                 # (`test_netlink_virt::a_reused_fd_number_is_not_virtualized`,
                 # which reddens when `close` leaves the notify table without the
                 # cookie set validating itself) and the N85 nail

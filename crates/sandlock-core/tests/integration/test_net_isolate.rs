@@ -1766,6 +1766,135 @@ fn inbound_park_probe() {
     }
 }
 
+/// N88 (readiness half): after the sandbox closes an epoll fd and a plain
+/// file lands on the *same* fd number, `epoll_wait` on that number must be
+/// answered by the kernel (a non-epoll fd is `EINVAL`), never by the
+/// readiness synthesis working from a stale registration. The mapped
+/// listener is registered first because only registrations that point at an
+/// inbound-mapped listener are synthesized at all.
+fn n88_reused_epoll_fd_probe() {
+    let mut out = unsafe { std::fs::File::from_raw_fd(3) };
+    let mut line = String::new();
+    let sandbox_port =
+        match std::env::var("INBOUND_SANDBOX_PORT").ok().and_then(|v| v.parse::<u16>().ok()) {
+            Some(p) => p,
+            None => {
+                let _ = out.write_all(b"no_port\n");
+                let _ = out.flush();
+                unsafe { libc::_exit(0) };
+            }
+        };
+    let listener = match TcpListener::bind(("127.0.0.1", sandbox_port)) {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = out.write_all(
+                format!("bind_errno={}\n", e.raw_os_error().unwrap_or(-1)).as_bytes(),
+            );
+            let _ = out.flush();
+            unsafe { libc::_exit(0) };
+        }
+    };
+    let epfd = unsafe { libc::epoll_create1(0) };
+    if epfd < 0 {
+        line.push_str(&format!(
+            "epoll_create_errno={}\n",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        ));
+    } else {
+        let mut ev: libc::epoll_event = unsafe { std::mem::zeroed() };
+        ev.events = libc::EPOLLIN as u32;
+        ev.u64 = 0x5a5a_5a5a_5a5a_5a5a;
+        let add = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, listener.as_raw_fd(), &mut ev) };
+        if add != 0 {
+            line.push_str(&format!(
+                "epoll_ctl_errno={}\n",
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+            ));
+        }
+        // Close the epoll fd, then hand the freed number to a plain file so
+        // the slot is provably reused (dup2 onto the freed number is exact).
+        unsafe { libc::close(epfd) };
+        let devnull = unsafe {
+            libc::open(
+                b"/dev/null\0".as_ptr() as *const libc::c_char,
+                libc::O_RDONLY,
+            )
+        };
+        if devnull != epfd {
+            unsafe { libc::dup2(devnull, epfd) };
+            unsafe { libc::close(devnull) };
+        }
+        let mut back: libc::epoll_event = unsafe { std::mem::zeroed() };
+        unsafe { *libc::__errno_location() = 0 };
+        let rc = unsafe { libc::epoll_wait(epfd, &mut back, 1, 0) };
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        line.push_str(&format!("reused_epoll_wait_rc={rc} errno={errno}\n"));
+    }
+    // Keep the mapped listener (and its host listener) alive until reporting.
+    drop(listener);
+    let _ = out.write_all(line.as_bytes());
+    let _ = out.flush();
+    unsafe { libc::_exit(0) };
+}
+
+/// N88 (inbound half, option ②(a)): the host mapping outlives the sandbox
+/// *closing* its listening socket, and a fresh listener on the same mapped
+/// port is served — the lazy-replacement contract. The probe listens,
+/// reports, closes, reports, then binds+listens again on the same port and
+/// serves one 4-byte echo round-trip from the host.
+fn n88_close_relisten_probe() {
+    let mut out = unsafe { std::fs::File::from_raw_fd(3) };
+    let sandbox_port =
+        match std::env::var("INBOUND_SANDBOX_PORT").ok().and_then(|v| v.parse::<u16>().ok()) {
+            Some(p) => p,
+            None => {
+                let _ = out.write_all(b"no_port\n");
+                let _ = out.flush();
+                unsafe { libc::_exit(0) };
+            }
+        };
+    let first = match TcpListener::bind(("127.0.0.1", sandbox_port)) {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = out.write_all(
+                format!("bind_errno={}\n", e.raw_os_error().unwrap_or(-1)).as_bytes(),
+            );
+            let _ = out.flush();
+            unsafe { libc::_exit(0) };
+        }
+    };
+    let _ = out.write_all(b"listening\n");
+    let _ = out.flush();
+    drop(first);
+    let _ = out.write_all(b"closed\n");
+    let _ = out.flush();
+
+    let second = match TcpListener::bind(("127.0.0.1", sandbox_port)) {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = out.write_all(
+                format!("relisten_errno={}\n", e.raw_os_error().unwrap_or(-1)).as_bytes(),
+            );
+            let _ = out.flush();
+            unsafe { libc::_exit(0) };
+        }
+    };
+    let _ = out.write_all(b"relistened\n");
+    let _ = out.flush();
+    match second.accept() {
+        Ok((mut conn, _)) => {
+            let mut buf = [0u8; 4];
+            let ok = conn.read_exact(&mut buf).is_ok() && conn.write_all(&buf).is_ok();
+            let _ = out.write_all(if ok { b"roundtrip=ok\n" } else { b"roundtrip=bad\n" });
+        }
+        Err(_) => {
+            let _ = out.write_all(b"roundtrip=accept_failed\n");
+        }
+    }
+    let _ = out.flush();
+    unsafe { libc::_exit(0) };
+}
+
 /// In-process probe for the S2.1 + S2.5 coordination: with both
 /// `fd_inject_connect` and `net_bind_map` active, the sandbox can still
 /// connect OUT to a host loopback echo server (injected fd) AND serve an
@@ -2443,6 +2572,144 @@ async fn test_net_isolation_inbound_mapping_poll_event_loop_serves_external() {
         "poll server sandbox failed: exit={:?} stderr={:?}",
         result.code(),
         result.stderr
+    );
+}
+
+// ============================================================
+// N88: who tears the inbound mapping down, and when
+// ============================================================
+
+/// Bounded wait for the host mapped port to accept a connection.
+fn host_port_accepts(port: u16, secs: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if connect_errno(port).is_none() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Next streamed probe line, with a hang bound (the probe is alive, so the
+/// channel must not close).
+async fn next_line(lines: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> String {
+    tokio::time::timeout(Duration::from_secs(30), lines.recv())
+        .await
+        .expect("probe did not report within 30s")
+        .expect("probe pipe closed before reporting")
+}
+
+/// N88 nail (readiness half): an fd number that was an epoll fd and is now a
+/// plain file must get the *kernel's* answer from `epoll_wait` (a non-epoll
+/// fd is `EINVAL`), not a synthesized result composed from a stale
+/// registration for that number.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn n88_a_reused_epoll_fd_number_is_not_synthesized() {
+    let sandbox_port = alloc_ephemeral_port();
+    let host_port = alloc_host_port_in_range(50005);
+
+    let (output, mut sb) = run_inbound_sandbox(
+        n88_reused_epoll_fd_probe,
+        "n88-reused-epfd",
+        true,
+        host_port,
+        sandbox_port,
+    )
+    .await;
+    let result = sb.wait().await.unwrap();
+    assert!(
+        result.success(),
+        "sandbox failed: {:?}\nprobe output:\n{}",
+        result.exit_status,
+        output
+    );
+    assert_eq!(
+        output, "reused_epoll_wait_rc=-1 errno=22\n",
+        "a reused fd number must be answered by the kernel (EINVAL), got:\n{}",
+        output
+    );
+}
+
+/// N88 nail (inbound half): the mapping outlives the sandbox *closing* its
+/// listening socket, and a listener bound to the same mapped port afterwards
+/// must be served — the lazy-replacement contract of option ②(a). The host
+/// listener is released at sandbox teardown, which
+/// `test_net_isolation_inbound_mapping_lifecycle_and_unmapped_refused`
+/// already pins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn n88_the_mapping_outlives_close_and_serves_a_relistened_socket() {
+    let sandbox_port = alloc_ephemeral_port();
+    let host_port = alloc_host_port_in_range(50005);
+
+    let (mut lines, mut sb) = start_inbound_sandbox_stream(
+        n88_close_relisten_probe,
+        "n88-close-relisten",
+        host_port,
+        sandbox_port,
+    )
+    .await;
+
+    assert_eq!(next_line(&mut lines).await, "listening");
+    assert!(
+        host_port_accepts(host_port, 10),
+        "the host mapped port must accept while the sandbox listens"
+    );
+
+    assert_eq!(next_line(&mut lines).await, "closed");
+    // The host port belongs to this sandbox's mapping; closing the sandbox
+    // listener does not (and must not) release it.
+    assert!(
+        host_port_accepts(host_port, 10),
+        "the mapping must outlive the sandbox listener's close"
+    );
+
+    assert_eq!(next_line(&mut lines).await, "relistened");
+    let echoed = tokio::task::spawn_blocking(move || -> Option<String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match TcpStream::connect(("127.0.0.1", host_port)) {
+                Ok(mut s) => {
+                    s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    if s.write_all(b"ping").is_err() {
+                        return None;
+                    }
+                    let mut buf = [0u8; 4];
+                    return match s.read_exact(&mut buf) {
+                        Ok(()) => Some(String::from_utf8_lossy(&buf).into_owned()),
+                        Err(_) => None,
+                    };
+                }
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50))
+                }
+                Err(_) => return None,
+            }
+        }
+    })
+    .await
+    .unwrap();
+    // Bounded: if the probe's `accept()` was never served it is parked there
+    // and reports nothing, so a hang here is itself the answer.
+    let roundtrip = match tokio::time::timeout(Duration::from_secs(5), lines.recv()).await {
+        Ok(Some(line)) => line,
+        Ok(None) => "<probe pipe closed>".to_string(),
+        Err(_) => "<no probe line within 5s: accept() was not served>".to_string(),
+    };
+    assert_eq!(
+        echoed.as_deref(),
+        Some("ping"),
+        "the listener that re-bound the mapped port must serve the host round-trip; probe said: {roundtrip:?}"
+    );
+    assert_eq!(roundtrip, "roundtrip=ok");
+
+    let result = sb.wait().await.unwrap();
+    assert!(
+        result.success(),
+        "relisten probe failed: {:?}",
+        result.exit_status
     );
 }
 

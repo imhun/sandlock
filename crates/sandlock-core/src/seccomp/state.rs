@@ -661,8 +661,11 @@ pub struct NetworkState {
     pub inbound_map: HashMap<u16, u16>,
     /// S2.5 live host-side inbound listeners, keyed by the sandbox listening
     /// socket's inode (stable across fork/dup of the listening fd). Dropping
-    /// an entry — the `close` handler, or NetworkState teardown with the
-    /// sandbox — closes the host listener.
+    /// an entry closes the host listener, which happens on sandbox teardown
+    /// (`NetworkState` drop) or when a later socket listens on the same mapped
+    /// port and replaces it (N88 ②(a); `close` no longer tears it down, so
+    /// every use re-validates the entry against the live socket — see
+    /// `network::inbound`).
     pub inbound: HashMap<u64, crate::network::inbound::InboundListener>,
     /// S2.5 bind-injection mode: inodes of the host-loopback listening sockets
     /// the supervisor created and injected over the sandbox's own socket at
@@ -670,17 +673,6 @@ pub struct NetworkState {
     /// already a host-netns listener), and `accept()`/`epoll_wait` need no
     /// mapping, so every inbound path checks this set before doing anything.
     pub injected_listeners: HashSet<u64>,
-    /// E7.1: epoll registration tracking for inbound-mapped listeners.
-    /// Keyed by `(pid, epoll fd)` — fd numbers are per-process, and the
-    /// sandbox runs several processes (the gateway plus its stdio MCP
-    /// subprocess) whose epoll fds overlap, so a bare epfd key would make
-    /// one process's `epoll_wait` consume another's registrations. Each
-    /// entry records the watched fd's registered event mask + payload so
-    /// `epoll_wait` can synthesize readiness for mapped listeners (whose
-    /// host-side queued connections never land in the sandbox's own kernel
-    /// backlog).
-    pub epoll_registrations:
-        HashMap<(u32, i32), HashMap<i32, crate::network::readiness::EpollRegistration>>,
 }
 
 impl NetworkState {
@@ -703,7 +695,6 @@ impl NetworkState {
             inbound_map: HashMap::new(),
             inbound: HashMap::new(),
             injected_listeners: HashSet::new(),
-            epoll_registrations: HashMap::new(),
         }
     }
 
