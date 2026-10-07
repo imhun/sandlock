@@ -132,8 +132,10 @@ pub struct SandboxBuilder {
     pub egress_proxy: Option<String>,
 
     /// RFC 1929 username for the egress proxy.
+    #[cfg_attr(feature = "cli", clap(skip))]
     pub egress_proxy_username: Option<String>,
     /// RFC 1929 password for the egress proxy.
+    #[cfg_attr(feature = "cli", clap(skip))]
     pub egress_proxy_password: Option<String>,
 
     /// Optional observation callback for HTTP learn mode. When set, the proxy is
@@ -168,6 +170,7 @@ pub struct SandboxBuilder {
     /// When exceeded the supervisor sleeps out the remainder of the window
     /// (the sandbox's intercepted syscalls queue in the kernel), bounding
     /// supervisor CPU spent on a notification flood. None = unlimited.
+    #[cfg_attr(feature = "cli", arg(long = "notify-rate-limit", value_name = "N"))]
     pub notify_rate_limit: Option<u32>,
 
     /// The deployment enforces this sandbox's memory and task budgets in the
@@ -175,6 +178,14 @@ pub struct SandboxBuilder {
     /// notifications that exist only for its own ledger. See
     /// `Sandbox::kernel_enforced_limits` for exactly which family goes, and why
     /// the clone family does not.
+    ///
+    /// The `arg` below is not decoration: this struct is `#[clap(flatten)]`ed by
+    /// the CLI, so a bare `bool` field without one becomes a *positional*
+    /// argument with `SetTrue`, which trips clap's debug assert and panics
+    /// **every** `sandlock` invocation -- exactly what `real_root` did above
+    /// when the field was added, and what this field did on 2026-10-07 (the
+    /// fork's `cli` phase went red with the same message).
+    #[cfg_attr(feature = "cli", arg(long = "kernel-enforced-limits"))]
     pub kernel_enforced_limits: bool,
 
     #[cfg_attr(feature = "cli", arg(long = "random-seed"))]

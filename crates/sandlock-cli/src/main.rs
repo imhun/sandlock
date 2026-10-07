@@ -499,6 +499,12 @@ fn apply_flattened_bool_flags(
     if pb.no_coredump {
         builder = builder.no_coredump(true);
     }
+    // N83 phase 2 / D7: same class as `--real-root` above -- this one arrived
+    // without a clap attribute at all, so it was a positional `bool` and every
+    // `sandlock` invocation panicked in clap's debug assert (N87).
+    if pb.kernel_enforced_limits {
+        builder = builder.kernel_enforced_limits(true);
+    }
     builder
 }
 
@@ -658,6 +664,9 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     for p in &pb.http_inject_ca { builder = builder.http_inject_ca(p); }
     if let Some(ref out) = pb.http_ca_out { builder = builder.http_ca_out(out); }
     if let Some(ref mask) = pb.host_mask { builder = builder.host_mask(mask); }
+    // The notification cap travels as a scalar; `0` means "no cap" (the same
+    // convention as `E2B_SANDBOX_NOTIFY_RATE_LIMIT`).
+    if let Some(rate) = pb.notify_rate_limit { builder = builder.notify_rate_limit(rate); }
     if let Some(ref auth) = args.egress_proxy_auth {
         let (user, pass) = auth
             .split_once(':')
@@ -1262,6 +1271,70 @@ mod net_bind_map_tests {
         assert!(
             !default_policy.real_root,
             "the emulated root must stay the default"
+        );
+    }
+
+    /// N87: `kernel_enforced_limits` was added to the flattened builder without
+    /// an `arg(...)`, so clap saw a positional `bool` and its debug assert
+    /// panicked on **every** invocation (`Argument 'kernel_enforced_limits' is
+    /// positional and it must take a value but action is SetTrue`) -- the same
+    /// failure `--real-root` had. The flag must also reach the runtime policy:
+    /// a name that parses and is ignored is the F6.2 class.
+    #[test]
+    fn test_kernel_enforced_limits_flag_reaches_runtime_policy() {
+        let cli = Cli::try_parse_from(["sandlock", "run", "--kernel-enforced-limits", "--", "true"])
+            .expect("--kernel-enforced-limits must parse");
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        let policy = apply_flattened_bool_flags(Sandbox::builder(), &args.sandbox_builder)
+            .build()
+            .expect("policy must build");
+        assert!(
+            policy.kernel_enforced_limits,
+            "--kernel-enforced-limits must reach the runtime policy"
+        );
+
+        let default = Cli::try_parse_from(["sandlock", "run", "--", "true"])
+            .expect("run without the flag must parse");
+        let Command::Run(default_args) = default.command else {
+            panic!("expected the run subcommand");
+        };
+        let default_policy =
+            apply_flattened_bool_flags(Sandbox::builder(), &default_args.sandbox_builder)
+                .build()
+                .expect("default policy must build");
+        assert!(
+            !default_policy.kernel_enforced_limits,
+            "the mediator's own accounting must stay the default"
+        );
+    }
+
+    /// The scalar sibling of the same class: `notify_rate_limit` had no
+    /// attribute either, so a bare `Option<u32>` field became a *positional*
+    /// argument (no panic -- it takes a value -- but the CLI grew an unnamed
+    /// argument that could swallow a stray word). It is a named flag now.
+    #[test]
+    fn test_notify_rate_limit_flag_is_named_and_optional() {
+        let cli = Cli::try_parse_from(["sandlock", "run", "--notify-rate-limit", "3000", "--", "true"])
+            .expect("--notify-rate-limit must parse");
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run subcommand");
+        };
+        assert_eq!(
+            args.sandbox_builder.notify_rate_limit,
+            Some(3000),
+            "--notify-rate-limit must land on the builder field"
+        );
+
+        let default = Cli::try_parse_from(["sandlock", "run", "--", "true"])
+            .expect("run without the flag must parse");
+        let Command::Run(default_args) = default.command else {
+            panic!("expected the run subcommand");
+        };
+        assert_eq!(
+            default_args.sandbox_builder.notify_rate_limit, None,
+            "the cap must stay unset unless asked for"
         );
     }
 }
