@@ -277,7 +277,11 @@
 # Environment note for the root phases: `test-all.sh` passes `--offline`, and
 # the repo-local cargo cache is missing `aho-corasick`, so the first
 # `--oci-root` run on a fresh machine has to warm the cache outside the script.
-core_lib = 945 # 2026-10-08 (A): 944 -> 945, +1:
+core_lib = 946 # 2026-10-08 (N90): 945 -> 946, +1:
+               # `sandbox::tests::builder_refuses_a_mapped_port_that_is_also_denied`
+               # (a mapped port is an ingress grant; the old shape let handler
+               # order decide it in the mapping's favour, silently).
+               # 2026-10-08 (A): 944 -> 945, +1:
                # `a_bind_injected_sandbox_does_not_trap_its_event_loop` -- the
                # inbound group (listen/accept4/ppoll/epoll_pwait) is trapped only
                # where the mapping is served by the supervisor's host listener;
@@ -545,7 +549,12 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 577 # 2026-10-07 (N88 ②): 575 -> 577, +2 -- the two N88 semantic
+core_integ = 578 # 2026-10-08 (N91): 577 -> 578, +1:
+                 # `test_net_isolate::test_injected_mapping_reports_the_sandbox_port_from_getsockname`
+                 # (with bind injection and host_port != sandbox_port, the
+                 # sandbox must still be told the port it bound; RED read
+                 # `getsockname=50005` where it asked for 34583).
+                 # 2026-10-07 (N88 ②): 575 -> 577, +2 -- the two N88 semantic
                  # nails (`test_net_isolate::n88_a_reused_epoll_fd_number_is_not_synthesized`,
                  # which reddens when `close` leaves the notify table with the
                  # readiness registrations still tracked supervisor-side; and

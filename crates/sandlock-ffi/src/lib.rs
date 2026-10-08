@@ -620,7 +620,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fd_inject_connect(
 /// the sandbox's `listen()`/`accept()` run on a real host-netns listening
 /// socket and the event loop's `poll`/`epoll_wait` are never trapped for
 /// readiness synthesis. Requires `net_isolation(true)` and at least one
-/// `net_bind_map` entry. Defaults to `false` (host-listener mapping).
+/// `net_bind_map` entry. `getsockname()` reports the loopback address and the
+/// port the sandbox asked for (a mapping whose host port differs is translated
+/// back). Defaults to `false` (host-listener mapping).
 ///
 /// # Safety
 /// `b` must be a valid builder pointer.

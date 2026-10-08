@@ -193,10 +193,19 @@ pub(crate) async fn handle_bind(
         // leave it bound-but-unreachable inside its own netns.
         Err(errno) => return NotifAction::Errno(errno),
     };
-    // No bookkeeping is needed for the injected socket: `net_bind_inject` also
-    // takes `listen`/`accept4`/`poll`/`epoll_wait` out of the notification
-    // table (`seccomp_plan`), so the kernel drives this listener end to end --
-    // which is the point of the mode.
+    // Record virtual -> real so `getsockname()` can translate back: the socket
+    // the sandbox now holds is bound to the *host* port, while the sandbox asked
+    // for `sandbox_port` (N91 -- with `host_port == sandbox_port`, which is how
+    // the E2B MCP gateway allocates, the two numbers coincide and
+    // `record_bind` stores only the bound-port entry). No other bookkeeping is
+    // needed: `net_bind_inject` also takes `listen`/`accept4`/`poll`/
+    // `epoll_wait` out of the notification table (`seccomp_plan`), so the
+    // kernel drives this listener end to end -- which is the point of the mode.
+    ctx.network
+        .lock()
+        .await
+        .port_map
+        .record_bind(sandbox_port, host_port);
     NotifAction::InjectFdAt {
         srcfd: host,
         targetfd: sockfd,

@@ -489,8 +489,11 @@ class Sandbox:
     ``poll``/``epoll_wait`` are never trapped for readiness synthesis.
     Requires :attr:`net_isolation` and at least one :attr:`port_mappings`
     entry; the host socket binds loopback only (never ``0.0.0.0``), so
-    ``getsockname()`` reports the loopback address.  Defaults to ``False``
-    (host-listener mapping)."""
+    ``getsockname()`` reports the loopback address -- but the *port* is
+    translated back, so a sandbox that bound ``<sandbox_port>`` still reads
+    ``<sandbox_port>`` even when the mapping's host port differs (the
+    translation is a no-op when the two coincide, which is how the MCP gateway
+    allocates).  Defaults to ``False`` (host-listener mapping)."""
 
     port_mappings: Mapping[int, int] | None = None
     """Inbound port mappings ``{host_port: sandbox_port}`` for

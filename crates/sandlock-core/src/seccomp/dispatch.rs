@@ -889,9 +889,16 @@ pub(crate) fn build_dispatch_table(
     }
 
     // ------------------------------------------------------------------
-    // getsockname — port remap
+    // getsockname — port remap, and the bind-injection translation.
+    //
+    // `net_bind_inject` replaces the sandbox's socket with a host one bound to
+    // the *host* port, so a `getsockname()` that reaches the kernel reports a
+    // port the sandbox never asked for (N91). The handler reads the real port
+    // and rewrites it to the virtual one, which is a no-op when the two are
+    // equal -- the E2B MCP allocation (`host == sandbox`) never pays anything
+    // but the round trip.
     // ------------------------------------------------------------------
-    if policy.port_remap {
+    if policy.port_remap || policy.net_bind_inject {
         let __sup = Arc::clone(ctx);
         table.register(libc::SYS_getsockname, move |cx: &HandlerCtx| {
             let notif = cx.notif;

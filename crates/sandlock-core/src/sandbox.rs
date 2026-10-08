@@ -975,6 +975,25 @@ impl Sandbox {
                         .into(),
                 ));
             }
+            // N90: a mapped port is an *ingress grant* for that port, and
+            // `net_deny_bind` denies binding it. The two disagree about the
+            // same port, and the disagreement used to be settled by handler
+            // order -- `network::bind_inject` answers `bind()` (which returns a
+            // terminal action) before `port_remap::handle_bind` ever runs its
+            // denylist check, so the mapping silently won. Refuse the pair
+            // instead of picking a winner nobody wrote down.
+            for (_, sandbox_port) in &self.net_bind_map {
+                if self.net_deny_bind.contains(sandbox_port) {
+                    return Err(SandboxError::Invalid(
+                        format!(
+                            "net_bind_map maps sandbox port {sandbox_port}, but that port \
+                             is also in net_deny_bind: the mapping grants ingress on it and \
+                             the denylist denies binding it -- drop one of the two"
+                        )
+                        .into(),
+                    ));
+                }
+            }
         }
         // Bind-injection mode answers `bind()` by replacing the sandbox's
         // socket with a host-loopback one, so it needs the mapped port set

@@ -1766,6 +1766,68 @@ fn inbound_park_probe() {
     }
 }
 
+/// N91 probe: with `net_bind_inject` on and `host_port != sandbox_port`, report
+/// the port `getsockname()` says the socket is on. The injected socket *is* the
+/// host one (bound to the host port), so without a translation the sandbox is
+/// told a different port than the one it asked to bind.
+fn inbound_injected_getsockname_probe() {
+    let mut out = unsafe { std::fs::File::from_raw_fd(3) };
+    let sandbox_port =
+        match std::env::var("INBOUND_SANDBOX_PORT").ok().and_then(|v| v.parse::<u16>().ok()) {
+            Some(p) => p,
+            None => {
+                let _ = out.write_all(b"no_port\n");
+                let _ = out.flush();
+                unsafe { libc::_exit(0) };
+            }
+        };
+    let line = match TcpListener::bind(("127.0.0.1", sandbox_port)) {
+        Ok(listener) => match listener.local_addr() {
+            Ok(addr) => format!("getsockname={}\n", addr.port()),
+            Err(e) => format!("getsockname_errno={}\n", e.raw_os_error().unwrap_or(-1)),
+        },
+        Err(e) => format!("bind_errno={}\n", e.raw_os_error().unwrap_or(-1)),
+    };
+    let _ = out.write_all(line.as_bytes());
+    let _ = out.flush();
+    unsafe { libc::_exit(0) };
+}
+
+/// `run_inbound_sandbox` with bind injection on (the worker's shipped shape).
+async fn run_injected_inbound_sandbox(
+    entry: fn(),
+    name: &str,
+    host_port: u16,
+    sandbox_port: u16,
+) -> (String, Sandbox) {
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
+    let (r, w) = (fds[0], fds[1]);
+    let mut sb = base_policy()
+        .net_isolation(true)
+        .net_bind_map(host_port, sandbox_port)
+        .net_bind_inject(true)
+        .net_allow(format!("127.0.0.1:{}", sandbox_port))
+        .net_allow_bind_port(sandbox_port)
+        .env_var("INBOUND_SANDBOX_PORT", &sandbox_port.to_string())
+        .build()
+        .unwrap();
+    sb.create_with_in_child_main(name, vec![(3, w)], entry)
+        .await
+        .unwrap();
+    unsafe { libc::close(w) };
+    sb.start().unwrap();
+    let buf = tokio::task::spawn_blocking(move || {
+        let mut buf = String::new();
+        let mut f = unsafe { std::fs::File::from_raw_fd(r) };
+        f.read_to_string(&mut buf).unwrap();
+        buf
+    })
+    .await
+    .unwrap();
+    (buf, sb)
+}
+
 /// N88 (readiness half): after the sandbox closes an epoll fd and a plain
 /// file lands on the *same* fd number, `epoll_wait` on that number must be
 /// answered by the kernel (a non-epoll fd is `EINVAL`), never by the
@@ -2630,6 +2692,37 @@ async fn n88_a_reused_epoll_fd_number_is_not_synthesized() {
         output, "reused_epoll_wait_rc=-1 errno=22\n",
         "a reused fd number must be answered by the kernel (EINVAL), got:\n{}",
         output
+    );
+}
+
+/// N91 nail: with bind injection on and `host_port != sandbox_port`, the
+/// sandbox must still be told the port it bound. The injected socket is the
+/// host one (bound to the *host* port), so this is the shape where the two
+/// numbers differ and the translation has to exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_injected_mapping_reports_the_sandbox_port_from_getsockname() {
+    let sandbox_port = alloc_ephemeral_port();
+    let host_port = alloc_host_port_in_range(50005);
+
+    let (output, mut sb) = run_injected_inbound_sandbox(
+        inbound_injected_getsockname_probe,
+        "n91-getsockname",
+        host_port,
+        sandbox_port,
+    )
+    .await;
+    let result = sb.wait().await.unwrap();
+    assert!(
+        result.success(),
+        "sandbox failed: {:?}\nprobe output:\n{}",
+        result.exit_status,
+        output
+    );
+    assert_eq!(
+        output,
+        format!("getsockname={sandbox_port}\n"),
+        "the sandbox must see the port it bound ({sandbox_port}), not the host port \
+         ({host_port}) the injected socket is actually on, got:\n{output}"
     );
 }
 

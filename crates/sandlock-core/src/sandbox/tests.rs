@@ -297,6 +297,36 @@ fn builder_net_deny_bind_rejects_wildcard() {
     assert!(Sandbox::builder().net_deny_bind("*").build().is_err());
 }
 
+/// N90: a mapped port may not also be denied. The two say opposite things about
+/// the same port, and handler order used to pick a winner silently (the
+/// injection handler answers `bind()` before the denylist check runs), so the
+/// pair has to be refused at build time instead.
+#[test]
+fn builder_refuses_a_mapped_port_that_is_also_denied() {
+    let err = Sandbox::builder()
+        .net_isolation(true)
+        .net_bind_map(50005, 8080)
+        .net_deny_bind_port(8080)
+        .build()
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("8080"),
+        "the refusal must name the port: {err}"
+    );
+    assert!(
+        err.to_string().contains("net_deny_bind"),
+        "the refusal must name the field: {err}"
+    );
+
+    // A deny list that does not touch a mapped port is still fine.
+    Sandbox::builder()
+        .net_isolation(true)
+        .net_bind_map(50005, 8080)
+        .net_deny_bind_port(9999)
+        .build()
+        .expect("an unrelated denied port must not block the mapping");
+}
+
 #[test]
 fn builder_net_bind_map_requires_net_isolation() {
     let err = Sandbox::builder()
