@@ -909,8 +909,8 @@ pub struct NotifPolicy {
     pub inbound_port_map: bool,
     /// S2.5 bind-injection mode: mapped ports are served by replacing the
     /// sandbox's socket at `bind()` time with a supervisor-created
-    /// host-loopback socket, so there is no host listener, no eager-accept
-    /// queue and no readiness synthesis.
+    /// host-loopback socket, so there is no host listener and no eager-accept
+    /// queue.
     pub net_bind_inject: bool,
     pub cow_enabled: bool,
     pub chroot_root: Option<std::path::PathBuf>,
@@ -2604,17 +2604,14 @@ async fn handle_notification(
             }
             return;
         }
-        // The S2.5 inbound accept and the E7.1 poll/epoll readiness waits
-        // defer unboundedly: their futures self-terminate when a connection
-        // arrives, the mapping is dropped, or the child's notification id
-        // becomes invalid — so they cannot park forever. Every other deferred
-        // handler keeps the 30s `DEFER_TIMEOUT` safety cap.
+        // The S2.5 inbound accept defers unboundedly: its future
+        // self-terminates when a connection arrives, the mapping is dropped, or
+        // the child's notification id becomes invalid — so it cannot park
+        // forever. Every other deferred handler keeps the 30s `DEFER_TIMEOUT`
+        // safety cap. (The poll family used to be on this list; N89 retired the
+        // readiness synthesis, so those four are no longer trapped at all.)
         let limit = if nr == libc::SYS_accept4
             || Some(nr) == arch::sys_accept()
-            || Some(nr) == arch::sys_poll()
-            || Some(nr) == arch::sys_epoll_wait()
-            || nr == libc::SYS_ppoll
-            || nr == libc::SYS_epoll_pwait
         {
             None
         } else {

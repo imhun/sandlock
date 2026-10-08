@@ -1,13 +1,17 @@
 //! S2.5 bind injection: serve an inbound-mapped sandbox port with a real
-//! host-loopback socket instead of a host listener plus readiness synthesis.
+//! host-loopback socket instead of a supervisor-side host listener.
 //!
 //! Why this exists: the host-listener design (`network::inbound`) can never
 //! make the sandbox's *own* listener readable — the queued connection lives in
-//! the host netns — so it has to trap `poll`/`ppoll`/`epoll_wait`/`epoll_pwait`
-//! and synthesize readiness (`network::readiness`). An event-loop server like
-//! uvicorn/uvloop keeps its listener registered in every `epoll_pwait` it
-//! makes, so *every* event-loop wait in that process goes through the
-//! supervisor. Measured on the E2B deployment (2026-09-16): an MCP request
+//! the host netns — so the sandbox's `accept()` has to be served on its behalf
+//! (which is what the host-listener shape does, and what a blocking/threaded
+//! accept loop is fine with). It used to trap
+//! `poll`/`ppoll`/`epoll_wait`/`epoll_pwait` and synthesize readiness for the
+//! *event-loop* consumer; N89 retired that synthesis, so an event-loop server
+//! over a host-listener mapping is no longer served at all. Injection is what
+//! makes it work again: the sandbox's own listener *is* a host-netns socket, so
+//! the kernel reports it readable and the event loop's own waits are ordinary
+//! kernel waits. Measured on the E2B deployment (2026-09-16): an MCP request
 //! cost ~390 ms per request under `net_isolation` versus ~8 ms on a
 //! shared-netns worker (170/226 ms split over the two directions, with the
 //! server's own work at 0.2 ms).
@@ -18,8 +22,9 @@
 //! (`SECCOMP_ADDFD_FLAG_SETFD` — the mechanism `fd_inject_connect` already
 //! uses). Everything after that is ordinary kernel work on a host-netns
 //! socket: `listen()` (left to the kernel), `accept()` (a real accept — the
-//! listener is not in `NetworkState::inbound`, so the accept handler and the
-//! readiness synthesizer both `Continue`), and the event loop's own waits.
+//! listener is not in `NetworkState::inbound`, so the accept handler
+//! `Continue`s), and the event loop's own waits. N89 removed the poll family
+//! from the notify table entirely, so those waits cost nothing here.
 //! The supervisor leaves the data path entirely.
 //!
 //! Deliberate limits:

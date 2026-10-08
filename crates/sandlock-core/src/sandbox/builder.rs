@@ -68,8 +68,8 @@ pub struct SandboxBuilder {
 
     /// S2.5 bind-injection mode for the mapped ports (see
     /// [`super::Sandbox::net_bind_inject`]). Off by default: the mapping path
-    /// (host listener + readiness synthesis) stays the default until a
-    /// deployment opts in.
+    /// (a supervisor-side host listener served to the sandbox's blocking
+    /// `accept()`) stays the default until a deployment opts in.
     #[cfg_attr(feature = "cli", arg(long = "net-bind-inject"))]
     pub net_bind_inject: bool,
 
@@ -690,9 +690,10 @@ impl SandboxBuilder {
 
     /// S2.5 bind-injection mode for the mapped ports: replace the sandbox's
     /// socket with a supervisor-created host-loopback socket at `bind()` time
-    /// instead of serving `accept()` from a host listener. Removes the
-    /// readiness synthesis (`poll`/`ppoll`/`epoll_wait` interception) from the
-    /// data path; see [`super::Sandbox::net_bind_inject`]. Requires
+    /// instead of serving `accept()` from a host listener. Both shapes now
+    /// serve blocking/threaded accept loops only -- N89 retired the readiness
+    /// synthesis that used to wake an *event-loop* consumer of a host-listener
+    /// mapping; see [`super::Sandbox::net_bind_inject`]. Requires
     /// `net_bind_map` and `net_isolation`.
     pub fn net_bind_inject(mut self, v: bool) -> Self {
         self.net_bind_inject = v;

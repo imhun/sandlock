@@ -43,7 +43,7 @@
 // own accept queue, which the worker then accepts and injects.
 
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::seccomp::ctx::SupervisorCtx;
@@ -65,10 +65,6 @@ pub struct InboundListener {
     /// `accept()`. Shared so concurrent accepts on the same listener (or a
     /// fork-inherited fd) can wait on one queue.
     pub conns: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<OwnedFd>>>,
-    /// E7.1: number of connections currently queued in `conns`. The
-    /// poll/epoll readiness synthesizer peeks this without consuming, so an
-    /// event-loop server wakes and calls `accept()`.
-    pub pending: Arc<AtomicUsize>,
     /// The eager-accept worker. Aborted (and cancellation flagged) on drop.
     pub worker: tokio::task::JoinHandle<()>,
     cancel: Arc<AtomicBool>,
@@ -272,15 +268,12 @@ fn spawn_inbound_worker(
     (
         tokio::sync::mpsc::Receiver<OwnedFd>,
         tokio::task::JoinHandle<()>,
-        Arc<AtomicUsize>,
     ),
     i32,
 > {
     let host_dup = duplicate_fd(host_listener)?;
     let sandbox_dup = duplicate_fd(sandbox_listener)?;
     let (tx, rx) = tokio::sync::mpsc::channel::<OwnedFd>(INBOUND_QUEUE_CAP);
-    let pending = Arc::new(AtomicUsize::new(0));
-    let pending_for_worker = Arc::clone(&pending);
     let cancel_for_worker = Arc::clone(&cancel);
     let worker = tokio::task::spawn_blocking(move || {
         let host = host_dup;
@@ -297,10 +290,9 @@ fn spawn_inbound_worker(
             if tx.blocking_send(fd).is_err() {
                 break;
             }
-            pending_for_worker.fetch_add(1, Ordering::SeqCst);
         }
     });
-    Ok((rx, worker, pending))
+    Ok((rx, worker))
 }
 
 /// `handle_listen` — a sandbox `listen()` on a mapped port:
@@ -416,7 +408,7 @@ async fn install_mapping(
         return NotifAction::Errno(unsafe { *libc::__errno_location() });
     }
     let cancel = Arc::new(AtomicBool::new(false));
-    let (rx, worker, pending) =
+    let (rx, worker) =
         match spawn_inbound_worker(host_listener.as_raw_fd(), dup_fd.as_raw_fd(), Arc::clone(&cancel))
         {
             Ok(w) => w,
@@ -430,7 +422,6 @@ async fn install_mapping(
             host_port,
             sandbox_port,
             conns,
-            pending,
             worker,
             cancel,
         },
@@ -482,11 +473,11 @@ async fn handle_accept_impl(
     // key can be recycled, and the mapping outlives the sandbox closing its
     // listener (option ②(a)), so an entry with no live socket behind it must
     // not serve this accept.
-    let (conns, pending) = {
+    let conns = {
         let mut ns = ctx.network.lock().await;
         match ns.inbound.get(&ino) {
             Some(l) if live_sandbox_port(&ns, dup_fd.as_raw_fd()) == Some(l.sandbox_port) => {
-                (Arc::clone(&l.conns), Arc::clone(&l.pending))
+                Arc::clone(&l.conns)
             }
             Some(_) => {
                 ns.inbound.remove(&ino);
@@ -502,7 +493,6 @@ async fn handle_accept_impl(
         let mut guard = conns.lock().await;
         match guard.try_recv() {
             Ok(fd) => {
-                pending.fetch_sub(1, Ordering::SeqCst);
                 return finish_accept(
                     fd,
                     notif,
@@ -538,7 +528,6 @@ async fn handle_accept_impl(
                 r = recv => {
                     return match r {
                         Some(fd) => {
-                            pending.fetch_sub(1, Ordering::SeqCst);
                             finish_accept(
                                 fd,
                                 &notif_owned,

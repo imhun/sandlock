@@ -485,8 +485,11 @@ class Sandbox:
     socket bound to ``127.0.0.1:<host_port>`` in the host netns and replacing
     the sandbox's socket with it (``SECCOMP_ADDFD_FLAG_SETFD``).  The sandbox's
     ``listen()``/``accept()`` then run on a real host-netns listening socket,
-    so ``accept()`` needs no interception and the event loop's
-    ``poll``/``epoll_wait`` are never trapped for readiness synthesis.
+    so ``accept()`` needs no interception and nothing has to be synthesized to
+    wake an event loop.  (Since N89 the poll family is never trapped in any
+    shape: a *host-listener* mapping serves blocking/threaded ``accept()``
+    loops only, because the synthesis that used to wake an event-loop consumer
+    is retired.)
     Requires :attr:`net_isolation` and at least one :attr:`port_mappings`
     entry; the host socket binds loopback only (never ``0.0.0.0``), so
     ``getsockname()`` reports the loopback address -- but the *port* is

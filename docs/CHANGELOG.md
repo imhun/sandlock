@@ -8,6 +8,28 @@
 
 ## 行为变化（升级 / 接线前必读）
 
+- **⚠️ BREAKING：退役 readiness 合成（N89，2026-10-08，`network/readiness.rs` 删除）—— 宿主
+  listener 形状只服务阻塞/线程式 `accept()`**：`poll`/`ppoll`/`epoll_wait`/`epoll_pwait`
+  从此**不在任何形状的通知表里**（连带 `InboundListener.pending` 这份只为合成存在的状态一起删）。
+  它只在 `net_bind_inject=false` 的车道上还有意义，而那条路是当时唯一一条"按事件循环迭代
+  `pidfd_getfd` 复制子进程 fd、把 events 写进子进程内存（目标指针由子进程给）、unbounded defer"
+  的特权操作，且**不做任何 allow/deny**；生产形状（注入开）根本不走它，A（`dda8dd7`）之后
+  连 trap 都不付（集群实测 `epoll_wait(0)` 16.33 → 0.49 µs/次）。
+  **用户可见的差别**：带映射的沙箱若关掉注入，**事件循环型**服务（uvicorn/asyncio、Node）
+  不再被唤醒 —— 宿主侧连接照常进队列，沙箱永远不会调 `accept()`。阻塞/线程式 `accept()`
+  不受影响（`handle_accept_impl` 的 defer 等 `conns`，与合成无关）。E2B 侧因此对"会带映射的
+  沙箱 + `E2B_NET_BIND_INJECT=0`"在建箱时**具名拒绝**（把静默挂死变成 fail-closed）。
+  回退杆：`git revert` 这次改动 + 重建 wheel/镜像；**不要**只把 poll 族塞回表而不恢复 handler
+  ——那会变成"被 trap 但没有 chain"（N81 型 planning bug），而新的跨表钉子正是为了让这种
+  状态进不了树。
+- **`fchmodat2` 的 handler 链补上（2026-10-08，跨表钉子的第一个收获）**：`fchmodat2`（452）
+  一直在 `chroot_path_syscalls()` 与 `cow_path_syscalls()` 里被 trap，`handle_chroot_write`
+  也早就写了它那一支（"与 `fchmodat` 同前三个参数，共用这个 gate"），但**两张注册表都没推
+  这个号** ⇒ 每个 chroot/COW 沙箱的 `chmod`（glibc 用的就是这个拼写）通知进来没有 handler：
+  mediator 的写 gate 与 COW 的 copy-up 都没跑，每次调用还白付一次通知往返与预算（COW 形态下
+  可见后果是"改只读层的文件报 EROFS"而不是 copy-up 后成功）。修法：两组各推一个
+  `arch::SYS_FCHMODAT2`，COW 侧再补一个 `parse_cow_write` 分支。
+
 - **`openat2(RESOLVE_IN_ROOT)` 的 `EAGAIN` 现在有界重试；exec 失败不再被改写成「文件不存在」
   （FUP-26，2026-09-15）**：当内核无法**证明**某个 `..` 组件没有逃出 root 时（竞态或潜在
   攻击；openat2(2) 原文：「The caller may choose to retry the openat2() call.」），它返回

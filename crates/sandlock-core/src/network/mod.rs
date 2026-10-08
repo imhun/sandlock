@@ -35,7 +35,6 @@ pub(crate) mod egress;
 pub(crate) mod bind_inject;
 pub(crate) mod inbound;
 pub(crate) mod materialize;
-pub(crate) mod readiness;
 mod rules;
 mod send;
 mod send_engine;

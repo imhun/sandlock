@@ -452,25 +452,6 @@ const PORT_REMAP_SYSCALLS: &[i64] = &[
 /// nothing registered here.
 const INBOUND_MAPPING_SYSCALLS: &[i64] = &[libc::SYS_listen, libc::SYS_accept4];
 
-/// S2.5 inbound port mapping, **readiness half** (E7.1): event-loop servers
-/// (uvicorn/asyncio, Node, Go) only call `accept()` once their listener reports
-/// readable, and a connection queued on the supervisor's host listener never
-/// makes the sandbox's own listener readable -- so their waits have to be
-/// synthesized. The synthesis reads the registrations from the kernel's own
-/// `/proc/<pid>/fdinfo/<epfd>`, so `epoll_ctl` is not trapped (N88 ②).
-/// `poll`/`epoll_wait` exist only on the legacy ABI (x86_64); the generic ABI
-/// (aarch64/riscv64) has only `ppoll`/`epoll_pwait`, which glibc's
-/// `poll()`/`epoll_wait()` wrappers call -- so intercepting the generic pair
-/// covers both.
-///
-/// Pushed **only where the mapping is actually served by a host listener**:
-/// under `net_bind_inject` the mapped port is a host socket, readiness on it is
-/// the kernel's own, and trapping these made every event-loop wait in every
-/// injected sandbox a supervisor round trip that could only answer `Continue`
-/// (measured on the fleet 2026-10-08: `epoll_wait(0)` 16.33 us/wait trapped vs
-/// 0.49 us/wait without the mapping -- 33x, for a code path that cannot fire).
-const INBOUND_READINESS_SYSCALLS: &[i64] = &[libc::SYS_ppoll, libc::SYS_epoll_pwait];
-
 /// Determine which syscalls need `SECCOMP_RET_USER_NOTIF`.
 pub(crate) fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> {
     let resolved = ResolvedSandbox::from_sandbox(policy, sandbox_name, &[]);
@@ -607,17 +588,24 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
     }
 
     // Inbound port mapping (S2.5)
-    // Both halves serve the *host-listener* shape only: under bind injection
-    // the sandbox's mapped port is a host socket, so these traps could only
-    // answer `Continue` -- and the poll family fires once per event-loop
-    // iteration (see INBOUND_READINESS_SYSCALLS for the 33x measurement that
-    // made this condition explicit).
+    //
+    // The *host-listener* half: the supervisor owns the host socket and serves
+    // the sandbox's `accept()` out of its own queue. Under bind injection the
+    // mapped port is a host socket the sandbox itself listens on, so these
+    // traps could only answer `Continue` and the group stays out of the table
+    // entirely.
+    //
+    // N89 (2026-10-08) retired the readiness synthesis that used to travel with
+    // this group (`poll`/`ppoll`/`epoll_wait`/`epoll_pwait`). A host-listener
+    // mapping now serves **blocking/threaded** accept loops only: an event-loop
+    // server (uvicorn/asyncio, Node) waits on its own listener, which never
+    // becomes readable from a connection queued supervisor-side. That is the
+    // trade the retirement made, and E2B refuses to build the shape for
+    // sandboxes that carry a mapping (`E2B_NET_BIND_INJECT=0` + mappings is a
+    // named refusal) -- see docs/production-deployment-requirements.md §2.4.7.
     if features.inbound_port_map && !features.net_bind_inject {
         nrs.extend(INBOUND_MAPPING_SYSCALLS);
         nrs.push_optional(arch::sys_accept());
-        nrs.extend(INBOUND_READINESS_SYSCALLS);
-        nrs.push_optional(arch::sys_poll());
-        nrs.push_optional(arch::sys_epoll_wait());
     }
 
     nrs.finish()
@@ -995,10 +983,11 @@ mod tests {
     /// candidate ①), the inbound mapping outlives the listener's close
     /// (`network::inbound`, option ②(a)), and the readiness synthesis reads the
     /// kernel's own `/proc/<pid>/fdinfo/<epfd>` instead of tracking
-    /// `epoll_ctl` -- which is why `epoll_ctl` is gone from the table too. The
-    /// mapped shape is the one that used to carry the member (option ①), so it
-    /// is pinned explicitly: a regression that re-adds `close` shows up here
-    /// before it shows up as a ladder reading.
+    /// `epoll_ctl` -- and N89 then retired that reader too, so `epoll_ctl` stays
+    /// untrapped for the simpler reason that nothing watches the poll family at
+    /// all. The mapped shape is the one that used to carry the member
+    /// (option ①), so it is pinned explicitly: a regression that re-adds
+    /// `close` shows up here before it shows up as a ladder reading.
     #[test]
     fn close_is_not_in_the_table_for_any_shape() {
         let plain = Sandbox::builder().pid_ns(true).build().unwrap();
@@ -1051,16 +1040,14 @@ mod tests {
             .net_bind_map(50005, 8080)
             .build()
             .unwrap();
-        // The host-listener shape keeps the whole group: listen/accept are how
-        // the mapping is served, and the readiness family is what wakes an
-        // event loop whose connection is queued supervisor-side.
+        // The host-listener shape keeps the accept half: listen/accept4 are how
+        // the mapping is served to a blocking/threaded accept loop. The poll
+        // family is not in that list any more -- N89 retired the synthesis that
+        // used to wake an event-loop consumer, and
+        // `the_poll_family_is_in_no_shapes_table` pins its absence for every
+        // shape (this test would otherwise re-assert the old shape by accident).
         let host_listener = notif_syscalls(&mapped, None);
-        for nr in [
-            libc::SYS_listen,
-            libc::SYS_accept4,
-            libc::SYS_ppoll,
-            libc::SYS_epoll_pwait,
-        ] {
+        for nr in [libc::SYS_listen, libc::SYS_accept4] {
             assert!(
                 host_listener.contains(&(nr as u32)),
                 "the host-listener mapping needs {nr} trapped"
@@ -1075,12 +1062,7 @@ mod tests {
             .build()
             .unwrap();
         let injected_nrs = notif_syscalls(&injected, None);
-        for nr in [
-            libc::SYS_listen,
-            libc::SYS_accept4,
-            libc::SYS_ppoll,
-            libc::SYS_epoll_pwait,
-        ] {
+        for nr in [libc::SYS_listen, libc::SYS_accept4] {
             assert!(
                 !injected_nrs.contains(&(nr as u32)),
                 "an injected sandbox must not pay an inbound trap for {nr}: the kernel \
@@ -1111,6 +1093,15 @@ mod tests {
     /// are what glibc's wrappers call on the generic one, so all four spellings
     /// that exist here are checked -- a table that dropped only the generic
     /// pair would keep paying the round trip on aarch64.
+    ///
+    /// This is also the N88 ② "a reused epoll fd number is not synthesized"
+    /// nail's replacement: with the four never trapped there is no
+    /// supervisor-side registration left to go stale, and no dispatch entry
+    /// that could answer for a number the kernel owns. That is the stronger
+    /// statement -- the integration nail checked the end-to-end consequence of
+    /// a trap that no longer exists (`test_net_isolate`'s
+    /// `n88_a_reused_epoll_fd_number_is_not_synthesized` and its probe were
+    /// deleted with the synthesis).
     #[test]
     fn the_poll_family_is_in_no_shapes_table() {
         fn mapped(inject: bool) -> Sandbox {

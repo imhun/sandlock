@@ -618,8 +618,10 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_fd_inject_connect(
 /// creates a socket bound to `127.0.0.1:<host_port>` in the host netns and
 /// *replaces the sandbox's socket* with it (`SECCOMP_ADDFD_FLAG_SETFD`), so
 /// the sandbox's `listen()`/`accept()` run on a real host-netns listening
-/// socket and the event loop's `poll`/`epoll_wait` are never trapped for
-/// readiness synthesis. Requires `net_isolation(true)` and at least one
+/// socket, so `accept()` needs no interception and nothing has to be
+/// synthesized to wake an event loop. (Since N89 the poll family is never
+/// trapped in any shape: a host-listener mapping serves blocking/threaded
+/// `accept()` loops only.) Requires `net_isolation(true)` and at least one
 /// `net_bind_map` entry. `getsockname()` reports the loopback address and the
 /// port the sandbox asked for (a mapping whose host port differs is translated
 /// back). Defaults to `false` (host-listener mapping).
