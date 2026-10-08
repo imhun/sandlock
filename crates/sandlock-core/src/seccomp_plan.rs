@@ -1094,6 +1094,79 @@ mod tests {
         );
     }
 
+    /// N89: the readiness synthesis is retired, so the poll family is in **no**
+    /// shape's notify table. It used to sit in the host-listener shape's table
+    /// -- that synthesis was its only reason to exist -- and a wait that is
+    /// trapped only to answer `Continue` costs a supervisor round trip per
+    /// event-loop iteration (fleet: 16.33 us/wait against 0.49 us/wait).
+    ///
+    /// What the mapped shapes still are, spelled out so this test cannot pass
+    /// by deleting the wrong thing: the host-listener shape keeps
+    /// `listen`/`accept4` (that pair is how the mapping is served, and a
+    /// blocking `accept()` still works without any synthesis), and the injected
+    /// shape keeps none of it (the kernel drives the injected host socket end
+    /// to end -- `bind` is where the injection happens).
+    ///
+    /// `poll`/`epoll_wait` exist only on the legacy ABI; `ppoll`/`epoll_pwait`
+    /// are what glibc's wrappers call on the generic one, so all four spellings
+    /// that exist here are checked -- a table that dropped only the generic
+    /// pair would keep paying the round trip on aarch64.
+    #[test]
+    fn the_poll_family_is_in_no_shapes_table() {
+        fn mapped(inject: bool) -> Sandbox {
+            let builder = Sandbox::builder()
+                .pid_ns(true)
+                .net_isolation(true)
+                .net_bind_map(50005, 8080);
+            let builder = if inject {
+                builder.net_bind_inject(true)
+            } else {
+                builder
+            };
+            builder.build().unwrap()
+        }
+
+        let mut poll_family: Vec<i64> = vec![libc::SYS_ppoll, libc::SYS_epoll_pwait];
+        poll_family.extend(arch::sys_poll());
+        poll_family.extend(arch::sys_epoll_wait());
+
+        let shapes: Vec<(&str, Sandbox)> = vec![
+            ("plain", Sandbox::builder().pid_ns(true).build().unwrap()),
+            ("host-listener mapping", mapped(false)),
+            ("injected mapping", mapped(true)),
+        ];
+        for (name, sandbox) in &shapes {
+            let nrs = notif_syscalls(sandbox, None);
+            for nr in &poll_family {
+                assert!(
+                    !nrs.contains(&(*nr as u32)),
+                    "{name}: the poll family must not be trapped any more -- \
+                     the readiness synthesis that made it mean something is \
+                     retired (N89); a trapped wait can only answer Continue and \
+                     costs a round trip per event-loop iteration"
+                );
+            }
+        }
+
+        // The blocking half of the mapping is untouched: the host-listener
+        // shape still traps the accept path (which is what a threaded server
+        // uses), and the injected shape traps neither.
+        let host_listener = notif_syscalls(&shapes[1].1, None);
+        for nr in [libc::SYS_listen, libc::SYS_accept4] {
+            assert!(
+                host_listener.contains(&(nr as u32)),
+                "the host-listener mapping still needs {nr} trapped"
+            );
+        }
+        let injected = notif_syscalls(&shapes[2].1, None);
+        for nr in [libc::SYS_listen, libc::SYS_accept4] {
+            assert!(
+                !injected.contains(&(nr as u32)),
+                "an injected mapping must not trap {nr}"
+            );
+        }
+    }
+
     /// A policy mount at or under `/proc` is made by the child *after* the
     /// filesystem check, so the policy alone can keep the gate.
     #[test]

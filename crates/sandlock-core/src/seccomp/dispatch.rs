@@ -258,6 +258,19 @@ impl DispatchTable {
         // look for a second view somewhere.
         NotifAction::Continue
     }
+
+    /// The syscall numbers this table has a chain for.
+    ///
+    /// Test support for the cross-table pin
+    /// (`every_trapped_syscall_has_a_handler_chain`): the filter's notify list
+    /// is planned by `seccomp_plan` and the chains are registered here, so the
+    /// two are assembled from two lists that have to agree. A syscall the
+    /// filter traps with no chain pays a round trip and spends the notification
+    /// budget without deciding anything (N81), and nothing used to check it.
+    #[cfg(test)]
+    pub(crate) fn chain_nrs(&self) -> std::collections::BTreeSet<i64> {
+        self.chains.keys().copied().collect()
+    }
 }
 
 // ============================================================
@@ -1106,6 +1119,13 @@ fn register_chroot_handlers(
         libc::SYS_symlinkat, libc::SYS_linkat, libc::SYS_fchmodat,
         libc::SYS_fchownat, libc::SYS_truncate,
     ];
+    // glibc reaches `chmod`/`fchmodat(AT_SYMLINK_NOFOLLOW)` through
+    // `fchmodat2`, and the filter traps it (`chroot_path_syscalls`), so the
+    // chain has to be here too: without it the notification had no handler,
+    // which meant the mediator's write gate and the COW copy-up never ran for
+    // this spelling (found by `every_trapped_syscall_has_a_handler_chain`,
+    // 2026-10-08). The handler already shares the `fchmodat` branch.
+    write_nrs.push(arch::SYS_FCHMODAT2);
     // renameat only exists where the ABI kept it, and libc's rename() lands
     // there on the arches without a plain rename(2).
     write_nrs.extend(arch::sys_renameat());
@@ -1310,6 +1330,10 @@ fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
         libc::SYS_symlinkat, libc::SYS_linkat, libc::SYS_fchmodat,
         libc::SYS_fchownat, libc::SYS_truncate,
     ];
+    // Same spelling as the chroot group above: `fchmodat2` is trapped
+    // (`cow_path_syscalls`) and its arguments share `fchmodat`'s shape, so it
+    // rides the same handler (`cow::dispatch::parse_cow_write`).
+    write_nrs.push(arch::SYS_FCHMODAT2);
     write_nrs.extend([
         arch::sys_unlink(), arch::sys_rmdir(), arch::sys_mkdir(), arch::sys_mknod(),
         arch::sys_rename(), arch::sys_symlink(), arch::sys_link(), arch::sys_chmod(),
@@ -1409,6 +1433,54 @@ mod handler_tests {
     /// any real run; they only need to satisfy the type signature so we
     /// can call `dispatch()`.
     fn fake_supervisor_ctx() -> Arc<SupervisorCtx> {
+        supervisor_ctx_with(policy_with_no_gates())
+    }
+
+    /// The policy a sandbox with nothing switched on resolves to. Every chain
+    /// this table can hold is gated by one of these flags; the cross-table pin
+    /// flips them from a real feature view instead.
+    fn policy_with_no_gates() -> NotifPolicy {
+        NotifPolicy {
+            max_memory_bytes: 0,
+            stat_metadata_mediated: true,
+            disk_stats_path: None,
+            max_processes: 0,
+            has_memory_limit: false,
+            has_net_destination_policy: false,
+            has_bind_denylist: false,
+            has_unix_fs_gate: false,
+            host_uid: 0,
+            host_gid: 0,
+            host_groups: Vec::new(),
+            has_random_seed: false,
+            has_time_start: false,
+            time_offset: 0,
+            num_cpus: None,
+            argv_safety_required: false,
+            port_remap: false,
+            fd_inject_connect: false,
+            net_isolation: false,
+            inbound_port_map: false,
+            net_bind_inject: false,
+            cow_enabled: false,
+            chroot_root: None,
+            chroot_readable: Vec::new(),
+            chroot_writable: Vec::new(),
+            chroot_denied: Vec::new(),
+            chroot_mounts: Vec::new(),
+            chroot_mount_ro: Vec::new(),
+            deterministic_dirs: false,
+            virtual_hostname: None,
+            has_http_acl: false,
+            virtual_etc_hosts: String::new(),
+            virtual_resolv_conf: None,
+            ca_inject_paths: Vec::new(),
+            ca_inject_pem: None,
+            pid_ns: None,
+        }
+    }
+
+    fn supervisor_ctx_with(policy: NotifPolicy) -> Arc<SupervisorCtx> {
         Arc::new(SupervisorCtx {
             resource: Arc::new(Mutex::new(ResourceState::new(0, 0))),
             cow: Arc::new(Mutex::new(CowState::new())),
@@ -1421,44 +1493,7 @@ mod handler_tests {
             write_fds: Arc::new(crate::dirty::WriteFds::new()),
             netlink: Arc::new(NetlinkState::new()),
             processes: Arc::new(ProcessIndex::new()),
-            policy: Arc::new(NotifPolicy {
-                max_memory_bytes: 0,
-                stat_metadata_mediated: true,
-                disk_stats_path: None,
-                max_processes: 0,
-                has_memory_limit: false,
-                has_net_destination_policy: false,
-                has_bind_denylist: false,
-                has_unix_fs_gate: false,
-                host_uid: 0,
-                host_gid: 0,
-                host_groups: Vec::new(),
-                has_random_seed: false,
-                has_time_start: false,
-                time_offset: 0,
-                num_cpus: None,
-                argv_safety_required: false,
-                port_remap: false,
-                fd_inject_connect: false,
-                net_isolation: false,
-                inbound_port_map: false,
-                net_bind_inject: false,
-                cow_enabled: false,
-                chroot_root: None,
-                chroot_readable: Vec::new(),
-                chroot_writable: Vec::new(),
-                chroot_denied: Vec::new(),
-                chroot_mounts: Vec::new(),
-                chroot_mount_ro: Vec::new(),
-                deterministic_dirs: false,
-                virtual_hostname: None,
-                has_http_acl: false,
-                virtual_etc_hosts: String::new(),
-                virtual_resolv_conf: None,
-                ca_inject_paths: Vec::new(),
-                ca_inject_pem: None,
-                pid_ns: None,
-            }),
+            policy: Arc::new(policy),
             child_pidfd: None,
             notif_fd: -1,
         })
@@ -1803,6 +1838,287 @@ mod handler_tests {
             handler.calls.load(Ordering::SeqCst),
             3,
             "dispatch must invoke the struct-based handler on every walk"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Cross-table pin: the filter's notify list vs this table's chains
+    // ------------------------------------------------------------------
+
+    /// The supervisor's policy view for a shape, projected from the same
+    /// feature view the child's BPF set is planned from.
+    ///
+    /// `NotifPolicy` is normally assembled inside `Sandbox::launch` from
+    /// `resolved.features` plus a handful of launch-time locals (host identity,
+    /// the CA bundle, the pid-ns map, ...). This helper repeats the
+    /// feature-driven half so the pin below can ask the real
+    /// `build_dispatch_table` what it would chain for a shape.
+    ///
+    /// It is deliberately an **exhaustive literal**: a new field on
+    /// `NotifPolicy` breaks this function until its author walks over here, and
+    /// that is the moment to ask whether the new field also gates a chain.
+    /// What it cannot answer is *drift in the launch-time locals* — those are
+    /// constants here, and the integration suite's real sandboxes are what
+    /// exercise them. The class it does cover is the one the `dispatch`
+    /// fallthrough warns about: a group added to the filter (or to a
+    /// `push_optional` list) with no chain registered for it.
+    fn policy_for(features: &crate::resolved::SandboxFeatures) -> NotifPolicy {
+        let mut policy = policy_with_no_gates();
+        policy.stat_metadata_mediated = features.stat_metadata_mediated;
+        policy.has_memory_limit = features.memory_limit;
+        policy.max_memory_bytes = if features.memory_limit { 64 << 20 } else { 0 };
+        policy.disk_stats_path = features
+            .disk_stats
+            .then(|| std::path::PathBuf::from("/nonexistent-disk-stats"));
+        policy.has_net_destination_policy = features.network_destination_policy;
+        policy.has_bind_denylist = features.bind_denylist;
+        policy.has_unix_fs_gate = features.unix_fs_gate;
+        policy.has_random_seed = features.random_seed;
+        policy.has_time_start = features.time_start;
+        policy.time_offset = if features.time_start { 1 } else { 0 };
+        policy.num_cpus = features.virtual_cpu_count.then_some(2);
+        policy.virtual_hostname = features.virtual_hostname.then(|| "n89.test".into());
+        policy.argv_safety_required = features.argv_safety_required;
+        policy.port_remap = features.port_remap;
+        policy.fd_inject_connect = features.fd_inject_connect;
+        policy.net_isolation = features.net_isolation;
+        policy.inbound_port_map = features.inbound_port_map;
+        policy.net_bind_inject = features.net_bind_inject;
+        policy.cow_enabled = features.cow;
+        policy.has_http_acl = features.http_acl;
+        // `pid_ns` is not a bool on the policy: the stat family's chains are
+        // registered only when the supervisor holds the leader's pid-ns map
+        // (`policy.stat_metadata_mediated && policy.pid_ns.is_some()`), and the
+        // filter traps that family only when the shape has a pid namespace. So
+        // the map stands in for the feature here.
+        policy.pid_ns = features
+            .pid_ns
+            .then(|| std::sync::Arc::new(std::sync::RwLock::new(
+                crate::procfs::PidNsMap::new(std::process::id() as i32),
+            )));
+        if features.chroot {
+            policy.chroot_root = Some(std::path::PathBuf::from("/nonexistent-root"));
+        }
+        if features.fs_denies {
+            policy.chroot_denied = vec![std::path::PathBuf::from("/nonexistent-denied")];
+        }
+        policy
+    }
+
+    /// Both views of one shape: what the child's filter would trap, and what
+    /// this table would chain. Both come from the *same* `ResolvedSandbox`,
+    /// which is what makes comparing them meaningful.
+    fn views_of(
+        sandbox: &crate::sandbox::Sandbox,
+        name: Option<&str>,
+    ) -> (std::collections::BTreeSet<u32>, std::collections::BTreeSet<i64>) {
+        let resolved = crate::resolved::ResolvedSandbox::from_sandbox(sandbox, name, &[]);
+        let ctx = supervisor_ctx_with(policy_for(&resolved.features));
+        let table = build_dispatch_table(&ctx.policy, &ctx.resource, &ctx, Vec::new());
+        (
+            crate::seccomp_plan::notif_syscalls_resolved(&resolved)
+                .into_iter()
+                .collect(),
+            table.chain_nrs(),
+        )
+    }
+
+    /// The nrs a shape traps with no chain behind them.
+    fn trapped_without_a_chain(sandbox: &crate::sandbox::Sandbox) -> Vec<u32> {
+        let (trapped, chained) = views_of(sandbox, Some("n89"));
+        trapped
+            .into_iter()
+            .filter(|nr| !chained.contains(&(*nr as i64)))
+            .collect()
+    }
+
+    /// **Every syscall the notify filter traps has a handler chain.**
+    ///
+    /// The filter's list (`seccomp_plan::notif_syscalls_resolved`) and this
+    /// table's chains are two lists that have to agree, and nothing used to
+    /// check that: a nr the filter traps with no chain behind it pays a
+    /// supervisor round trip, spends the notification budget, and decides
+    /// nothing. N81 hit exactly that (5000/s ceiling, ~940 ms stalls, no
+    /// handler registered), which is why the `dispatch` fallthrough carries a
+    /// comment about planning bugs — a comment is not a test.
+    ///
+    /// The shapes are the ones the tree can build without live resources.
+    /// `policy_fn` is deliberately absent: its traps are answered by *user*
+    /// handlers (`run_with_handlers`), so its chain set is not a property of
+    /// the policy — `tests/integration/test_handlers.rs` covers that.
+    #[test]
+    fn every_trapped_syscall_has_a_handler_chain() {
+        use crate::sandbox::{ByteSize, Sandbox};
+
+        let root = std::env::temp_dir().join(format!("sandlock-n89-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let shapes: Vec<(&str, Sandbox)> = vec![
+            ("plain", Sandbox::builder().pid_ns(true).build().unwrap()),
+            (
+                "memory + processes",
+                Sandbox::builder()
+                    .pid_ns(true)
+                    .max_memory(ByteSize::mib(64))
+                    .max_processes(64)
+                    .build()
+                    .unwrap(),
+            ),
+            (
+                "kernel-enforced budgets",
+                Sandbox::builder()
+                    .pid_ns(true)
+                    .max_memory(ByteSize::mib(64))
+                    .max_processes(64)
+                    .kernel_enforced_limits(true)
+                    .build()
+                    .unwrap(),
+            ),
+            (
+                "mapped host-listener",
+                Sandbox::builder()
+                    .pid_ns(true)
+                    .net_isolation(true)
+                    .net_bind_map(50005, 8080)
+                    .build()
+                    .unwrap(),
+            ),
+            (
+                "mapped injected",
+                Sandbox::builder()
+                    .pid_ns(true)
+                    .net_isolation(true)
+                    .net_bind_map(50005, 8080)
+                    .net_bind_inject(true)
+                    .build()
+                    .unwrap(),
+            ),
+            (
+                "egress allowlist + fd injection",
+                Sandbox::builder()
+                    .pid_ns(true)
+                    .net_isolation(true)
+                    .net_allow("api.example.test:443")
+                    .fd_inject_connect(true)
+                    .build()
+                    .unwrap(),
+            ),
+            (
+                "port remap",
+                Sandbox::builder()
+                    .pid_ns(true)
+                    .port_remap(true)
+                    .build()
+                    .unwrap(),
+            ),
+            (
+                "disk stats",
+                Sandbox::builder()
+                    .pid_ns(true)
+                    .disk_stats_path(root.join("disk-stats"))
+                    .build()
+                    .unwrap(),
+            ),
+            (
+                "time + random",
+                Sandbox::builder()
+                    .pid_ns(true)
+                    .time_start(
+                        std::time::SystemTime::UNIX_EPOCH
+                            + std::time::Duration::from_secs(1_700_000_000),
+                    )
+                    .random_seed(7)
+                    .build()
+                    .unwrap(),
+            ),
+            (
+                "cpu count",
+                Sandbox::builder()
+                    .pid_ns(true)
+                    .num_cpus(2)
+                    .build()
+                    .unwrap(),
+            ),
+            (
+                "chroot + grants",
+                Sandbox::builder()
+                    .chroot(root.clone())
+                    .fs_read("/usr")
+                    .fs_write(root.join("ws"))
+                    .build()
+                    .unwrap(),
+            ),
+            (
+                "chroot + denies",
+                Sandbox::builder()
+                    .chroot(root.clone())
+                    .fs_deny("/secret")
+                    .build()
+                    .unwrap(),
+            ),
+            (
+                "cow (workdir)",
+                Sandbox::builder()
+                    .pid_ns(true)
+                    .workdir(root.join("wd"))
+                    .build()
+                    .unwrap(),
+            ),
+        ];
+
+        for (name, sandbox) in &shapes {
+            let missing = trapped_without_a_chain(sandbox);
+            assert!(
+                missing.is_empty(),
+                "{name}: the filter traps {missing:?} with no handler chain in the \
+                 dispatch table. A trapped nr with no chain is a planning bug (N81): \
+                 it pays a supervisor round trip and spends the notification budget \
+                 without deciding anything. Either register a chain in \
+                 `build_dispatch_table` or take the nr out of \
+                 `notif_syscalls_resolved`."
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The pin above is only worth its runtime if it reddens on a real
+    /// mismatch, so here is one: a sandbox that asked for the inbound mapping,
+    /// checked against the table a sandbox *without* one would build — the
+    /// wiring gap a planner would ship by adding the BPF group and forgetting
+    /// the chains.
+    #[test]
+    fn the_cross_table_check_catches_a_missing_chain() {
+        use crate::sandbox::Sandbox;
+
+        let mapped = Sandbox::builder()
+            .pid_ns(true)
+            .net_isolation(true)
+            .net_bind_map(50005, 8080)
+            .build()
+            .unwrap();
+        let (trapped, _) = views_of(&mapped, Some("n89"));
+
+        let plain = Sandbox::builder().pid_ns(true).build().unwrap();
+        let resolved_plain =
+            crate::resolved::ResolvedSandbox::from_sandbox(&plain, Some("n89"), &[]);
+        let ctx = supervisor_ctx_with(policy_for(&resolved_plain.features));
+        let table = build_dispatch_table(&ctx.policy, &ctx.resource, &ctx, Vec::new());
+        let chained = table.chain_nrs();
+
+        let missing: Vec<u32> = trapped
+            .iter()
+            .copied()
+            .filter(|nr| !chained.contains(&(*nr as i64)))
+            .collect();
+        assert!(
+            missing.contains(&(libc::SYS_listen as u32))
+                && missing.contains(&(libc::SYS_accept4 as u32)),
+            "the check has to see the mapping's accept path as trapped-without-a-chain \
+             when the table was built for a plain sandbox; it reported {missing:?}"
+        );
+        assert!(
+            trapped_without_a_chain(&plain).is_empty(),
+            "a shape's own two views must agree"
         );
     }
 }

@@ -418,7 +418,12 @@ fn parse_cow_write(
         let new_path = read_resolved(notif, 3, Some(2), notif_fd, virtual_cwd)?;
         return Some(CowWriteOp::Link { old_path, new_path });
     }
-    if nr == libc::SYS_fchmodat {
+    // `fchmodat2(dirfd, path, mode, flags)` shares the first three arguments
+    // with `fchmodat`, and the flags word is deliberately not honoured -- the
+    // same ruling as the chroot handler's gate: Linux has no `lchmod`, so
+    // `AT_SYMLINK_NOFOLLOW`'s only effect is a refusal that `EOPNOTSUPP`-ing
+    // here would invent. The target is write-checked either way.
+    if nr == libc::SYS_fchmodat || nr == arch::SYS_FCHMODAT2 {
         let path = read_resolved(notif, 1, Some(0), notif_fd, virtual_cwd)?;
         return Some(CowWriteOp::Chmod { path, mode: (notif.data.args[2] & 0o7777) as u32 });
     }
