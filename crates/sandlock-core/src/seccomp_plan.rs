@@ -435,26 +435,41 @@ const PORT_REMAP_SYSCALLS: &[i64] = &[
     libc::SYS_getsockname,
 ];
 
-/// S2.5 inbound port mapping: `listen` triggers host-listener creation for a
-/// mapped sandbox port, and `accept4` (plus legacy `accept` where the ABI has
-/// it) is served from that host listener with the accepted fd injected into
-/// the sandbox. `close` is deliberately absent (N88 ②): the mapping outlives
-/// the listener's close, so nothing on this path tears down on it.
-// E7.1: besides listen/accept, event-loop servers (uvicorn/asyncio, Node,
-// Go) need poll/epoll readiness synthesis so a host-side queued connection
-// wakes their accept(); the synthesis reads the registrations from the
-// kernel's own `/proc/<pid>/fdinfo/<epfd>`, so `epoll_ctl` is not trapped
-// (N88 ②). `poll`/`epoll_wait` exist only on the legacy ABI
-// (x86_64); the generic ABI (aarch64/riscv64) has only `ppoll`/
-// `epoll_pwait`, which glibc's `poll()`/`epoll_wait()` wrappers call — so
-// intercepting the generic pair covers both. All are trapped only when the
-// feature is on — the default path never notifies on them.
-const INBOUND_MAPPING_SYSCALLS: &[i64] = &[
-    libc::SYS_listen,
-    libc::SYS_accept4,
-    libc::SYS_ppoll,
-    libc::SYS_epoll_pwait,
-];
+/// S2.5 inbound port mapping, **host-listener half**: `listen` triggers
+/// host-listener creation for a mapped sandbox port, and `accept4` (plus
+/// legacy `accept` where the ABI has it) is served from that host listener
+/// with the accepted fd injected into the sandbox. `close` is deliberately
+/// absent (N88 ②): the mapping outlives the listener's close, so nothing on
+/// this path tears down on it.
+///
+/// Pushed only for the shape that gets here without bind injection. With
+/// injection the mapped port is already a host socket, so a trapped `listen`
+/// would look it up as an inbound mapping and try to put a *second* host
+/// listener on the same port (EADDRINUSE, failing the sandbox's `listen()` --
+/// reachable exactly when `host_port == sandbox_port`, which is how the E2B MCP
+/// gateway allocates); `bind` -- which is where injection happens -- is trapped
+/// anyway (the netlink group carries it), so the mode keeps working with
+/// nothing registered here.
+const INBOUND_MAPPING_SYSCALLS: &[i64] = &[libc::SYS_listen, libc::SYS_accept4];
+
+/// S2.5 inbound port mapping, **readiness half** (E7.1): event-loop servers
+/// (uvicorn/asyncio, Node, Go) only call `accept()` once their listener reports
+/// readable, and a connection queued on the supervisor's host listener never
+/// makes the sandbox's own listener readable -- so their waits have to be
+/// synthesized. The synthesis reads the registrations from the kernel's own
+/// `/proc/<pid>/fdinfo/<epfd>`, so `epoll_ctl` is not trapped (N88 ②).
+/// `poll`/`epoll_wait` exist only on the legacy ABI (x86_64); the generic ABI
+/// (aarch64/riscv64) has only `ppoll`/`epoll_pwait`, which glibc's
+/// `poll()`/`epoll_wait()` wrappers call -- so intercepting the generic pair
+/// covers both.
+///
+/// Pushed **only where the mapping is actually served by a host listener**:
+/// under `net_bind_inject` the mapped port is a host socket, readiness on it is
+/// the kernel's own, and trapping these made every event-loop wait in every
+/// injected sandbox a supervisor round trip that could only answer `Continue`
+/// (measured on the fleet 2026-10-08: `epoll_wait(0)` 16.33 us/wait trapped vs
+/// 0.49 us/wait without the mapping -- 33x, for a code path that cannot fire).
+const INBOUND_READINESS_SYSCALLS: &[i64] = &[libc::SYS_ppoll, libc::SYS_epoll_pwait];
 
 /// Determine which syscalls need `SECCOMP_RET_USER_NOTIF`.
 pub(crate) fn notif_syscalls(policy: &Sandbox, sandbox_name: Option<&str>) -> Vec<u32> {
@@ -592,11 +607,17 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
     }
 
     // Inbound port mapping (S2.5)
-    if features.inbound_port_map {
+    // Both halves serve the *host-listener* shape only: under bind injection
+    // the sandbox's mapped port is a host socket, so these traps could only
+    // answer `Continue` -- and the poll family fires once per event-loop
+    // iteration (see INBOUND_READINESS_SYSCALLS for the 33x measurement that
+    // made this condition explicit).
+    if features.inbound_port_map && !features.net_bind_inject {
         nrs.extend(INBOUND_MAPPING_SYSCALLS);
+        nrs.push_optional(arch::sys_accept());
+        nrs.extend(INBOUND_READINESS_SYSCALLS);
         nrs.push_optional(arch::sys_poll());
         nrs.push_optional(arch::sys_epoll_wait());
-        nrs.push_optional(arch::sys_accept());
     }
 
     nrs.finish()
@@ -1002,6 +1023,74 @@ mod tests {
         assert!(
             !mapped_nrs.contains(&(libc::SYS_epoll_ctl as u32)),
             "the readiness synthesis reads fdinfo, so epoll_ctl is not trapped"
+        );
+    }
+
+    /// A (2026-10-08): the inbound group is trapped only where the mapping is
+    /// actually served by the supervisor's host listener. With bind injection
+    /// the mapped port is a host socket the kernel drives end to end, so every
+    /// one of these traps could only answer `Continue` -- and the poll family
+    /// fires once per event-loop iteration. Measured on the fleet with
+    /// injection on: `epoll_wait(0)` cost 16.33 us/wait trapped against
+    /// 0.49 us/wait in the same shape without the mapping (33x, for a path that
+    /// cannot do anything).
+    ///
+    /// `listen` has to leave the table with the rest: an injected socket is
+    /// already bound to the *host* port, so a trapped `listen` would look the
+    /// port up as an inbound mapping and try to put a second host listener on
+    /// it. That is reachable exactly when `host_port == sandbox_port` -- which
+    /// is how the E2B MCP gateway allocates (`_mcp_bind_port` is both) -- and
+    /// its `EADDRINUSE` fails the sandbox's `listen()`. This nail reddened on
+    /// the first cut, which kept `listen`/`accept4` trapped while deleting the
+    /// injected-listener bookkeeping that used to make them pass through.
+    #[test]
+    fn a_bind_injected_sandbox_does_not_trap_its_event_loop() {
+        let mapped = Sandbox::builder()
+            .pid_ns(true)
+            .net_isolation(true)
+            .net_bind_map(50005, 8080)
+            .build()
+            .unwrap();
+        // The host-listener shape keeps the whole group: listen/accept are how
+        // the mapping is served, and the readiness family is what wakes an
+        // event loop whose connection is queued supervisor-side.
+        let host_listener = notif_syscalls(&mapped, None);
+        for nr in [
+            libc::SYS_listen,
+            libc::SYS_accept4,
+            libc::SYS_ppoll,
+            libc::SYS_epoll_pwait,
+        ] {
+            assert!(
+                host_listener.contains(&(nr as u32)),
+                "the host-listener mapping needs {nr} trapped"
+            );
+        }
+
+        let injected = Sandbox::builder()
+            .pid_ns(true)
+            .net_isolation(true)
+            .net_bind_map(50005, 8080)
+            .net_bind_inject(true)
+            .build()
+            .unwrap();
+        let injected_nrs = notif_syscalls(&injected, None);
+        for nr in [
+            libc::SYS_listen,
+            libc::SYS_accept4,
+            libc::SYS_ppoll,
+            libc::SYS_epoll_pwait,
+        ] {
+            assert!(
+                !injected_nrs.contains(&(nr as u32)),
+                "an injected sandbox must not pay an inbound trap for {nr}: the kernel \
+                 drives the injected host socket end to end"
+            );
+        }
+        // The injection itself still needs `bind` (that is where it happens).
+        assert!(
+            injected_nrs.contains(&(libc::SYS_bind as u32)),
+            "bind is the injection point and must stay trapped"
         );
     }
 

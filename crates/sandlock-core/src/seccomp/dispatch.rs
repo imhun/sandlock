@@ -911,8 +911,17 @@ pub(crate) fn build_dispatch_table(
     // NOT trapped (N88 ②): the mapping outlives the listener's close and is
     // replaced on re-listen or dropped with the sandbox, which is what keeps
     // the hottest syscall in the sandbox off the notification table.
+    //
+    // All of it is for the *host-listener* shape. Under `net_bind_inject` the
+    // mapped port is a host socket the sandbox listens/accepts on directly, so
+    // these handlers could only ever answer `Continue` -- and `poll`/
+    // `epoll_wait` firing per event-loop iteration on a path that cannot do
+    // anything is exactly what this condition removes (see
+    // `seccomp_plan::INBOUND_READINESS_SYSCALLS` for the measurement). The
+    // same condition gates the BPF list, so interception and handling cannot
+    // drift.
     // ------------------------------------------------------------------
-    if policy.inbound_port_map {
+    if policy.inbound_port_map && !policy.net_bind_inject {
         let __sup = Arc::clone(ctx);
         table.register(libc::SYS_listen, move |cx: &HandlerCtx| {
             let notif = cx.notif;

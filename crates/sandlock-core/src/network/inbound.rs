@@ -326,17 +326,6 @@ pub(crate) async fn handle_listen(
         Ok(fd) => fd,
         Err(e) => return NotifAction::Errno(e.raw_os_error().unwrap_or(libc::EBADF)),
     };
-    // Bind-injection mode (S2.5): the sandbox's socket was already replaced
-    // with a host-loopback listening socket by `network::bind_inject`, so this
-    // `listen()` is ordinary kernel work on a host-netns socket. Letting it
-    // continue is what keeps the eager-accept worker and the readiness
-    // synthesis out of this path entirely.
-    if let Some(ino) = socket_ino(dup_fd.as_raw_fd()) {
-        if ctx.network.lock().await.injected_listeners.contains(&ino) {
-            return NotifAction::Continue;
-        }
-    }
-
     let ino = match socket_ino(dup_fd.as_raw_fd()) {
         Some(i) => i,
         None => return NotifAction::Errno(libc::EIO),

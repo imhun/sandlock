@@ -39,7 +39,6 @@ use std::os::fd::FromRawFd;
 use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
-use crate::network::inbound::socket_ino;
 use crate::network::{query_socket_protocol, Protocol};
 use crate::seccomp::ctx::SupervisorCtx;
 use crate::seccomp::notif::{dup_fd_from_pid, read_child_mem, NotifAction};
@@ -194,11 +193,10 @@ pub(crate) async fn handle_bind(
         // leave it bound-but-unreachable inside its own netns.
         Err(errno) => return NotifAction::Errno(errno),
     };
-    if let Some(ino) = socket_ino(host.as_raw_fd()) {
-        // Remember it so `listen()` passes through to the kernel and
-        // `accept()`/readiness leave this listener alone.
-        ctx.network.lock().await.injected_listeners.insert(ino);
-    }
+    // No bookkeeping is needed for the injected socket: `net_bind_inject` also
+    // takes `listen`/`accept4`/`poll`/`epoll_wait` out of the notification
+    // table (`seccomp_plan`), so the kernel drives this listener end to end --
+    // which is the point of the mode.
     NotifAction::InjectFdAt {
         srcfd: host,
         targetfd: sockfd,

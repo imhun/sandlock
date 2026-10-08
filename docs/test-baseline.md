@@ -277,7 +277,14 @@
 # Environment note for the root phases: `test-all.sh` passes `--offline`, and
 # the repo-local cargo cache is missing `aho-corasick`, so the first
 # `--oci-root` run on a fresh machine has to warm the cache outside the script.
-core_lib = 944 # 2026-10-07 (N88 ②): 941 -> 944, +2 net. +2 new readiness tests
+core_lib = 945 # 2026-10-08 (A): 944 -> 945, +1:
+               # `a_bind_injected_sandbox_does_not_trap_its_event_loop` -- the
+               # inbound group (listen/accept4/ppoll/epoll_pwait) is trapped only
+               # where the mapping is served by the supervisor's host listener;
+               # with bind injection the mapped port is a host socket and the
+               # traps could only answer Continue (fleet measurement: 16.33 us
+               # vs 0.49 us per epoll_wait(0), 33x).
+               # 2026-10-07 (N88 ②): 941 -> 944, +2 net. +2 new readiness tests
                # (`epoll_fdinfo_parses_the_kernels_tfd_lines` pins both spellings
                # of the kernel's `tfd:` line, modern and pre-`ino:`; and
                # `the_kernel_reports_a_live_epoll_fds_registrations` reads a real
