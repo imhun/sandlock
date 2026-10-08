@@ -277,7 +277,17 @@
 # Environment note for the root phases: `test-all.sh` passes `--offline`, and
 # the repo-local cargo cache is missing `aho-corasick`, so the first
 # `--oci-root` run on a fresh machine has to warm the cache outside the script.
-core_lib = 946 # 2026-10-08 (N90): 945 -> 946, +1:
+core_lib = 944 # 2026-10-08 (N89): 946 -> 944, -4 / +2:
+               # the four `network::readiness` unit tests went with the module
+               # (`poll`/`ppoll`/`epoll_wait`/`epoll_pwait` are in no shape's
+               # notify table any more), and two nails came in:
+               # `seccomp::dispatch::handler_tests::every_trapped_syscall_has_a_handler_chain`
+               # (13 shapes; the filter's notify list must be a subset of the
+               # table's chains -- its first run caught a real pre-existing
+               # defect, `fchmodat2` trapped with no chain, fixed in the same
+               # round) and
+               # `seccomp_plan::tests::the_poll_family_is_in_no_shapes_table`.
+               # 2026-10-08 (N90): 945 -> 946, +1:
                # `sandbox::tests::builder_refuses_a_mapped_port_that_is_also_denied`
                # (a mapped port is an ingress grant; the old shape let handler
                # order decide it in the mapping's favour, silently).
@@ -549,7 +559,19 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 578 # 2026-10-08 (N91): 577 -> 578, +1:
+core_integ = 573 # 2026-10-08 (N89): 578 -> 573, -5:
+                 # the four `*_event_loop_serves_external` tests (asyncio +
+                 # `select.poll`, plain + chroot) and their two probes went with
+                 # the readiness synthesis, and
+                 # `test_net_isolate::n88_a_reused_epoll_fd_number_is_not_synthesized`
+                 # (with its probe) is replaced by the table nail
+                 # `seccomp_plan::tests::the_poll_family_is_in_no_shapes_table`:
+                 # a nr that is never trapped cannot leave a stale registration
+                 # behind, which is the stronger statement. The mapping's
+                 # blocking half stays covered (mcp roundtrip, internal
+                 # loopback, lifecycle, fd-injection coexistence, chroot
+                 # roundtrip, and `n88_the_mapping_outlives_close_...`).
+                 # 2026-10-08 (N91): 577 -> 578, +1:
                  # `test_net_isolate::test_injected_mapping_reports_the_sandbox_port_from_getsockname`
                  # (with bind injection and host_port != sandbox_port, the
                  # sandbox must still be told the port it bound; RED read
