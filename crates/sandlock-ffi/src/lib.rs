@@ -648,6 +648,10 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_net_bind_inject(
 /// result. Requires `net_isolation(true)` and the seccomp supervisor
 /// (build-time fail-closed).
 ///
+/// Serves a **blocking/threaded** `accept()` loop only (N89): an event-loop
+/// server over this mapping is never woken. Use
+/// `sandlock_sandbox_builder_net_bind_inject` for that shape.
+///
 /// # Safety
 /// `b` must be a valid builder pointer.
 #[no_mangle]

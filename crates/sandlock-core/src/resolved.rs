@@ -37,7 +37,6 @@ pub(crate) struct SandboxFeatures {
     /// A host-maintained disk accounting file is configured, so `statfs(2)`
     /// must be trapped and answered from it.
     pub(crate) disk_stats: bool,
-    pub(crate) network_supervision: bool,
     pub(crate) network_destination_policy: bool,
     pub(crate) bind_denylist: bool,
     pub(crate) unix_fs_gate: bool,
@@ -163,7 +162,6 @@ impl SandboxFeatures {
             memory_limit: sandbox.max_memory.is_some(),
             kernel_enforced_limits: sandbox.kernel_enforced_limits,
             disk_stats: sandbox.disk_stats_path.is_some(),
-            network_supervision: network_destination_policy || bind_denylist,
             network_destination_policy,
             bind_denylist,
             unix_fs_gate: sandbox.has_unix_fs_gate(),

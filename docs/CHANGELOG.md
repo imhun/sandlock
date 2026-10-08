@@ -26,8 +26,10 @@
   一直在 `chroot_path_syscalls()` 与 `cow_path_syscalls()` 里被 trap，`handle_chroot_write`
   也早就写了它那一支（"与 `fchmodat` 同前三个参数，共用这个 gate"），但**两张注册表都没推
   这个号** ⇒ 每个 chroot/COW 沙箱的 `chmod`（glibc 用的就是这个拼写）通知进来没有 handler：
-  mediator 的写 gate 与 COW 的 copy-up 都没跑，每次调用还白付一次通知往返与预算（COW 形态下
-  可见后果是"改只读层的文件报 EROFS"而不是 copy-up 后成功）。修法：两组各推一个
+  **第一件事是那道 gate 根本没跑** —— mediator 的路径写判定（`can_write`）与 COW 的
+  copy-up 都跳过了，只由外层（真根的 pivot + 沙箱自己的 uid + Landlock）兜着；其次是每次
+  调用还白付一次通知往返与预算，COW 形态下可见后果是"改只读层的文件报 EROFS"而不是
+  copy-up 后成功。修法：两组各推一个
   `arch::SYS_FCHMODAT2`，COW 侧再补一个 `parse_cow_write` 分支。
 
 - **`openat2(RESOLVE_IN_ROOT)` 的 `EAGAIN` 现在有界重试；exec 失败不再被改写成「文件不存在」

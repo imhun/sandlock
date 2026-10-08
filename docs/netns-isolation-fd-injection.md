@@ -128,8 +128,10 @@ sysctl 不再需要**——比现状更"无特权"。
 
 ### E2B 侧（小-中）
 
-- MCP/gateway 到沙箱内 MCP 的路径适配（E7.1 已落地：S2.5 入站映射 +
-  poll/epoll 可读性合成，事件循环型 server 也能被外部连接唤醒）；
+- MCP/gateway 到沙箱内 MCP 的路径适配（E7.1 落地：S2.5 入站映射 + poll/epoll 可读性合成，事件循环型
+  server 也能被外部连接唤醒；**2026-10-08 的 N89 把那条合成退役了** —— 宿主 listener 形状现在只服务
+  阻塞/线程式 `accept()`，事件循环型 server 必须开 `net_bind_inject`，E2B 侧对"带映射 + 注入关"
+  建箱即拒）；
 - 网络配置透传（策略判定逻辑不变；E7.2 已落地：
   `E2B_ENABLE_NET_ISOLATION` / `E2B_FD_INJECT_CONNECT` / `E2B_PORT_MAPPINGS`
   默认关闭，MCP 端口在 netns 下自动做恒等映射）；

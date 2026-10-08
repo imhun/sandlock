@@ -210,7 +210,9 @@ pub struct SupervisePolicy {
     pub fd_inject_connect: bool,
     /// S2.5 bind injection: mapped ports are answered by replacing the
     /// sandbox's socket with a host-loopback one at `bind()` time, instead of
-    /// serving `accept()` from a host listener with readiness synthesis.
+    /// serving `accept()` from a host listener. That host listener serves a
+    /// blocking/threaded `accept()` only (N89 retired the readiness synthesis
+    /// that used to wake an event-loop consumer of it).
     #[serde(default)]
     pub net_bind_inject: bool,
     pub port_mappings: Option<BTreeMap<u16, u16>>,

@@ -63,6 +63,10 @@ pub struct SandboxBuilder {
     /// by injecting the accepted connection fd. This is the MCP-server path:
     /// an external gateway connects to `host_port` to reach a server that
     /// listens inside the loopback-only sandbox netns.
+    ///
+    /// Serves a **blocking/threaded** `accept()` loop only (N89): an event-loop
+    /// server over this mapping is never woken -- set `--net-bind-inject` (or a
+    /// higher-level deployment's equivalent switch) for that shape.
     #[cfg_attr(feature = "cli", arg(long = "net-bind-map", value_name = "HOST:SANDBOX", value_parser = parse_port_pair))]
     pub net_bind_map: Vec<(u16, u16)>,
 

@@ -537,6 +537,13 @@ pub struct Sandbox {
     /// at `host_port` (>= 50005) and serves the sandbox's `accept()` from that
     /// host listener by injecting the accepted connection fd (MCP-server path:
     /// external gateway -> host mapped port -> sandbox listener).
+    ///
+    /// **Blocking/threaded `accept()` only** (N89, 2026-10-08): the readiness
+    /// synthesis that used to wake an *event-loop* consumer of such a listener
+    /// is retired, so a server that waits in `poll`/`epoll` will queue the host
+    /// connection and never answer -- with no error anywhere. Set
+    /// [`Self::net_bind_inject`] for an event-loop server (the injected socket
+    /// is a host socket the kernel reports readable).
     #[serde(default)]
     pub net_bind_map: Vec<(u16, u16)>,
     /// S2.5 bind-injection mode: instead of letting the sandbox bind inside

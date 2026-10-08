@@ -277,16 +277,21 @@
 # Environment note for the root phases: `test-all.sh` passes `--offline`, and
 # the repo-local cargo cache is missing `aho-corasick`, so the first
 # `--oci-root` run on a fresh machine has to warm the cache outside the script.
-core_lib = 944 # 2026-10-08 (N89): 946 -> 944, -4 / +2:
-               # the four `network::readiness` unit tests went with the module
+core_lib = 944 # 2026-10-08 (N89): 946 -> 944, -5 / +3:
+               # the five `network::readiness` unit tests went with the module
                # (`poll`/`ppoll`/`epoll_wait`/`epoll_pwait` are in no shape's
-               # notify table any more), and two nails came in:
+               # notify table any more; counted from
+               # `git show 53f9c7b:crates/sandlock-core/src/network/readiness.rs`),
+               # and three nails came in:
                # `seccomp::dispatch::handler_tests::every_trapped_syscall_has_a_handler_chain`
                # (13 shapes; the filter's notify list must be a subset of the
                # table's chains -- its first run caught a real pre-existing
                # defect, `fchmodat2` trapped with no chain, fixed in the same
                # round) and
+               # `the_cross_table_check_catches_a_missing_chain` (the checker's
+               # own falsifiability) and
                # `seccomp_plan::tests::the_poll_family_is_in_no_shapes_table`.
+               # 946 - 5 + 3 = 944 = the measured value.
                # 2026-10-08 (N90): 945 -> 946, +1:
                # `sandbox::tests::builder_refuses_a_mapped_port_that_is_also_denied`
                # (a mapped port is an ingress grant; the old shape let handler

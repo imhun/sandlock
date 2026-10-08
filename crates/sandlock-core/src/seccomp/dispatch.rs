@@ -1819,6 +1819,12 @@ mod handler_tests {
     /// It is deliberately an **exhaustive literal**: a new field on
     /// `NotifPolicy` breaks this function until its author walks over here, and
     /// that is the moment to ask whether the new field also gates a chain.
+    /// What that protects is field *presence*, not field *value*:
+    /// `max_processes` stays 0 and `max_memory_bytes` is a stand-in, because no
+    /// chain reads them for anything but its own bookkeeping today. When a new
+    /// chain reads a value from here, read the real one out of
+    /// `Sandbox::launch`'s construction (the same place that assigns
+    /// `policy.pid_ns` for real).
     /// What it cannot answer is *drift in the launch-time locals* — those are
     /// constants here, and the integration suite's real sandboxes are what
     /// exercise them. The class it does cover is the one the `dispatch`
@@ -1908,6 +1914,12 @@ mod handler_tests {
     /// `policy_fn` is deliberately absent: its traps are answered by *user*
     /// handlers (`run_with_handlers`), so its chain set is not a property of
     /// the policy — `tests/integration/test_handlers.rs` covers that.
+    ///
+    /// **Expected exceptions** — shapes that would redden this without being
+    /// bugs, so do not add them as-is: a chroot-less `fs_deny` sandbox traps the
+    /// deny family with no chain *on purpose*, because `notif.rs`'s
+    /// pre-dispatch precheck answers it before the table is consulted. Anything
+    /// else that reddens here is a real wiring gap.
     #[test]
     fn every_trapped_syscall_has_a_handler_chain() {
         use crate::sandbox::{ByteSize, Sandbox};
@@ -1970,6 +1982,18 @@ mod handler_tests {
                 Sandbox::builder()
                     .pid_ns(true)
                     .port_remap(true)
+                    .build()
+                    .unwrap(),
+            ),
+            (
+                // A `bind` denylist with no destination policy and no fs
+                // grants: the bind chain exists (the denylist is answered
+                // there, and the netlink group traps `bind` in every shape),
+                // but nothing answers `connect`/`send*`.
+                "bind denylist only",
+                Sandbox::builder()
+                    .pid_ns(true)
+                    .net_deny_bind_port(8080)
                     .build()
                     .unwrap(),
             ),

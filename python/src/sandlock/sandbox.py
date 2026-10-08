@@ -510,7 +510,13 @@ class Sandbox:
     unique per sandbox; ``sandbox_port`` must be unique per sandbox.
     Requires ``net_isolation=True`` and the seccomp supervisor — a mapping
     without either fails closed at build time.  ``None`` or empty = no
-    inbound mappings."""
+    inbound mappings.
+
+    Serves a **blocking/threaded** ``accept()`` loop only (N89, 2026-10-08):
+    the readiness synthesis that used to wake an *event-loop* consumer of the
+    supervisor's listener is retired, so a server that waits in ``poll``/
+    ``epoll`` would queue the host connection and never answer — with no error
+    anywhere.  Set :attr:`net_bind_inject` for an event-loop server."""
 
     # Deterministic execution
     random_seed: int | None = None

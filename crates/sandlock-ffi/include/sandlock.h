@@ -661,7 +661,10 @@ sandlock_builder_t *sandlock_sandbox_builder_fd_inject_connect(sandlock_builder_
  * `sandlock_sandbox_builder_net_bind_map` (see the Rust doc comment):
  * `bind()` on a mapped port is answered by replacing the sandbox's socket
  * with a host-loopback one, so `listen()`/`accept()` are ordinary kernel work
- * and the event loop's readiness syscalls stay out of the supervisor.
+ * and an event loop's own waits are ordinary kernel waits. (Since N89 the poll
+ * family is never trapped in any shape: a host-listener mapping -- the default
+ * -- serves a blocking/threaded `accept()` loop only, and set this switch for
+ * an event-loop server.)
  *
  * # Safety
  * `b` must be a valid builder pointer.
@@ -676,6 +679,10 @@ sandlock_builder_t *sandlock_sandbox_builder_net_bind_inject(sandlock_builder_t 
  * supervisor and the connected fd is injected as the sandbox's `accept()`
  * result. Requires `net_isolation(true)` and the seccomp supervisor
  * (build-time fail-closed).
+ *
+ * Serves a **blocking/threaded** `accept()` loop only (N89): an event-loop
+ * server over this mapping is never woken. Use
+ * `sandlock_sandbox_builder_net_bind_inject` for that shape.
  *
  * # Safety
  * `b` must be a valid builder pointer.

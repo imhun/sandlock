@@ -500,7 +500,18 @@ pub(crate) fn notif_syscalls_resolved(resolved: &ResolvedSandbox) -> Vec<u32> {
         nrs.extend(EXEC_ADDRESS_SPACE_RESET_SYSCALLS);
     }
 
-    if features.network_supervision {
+    // The connect/send family is trapped exactly where a handler answers it:
+    // `dispatch` registers those four chains under
+    // `has_net_destination_policy || has_unix_fs_gate`. This used to be spelled
+    // `features.network_supervision` (`destination_policy || bind_denylist`) --
+    // so a **bind-denylist-only** sandbox trapped all four with no chain behind
+    // them: a round trip plus a slice of the notification budget per connect or
+    // send, decided by nobody (the N81 class; found by
+    // `seccomp::dispatch::handler_tests::every_trapped_syscall_has_a_handler_chain`
+    // on 2026-10-08). The denylist itself does not need these traps: it is
+    // answered in the `bind` chain, and `bind` comes from the netlink group in
+    // every shape.
+    if features.network_destination_policy {
         nrs.extend(NETWORK_POLICY_SYSCALLS);
     } else if features.unix_fs_gate {
         // Named-unix gate: trap connect() (stream) and sendto()/sendmsg()/
@@ -981,13 +992,12 @@ mod tests {
     /// N88 ②: nothing tears down on `close` any more, so no shape pays for it.
     /// The netlink cookie set validates itself against procfs at use time (N82
     /// candidate ①), the inbound mapping outlives the listener's close
-    /// (`network::inbound`, option ②(a)), and the readiness synthesis reads the
-    /// kernel's own `/proc/<pid>/fdinfo/<epfd>` instead of tracking
-    /// `epoll_ctl` -- and N89 then retired that reader too, so `epoll_ctl` stays
-    /// untrapped for the simpler reason that nothing watches the poll family at
-    /// all. The mapped shape is the one that used to carry the member
-    /// (option ①), so it is pinned explicitly: a regression that re-adds
-    /// `close` shows up here before it shows up as a ladder reading.
+    /// (`network::inbound`, option ②(a)), and nothing tracks `epoll_ctl`: the
+    /// readiness synthesis that used to read the kernel's own
+    /// `/proc/<pid>/fdinfo/<epfd>` was retired by N89, so the poll family is
+    /// not watched at all. The mapped shape is the one that used to carry the
+    /// `close` member (option ①), so it is pinned explicitly: a regression that
+    /// re-adds `close` shows up here before it shows up as a ladder reading.
     #[test]
     fn close_is_not_in_the_table_for_any_shape() {
         let plain = Sandbox::builder().pid_ns(true).build().unwrap();
@@ -1011,7 +1021,7 @@ mod tests {
         );
         assert!(
             !mapped_nrs.contains(&(libc::SYS_epoll_ctl as u32)),
-            "the readiness synthesis reads fdinfo, so epoll_ctl is not trapped"
+            "nothing watches the poll family since N89, so epoll_ctl is not trapped"
         );
     }
 
