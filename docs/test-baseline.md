@@ -277,7 +277,12 @@
 # Environment note for the root phases: `test-all.sh` passes `--offline`, and
 # the repo-local cargo cache is missing `aho-corasick`, so the first
 # `--oci-root` run on a fresh machine has to warm the cache outside the script.
-core_lib = 944 # 2026-10-08 (N89): 946 -> 944, -5 / +3:
+core_lib = 945 # 2026-10-10 (N95): 944 -> 945, +1 -- `chroot::resolve`'s
+               # `test_resolve_in_root_names_the_parent_errno`: a creating
+               # resolve under a missing parent must name ENOENT (it used to
+               # be a nameless `None` that every write handler turned into
+               # EACCES). See the E2B repo's docs/n95-write-path-errno.md.
+               # 2026-10-08 (N89): 946 -> 944, -5 / +3:
                # the five `network::readiness` unit tests went with the module
                # (`poll`/`ppoll`/`epoll_wait`/`epoll_pwait` are in no shape's
                # notify table any more; counted from
@@ -564,7 +569,14 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 573 # 2026-10-08 (N89): 578 -> 573, -5:
+core_integ = 574 # 2026-10-10 (N95): 573 -> 574, +1 --
+                 # `test_chroot::test_chroot_create_paths_answer_the_kernels_errno`:
+                 # a create-capable path under a missing parent answers the
+                 # kernel's ENOENT (2) for mkdir/symlink/readlink, while a
+                 # read-only refusal still answers EACCES (13). Its RED on the
+                 # pre-fix tree is `ERR 13` where the test wants `ERR 2`.
+                 # See the E2B repo's docs/n95-write-path-errno.md.
+                 # 2026-10-08 (N89): 578 -> 573, -5:
                  # the four `*_event_loop_serves_external` tests (asyncio +
                  # `select.poll`, plain + chroot) and their two probes went with
                  # the readiness synthesis, and

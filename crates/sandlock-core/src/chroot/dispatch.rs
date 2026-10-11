@@ -297,32 +297,35 @@ impl ChrootCtx<'_> {
     fn resolve_mount_with(
         &self,
         virtual_path: &str,
-        resolver: fn(&Path, &str) -> Option<(PathBuf, PathBuf)>,
-    ) -> Option<(PathBuf, PathBuf)> {
+        resolver: fn(&Path, &str) -> Result<(PathBuf, PathBuf), i32>,
+    ) -> Result<(PathBuf, PathBuf), i32> {
         let confined = confine(virtual_path);
-        let (mount_target, sub_path) = self.mount_target(&confined)?;
+        // No mount matches: that is not a verdict about the path either, and
+        // the caller falls through to the in-root resolver for exactly this
+        // case -- so the errno here is never read.
+        let (mount_target, sub_path) = self.mount_target(&confined).ok_or(libc::EACCES)?;
         if sub_path == "/" {
             // The child asked for the mount point itself. Resolving inside
             // the source would open the source as a directory root, which
             // fails with ENOTDIR for file/chardev single-node mounts; the
             // bound object is the leaf, so return it directly.
-            return Some((mount_target.to_path_buf(), confined));
+            return Ok((mount_target.to_path_buf(), confined));
         }
         resolver(mount_target, &sub_path).map(|(host, _)| (host, confined))
     }
 
     /// Resolve against mounts for paths that may not exist yet (O_CREAT).
-    fn resolve_mount(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
+    fn resolve_mount(&self, virtual_path: &str) -> Result<(PathBuf, PathBuf), i32> {
         self.resolve_mount_with(virtual_path, resolve_in_root)
     }
 
     /// Resolve against mounts for paths that must exist.
-    fn resolve_mount_existing(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
+    fn resolve_mount_existing(&self, virtual_path: &str) -> Result<(PathBuf, PathBuf), i32> {
         self.resolve_mount_with(virtual_path, resolve_existing_in_root)
     }
 
     /// Resolve against mounts without following a final symlink.
-    fn resolve_mount_nofollow(&self, virtual_path: &str) -> Option<(PathBuf, PathBuf)> {
+    fn resolve_mount_nofollow(&self, virtual_path: &str) -> Result<(PathBuf, PathBuf), i32> {
         self.resolve_mount_with(virtual_path, resolve_in_root_nofollow)
     }
 
@@ -658,10 +661,13 @@ fn resolve_chroot_path(
     dirfd: i64,
     path: &str,
     ctx: &ChrootCtx<'_>,
-) -> Option<(PathBuf, PathBuf)> {
-    let full_path = build_virtual_path(notif, dirfd, path, ctx)?;
-    if let Some(result) = ctx.resolve_mount(&full_path) {
-        return Some(result);
+) -> Result<(PathBuf, PathBuf), i32> {
+    // A path we cannot even *name* (no tracked cwd, an unmappable dirfd) is
+    // not a verdict about the filesystem, so it keeps the answer every handler
+    // used to give for it.
+    let full_path = build_virtual_path(notif, dirfd, path, ctx).ok_or(libc::EACCES)?;
+    if let Ok(result) = ctx.resolve_mount(&full_path) {
+        return Ok(result);
     }
     resolve_in_root(ctx.root, &full_path)
 }
@@ -676,10 +682,10 @@ fn resolve_chroot_path_nofollow(
     dirfd: i64,
     path: &str,
     ctx: &ChrootCtx<'_>,
-) -> Option<(PathBuf, PathBuf)> {
-    let full_path = build_virtual_path(notif, dirfd, path, ctx)?;
-    if let Some(result) = ctx.resolve_mount_nofollow(&full_path) {
-        return Some(result);
+) -> Result<(PathBuf, PathBuf), i32> {
+    let full_path = build_virtual_path(notif, dirfd, path, ctx).ok_or(libc::EACCES)?;
+    if let Ok(result) = ctx.resolve_mount_nofollow(&full_path) {
+        return Ok(result);
     }
     resolve_in_root_nofollow(ctx.root, &full_path)
 }
@@ -695,10 +701,10 @@ fn resolve_chroot_path_existing(
     dirfd: i64,
     path: &str,
     ctx: &ChrootCtx<'_>,
-) -> Option<(PathBuf, PathBuf)> {
-    let full_path = build_virtual_path(notif, dirfd, path, ctx)?;
-    if let Some(result) = ctx.resolve_mount_existing(&full_path) {
-        return Some(result);
+) -> Result<(PathBuf, PathBuf), i32> {
+    let full_path = build_virtual_path(notif, dirfd, path, ctx).ok_or(libc::EACCES)?;
+    if let Ok(result) = ctx.resolve_mount_existing(&full_path) {
+        return Ok(result);
     }
     resolve_existing_in_root(ctx.root, &full_path)
 }
@@ -746,8 +752,12 @@ fn read_and_resolve(
     let path = read_path(notif, notif.data.args[path_idx], notif_fd)
         .ok_or(NotifAction::Continue)?;
     let dirfd = notif.data.args[dirfd_idx] as i64;
+    // The caller's own errno, not a substitute (N95). This is the helper the
+    // creating handlers use (mkdirat, symlinkat, fchmodat, …), and "the parent
+    // is not there" has to reach them as ENOENT so the program can walk up;
+    // EACCES stays what it is -- the policy refusing a path it did resolve.
     let (host_path, virtual_path) =
-        resolve_chroot_path(notif, dirfd, &path, ctx).ok_or(NotifAction::Errno(libc::EACCES))?;
+        resolve_chroot_path(notif, dirfd, &path, ctx).map_err(NotifAction::Errno)?;
     Ok((path, host_path, virtual_path))
 }
 
@@ -764,7 +774,7 @@ fn read_and_resolve_nofollow(
         .ok_or(NotifAction::Continue)?;
     let dirfd = notif.data.args[dirfd_idx] as i64;
     let (host_path, virtual_path) = resolve_chroot_path_nofollow(notif, dirfd, &path, ctx)
-        .ok_or(NotifAction::Errno(libc::EACCES))?;
+        .map_err(NotifAction::Errno)?;
     Ok((path, host_path, virtual_path))
 }
 
@@ -780,9 +790,12 @@ fn read_and_resolve_existing(
     let path = read_path(notif, notif.data.args[path_idx], notif_fd)
         .ok_or(NotifAction::Continue)?;
     let dirfd = notif.data.args[dirfd_idx] as i64;
+    // This one used to answer a nameless ENOENT for every failure; it now says
+    // what the resolver said. For a missing leaf that is ENOENT either way --
+    // the difference shows up only for a path the kernel refused to *resolve*
+    // (an escape: EXDEV, a loop: ELOOP), where ENOENT was an invented answer.
     let (host_path, virtual_path) =
-        resolve_chroot_path_existing(notif, dirfd, &path, ctx)
-            .ok_or(NotifAction::Errno(libc::ENOENT))?;
+        resolve_chroot_path_existing(notif, dirfd, &path, ctx).map_err(NotifAction::Errno)?;
     Ok((path, host_path, virtual_path))
 }
 
@@ -830,8 +843,8 @@ pub(crate) async fn handle_chroot_open(
 
     // Resolve to get the virtual path for access control.
     let (host_path, virtual_path) = match resolve_chroot_path(notif, dirfd, &rel_path, ctx) {
-        Some(r) => r,
-        None => return NotifAction::Errno(libc::EACCES),
+        Ok(r) => r,
+        Err(e) => return NotifAction::Errno(e),
     };
 
     // Access check: writes need can_write, reads need can_read
@@ -1690,12 +1703,12 @@ pub(crate) async fn handle_chroot_write(
         // rename(2) moves the names themselves: a symlink on either side is
         // renamed, not chased.
         let (old_host, old_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[0] as i64, &old_path, ctx) {
-            Some(r) => r,
-            None => return NotifAction::Errno(libc::EACCES),
+            Ok(r) => r,
+            Err(e) => return NotifAction::Errno(e),
         };
         let (new_host, new_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[2] as i64, &new_path, ctx) {
-            Some(r) => r,
-            None => return NotifAction::Errno(libc::EACCES),
+            Ok(r) => r,
+            Err(e) => return NotifAction::Errno(e),
         };
         if !ctx.can_write(&old_vp) || !ctx.can_write(&new_vp) {
             return NotifAction::Errno(libc::EACCES);
@@ -1745,8 +1758,8 @@ pub(crate) async fn handle_chroot_write(
             None => return NotifAction::Continue,
         };
         let (host_link, link_vp) = match resolve_chroot_path(notif, notif.data.args[1] as i64, &linkpath, ctx) {
-            Some(r) => r,
-            None => return NotifAction::Errno(libc::EACCES),
+            Ok(r) => r,
+            Err(e) => return NotifAction::Errno(e),
         };
         if !ctx.can_write(&link_vp) { return NotifAction::Errno(libc::EACCES); }
         // Over budget: a new name is tree growth, which no per-file ceiling
@@ -1814,22 +1827,25 @@ pub(crate) async fn handle_chroot_write(
             // would otherwise be judged by the link's own name, and a denied
             // or read-only target would pass under any allowed spelling.
             resolve_chroot_path_existing(notif, notif.data.args[0] as i64, &old_path, ctx)
-                .and_then(|(host, _)| ctx.host_to_virtual(&host).map(|vp| (host, vp)))
+                .and_then(|(host, _)| {
+                    ctx.host_to_virtual(&host)
+                        .map(|vp| (host, vp))
+                        .ok_or(libc::EACCES)
+                })
         } else {
             resolve_chroot_path_nofollow(notif, notif.data.args[0] as i64, &old_path, ctx)
         };
         let (old_host, old_vp) = match old_resolved {
-            Some(r) => r,
-            // A followed source that will not resolve is either missing or
-            // pointing out of the root, and the sandbox says the same thing
-            // about both: ENOENT is also what the kernel reports natively for
-            // AT_SYMLINK_FOLLOW on a dangling symlink.
-            None if follow_old => return NotifAction::Errno(libc::ENOENT),
-            None => return NotifAction::Errno(libc::EACCES),
+            Ok(r) => r,
+            // The resolver's own errno: ENOENT for a missing name, which is
+            // also what the kernel reports natively for AT_SYMLINK_FOLLOW on a
+            // dangling symlink, and the kernel's answer for a source that
+            // points out of the root.
+            Err(e) => return NotifAction::Errno(e),
         };
         let (new_host, new_vp) = match resolve_chroot_path_nofollow(notif, notif.data.args[2] as i64, &new_path, ctx) {
-            Some(r) => r,
-            None => return NotifAction::Errno(libc::EACCES),
+            Ok(r) => r,
+            Err(e) => return NotifAction::Errno(e),
         };
         // A hard link is a second name for one inode, so afterwards the
         // authority over that inode is the union of the policy on both names.
@@ -1981,8 +1997,8 @@ pub(crate) async fn handle_chroot_write(
             None => return NotifAction::Continue,
         };
         let (host_path, vp) = match resolve_chroot_path(notif, libc::AT_FDCWD as i64, &path, ctx) {
-            Some(r) => r,
-            None => return NotifAction::Errno(libc::EACCES),
+            Ok(r) => r,
+            Err(e) => return NotifAction::Errno(e),
         };
         if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
         ctx.mark_dirty(&host_path);
@@ -2128,8 +2144,8 @@ pub(crate) async fn handle_chroot_statx(
         resolve_chroot_path_existing(notif, dirfd, &path, ctx)
     };
     let (host_path, vp) = match resolved {
-        Some(r) => r,
-        None => return NotifAction::Errno(libc::ENOENT),
+        Ok(r) => r,
+        Err(e) => return NotifAction::Errno(e),
     };
     if !ctx.can_read(&vp) { return NotifAction::Errno(libc::EACCES); }
 
@@ -2267,8 +2283,8 @@ pub(crate) async fn handle_chroot_readlink(
     // readlink must read the link itself, never what it points at, which is
     // exactly what the no-follow resolver gives.
     let (host_path, _) = match resolve_chroot_path_nofollow(notif, dirfd, &path, ctx) {
-        Some(r) => r,
-        None => return NotifAction::Errno(libc::EACCES),
+        Ok(r) => r,
+        Err(e) => return NotifAction::Errno(e),
     };
 
     // COW
@@ -2419,8 +2435,8 @@ pub(crate) async fn handle_chroot_xattr(
         } else {
             resolve_chroot_path_nofollow(notif, libc::AT_FDCWD as i64, &path, ctx)
         } {
-            Some(r) => r,
-            None => return NotifAction::Errno(libc::ENOENT),
+            Ok(r) => r,
+            Err(e) => return NotifAction::Errno(e),
         };
 
     let writing = matches!(op, XattrOp::Set | XattrOp::Remove);
@@ -2665,8 +2681,8 @@ pub(crate) async fn handle_chroot_statfs(
     };
 
     let (host_path, _) = match resolve_chroot_path_existing(notif, libc::AT_FDCWD as i64, &path, ctx) {
-        Some(r) => r,
-        None => return NotifAction::Errno(libc::ENOENT),
+        Ok(r) => r,
+        Err(e) => return NotifAction::Errno(e),
     };
 
     let c_path = match path_cstr(&host_path, libc::ENOENT) {
@@ -2744,8 +2760,8 @@ pub(crate) async fn handle_chroot_inotify_add_watch(
     // (see handle_chroot_chdir).
     let (host_path, virtual_path) =
         match resolve_chroot_path(notif, libc::AT_FDCWD as i64, &path, ctx) {
-            Some(r) => r,
-            None => return NotifAction::Errno(libc::EACCES),
+            Ok(r) => r,
+            Err(e) => return NotifAction::Errno(e),
         };
     if !ctx.can_read(&virtual_path) {
         return NotifAction::Errno(libc::EACCES);
@@ -2801,8 +2817,8 @@ pub(crate) async fn handle_chroot_utimensat(
         resolve_chroot_path(notif, dirfd, &path, ctx)
     };
     let (host_path, vp) = match resolved {
-        Some(r) => r,
-        None => return NotifAction::Errno(libc::EACCES),
+        Ok(r) => r,
+        Err(e) => return NotifAction::Errno(e),
     };
     if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
 

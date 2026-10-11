@@ -253,6 +253,88 @@ async fn test_chroot_mediated_create_is_owned_by_caller_and_self_chmod_works() {
     cleanup_rootfs(&rootfs);
 }
 
+/// N95: a *creating* path whose parent is not there yet must answer ENOENT,
+/// not EACCES.
+///
+/// Node's `fs.mkdir(p, {recursive: true})`, Go's `os.MkdirAll` and every
+/// `mkdir -p` walk up on ENOENT and give up on anything else, so answering
+/// EACCES for "the parent is missing" is what made `npm install` die inside a
+/// sandbox (`docs/n95-write-path-errno.md`). EACCES stays what it is: the
+/// policy refusing a path it *did* resolve (the read-only leg below).
+///
+/// The `legacy-*` verbs print the raw errno (`ERR <n>`), which is what makes
+/// the assertion exact rather than a `strerror` match.
+#[tokio::test]
+async fn test_chroot_create_paths_answer_the_kernels_errno() {
+    let rootfs = build_test_rootfs("create-errno");
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_write("/tmp")
+        .build()
+        .unwrap();
+
+    let run = |argv: [&'static str; 3]| {
+        let mut policy = policy.clone();
+        async move {
+            policy
+                .run(&["rootfs-helper", argv[0], argv[1], argv[2]])
+                .await
+                .expect("the chroot sandbox must be creatable")
+        }
+    };
+
+    // The parent exists: a direct child of the writable root is created.
+    let ok = run(["legacy-mkdir", "/tmp/n95", ""]).await;
+    assert_eq!(
+        ok.stdout_str().unwrap_or(""),
+        "OK",
+        "mkdir of a direct child must succeed; stderr: {:?}",
+        ok.stderr_str()
+    );
+
+    // The parent is missing: ENOENT(2). This is the reading N95 is about --
+    // before the fix every one of these answered EACCES(13).
+    let deep = run(["legacy-mkdir", "/tmp/n95/deep/inner", ""]).await;
+    assert_eq!(
+        deep.stdout_str().unwrap_or(""),
+        "ERR 2",
+        "mkdir under a missing parent must answer ENOENT; stderr: {:?}",
+        deep.stderr_str()
+    );
+
+    let link = run(["legacy-symlink", "/etc/hostname", "/tmp/n95/missing/link"]).await;
+    assert_eq!(
+        link.stdout_str().unwrap_or(""),
+        "ERR 2",
+        "symlink into a missing directory must answer ENOENT; stderr: {:?}",
+        link.stderr_str()
+    );
+
+    let read = run(["legacy-readlink", "/tmp/n95/missing/link", ""]).await;
+    assert_eq!(
+        read.stdout_str().unwrap_or(""),
+        "ERR 2",
+        "readlink under a missing directory must answer ENOENT; stderr: {:?}",
+        read.stderr_str()
+    );
+
+    // And the refusal that is *not* a missing parent keeps its own answer:
+    // /etc is read-only here, so this is the policy, EACCES(13).
+    let refused = run(["legacy-mkdir", "/etc/n95-nope", ""]).await;
+    assert_eq!(
+        refused.stdout_str().unwrap_or(""),
+        "ERR 13",
+        "a refused path must still answer EACCES; stderr: {:?}",
+        refused.stderr_str()
+    );
+
+    cleanup_rootfs(&rootfs);
+}
+
 /// Path traversal via /../../ stays confined — reads a file unique to the chroot.
 #[tokio::test]
 async fn test_chroot_no_escape() {

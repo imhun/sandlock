@@ -181,14 +181,26 @@ pub fn mount_walk_path_bounded(
 ///
 /// Self-referential symlinks (e.g. `rootfs/bin → /bin`) return `ELOOP` and
 /// are treated as resolution failures — such rootfs layouts are unsupported.
-pub fn resolve_in_root(chroot_root: &Path, child_path: &str) -> Option<(PathBuf, PathBuf)> {
-    if let Some(result) = resolve_existing_in_root(chroot_root, child_path) {
-        return Some(result);
+///
+/// **The error is the kernel's errno, not a verdict.** N95: callers that
+/// create a name (mkdir/symlink/rename/link/truncate/…) have to tell "the
+/// parent is not there yet" (ENOENT — walk up and make it) from "the policy
+/// refuses this" (EACCES); answering EACCES for both is what made `npm
+/// install` -- and any recursive-mkdir caller -- give up. See
+/// `docs/chroot-workspace-exec.md` §9 for the same rule on the exec path.
+pub fn resolve_in_root(
+    chroot_root: &Path,
+    child_path: &str,
+) -> Result<(PathBuf, PathBuf), i32> {
+    if let Ok(result) = resolve_existing_in_root(chroot_root, child_path) {
+        return Ok(result);
     }
 
     // Full path doesn't exist — resolve the parent and append the missing
     // filename.  This is needed for O_CREAT targets where the final
-    // component will be created.
+    // component will be created.  The errno that comes back is the parent
+    // open's: `ENOENT` when the parent itself is missing, which is what the
+    // caller's walk-up expects.
     resolve_in_root_nofollow(chroot_root, child_path)
 }
 
@@ -206,7 +218,7 @@ pub fn resolve_in_root(chroot_root: &Path, child_path: &str) -> Option<(PathBuf,
 pub fn resolve_in_root_nofollow(
     chroot_root: &Path,
     child_path: &str,
-) -> Option<(PathBuf, PathBuf)> {
+) -> Result<(PathBuf, PathBuf), i32> {
     let confined = confine(child_path);
     // "/" has no final component to leave unresolved.
     let Some(file_name) = confined.file_name() else {
@@ -214,23 +226,23 @@ pub fn resolve_in_root_nofollow(
     };
     let parent = confined.parent().unwrap_or(Path::new("/"));
 
-    match openat2_in_root(
+    let fd = openat2_in_root(
         chroot_root,
-        parent.to_str()?,
+        parent.to_str().ok_or(libc::EINVAL)?,
         libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
         0,
-    ) {
-        Ok(fd) => {
-            let parent_host = std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok();
-            unsafe { libc::close(fd) };
-            let parent_host = parent_host?;
-            let host_path = parent_host.join(file_name);
-            let parent_virtual = to_virtual_path(chroot_root, &parent_host)?;
-            let virtual_path = parent_virtual.join(file_name);
-            Some((host_path, virtual_path))
-        }
-        Err(_) => None,
-    }
+    )?;
+    let parent_host = std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok();
+    unsafe { libc::close(fd) };
+    // Internal failures below are not verdicts about the caller's path: the
+    // parent *did* open, so what is left is the supervisor failing to name
+    // what it opened (EIO) or a parent that resolved outside the root
+    // (EXDEV — the same answer `openat2` gives for an escape).
+    let parent_host = parent_host.ok_or(libc::EIO)?;
+    let host_path = parent_host.join(file_name);
+    let parent_virtual = to_virtual_path(chroot_root, &parent_host).ok_or(libc::EXDEV)?;
+    let virtual_path = parent_virtual.join(file_name);
+    Ok((host_path, virtual_path))
 }
 
 /// Resolve a virtual path that must already exist within the chroot.
@@ -242,22 +254,21 @@ pub fn resolve_in_root_nofollow(
 ///
 /// Use this for read-only lookups (stat, access, readlink) where the file
 /// must already exist.
-pub fn resolve_existing_in_root(chroot_root: &Path, child_path: &str) -> Option<(PathBuf, PathBuf)> {
-    match openat2_in_root(
+pub fn resolve_existing_in_root(
+    chroot_root: &Path,
+    child_path: &str,
+) -> Result<(PathBuf, PathBuf), i32> {
+    let fd = openat2_in_root(
         chroot_root,
         child_path,
         libc::O_PATH | libc::O_CLOEXEC,
         0,
-    ) {
-        Ok(fd) => {
-            let host_path = std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok();
-            unsafe { libc::close(fd) };
-            let host_path = host_path?;
-            let virtual_path = to_virtual_path(chroot_root, &host_path)?;
-            Some((host_path, virtual_path))
-        }
-        Err(_) => None,
-    }
+    )?;
+    let host_path = std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok();
+    unsafe { libc::close(fd) };
+    let host_path = host_path.ok_or(libc::EIO)?;
+    let virtual_path = to_virtual_path(chroot_root, &host_path).ok_or(libc::EXDEV)?;
+    Ok((host_path, virtual_path))
 }
 
 /// Resolve the configured chroot root to a canonical, on-disk path.
@@ -575,7 +586,7 @@ mod tests {
         std::fs::write(root.join("usr/bin/hello"), "").unwrap();
 
         let result = resolve_in_root(root, "/usr/bin/hello");
-        assert!(result.is_some());
+        assert!(result.is_ok());
         let (host, virt) = result.unwrap();
         assert_eq!(virt, PathBuf::from("/usr/bin/hello"));
         assert!(host.starts_with(root));
@@ -590,7 +601,7 @@ mod tests {
         symlink("/usr/lib64", root.join("lib")).unwrap();
 
         let result = resolve_in_root(root, "/lib/foo");
-        assert!(result.is_some());
+        assert!(result.is_ok());
         let (host, virt) = result.unwrap();
         assert_eq!(virt, PathBuf::from("/usr/lib64/foo"));
         assert!(host.starts_with(root));
@@ -604,7 +615,7 @@ mod tests {
 
         // File doesn't exist but parent does — should resolve via parent.
         let result = resolve_in_root(root, "/tmp/newfile");
-        assert!(result.is_some());
+        assert!(result.is_ok());
         let (host, virt) = result.unwrap();
         assert_eq!(virt, PathBuf::from("/tmp/newfile"));
         assert!(host.ends_with("tmp/newfile"));
@@ -620,7 +631,7 @@ mod tests {
         symlink("/etc/shadow", root.join("evil")).unwrap();
 
         let result = resolve_in_root(root, "/evil");
-        assert!(result.is_some());
+        assert!(result.is_ok());
         let (host, virt) = result.unwrap();
         assert_eq!(virt, PathBuf::from("/etc/shadow"));
         assert!(host.starts_with(root));
@@ -633,8 +644,8 @@ mod tests {
         std::fs::create_dir_all(root.join("a")).unwrap();
 
         let result = resolve_in_root(root, "/a/../../etc/group");
-        // Either resolves within root or returns None — never escapes.
-        if let Some((host, _)) = result {
+        // Either resolves within root or is refused — never escapes.
+        if let Ok((host, _)) = result {
             assert!(host.starts_with(root));
         }
     }
@@ -645,7 +656,7 @@ mod tests {
         let root = tmp.path();
 
         let result = resolve_in_root(root, "/");
-        assert!(result.is_some());
+        assert!(result.is_ok());
         let (host, virt) = result.unwrap();
         assert_eq!(virt, PathBuf::from("/"));
         assert_eq!(host, root);
@@ -663,13 +674,13 @@ mod tests {
         // the resolved target path, not the symlink itself.
         let result = resolve_existing_in_root(root, "/usr/local/bin/python3");
         match result {
-            Some((host, virt)) => {
+            Ok((host, virt)) => {
                 assert!(host.starts_with(root));
                 assert!(host.ends_with("python3.12"),
                     "host path should be resolved through symlink: {:?}", host);
                 assert_eq!(virt, PathBuf::from("/usr/local/bin/python3.12"));
             }
-            None => {
+            Err(_) => {
                 // openat2 not available on this kernel — skip
             }
         }
@@ -687,13 +698,13 @@ mod tests {
 
         let result = resolve_existing_in_root(root, "/usr/local/bin/python3");
         match result {
-            Some((host, virt)) => {
+            Ok((host, virt)) => {
                 assert!(host.starts_with(root),
                     "absolute symlink must not escape chroot: {:?}", host);
                 assert!(host.ends_with("usr/bin/python3.12"));
                 assert_eq!(virt, PathBuf::from("/usr/bin/python3.12"));
             }
-            None => {
+            Err(_) => {
                 // openat2 not available — skip
             }
         }
@@ -706,9 +717,36 @@ mod tests {
         std::fs::create_dir_all(root.join("usr/bin")).unwrap();
 
         let result = resolve_existing_in_root(root, "/usr/bin/nonexistent");
-        // openat2 may not be available, but if it is, missing file → None
-        if resolve_existing_in_root(root, "/usr/bin").is_some() {
-            assert!(result.is_none());
+        // openat2 may not be available, but if it is, a missing file is an
+        // ENOENT *errno* — not a nameless failure (N95: the handlers now hand
+        // the caller's own errno back, so the resolver has to say which one).
+        if resolve_existing_in_root(root, "/usr/bin").is_ok() {
+            assert_eq!(result.unwrap_err(), libc::ENOENT);
         }
+    }
+
+    /// N95: the errno a create-capable resolve answers for "the parent is not
+    /// there" is the one Node's `fs.mkdir(..., {recursive:true})`, Go's
+    /// `os.MkdirAll` and `mkdir -p` all walk up on. A nameless failure (the
+    /// old `None`) became EACCES in every write handler, and `npm install`
+    /// died on it.
+    #[test]
+    fn test_resolve_in_root_names_the_parent_errno() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("home/user")).unwrap();
+
+        // Sanity: the parent exists, so this one resolves.
+        assert!(resolve_in_root(root, "/home/user/one").is_ok());
+
+        // The parent does not exist: ENOENT, twice deep.
+        let err = resolve_in_root(root, "/home/user/missing/inner").unwrap_err();
+        assert_eq!(err, libc::ENOENT, "missing parent must answer ENOENT");
+        let err = resolve_in_root_nofollow(root, "/home/user/missing/inner").unwrap_err();
+        assert_eq!(err, libc::ENOENT, "no-follow must answer the same");
+
+        // And the "must exist" resolver says the same thing for a missing leaf.
+        let err = resolve_existing_in_root(root, "/home/user/missing").unwrap_err();
+        assert_eq!(err, libc::ENOENT);
     }
 }
