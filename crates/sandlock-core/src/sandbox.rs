@@ -2287,7 +2287,19 @@ impl Sandbox {
                 .chain(resolved_net_allow.udp.wildcard_domains.iter())
                 .cloned()
                 .collect();
-        let need_gateway = !wildcard_suffixes.is_empty();
+        // 2026-10-10（E2B 侧裁定）：会话 DNS 网关**常开**，不再只在存在通配域
+        // 规则时才启用。理由：沙箱的域名解析不该取决于镜像里那份
+        // `/etc/resolv.conf` —— 每张镜像各写各的 nameserver（线上基础镜像写的是
+        // `1.1.1.1`，而它在部署网络里不可达，每次冷解析白等 5 s 才落到第二个），
+        // 平台没有任何统一它的手段。常开之后 `/etc/resolv.conf` 一律被虚拟成
+        // `<gateway>:53`（回环），上游由 `worker_upstream_resolver()` 决定
+        // （线上 = worker 的 `/etc/resolv.conf` 第一个 nameserver = CoreDNS），
+        // 于是"镜像里写什么"彻底与行为无关。
+        //
+        // 保留成具名常量 + 原有表达式，是为了让这条开关可 grep、将来要改成
+        // "按策略/环境可配"时只动这一处。
+        const SESSION_DNS_GATEWAY_ALWAYS_ON: bool = true;
+        let need_gateway = SESSION_DNS_GATEWAY_ALWAYS_ON || !wildcard_suffixes.is_empty();
         let netns_gateway_ip: Option<std::net::Ipv4Addr> = if self.net_isolation {
             let ip = if need_gateway {
                 Some(crate::network::dns_synth::allocate_gateway_addr().ok_or_else(|| {
@@ -2948,12 +2960,13 @@ impl Sandbox {
 
         // ---- DNS gateway (after the notif-fd read) ----
         //
-        // Wildcard-domain rules are served by a per-sandbox DNS gateway on
-        // `<gateway>:53`: a loopback address (`127.0.1.x`, since resolv.conf
-        // cannot express a port). The gateway answers wildcard-suffix A
-        // queries with synthetic IPs and forwards the rest upstream so
-        // normal DNS keeps working; /etc/resolv.conf is virtualized to point
-        // at it.
+        // Every session gets a per-sandbox DNS gateway on `<gateway>:53`: a
+        // loopback address (`127.0.1.x`, since resolv.conf cannot express a
+        // port). It answers wildcard-suffix A queries with synthetic IPs and
+        // forwards the rest upstream, and `/etc/resolv.conf` is virtualized to
+        // point at it -- so name resolution never depends on the image's own
+        // resolv.conf. 2026-10-10: the gateway is **always on**, not only when
+        // a wildcard rule needs it (see `need_gateway` above).
         let mut gateway_synthetic_dns: Option<crate::network::dns_synth::SyntheticDns> = None;
         let virtual_resolv_conf = if need_gateway {
             use crate::network::dns_gateway::{run_dns_gateway, worker_upstream_resolver};
