@@ -4,9 +4,9 @@
 //! path that keeps sandlock usable by any unprivileged process.
 
 use sandlock_core::Sandbox;
-use std::io::Write;
 use std::net::Ipv4Addr;
-use std::net::TcpListener;
+
+use tokio::io::AsyncWriteExt;
 
 use crate::net_fixture::WorkerLocalHost;
 
@@ -76,11 +76,21 @@ async fn test_shared_netns_wildcard_connect() {
 
 async fn test_shared_netns_wildcard_connect_inner() {
     let _host = WorkerLocalHost::setup("conn.example.com");
-    let listener = TcpListener::bind((_host.addr(), 0)).unwrap();
+    // Async listener, deliberately. A *blocking* `accept()` inside
+    // `tokio::spawn` holds one of this test's two runtime workers for as long
+    // as no connection arrives, and the sandbox's seccomp-notify supervisor is
+    // a task on the same runtime: when the caller's own stdout read holds the
+    // other worker, nothing is left to drive the 30 s `timeout` around this
+    // function, so the test hangs with no diagnosis instead of failing by name.
+    // Measured 2026-10-12 -- one full `core_integ` run parked here
+    // (`futex_wait`, no timer) in about seven; every other listener in the
+    // suites is on a `std::thread::spawn`, which is the shape that cannot do
+    // this.
+    let listener = tokio::net::TcpListener::bind((_host.addr(), 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream.write_all(b"OK").unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        stream.write_all(b"OK").await.unwrap();
     });
 
     let mut policy = base_policy()
