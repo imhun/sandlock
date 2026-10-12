@@ -295,7 +295,32 @@
 # one lap always finds a free address unless all 253 are live at once -- which
 # is the only thing that error should mean. A worker process can therefore
 # create sandboxes for as long as it lives, not 253 of them.
-core_lib = 946 # 2026-10-12 (N100): 945 -> 946, +1 -- the per-sandbox DNS
+#
+# 2026-10-12 (N101): **the one red nobody had explained yet was a real race,
+# not a flake.** `core_lib` failed once with
+# `control::tests::test_runtime_dir_mode_file_roundtrip` panicking on
+# `read_to_string(&token_file)` with NotFound -- one line after
+# `token_file.exists()` had answered true. The only deleter is
+# `list_live_sandboxes`'s prune, which asks `dir_is_recent` about a directory
+# that has no pid file yet (setup writes the token, then the name, then the
+# mode, and the pid file last). `dir_is_recent` compared against a `now`
+# captured *before* the scan walked the root and treated
+# `SystemTime::duration_since`'s `Err` -- which is what you get when the
+# directory's mtime is *after* `now`, i.e. when it was created while the scan
+# was starting -- as "not recent", so it pruned a directory that was in the
+# middle of being set up. The window is the gap between capturing `now` and
+# reaching that entry, which is why the parallel
+# `test_list_live_sandboxes_empty` only ever hit it once. A future mtime now
+# reads as recent, and the new nail pins both halves (newer than `now` is
+# recent; five seconds older is not).
+core_lib = 947 # 2026-10-12 (N101): 946 -> 947, +1 --
+               # `control::tests::a_directory_created_after_the_scan_started_
+               # is_recent`: `dir_is_recent` read `SystemTime::duration_since`'s
+               # `Err` (the dir's mtime is *after* the `now` the scan captured)
+               # as "not recent", so a concurrent `list_live_sandboxes` pruned a
+               # directory whose token file had just been written -- see the
+               # N101 note below.
+               # 2026-10-12 (N100): 945 -> 946, +1 -- the per-sandbox DNS
                # gateway pool now *rotates* instead of growing a cursor that
                # could only be spent once (see the N100 note below), and
                # `network::dns_synth` pins that:

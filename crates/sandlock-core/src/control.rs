@@ -948,9 +948,20 @@ fn is_sandbox_state_dir(dir: &Path) -> bool {
 fn dir_is_recent(dir: &Path, now: &std::time::SystemTime) -> bool {
     if let Ok(meta) = std::fs::metadata(dir) {
         if let Ok(mtime) = meta.modified() {
-            if let Ok(elapsed) = now.duration_since(mtime) {
-                return elapsed.as_secs() < 2;
-            }
+            return match now.duration_since(mtime) {
+                Ok(elapsed) => elapsed.as_secs() < 2,
+                // `mtime` is *after* the `now` this scan captured before it
+                // walked the root: the directory was created while the scan
+                // was starting, which is the opposite of stale.
+                // `duration_since` answers `Err` rather than a negative
+                // duration, and reading that as "not recent" let a concurrent
+                // `list_live_sandboxes` prune a directory whose token file had
+                // just been written -- measured 2026-10-12,
+                // `test_runtime_dir_mode_file_roundtrip` failed with NotFound
+                // on `read_to_string(&token_file)` immediately after
+                // `token_file.exists()` was true.
+                Err(_) => true,
+            };
         }
     }
     false
@@ -1809,6 +1820,35 @@ mod tests {
         // May or may not be empty depending on test environment; just ensure
         // it doesn't error.
         assert!(result.iter().all(|(_, pid)| *pid > 0));
+    }
+
+    /// A directory created *while* a listing is starting is the opposite of
+    /// stale -- and `SystemTime::duration_since` says so by failing.
+    ///
+    /// `list_live_sandboxes` captures `now` once, before it walks the root,
+    /// and `dir_is_recent` is what lets a dir without a pid file be pruned.
+    /// A dir created after that capture has an mtime *after* `now`, so the
+    /// subtraction returns `Err` rather than a negative duration; reading that
+    /// as "not recent" pruned a directory whose token file had just been
+    /// written. Measured 2026-10-12: `test_runtime_dir_mode_file_roundtrip`
+    /// failed with NotFound on `read_to_string(&token_file)` immediately after
+    /// `token_file.exists()` was true, while the parallel
+    /// `test_list_live_sandboxes_empty` sat inside that window.
+    #[test]
+    fn a_directory_created_after_the_scan_started_is_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mtime = std::fs::metadata(dir.path()).unwrap().modified().unwrap();
+        // Exactly the shape a scan sees: `now` from just before the dir's own
+        // timestamp. Taking the real mtime keeps this independent of the
+        // filesystem's timestamp granularity.
+        let scan_started = mtime - std::time::Duration::from_millis(1);
+        assert!(
+            dir_is_recent(dir.path(), &scan_started),
+            "a directory newer than the scan's `now` must not read as stale"
+        );
+        // ... and the guard keeps its other half: an old directory is not.
+        let long_after = mtime + std::time::Duration::from_secs(5);
+        assert!(!dir_is_recent(dir.path(), &long_after));
     }
 
     /// F19/SL-13: the refusal `code` rides the same frame as `err`, and both
