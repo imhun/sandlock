@@ -29,15 +29,18 @@ const SYNTHETIC_BASE: u32 = 0x0afa_0002;
 /// Last usable synthetic address (inclusive): `10.250.255.254`.
 const SYNTHETIC_END: u32 = 0x0afa_fffe;
 
-/// Per-sandbox DNS gateway address pool for the unprivileged (shared-netns)
-/// mode: each sandbox's gateway binds a `127.0.0.x` loopback address on
-/// port 53 (glibc's resolv.conf cannot express a port, so every sandbox
-/// needs its own loopback address). Loopback is a natural home for the
-/// gateway because it is per-host and never routed; it is disjoint from the
-/// synthetic range (`10.250.0.0/16`). Allocation is process-wide and
-/// atomic, mirroring the veth pool in netns mode.
+/// Per-sandbox DNS gateway address pool: each sandbox's gateway binds a
+/// `127.0.0.x` loopback address on port 53 (glibc's resolv.conf cannot
+/// express a port, so a sandbox that wants a gateway of its own needs its own
+/// loopback address). Loopback is a natural home for the gateway because it
+/// is per-host and never routed; it is disjoint from the synthetic range
+/// (`10.250.0.0/16`). Allocation is process-wide and atomic, mirroring the
+/// veth pool in netns mode.
 const GATEWAY_BASE: u32 = 0x7f00_0002; // 127.0.0.2
 const GATEWAY_END: u32 = 0x7f00_00fe; // 127.0.0.254
+
+/// How many addresses the pool holds (`127.0.0.2` .. `127.0.0.254`).
+pub const GATEWAY_POOL_SIZE: u32 = GATEWAY_END - GATEWAY_BASE + 1;
 
 static NEXT_GATEWAY: AtomicU32 = AtomicU32::new(0);
 
@@ -195,16 +198,28 @@ pub fn wildcard_suffix_matches(hostname: &str, suffix: &str) -> bool {
         && hostname.as_bytes().get(before) == Some(&b'.')
 }
 
-/// Allocate the next per-sandbox DNS gateway address (`127.0.1.x`), or
-/// `None` when the pool is exhausted (127 sandboxes per process is far above
-/// any practical worker density).
-pub fn allocate_gateway_addr() -> Option<Ipv4Addr> {
-    let n = NEXT_GATEWAY.fetch_add(1, Ordering::Relaxed);
-    let addr = GATEWAY_BASE.checked_add(n)?;
-    if addr > GATEWAY_END {
-        return None;
-    }
-    Some(Ipv4Addr::from(addr))
+/// The next candidate per-sandbox DNS gateway address, rotating through the
+/// pool (`127.0.0.2` .. `127.0.0.254`).
+///
+/// The cursor **wraps**: it is a starting hint, not a resource that can be
+/// spent. A worker process is long-lived and creates sandboxes one after
+/// another, so a cursor that only grew ran the pool out after 253 creations
+/// and every later sandbox died with "no free per-sandbox DNS gateway
+/// address" -- measured 2026-10-12 in the fork gate, where the always-on
+/// session gateway (2026-10-11) made every sandbox an allocator caller and
+/// `core_integ` failed from its 254th sandbox on.
+///
+/// Rotating is sound for both callers:
+///
+/// * netns mode -- the child binds the address inside the sandbox's *own*
+///   netns, so two sandboxes can never collide on it whatever the number;
+/// * shared-netns mode -- the caller binds and skips `AddrInUse` candidates
+///   (see `Sandbox::launch`), so an address another process still holds is
+///   passed over. The pool is only exhausted when all 253 are live at once,
+///   which is the only thing that error should mean.
+pub fn allocate_gateway_addr() -> Ipv4Addr {
+    let n = NEXT_GATEWAY.fetch_add(1, Ordering::Relaxed) % GATEWAY_POOL_SIZE;
+    Ipv4Addr::from(GATEWAY_BASE + n)
 }
 
 #[cfg(test)]
@@ -284,13 +299,59 @@ mod tests {
         assert!(wildcard_suffix_matches("api.example.com", "EXAMPLE.com"));
     }
 
+    /// The cursor is process-global, so the two tests below must not
+    /// interleave: each one reads a run of consecutive allocations.
+    static GATEWAY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn gateway_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        GATEWAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn in_gateway_pool(addr: Ipv4Addr) -> bool {
+        (GATEWAY_BASE..=GATEWAY_END).contains(&u32::from(addr))
+    }
+
     #[test]
-    fn gateway_addresses_are_sequential_and_outside_the_synthetic_range() {
-        let a = allocate_gateway_addr().unwrap();
-        let b = allocate_gateway_addr().unwrap();
-        assert_eq!(a, Ipv4Addr::new(127, 0, 0, 2));
-        assert_eq!(b, Ipv4Addr::new(127, 0, 0, 3));
-        assert!(!SyntheticDns::is_synthetic_ip(IpAddr::V4(a)));
-        assert!(!SyntheticDns::is_synthetic_ip(IpAddr::V4(b)));
+    fn gateway_addresses_advance_one_at_a_time_and_outside_the_synthetic_range() {
+        let _guard = gateway_test_lock();
+        let a = allocate_gateway_addr();
+        let b = allocate_gateway_addr();
+        // The exact starting point is not the contract (the cursor is shared);
+        // "the next address in the pool" is, and it is what makes the pool
+        // walkable in one lap.
+        let expected = GATEWAY_BASE + (u32::from(a) - GATEWAY_BASE + 1) % GATEWAY_POOL_SIZE;
+        assert_eq!(u32::from(b), expected);
+        for addr in [a, b] {
+            assert!(in_gateway_pool(addr), "{addr} must come from the pool");
+            assert!(!SyntheticDns::is_synthetic_ip(IpAddr::V4(addr)));
+        }
+    }
+
+    #[test]
+    fn the_gateway_pool_rotates_instead_of_exhausting() {
+        // RED before the rotation: the 254th allocation returned `None`, and
+        // `Sandbox::launch` turned that into a launch failure -- so a
+        // long-lived process could only ever create 253 gateway sandboxes.
+        let _guard = gateway_test_lock();
+        let pool = GATEWAY_POOL_SIZE as usize;
+        let run: Vec<Ipv4Addr> = (0..2 * pool).map(|_| allocate_gateway_addr()).collect();
+        assert_eq!(
+            run[..pool]
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            pool,
+            "one lap must hand out every address exactly once"
+        );
+        assert_eq!(
+            run[..pool],
+            run[pool..],
+            "the second lap repeats the first, in order: the cursor comes back \
+             around instead of running out"
+        );
+        assert!(run.iter().all(|addr| in_gateway_pool(*addr)));
     }
 }

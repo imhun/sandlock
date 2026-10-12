@@ -277,7 +277,37 @@
 # Environment note for the root phases: `test-all.sh` passes `--offline`, and
 # the repo-local cargo cache is missing `aho-corasick`, so the first
 # `--oci-root` run on a fresh machine has to warm the cache outside the script.
-core_lib = 945 # 2026-10-10 (N95): 944 -> 945, +1 -- `chroot::resolve`'s
+#
+# 2026-10-12 (N100): **the gate was red from `aee1bad` on, and nobody had
+# run it.** `aee1bad` made the session DNS gateway always on (2026-10-11), so
+# *every* sandbox -- not just the ones with a wildcard rule -- called
+# `dns_synth::allocate_gateway_addr`. That function was a process-global
+# `fetch_add` cursor over `127.0.0.2` .. `127.0.0.254` that was **never
+# released**: the 254th sandbox in one process got `None`, and
+# `Sandbox::launch` turned it into "per-sandbox DNS gateway pool exhausted".
+# `core_integ` creates ~300 sandboxes in one process, so from its 254th on
+# every case failed (`no free per-sandbox DNS gateway address in 127.0.1.0/24`
+# -- 26 FAILED, measured 2026-10-12, `tmp/k0s/core-integ-nocapture.log`), while
+# each family run alone stayed green because it never reached the limit. The
+# fix makes the cursor *rotate* (`GATEWAY_POOL_SIZE` per lap): netns mode
+# binds the address inside the sandbox's own netns, where it is only a hint,
+# and shared-netns mode already probes with `bind` and skips `AddrInUse`, so
+# one lap always finds a free address unless all 253 are live at once -- which
+# is the only thing that error should mean. A worker process can therefore
+# create sandboxes for as long as it lives, not 253 of them.
+core_lib = 946 # 2026-10-12 (N100): 945 -> 946, +1 -- the per-sandbox DNS
+               # gateway pool now *rotates* instead of growing a cursor that
+               # could only be spent once (see the N100 note below), and
+               # `network::dns_synth` pins that:
+               # `the_gateway_pool_rotates_instead_of_exhausting` (one lap
+               # hands out all 253 addresses; the second lap repeats the first
+               # in order). The test it replaces,
+               # `gateway_addresses_are_sequential_and_outside_the_synthetic_
+               # range`, read the cursor's absolute phase -- which two tests
+               # sharing one process-global cursor cannot both do -- so it
+               # became `..._advance_one_at_a_time_and_outside_the_synthetic_
+               # range` and asserts the step, not the starting point.
+               # 2026-10-10 (N95): 944 -> 945, +1 -- `chroot::resolve`'s
                # `test_resolve_in_root_names_the_parent_errno`: a creating
                # resolve under a missing parent must name ENOENT (it used to
                # be a nameless `None` that every write handler turned into

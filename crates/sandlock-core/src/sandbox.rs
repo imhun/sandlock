@@ -2302,11 +2302,11 @@ impl Sandbox {
         let need_gateway = SESSION_DNS_GATEWAY_ALWAYS_ON || !wildcard_suffixes.is_empty();
         let netns_gateway_ip: Option<std::net::Ipv4Addr> = if self.net_isolation {
             let ip = if need_gateway {
-                Some(crate::network::dns_synth::allocate_gateway_addr().ok_or_else(|| {
-                    SandboxRuntimeError::Child(
-                        "per-sandbox DNS gateway pool exhausted (127.0.1.0/24)".into(),
-                    )
-                })?)
+                // The address is bound by the child inside the sandbox's own
+                // netns, so it is a hint rather than a resource: two sandboxes
+                // can never collide on it and this branch cannot run the pool
+                // out (see `dns_synth::allocate_gateway_addr`).
+                Some(crate::network::dns_synth::allocate_gateway_addr())
             } else {
                 None
             };
@@ -2975,7 +2975,7 @@ impl Sandbox {
             // sandbox's own netns and reported the socket's fd number; dup
             // it here and wrap it in a tokio UDP socket. Shared-netns mode
             // (default) keeps binding the gateway supervisor-side as before.
-            let (gateway_ip, dns_sock) = if let Some(gateway_ip) = netns_gateway_ip {
+            let gateway = if let Some(gateway_ip) = netns_gateway_ip {
                 let dns_fd_num = read_u32_fd(pipes.dns_r.as_raw_fd()).map_err(|e| {
                     SandboxRuntimeError::Child(format!("read DNS gateway fd from child: {}", e))
                 })?;
@@ -3003,7 +3003,7 @@ impl Sandbox {
                         e
                     ))
                 })?;
-                (gateway_ip, dns_sock)
+                Some((gateway_ip, dns_sock))
             } else {
                 // Shared-netns mode: this supervisor binds, and on a worker
                 // that runs route-B slots the supervisor is one of *several*
@@ -3020,9 +3020,15 @@ impl Sandbox {
                 // keep it only if the bind takes. `AddrInUse` means someone
                 // else holds that address and the pool has another; anything
                 // else is a real failure and is reported as such.
+                let required = !wildcard_suffixes.is_empty();
                 let mut taken: Option<(std::net::Ipv4Addr, tokio::net::UdpSocket)> = None;
                 let mut last_err: Option<std::io::Error> = None;
-                while let Some(ip) = crate::network::dns_synth::allocate_gateway_addr() {
+                let mut refused: Option<std::io::Error> = None;
+                // One lap: the cursor wraps, so a pool that is not fully live
+                // always yields an address within `GATEWAY_POOL_SIZE` probes,
+                // and the error below means what it says -- all 253 in use.
+                for _ in 0..crate::network::dns_synth::GATEWAY_POOL_SIZE {
+                    let ip = crate::network::dns_synth::allocate_gateway_addr();
                     let gateway_addr = std::net::SocketAddr::from((ip, 53));
                     match tokio::net::UdpSocket::bind(gateway_addr).await {
                         Ok(sock) => {
@@ -3033,35 +3039,56 @@ impl Sandbox {
                             last_err = Some(e);
                             continue;
                         }
+                        // Not "someone else holds it" but "this process may not
+                        // bind a low port here at all": no low-port window in
+                        // this netns, or a *nested* sandbox whose outer policy
+                        // refuses `bind` (measured 2026-10-12, cli
+                        // `test_no_supervisor_nested_sandbox`). No other
+                        // candidate can fare better, so stop probing.
                         Err(e) => {
-                            return Err(SandboxRuntimeError::Child(format!(
-                                "bind DNS gateway: {}",
-                                e
-                            ))
-                            .into());
+                            refused = Some(e);
+                            break;
                         }
                     }
                 }
-                taken.ok_or_else(|| {
-                    crate::error::SandlockError::Runtime(SandboxRuntimeError::Child(format!(
-                        "no free per-sandbox DNS gateway address in 127.0.1.0/24{}",
-                        last_err
-                            .map(|e| format!(" (last: {e})"))
-                            .unwrap_or_default()
-                    )))
-                })?
+                if taken.is_none() && required {
+                    // A wildcard rule *needs* the gateway, so this is a real
+                    // failure and it names its cause.
+                    return Err(crate::error::SandlockError::Runtime(
+                        SandboxRuntimeError::Child(match refused {
+                            Some(e) => format!("bind DNS gateway: {}", e),
+                            None => format!(
+                                "no free per-sandbox DNS gateway address in 127.0.0.0/24{}",
+                                last_err
+                                    .map(|e| format!(" (last: {e})"))
+                                    .unwrap_or_default()
+                            ),
+                        }),
+                    )
+                    .into());
+                }
+                // `None` with no wildcard rule: the always-on session gateway
+                // could not be offered in this shape. Leave the image's own
+                // `resolv.conf` in place instead of refusing to launch -- the
+                // sandbox keeps working and no wildcard rule is at stake.
+                taken
             };
-            let dns = crate::network::dns_synth::SyntheticDns::new();
-            gateway_synthetic_dns = Some(dns.clone());
-            let upstream = worker_upstream_resolver();
-            let gateway_handle =
-                tokio::spawn(run_dns_gateway(dns_sock, wildcard_suffixes, dns, upstream));
-            self.rt_mut().dns_gateway_handle = Some(gateway_handle);
-            self.rt_mut().dns_gateway_addr = Some(gateway_ip);
-            Some(format!(
-                "nameserver {}\noptions ndots:0 timeout:1 attempts:1\n",
-                gateway_ip
-            ))
+            match gateway {
+                Some((gateway_ip, dns_sock)) => {
+                    let dns = crate::network::dns_synth::SyntheticDns::new();
+                    gateway_synthetic_dns = Some(dns.clone());
+                    let upstream = worker_upstream_resolver();
+                    let gateway_handle =
+                        tokio::spawn(run_dns_gateway(dns_sock, wildcard_suffixes, dns, upstream));
+                    self.rt_mut().dns_gateway_handle = Some(gateway_handle);
+                    self.rt_mut().dns_gateway_addr = Some(gateway_ip);
+                    Some(format!(
+                        "nameserver {}\noptions ndots:0 timeout:1 attempts:1\n",
+                        gateway_ip
+                    ))
+                }
+                None => None,
+            }
         } else {
             None
         };

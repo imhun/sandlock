@@ -1436,6 +1436,22 @@ fn handle_virtual_file_open(
     chroot_mounts: &[(std::path::PathBuf, std::path::PathBuf)],
     processes: &ProcessIndex,
 ) -> Option<NotifAction> {
+    // An explicit mount *at* the virtual path is the caller's own
+    // configuration and wins: F6.2/P5 makes a single-node bind mount a leaf
+    // ("the object the child asked for *is* the configured host source"), and
+    // `test_mount_single_file_node` pins exactly that with
+    // `mount /etc/resolv.conf`. The virtual file is the default for a path
+    // nobody bound -- otherwise the always-on session gateway (2026-10-10)
+    // silently shadowed a configured mount, which is a supported shape.
+    // A *directory* mount over the parent (`/etc`) still gets the virtual
+    // file, which is the same class as an image that ships its own
+    // `resolv.conf`: resolution stays platform-owned there by design.
+    if chroot_mounts
+        .iter()
+        .any(|(destination, _)| destination == virtual_path)
+    {
+        return None;
+    }
     let resolved = resolve_open_target(notif, notif_fd, chroot_root, chroot_mounts, processes)?;
     if resolved != virtual_path {
         return None;
