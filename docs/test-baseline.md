@@ -331,7 +331,29 @@
 # race that turns the task into a zombie between the check and the seize is
 # re-read rather than trusted. Any *other* EPERM still fails the freeze
 # closed.
-core_lib = 948 # 2026-10-12 (N102): 947 -> 948, +1 --
+#
+# 2026-10-12 (N104): **the freeze could leave a live task attached forever.**
+# The same nail (`tests/contract/test_exec_freeze_zombie_race.py`, E2B side)
+# stayed red under load even after N102, with the forensics naming a *live*
+# `dash` in `t (tracing stop)` and `TracerPid` set: every later `PTRACE_SEIZE`
+# on it answered EPERM, and the strict rule denied every execve in that sandbox
+# from then on. The only path that can leave an attachment is `reap_pending`'s
+# bound: a task parked in an uninterruptible kernel wait cannot be detached
+# until it stops, so after 2 s the freeze gives up -- and the attachment used to
+# outlive it, because the tracer was a *pooled* `spawn_blocking` thread that
+# lives on. The freeze owner is now a dedicated thread spawned per freeze, so
+# its exit releases whatever it still holds (the kernel's `exit_ptrace`), which
+# the new nail pins directly. Verified deterministically: with `reap_pending`
+# cut to zero (give up at once) the old pooled-thread shape failed 18 of 20
+# probe cycles on `PTRACE_SEIZE tid 68: Operation not permitted` while the
+# per-freeze thread passed the same shape in 6.2 s.
+core_lib = 949 # 2026-10-12 (N104): 948 -> 949, +1 --
+               # `freeze::tests::a_task_left_seized_is_released_when_its_tracer_
+               # thread_exits`: the kernel detaches a thread's tracees when that
+               # thread exits, which is what makes the freeze owner's
+               # per-freeze thread able to give up on a task safely -- see the
+               # N104 note below.
+               # 2026-10-12 (N102): 947 -> 948, +1 --
                # `freeze::tests::a_zombie_task_does_not_fail_the_freeze`: a
                # zombie in the sandbox's task table made `PTRACE_SEIZE` answer
                # EPERM (not ESRCH), so the whole argv-safety freeze failed and

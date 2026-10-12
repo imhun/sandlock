@@ -69,8 +69,6 @@ use std::io;
 use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
 
-use tokio::task::JoinHandle;
-
 /// Read the `State:` field from `/proc/<tid>/status`. Returns the
 /// single-character state code (`R`, `S`, `D`, `T`, `t`, `Z`, `X`)
 /// or `None` if the file or line is unreadable.
@@ -467,8 +465,8 @@ enum FreezeCmd {
     Deny,
 }
 
-/// Handle to the dedicated blocking thread that owns an execve argv-safety
-/// freeze (F5 regression fix).
+/// Handle to the dedicated thread that owns an execve argv-safety freeze
+/// (F5 regression fix).
 ///
 /// ptrace commands are per-tracer-*thread*. The notif supervisor is an async
 /// task that can migrate between tokio workers at every `.await`, so a
@@ -476,11 +474,21 @@ enum FreezeCmd {
 /// different thread than the one that seized the peers — silently failing
 /// and leaving a sandbox peer frozen forever (observed: `sandlock-init`
 /// parked in a ptrace stop while the session hung). The whole
-/// freeze→(park)→detach lifecycle therefore runs on one `spawn_blocking`
-/// thread, exactly like the process-creation fork tracker.
+/// freeze→(park)→detach lifecycle therefore runs on one thread.
+///
+/// That thread is **spawned per freeze and exits with it**, rather than being
+/// borrowed from the blocking pool. The reason is what happens when the
+/// lifecycle has to give up: a task parked in an uninterruptible kernel wait
+/// cannot be detached until it stops, and [`reap_pending`] bounds how long the
+/// freeze waits for that — so a task can be left *seized*. The kernel releases
+/// every task a thread still holds when that thread exits (`exit_ptrace`), and
+/// a pooled thread lives on, so the attachment would survive forever: measured
+/// 2026-10-12, a live `dash` left in `t (tracing stop)` made every later
+/// `PTRACE_SEIZE` on it answer EPERM, which the strict rule turned into a
+/// denied `execve` for the whole rest of that sandbox's life.
 pub(crate) struct ExecveFreezeOwner {
     cmd_tx: SyncSender<FreezeCmd>,
-    join: Option<JoinHandle<()>>,
+    done_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 impl ExecveFreezeOwner {
@@ -490,8 +498,8 @@ impl ExecveFreezeOwner {
     pub(crate) async fn finish(mut self, allow: bool) {
         let cmd = if allow { FreezeCmd::Allow } else { FreezeCmd::Deny };
         let _ = self.cmd_tx.send(cmd);
-        if let Some(join) = self.join.take() {
-            let _ = join.await;
+        if let Some(done) = self.done_rx.take() {
+            let _ = done.await;
         }
     }
 }
@@ -521,13 +529,22 @@ pub(crate) fn spawn_execve_freeze_owner(
 ) {
     let (attached_tx, attached_rx) = tokio::sync::oneshot::channel();
     let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<FreezeCmd>(1);
-    let join = tokio::task::spawn_blocking(move || {
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    // A *dedicated* thread (see `ExecveFreezeOwner`): its exit is what releases
+    // anything this freeze had to leave seized. A spawn failure drops the
+    // closure, and with it `attached_tx` -- the caller then sees the vanished
+    // worker and denies, which is the same fail-closed answer it gives for any
+    // other freeze failure.
+    let _ = std::thread::Builder::new()
+        .name("sandlock-execve-freeze".to_string())
+        .spawn(move || {
         execve_freeze_worker(processes, caller_tid, attached_tx, cmd_rx);
+        let _ = done_tx.send(());
     });
     (
         ExecveFreezeOwner {
             cmd_tx,
-            join: Some(join),
+            done_rx: Some(done_rx),
         },
         attached_rx,
     )
@@ -574,6 +591,59 @@ fn execve_freeze_worker(
 mod tests {
     use super::*;
     use crate::seccomp::state::ProcessIndex;
+
+    /// The guarantee the freeze owner's per-freeze thread relies on: when the
+    /// tracer *thread* exits, the kernel detaches every task it still holds
+    /// (`exit_ptrace`).
+    ///
+    /// [`reap_pending`] has to bound how long it waits for a task parked in an
+    /// uninterruptible kernel wait, so a task can be left seized. If that
+    /// attachment outlived the thread, the sandbox could never `execve` again:
+    /// measured 2026-10-12, a live `dash` left in `t (tracing stop)` made every
+    /// later `PTRACE_SEIZE` on it answer EPERM, and the strict rule turned that
+    /// into a denied execve for the rest of that sandbox's life.
+    #[test]
+    fn a_task_left_seized_is_released_when_its_tracer_thread_exits() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a child to seize");
+        let pid = child.id() as i32;
+        std::thread::spawn(move || {
+            let rc = unsafe { libc::ptrace(libc::PTRACE_SEIZE as libc::c_uint, pid, 0, 0) };
+            assert_eq!(
+                rc,
+                0,
+                "PTRACE_SEIZE must succeed: {:?}",
+                io::Error::last_os_error()
+            );
+            // Deliberately no PTRACE_DETACH: the thread simply ends, which is
+            // the shape the freeze owner has once `reap_pending` gives up.
+        })
+        .join()
+        .expect("the seizing thread");
+
+        let tracer_pid = |pid: i32| -> String {
+            fs::read_to_string(format!("/proc/{pid}/status"))
+                .unwrap_or_default()
+                .lines()
+                .find_map(|line| line.strip_prefix("TracerPid:"))
+                .map(|value| value.trim().to_string())
+                .unwrap_or_else(|| "0".to_string())
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tracer_pid(pid) != "0" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the kernel must detach a thread's tracees when it exits \
+                 (TracerPid is still {})",
+                tracer_pid(pid)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     /// A zombie in the task table must not fail the freeze.
     ///
