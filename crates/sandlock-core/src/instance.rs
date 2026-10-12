@@ -1198,7 +1198,43 @@ impl SandboxInstance {
                 .into());
             }
         };
-        let pid = self.translate_announced_pid(pid)?;
+        // N99: a child that exits at once -- a missing binary, a command that
+        // fails immediately -- can be *gone* by the time the announced pid is
+        // translated, because that translation falls back to a full /proc scan
+        // (`procfs.rs::PidNsMap::host_pid`) whose cost grows with the number of
+        // processes on the node. Refusing there turns "the command exited 127"
+        // into "the exec failed", which is what a busy fleet saw while an idle
+        // box never did (measured 2026-10-12: 0 refusals at <=800 processes,
+        // 25% at 1500, 93-98% at 3000; see
+        // `deploy/scripts/acceptance/probe_n99_short_lived_child.py`).
+        //
+        // The exec itself did happen and the child did exit, so answer that
+        // instead: register the child with the exit status init reports and
+        // hand back a **sentinel pid** (0 -- no host process). That is what
+        // every caller's liveness poll already wants ("it is gone"), and
+        // `wait_child` then returns the real status rather than hanging.
+        // `kill_child` stays safe for such a child because the status is cached
+        // *before* it is registered, and that check is the first thing
+        // `kill_child` does -- a sentinel pid must never reach a signal.
+        let mut early_exit: Option<ExitStatus> = None;
+        let pid = match self.translate_announced_pid(pid) {
+            Ok(host) => host,
+            Err(refused) => {
+                let session = self
+                    .exec_session
+                    .as_ref()
+                    .expect("exec session presence checked by callers");
+                let rx = session.link.register_exit(child_id);
+                match tokio::time::timeout(EARLY_EXIT_GRACE, rx).await {
+                    Ok(Ok(status)) => {
+                        early_exit = Some(status);
+                        0
+                    }
+                    // No exit frame arrived: keep the fail-closed refusal.
+                    _ => return Err(refused),
+                }
+            }
+        };
         // Seed the tracked cwd from the request. The child already chdir'd to
         // it, but that chdir is serviced by *recording* (see
         // handle_chroot_chdir), and the seed is what makes the record
@@ -1250,7 +1286,7 @@ impl SandboxInstance {
                 // the handle's master either way.
                 pty: registry_pty,
                 params: params.clone(),
-                status: None,
+                status: early_exit,
                 net_gen,
             },
         );
@@ -3644,6 +3680,14 @@ mod tests {
 }
 /// How far up a parent chain [`SandboxInstance::grown_by_target`] looks.
 const MAX_ANCESTOR_HOPS: usize = 32;
+
+/// How long an exec waits for the exit frame of a child whose announced pid
+/// could not be translated, before it keeps the old fail-closed refusal (N99).
+///
+/// The child is already gone in that case -- the init has reaped it and queued
+/// its exit -- so the frame is either buffered already or on its way; the bound
+/// only exists so a machinery failure still refuses instead of hanging.
+const EARLY_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The parent of `pid` in this process's own pid namespace, when it is alive.
 ///
