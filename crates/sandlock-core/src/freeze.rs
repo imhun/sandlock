@@ -121,9 +121,18 @@ enum SeizeOutcome {
 /// PTRACE_INTERRUPT did not), the function detaches itself before
 /// returning so the caller doesn't have to track partial state.
 fn seize_and_interrupt(tid: i32) -> io::Result<SeizeOutcome> {
-    // Fast path: the kernel is already holding this task; it cannot mutate
-    // user memory and does not need an attachment.
-    if read_task_state(tid) == Some('D') {
+    // Fast path: a task the kernel already holds (`D`) and a task that has
+    // already exited but not been reaped (`Z`, `X`) both need no attachment --
+    // neither can run user code, so neither can mutate argv.
+    //
+    // The zombie case is not cosmetic. `PTRACE_SEIZE` on a zombie answers
+    // **EPERM**, not ESRCH (measured 2026-10-12), so a sandbox that had just
+    // lost a short-lived child -- a `sleep` that finished, a `/bin/true` in a
+    // shell loop -- failed the whole freeze and, by the strict rule below, had
+    // its *unrelated* concurrent execve denied with EPERM. The task table
+    // keeps the zombie until its parent reaps it, which is a window a busy
+    // sandbox is in most of the time.
+    if matches!(read_task_state(tid), Some('D' | 'Z' | 'X')) {
         return Ok(SeizeOutcome::NotNeeded);
     }
 
@@ -134,6 +143,15 @@ fn seize_and_interrupt(tid: i32) -> io::Result<SeizeOutcome> {
         let err = io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::ESRCH) {
             return Ok(SeizeOutcome::NotNeeded); // already exited
+        }
+        // The task can become a zombie between the check above and the seize
+        // (or disappear entirely). Re-read the state rather than trusting the
+        // errno: any *other* EPERM -- a foreign tracer, a policy refusal --
+        // must still fail the freeze closed.
+        if err.raw_os_error() == Some(libc::EPERM)
+            && matches!(read_task_state(tid), Some('Z' | 'X') | None)
+        {
+            return Ok(SeizeOutcome::NotNeeded);
         }
         return Err(io::Error::new(
             err.kind(),
@@ -556,6 +574,38 @@ fn execve_freeze_worker(
 mod tests {
     use super::*;
     use crate::seccomp::state::ProcessIndex;
+
+    /// A zombie in the task table must not fail the freeze.
+    ///
+    /// `PTRACE_SEIZE` answers **EPERM** for a zombie (not ESRCH), and the
+    /// strict rule turns any failure into "deny this execve with EPERM" --
+    /// measured 2026-10-12: a sandbox running a fork+exec storm had every
+    /// *other* exec denied while an unreaped child sat in `/proc`, and the
+    /// sandbox recovered the moment the storm stopped (the zombie was reaped).
+    /// A zombie cannot run user code, so it is not a writer.
+    #[test]
+    fn a_zombie_task_does_not_fail_the_freeze() {
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn a child that exits at once");
+        let pid = child.id() as i32;
+        // Wait for the exit *without* reaping: the task stays in the table as
+        // a zombie until `wait` below.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while read_task_state(pid) != Some('Z') {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child pid {pid} never reached the zombie state"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            seize_and_interrupt(pid).expect("a zombie is not a freeze failure"),
+            SeizeOutcome::NotNeeded,
+            "a zombie cannot mutate argv, so it needs no attachment"
+        );
+        let _ = child.wait();
+    }
 
     #[test]
     fn list_threads_of_tgid_includes_self() {

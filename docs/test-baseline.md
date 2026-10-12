@@ -313,7 +313,31 @@
 # `test_list_live_sandboxes_empty` only ever hit it once. A future mtime now
 # reads as recent, and the new nail pins both halves (newer than `now` is
 # recent; five seconds older is not).
-core_lib = 947 # 2026-10-12 (N101): 946 -> 947, +1 --
+#
+# 2026-10-12 (N102): **a zombie in the sandbox's task table denied unrelated
+# execve calls.** The argv-safety freeze walks every task in the sandbox and
+# `PTRACE_SEIZE`s it; the strict rule turns any seize failure into "deny this
+# execve with EPERM" (TOCTOU invariant). `PTRACE_SEIZE` on a task that has
+# exited but not been reaped answers **EPERM**, and only ESRCH was treated as
+# "already exited", so the freeze failed and an *unrelated* process's execve
+# was denied. Measured 2026-10-12 with a pause/exec-storm probe
+# (`tests/contract/test_zz_probe_pause_exec_race.py`): a sandbox running
+# `while :; do /bin/true; done` had 3-13 of 20 pause/resume cycles fail with
+# `/bin/sh: 1: touch: Operation not permitted`, and the sandbox recovered the
+# moment the storm stopped (i.e. once the zombie was reaped) -- the trace that
+# named it reads `seize tid=80 state=Some('S')` / `detach tid=80 rc=0` /
+# `seize tid=80 state=Some('Z')` / `SEIZE FAILED Operation not permitted`.
+# Zombies (`Z`/`X`) are now skipped like the `D` fast path already was, and a
+# race that turns the task into a zombie between the check and the seize is
+# re-read rather than trusted. Any *other* EPERM still fails the freeze
+# closed.
+core_lib = 948 # 2026-10-12 (N102): 947 -> 948, +1 --
+               # `freeze::tests::a_zombie_task_does_not_fail_the_freeze`: a
+               # zombie in the sandbox's task table made `PTRACE_SEIZE` answer
+               # EPERM (not ESRCH), so the whole argv-safety freeze failed and
+               # an *unrelated* concurrent execve was denied -- see the N102
+               # note below.
+               # 2026-10-12 (N101): 946 -> 947, +1 --
                # `control::tests::a_directory_created_after_the_scan_started_
                # is_recent`: `dir_is_recent` read `SystemTime::duration_since`'s
                # `Err` (the dir's mtime is *after* the `now` the scan captured)
