@@ -177,6 +177,22 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_workdir(
     Box::into_raw(Box::new(builder.workdir(path)))
 }
 
+/// Create the COW branch in discard mode; see `SandboxBuilder::cow_discard`.
+///
+/// # Safety
+/// `b` must be a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_cow_discard(
+    b: *mut SandboxBuilder,
+    v: bool,
+) -> *mut SandboxBuilder {
+    if b.is_null() {
+        return b;
+    }
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.cow_discard(v)))
+}
+
 /// # Safety
 /// `b` and `path` must be valid pointers.
 #[no_mangle]

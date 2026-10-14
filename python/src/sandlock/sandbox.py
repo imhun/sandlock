@@ -605,6 +605,14 @@ class Sandbox:
     """COW root directory.  Only controls which directory COW tracks —
     does NOT set the child's working directory.  Use ``cwd`` for that."""
 
+    cow_discard: bool = False
+    """Release the COW upper on exit instead of merging it into ``workdir``.
+
+    For a ``workdir`` the sandbox must not write — the writable-rootfs route
+    uses the shared image rootfs as its COW root, where a merge would write one
+    tenant's changes into every tenant's cache.  Ignored when no branch is
+    created (``workdir`` unset)."""
+
     cwd: str | None = None
     """Child working directory (chdir target).  The child process starts
     in this directory.  Independent of ``workdir`` (COW root)."""

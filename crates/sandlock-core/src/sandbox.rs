@@ -668,6 +668,8 @@ pub struct Sandbox {
 
     // Filesystem branch
     pub workdir: Option<PathBuf>,
+    /// Create the COW branch in discard mode (see `SandboxBuilder::cow_discard`).
+    pub cow_discard: bool,
     pub cwd: Option<PathBuf>,
     pub fs_storage: Option<PathBuf>,
     pub max_disk: Option<ByteSize>,
@@ -880,6 +882,7 @@ impl Clone for Sandbox {
             // spawn-time upper grant lands in fs_readable.
             cow_upper: self.cow_upper.clone(),
             workdir: self.workdir.clone(),
+            cow_discard: self.cow_discard,
             cwd: self.cwd.clone(),
             fs_storage: self.fs_storage.clone(),
             max_disk: self.max_disk,
@@ -2381,7 +2384,12 @@ impl Sandbox {
             let workdir = self.workdir.as_ref().unwrap().clone();
             let storage = self.fs_storage.clone();
             let max_disk = self.max_disk.map(|b| b.0).unwrap_or(0);
-            match crate::cow::seccomp::SeccompCowBranch::create(&workdir, storage.as_deref(), max_disk) {
+            match crate::cow::seccomp::SeccompCowBranch::create_with(
+                &workdir,
+                storage.as_deref(),
+                max_disk,
+                self.cow_discard,
+            ) {
                 Ok(mut branch) => {
                     // `Keep` must survive a sandbox that is never `wait()`ed:
                     // the branch only reaches `Sandbox`'s own disposition after

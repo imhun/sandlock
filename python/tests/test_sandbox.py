@@ -948,6 +948,21 @@ class TestUnwiredFieldWarning:
             _policy(notify_rate_limit=1000).run(["echo", "ok"])
         assert [str(x.message) for x in w if "notify_rate_limit" in str(x.message)] == []
 
+    def test_cow_discard_is_declared_handled(self):
+        """`cow_discard` 经 FFI 生效，不得被当成未接线字段。
+
+        No `workdir`, so no COW branch is created and the field is inert here —
+        the pin is about the *declaration*, which is what the warning is keyed
+        on (`_HANDLED_FIELDS`). The behaviour is pinned in Rust
+        (`cow::seccomp::tests::discard_refuses_to_merge_even_when_the_caller_asks_to_commit`).
+        """
+        import warnings
+        assert "cow_discard" in _NativePolicy._HANDLED_FIELDS
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            _policy(cow_discard=True).run(["echo", "ok"])
+        assert [str(x.message) for x in w if "cow_discard" in str(x.message)] == []
+
 class TestDiskQuota:
     """Tests for max_disk quota enforcement via seccomp COW.
 

@@ -214,6 +214,16 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "workdir"))]
     pub workdir: Option<PathBuf>,
 
+    /// Create the COW branch in discard mode: `commit` releases the upper
+    /// instead of merging it into `workdir`.
+    ///
+    /// For a lower the sandbox must not write -- the writable-rootfs route uses
+    /// the *shared* image rootfs as `workdir`, where a merge would write one
+    /// tenant's changes into every tenant's cache. Ignored when no branch is
+    /// created (`workdir` unset).
+    #[cfg_attr(feature = "cli", arg(long = "cow-discard"))]
+    pub cow_discard: bool,
+
     #[cfg_attr(feature = "cli", arg(long = "cwd"))]
     pub cwd: Option<PathBuf>,
 
@@ -443,6 +453,7 @@ impl Default for SandboxBuilder {
             no_coredump: false,
             deterministic_dirs: false,
             workdir: None,
+            cow_discard: false,
             cwd: None,
             fs_storage: None,
             max_disk: None,
@@ -522,6 +533,7 @@ impl Clone for SandboxBuilder {
             no_coredump: self.no_coredump,
             deterministic_dirs: self.deterministic_dirs,
             workdir: self.workdir.clone(),
+            cow_discard: self.cow_discard,
             cwd: self.cwd.clone(),
             fs_storage: self.fs_storage.clone(),
             max_disk: self.max_disk,
@@ -906,6 +918,12 @@ impl SandboxBuilder {
 
     pub fn workdir(mut self, path: impl Into<PathBuf>) -> Self {
         self.workdir = Some(path.into());
+        self
+    }
+
+    /// Create the COW branch in discard mode; see the field's note.
+    pub fn cow_discard(mut self, discard: bool) -> Self {
+        self.cow_discard = discard;
         self
     }
 
@@ -1469,6 +1487,7 @@ impl SandboxBuilder {
             no_coredump: self.no_coredump,
             deterministic_dirs: self.deterministic_dirs,
             workdir: self.workdir,
+            cow_discard: self.cow_discard,
             cwd: self.cwd,
             fs_storage: self.fs_storage,
             max_disk: self.max_disk,

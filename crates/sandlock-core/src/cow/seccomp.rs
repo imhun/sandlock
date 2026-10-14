@@ -627,6 +627,11 @@ pub struct SeccompCowBranch {
     keep_if_abandoned: bool,
     max_disk_bytes: u64,
     disk_used: u64,
+    /// A branch whose lower must never be written: `commit` releases the upper
+    /// instead of merging it, and `commit_merge` refuses outright. Set by the
+    /// writable-rootfs route, whose lower is the *shared* image rootfs -- a
+    /// merge there would write one tenant's changes into every tenant's cache.
+    discard: bool,
 }
 
 impl SeccompCowBranch {
@@ -644,6 +649,21 @@ impl SeccompCowBranch {
     /// cross-session recovery MUST set an explicit durable `fs_storage`. See
     /// [`crate::recovery`].
     pub fn create(workdir: &Path, storage: Option<&Path>, max_disk_bytes: u64) -> Result<Self, BranchError> {
+        Self::create_with(workdir, storage, max_disk_bytes, false)
+    }
+
+    /// [`Self::create`] with the commit policy named.
+    ///
+    /// `discard == true` says the lower is not this branch's to write: `commit`
+    /// releases the upper instead of merging it, and `commit_merge` refuses even
+    /// when a caller reaches it by another path. The writable-rootfs route uses
+    /// it because its lower is the shared image rootfs (see the field's note).
+    pub fn create_with(
+        workdir: &Path,
+        storage: Option<&Path>,
+        max_disk_bytes: u64,
+        discard: bool,
+    ) -> Result<Self, BranchError> {
         let storage_base = match storage {
             Some(p) => p.to_path_buf(),
             None => resolve_default_storage_base(
@@ -685,6 +705,7 @@ impl SeccompCowBranch {
             keep_if_abandoned: false,
             max_disk_bytes,
             disk_used: 0,
+            discard,
         })
     }
 
@@ -772,6 +793,11 @@ impl SeccompCowBranch {
     /// When `additional` is 0 the check uses `>=` — meaning "quota is
     /// already exhausted, don't allow any new allocations".
     fn check_quota(&self, additional: u64) -> Result<(), BranchError> {
+        if self.discard {
+            // There is nothing to bound: a discard branch is a scratch layer the
+            // sandbox alone reads, and it is released rather than merged.
+            return Ok(());
+        }
         if self.max_disk_bytes > 0 {
             if additional == 0 {
                 if self.disk_used >= self.max_disk_bytes {
@@ -786,6 +812,9 @@ impl SeccompCowBranch {
 
     /// Recalculate `disk_used` by walking the upper directory.
     fn recalc_disk_used(&mut self) {
+        if self.discard {
+            return;
+        }
         self.disk_used = dir_size(&self.upper);
     }
 
@@ -1758,6 +1787,12 @@ impl SeccompCowBranch {
     /// Entries are merged in sorted order, so a partial merge is a prefix of a
     /// deterministic sequence rather than an arbitrary subset.
     pub fn commit(&mut self) -> Result<(), BranchError> {
+        if self.discard {
+            // The caller asked to publish; the branch's whole point is that it
+            // cannot. Releasing is the disposition, so this is not an error the
+            // caller has to handle -- it is the answer.
+            return self.abort();
+        }
         self.commit_inner(DROP_COMMIT_LOCK_WAIT, std::thread::sleep)
     }
 
@@ -1858,6 +1893,14 @@ impl SeccompCowBranch {
     /// destructive step so a crash mid-merge still leaves a sweep something to
     /// find.
     fn commit_merge(&mut self) -> Result<(), BranchError> {
+        if self.discard {
+            // Second gate: reached only if `commit`'s early return is ever
+            // bypassed. The lower is the shared image rootfs, so this is the one
+            // step that must not run.
+            return Err(BranchError::Operation(
+                "a discard branch must not merge its upper into the lower".to_string(),
+            ));
+        }
         // Nothing to merge — and therefore nothing for a crash record to
         // describe. Short-circuiting here is not an optimisation of the merge
         // below, it removes a failure the merge cannot justify:
@@ -2463,6 +2506,48 @@ mod tests {
         };
         assert!(kept.exists(), "a kept branch must survive drop");
         let _ = fs::remove_dir_all(&kept);
+    }
+
+    /// A discard branch is the writable-rootfs route's safety rail: its lower is
+    /// the *shared* image rootfs, so a merge would write one tenant's changes
+    /// into every tenant's cache. The caller asking to commit must not be able
+    /// to reach the merge at all.
+    #[test]
+    fn discard_refuses_to_merge_even_when_the_caller_asks_to_commit() {
+        let lower = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let f = lower.path().join("f");
+        fs::write(&f, b"lower").unwrap();
+
+        let mut branch =
+            SeccompCowBranch::create_with(lower.path(), Some(storage.path()), 0, true).unwrap();
+        let dir = branch.storage_dir.clone();
+        branch.handle_open(f.to_str().unwrap(), libc::O_WRONLY as u64).unwrap();
+        branch.commit().unwrap();
+
+        assert_eq!(fs::read(&f).unwrap(), b"lower", "the lower must not be written");
+        assert!(!dir.exists(), "a discard branch releases its upper on commit");
+    }
+
+    /// The quota is a statement about the *workdir* this branch would merge into.
+    /// A discard branch never merges, so it neither walks the upper for an
+    /// accounting figure nor refuses a write on it (design doc D3: the O(upper)
+    /// `recalc_disk_used` is what makes a write-open cost 8 ms at 5200 entries).
+    #[test]
+    fn a_discard_branch_ignores_max_disk() {
+        let lower = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::write(lower.path().join("big"), vec![0u8; 64 * 1024]).unwrap();
+
+        // One byte of "quota": a merging branch would refuse the second open.
+        let mut branch =
+            SeccompCowBranch::create_with(lower.path(), Some(storage.path()), 1, true).unwrap();
+        let big = lower.path().join("big");
+        branch.handle_open(big.to_str().unwrap(), libc::O_WRONLY as u64).unwrap();
+        assert!(
+            branch.handle_open(big.to_str().unwrap(), libc::O_WRONLY as u64).is_ok(),
+            "a discard branch has no workdir to bound"
+        );
     }
 
     /// A commit that cannot record itself must not start destroying.

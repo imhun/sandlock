@@ -347,7 +347,16 @@
 # cut to zero (give up at once) the old pooled-thread shape failed 18 of 20
 # probe cycles on `PTRACE_SEIZE tid 68: Operation not permitted` while the
 # per-freeze thread passed the same shape in 6.2 s.
-core_lib = 947 # 2026-10-14 (netns-egress end-state B, tasks 1-4): 949 -> 947,
+core_lib = 949 # 2026-10-14 (writable rootfs COW, task 1): 947 -> 949, +2 --
+               # `cow::seccomp::tests::discard_refuses_to_merge_even_when_the_
+               # caller_asks_to_commit` and
+               # `cow::seccomp::tests::a_discard_branch_ignores_max_disk`: a
+               # discard-mode COW branch releases its upper instead of merging
+               # it into a lower that is not the sandbox's to write (the shared
+               # image rootfs), and skips the upper-tree accounting that would
+               # otherwise run on every write-open. See
+               # `docs/rootfs-writable-cow.md` and the phase-1 plan.
+               # 2026-10-14 (netns-egress end-state B, tasks 1-4): 949 -> 947,
                # -2. The per-exec network attribution is deleted, so its five
                # state.rs pins go with it
                # (`bound_child_policy_wins_over_shared_static_policy`,
@@ -1419,7 +1428,12 @@ oci = 157     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root.
               # 56 lib + 68 bin + 15 integration.rs + 2 reaper + 3 process
               # groups = 144).
 cli_build = 0 # workspace release build gate (no test binaries; 0 = build passed)
-python = 465  # 2026-10-06: 466 -> 465 -- N79's `notify_rate_limit_stat` retired
+python = 466  # 2026-10-14 (writable rootfs COW, task 1): 465 -> 466, +1 --
+              # `TestUnwiredFieldWarning::test_cow_discard_is_declared_handled`:
+              # the new `cow_discard` policy field must not be reported as
+              # unwired (verified falsifiable: removing it from
+              # `_HANDLED_FIELDS` turns the pin red).
+              # 2026-10-06: 466 -> 465 -- N79's `notify_rate_limit_stat` retired
               # (N81 superseded it: the stat family leaves the notify table),
               # so its wiring test went with the field.
               # F19/SL-13 (2026-09-14): 464 -> 465, +1 in
