@@ -314,10 +314,14 @@ impl PolicyContext {
 /// so it can only narrow the instance policy — never widen it. The caller
 /// (the `update_network` verb) validates the request against the ceiling's
 /// explicit denies before calling this.
+///
+/// The write lock is taken with `expect`, exactly like the ceiling write in
+/// `Sandbox::create`: a poisoned lock is a real failure, and the verb must not
+/// report success while the narrowing never landed (the FFI entry point turns
+/// the unwind into an error code).
 pub fn narrow_live_network(live: &Arc<RwLock<LivePolicy>>, ips: &[IpAddr]) {
-    if let Ok(mut lp) = live.write() {
-        lp.narrowed_ips = Some(ips.iter().copied().collect());
-    }
+    let mut lp = live.write().expect("live policy lock");
+    lp.narrowed_ips = Some(ips.iter().copied().collect());
 }
 
 // ============================================================

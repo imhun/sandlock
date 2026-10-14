@@ -896,13 +896,30 @@ async fn test_failed_chdir_is_loud_exit_125() {
 async fn test_update_network_refuses_static_denylist_destination() {
     // net_allow and net_deny are mutually exclusive at build time: a pure
     // DenyList instance is default-allow except the explicit denies.
-    let policy = base_policy().net_deny("127.0.0.2");
+    let policy = base_policy().net_deny("127.0.0.2").net_deny("127.0.0.3");
     let mut inst = launch_exec_only_tmp(policy).await;
 
     let err = inst
         .update_network(&["127.0.0.2".parse::<IpAddr>().unwrap()])
         .await
         .expect_err("a statically denied destination must be refused");
+    match err {
+        SandlockError::Runtime(SandboxRuntimeError::PolicyTooWide {
+            field: "update_network",
+            value,
+        }) => assert_eq!(value, "127.0.0.2"),
+        other => panic!("expected update_network PolicyTooWide, got {other:?}"),
+    }
+
+    // Two denied destinations in one request name the sorted-first one, not
+    // whichever entry the `HashSet` happened to yield.
+    let err = inst
+        .update_network(&[
+            "127.0.0.3".parse::<IpAddr>().unwrap(),
+            "127.0.0.2".parse::<IpAddr>().unwrap(),
+        ])
+        .await
+        .expect_err("both denied destinations must be refused");
     match err {
         SandlockError::Runtime(SandboxRuntimeError::PolicyTooWide {
             field: "update_network",

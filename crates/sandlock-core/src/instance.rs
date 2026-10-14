@@ -1560,7 +1560,11 @@ impl SandboxInstance {
         {
             return Ok(());
         }
-        for ip in &normalized {
+        // Sorted, so a request naming two denied IPs always names the same one
+        // in `PolicyTooWide.value` (the `HashSet` iteration order is not).
+        let mut narrowed: Vec<IpAddr> = normalized.iter().copied().collect();
+        narrowed.sort_unstable();
+        for ip in &narrowed {
             for ceiling in [&ns.tcp_policy, &ns.udp_policy, &ns.icmp_policy] {
                 if crate::seccomp::state::update_network_denied_by_ceiling(ceiling, *ip) {
                     return Err(SandboxRuntimeError::PolicyTooWide {
@@ -1573,7 +1577,6 @@ impl SandboxInstance {
         }
         // Instance-wide narrowing: every process of the sandbox (running or
         // exec'd later) is judged against this set from its next connect on.
-        let narrowed: Vec<IpAddr> = normalized.iter().copied().collect();
         crate::policy_fn::narrow_live_network(&live, &narrowed);
         Ok(())
     }
