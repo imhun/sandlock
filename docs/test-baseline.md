@@ -347,7 +347,29 @@
 # cut to zero (give up at once) the old pooled-thread shape failed 18 of 20
 # probe cycles on `PTRACE_SEIZE tid 68: Operation not permitted` while the
 # per-freeze thread passed the same shape in 6.2 s.
-core_lib = 950 # 2026-10-14 (writable rootfs COW, task 2): 949 -> 950, +1 --
+core_lib = 952 # 2026-10-14 (writable rootfs COW, task 3): 950 -> 952, +2 --
+               # `landlock::tests::the_cow_upper_dir_is_readable_and_executabl
+               # e_by_the_sandbox` and `landlock::tests::a_branchless_policy_
+               # installs_exactly_its_declared_host_grants`. The writable-
+               # rootfs route's upper is a sibling of the sandbox tree
+               # (`<workspace>/.rootfs/<id>/upper`), never inside the image
+               # rootfs, so the chroot-translated `fs_readable` list drops it
+               # -- `root.join(...)` names a path that does not exist. The
+               # upper therefore has to be granted as the *host* path it is,
+               # which is what `host_path_rules` now assembles (`fs_readable_
+               # host` plus `Sandbox::cow_upper`). Without it, a binary the
+               # workload wrote into the rootfs is exec'd through
+               # `/proc/self/fd/N` (`cow::dispatch::handle_cow_exec`) and
+               # Landlock judges that file by its real path -- the upper --
+               # so the exec is refused with EACCES. Read+execute only: the
+               # rule is `READ_ACCESS`, the same rights the historical
+               # `fs_readable` entry carried, and the field it reads is
+               # `pub(crate)` + `serde(skip)`, so it can only name an upper
+               # this process created (`SeccompCowBranch::create_with`) and
+               # never a path a policy document smuggled in. The second case
+               # is the fail-closed half: no branch, no upper rule, and the
+               # set is exactly the declared `fs_readable_host` grants.
+               # 2026-10-14 (writable rootfs COW, task 2): 949 -> 950, +1 --
                # `chroot::dispatch::tests::cow_owns_only_the_branch_s_own_
                # tree`: the chroot write sites admit a write the COW branch
                # owns, and the grant is `SeccompCowBranch::matches` -- the

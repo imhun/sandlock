@@ -1,5 +1,5 @@
 use std::os::fd::OwnedFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{ConfinementError, SandlockError};
 use crate::protection::{Protection, ProtectionPolicy, ProtectionStatus};
@@ -235,6 +235,45 @@ fn add_net_rule(ruleset_fd: &OwnedFd, port: u16, access: u64) -> Result<(), Conf
     .map_err(|e| ConfinementError::Landlock(format!("add net rule for port {}: {}", port, e)))?;
 
     Ok(())
+}
+
+/// The **host-path** rule set a policy installs: every `fs_readable_host`
+/// entry, plus the internal COW-upper grant (`Sandbox::cow_upper`).
+///
+/// These are the rules that are *not* chroot-translated — the path is the host
+/// path, exactly as the sandbox's own file operations resolve it. That is the
+/// only spelling that can reach the COW upper: the branch lives beside the
+/// sandbox tree (e.g. `<workspace>/.rootfs/<id>/upper`), never inside the image
+/// rootfs, so the translated `fs_readable` list drops it (`root.join(...)`
+/// names a path that does not exist).
+///
+/// Why it has to be here: Landlock judges an exec'd file by its *real* path,
+/// and a binary the workload wrote into the rootfs lives only in the upper.
+/// The mediator is what hands the kernel that file (the COW open/exec arms), so
+/// the rule is the difference between "the branch's file is reachable" and
+/// EACCES. Note the shape that matters today is the one with a root of its own:
+/// there `/proc/self/fd/N` does not resolve, so the COW *exec* redirect is not
+/// what reaches the upper (measured 2026-09-23 in `chroot::dispatch`; see the
+/// task-3 report's probe) — this rule is the Landlock half of that path, and it
+/// is the half that would refuse the upper's file if it ever were reached.
+///
+/// **Read+execute only.** The upper is the sandbox's own writable layer, but
+/// the sandbox never writes it directly: a write to a path the branch owns is
+/// served by the mediator, on the child's behalf (`ChrootCtx::cow_owns`). This
+/// rule grants `READ_ACCESS` — the same rights the historical `fs_readable`
+/// entry carried — so it cannot be read as a write grant.
+///
+/// The field is `pub(crate)` and `serde(skip)`: it can only name an upper this
+/// process created (`SeccompCowBranch::create_with`), never a path a caller
+/// smuggled in through a policy document.
+fn host_path_rules(policy: &Sandbox) -> Vec<&Path> {
+    let mut rules: Vec<&Path> = policy.fs_readable_host.iter().map(PathBuf::as_path).collect();
+    if let Some(upper) = policy.cow_upper.as_deref() {
+        if !rules.contains(&upper) {
+            rules.push(upper);
+        }
+    }
+    rules
 }
 
 // ============================================================
@@ -536,14 +575,16 @@ pub(crate) fn build_ruleset(
         })?;
     }
 
-    // Host-path grants (`fs_readable_host`). Every `fs_readable` entry above is
-    // translated *into* the rootfs when a chroot is active, and the ones that do
-    // not exist there are dropped -- which is precisely what happens to a host
-    // build artifact such as the restore stub. These entries are granted as the
-    // host paths they are; `add_path_rule` narrows a non-directory to
-    // `EXECUTE|READ_FILE` (the measured minimum for exec'ing a binary the
-    // sandbox reaches by descriptor: docs/chroot-workspace-exec.md §11.6.1).
-    for path in &policy.fs_readable_host {
+    // Host-path grants (`host_path_rules`: `fs_readable_host` plus the COW
+    // upper). Every `fs_readable` entry above is translated *into* the rootfs
+    // when a chroot is active, and the ones that do not exist there are dropped
+    // -- which is precisely what happens to a host build artifact such as the
+    // restore stub, and to the COW upper of the writable-rootfs route. These
+    // entries are granted as the host paths they are; `add_path_rule` narrows a
+    // non-directory to `EXECUTE|READ_FILE` (the measured minimum for exec'ing a
+    // binary the sandbox reaches by descriptor: docs/chroot-workspace-exec.md
+    // §11.6.1).
+    for path in host_path_rules(policy) {
         if !path.exists() {
             continue;
         }
@@ -1070,6 +1111,61 @@ mod mount_source_rights_tests {
             path_rule_rights(&sb, Path::new("/etc/resolv.conf"), WRITE_MASK),
             Some(READ_ACCESS),
             "a read-only mount falls back to read+execute even under a writable prefix",
+        );
+    }
+}
+
+// ============================================================
+// Host-path rules (the COW upper reaches the sandbox through these)
+// ============================================================
+//
+// The writable-rootfs route points a `SeccompCowBranch`'s lower at the shared
+// image rootfs and stores its upper beside the sandbox tree. Every write the
+// workload makes lands in that upper, and the mediator is what serves the
+// workload's access to it (the COW arms of the chroot handlers). Landlock
+// judges such a file by its *real* path -- the upper -- so the upper has to be
+// in the ruleset for the branch's own tree to be reachable at all. These tests
+// pin the rule set `build_ruleset` installs for host paths, which is where that
+// grant has to appear: the upper is outside the rootfs, so the
+// chroot-translated `fs_readable` list drops it.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Sandbox;
+
+    /// The host-path rules a policy carrying `cow_upper` installs, as the paths
+    /// `build_ruleset` would add a rule for.
+    fn readable_host_rules_for(cow_upper: Option<&str>) -> Vec<PathBuf> {
+        let mut sb = Sandbox::builder()
+            .build_unchecked()
+            .expect("minimal builder must produce a sandbox in unit tests");
+        sb.cow_upper = cow_upper.map(PathBuf::from);
+        host_path_rules(&sb)
+            .into_iter()
+            .map(Path::to_path_buf)
+            .collect()
+    }
+
+    #[test]
+    fn the_cow_upper_dir_is_readable_and_executable_by_the_sandbox() {
+        let rules = readable_host_rules_for(Some("/ws/.rootfs/<id>/upper"));
+        assert!(
+            rules.contains(&PathBuf::from("/ws/.rootfs/<id>/upper")),
+            "the COW upper must be a host-path rule (read+execute), got {rules:?}",
+        );
+    }
+
+    #[test]
+    fn a_branchless_policy_installs_exactly_its_declared_host_grants() {
+        // Fail-closed the other way round: no branch, no upper rule. An
+        // unconditional push (e.g. of an empty path) would grant a rule for
+        // whatever path the default spelled.
+        let rules = readable_host_rules_for(None);
+        assert_eq!(
+            rules,
+            Vec::<PathBuf>::new(),
+            "a policy with no COW branch must install no extra host rule",
         );
     }
 }
