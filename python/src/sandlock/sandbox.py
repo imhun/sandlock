@@ -2383,8 +2383,7 @@ class ExecProcess:
     @property
     def child_id(self) -> int:
         """The registered child id this process owns in the instance's
-        per-child registry (the id used by ``wait_child``/``kill_child`` and
-        reported by :meth:`SandboxInstance.update_network` staleness)."""
+        per-child registry (the id used by ``wait_child``/``kill_child``)."""
         return self._child_id
 
     def resize(self, rows: int, cols: int) -> None:

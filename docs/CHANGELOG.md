@@ -8,6 +8,23 @@
 
 ## 行为变化（升级 / 接线前必读）
 
+- **⚠️ BREAKING：出网判定改读沙箱的**当前**策略，per-exec 归属机制整体退役（终态 B，
+  2026-10-14，`7a53a18`）**：`update_network` 从"只绑新 exec"改成**实例级收窄通道**
+  （`policy_fn::narrow_live_network` 写 `PolicyFnState.live_policy` 的 `narrowed_ips`，判定时
+  与各协议的静态 ceiling 取交集）—— 收窄**对全沙箱立即生效**，包括**正在跑的命令**（旧语义下
+  它继续享受旧白名单，是 fail-open 面）；**放宽/模型翻转仍然在 persist 前拒绝**（`PolicyTooWide`
+  /控制面 409 不变，只收窄的纪律没动）。判定不再看 pid/pgid/父链：`child_policies` /
+  `pid_policies` / `resolve_pid_binding`（32 层父链 walk）/ `has_exec_bindings` / "未归属即
+  `deny_all`"的兜底 / `NetworkStaleness` 全部删除，所以脱离会话的进程（`nohup … &` /
+  `setsid … &` / daemon / 平台自己拉起的常驻 MCP 网关）不再一律 `ECONNREFUSED`。
+  **用户可见的差别**：① "后台跑、下一条 exec 读日志"这种最自然的写法**现在能用**；
+  ② 收窄一条正在跑的命令时，它**下一次 `connect` 立刻被拒**（不再有"收窄了但旧命令照跑"的窗口）；
+  ③ **没有 staleness 回报**——`sandlock_instance_update_network` **去掉三个 stale 出参**
+  （`stale` / `stale_capacity` / `out_stale_count`），签名从六个参数变成
+  `(h, ips, ip_count)`（**ABI 破坏**，`sandlock.h`、Python ctypes 绑定与
+  `SandboxInstance.update_network` 的返回值同步改成 `None`，supervise `update_network` verb 的
+  应答不再有 `stale_child_ids`）⇒ **需同批更新 wheel/`.so`**。回退杆：`git revert` 这次改动
+  + 重建 wheel/镜像（策略只在内存里，无数据迁移）。
 - **⚠️ BREAKING：退役 readiness 合成（N89，2026-10-08，`network/readiness.rs` 删除）—— 宿主
   listener 形状只服务阻塞/线程式 `accept()`**：`poll`/`ppoll`/`epoll_wait`/`epoll_pwait`
   从此**不在任何形状的通知表里**（连带 `InboundListener.pending` 这份只为合成存在的状态一起删）。
@@ -470,8 +487,9 @@
   既有合法客户端协议不变，畸形/截断帧被拒且不泄漏 fd。
 - **per-exec 参数只能收窄**（F4，`b58b634`/`c5d1108` 等）：exec 的
   `cwd/env/extra_writable/bind_ports` 越出实例创建时定死的上限 ⇒ `EPERM`/
-  `PolicyTooWide`；`update_network` 只对**新** exec 生效，在跑 child 保原策略，API
-  回报 stale child id。
+  `PolicyTooWide`。~~`update_network` 只对**新** exec 生效，在跑 child 保原策略，API
+  回报 stale child id~~ —— **这一半已被终态 B 取代**（见本节第一条：实例级立即生效、
+  无 staleness、FFI 少三个出参）；`cwd/env/extra_writable/bind_ports` 的收窄语义不变。
 - **`pid_ns` + 实例并存**（F5.3，`2c016bd`）：开 `pid_ns` 后 on-behalf `/proc` 按
   `PidKey` 收窄到本 child 子树；ns PID 1 退出不静默带走整树（实例级 reaper 语义，
   见 `docs/e2b-integration.md` §3.9/§7.4 S4 解释）。

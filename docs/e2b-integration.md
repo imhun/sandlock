@@ -57,7 +57,7 @@ F13 行）。F14（2026-09-06）：core_lib 828 / mediation_2uid 9（root 档其
 | 测试 | 非 root 测试入口 `b6ef050`（`Dockerfile.test-runner` 里 `/usr/bin/python3 → /usr/local/bin/python3` 之类由 E2B 侧镜像负责） | python 测试 | ✅ 430 passed | — |
 | M0 每沙箱一实例（fork-plan F2） | `SandboxInstance` 持 ResourceState / notif / 控制目录+token / DNS 网关；`Sandbox::run/popen/spawn` 走一次性实例（外部语义与 ABI 不变）；`shutdown()` 七步固定顺序且幂等；stats 露出 `proc_count_vs_live`/`children_live`/`instance_state` | `instance.rs`（F2.1–F2.3） | ✅ commit `57f543c`..`2cb1d99`（core_integ 477→488；全门绿） | §8 M4（E2B 接线）已由 E2B Task 1–11 于 2026-09-06 收口（见 §8 与 §7.6） |
 | M1 `exec` 下沉 + child 句柄（fork-plan F3） | init/proto/fdpass 从 `sandlock-oci` 原样搬入 `core::init`（oci 走 re-export seam，oci-root 144 精确不变）；per-child `exec/wait_child/kill_child/resize_child` + SCM_RIGHTS stdio；FFI `sandlock_instance_*`（launch/exec/wait/kill/resize/free，F4 再加 exec_params/update_network，cbindgen 同步）；Python `SandboxInstance.exec() -> ExecProcess` | core::init + supervise 双传输 + FFI/Python | ✅ commit `d063437`、`4411c7b`、`3d42bc7` + fix `3fa0b95` | supervise 主退出顺序竞态等见 `docs/fork-plan-followups.md` |
-| M2 per-exec 参数 + 子集校验（fork-plan F4） | per-exec `cwd/env/extra_writable/bind_ports`（execve 前 chdir/envp）；S9 单 choke point（越出实例上限 ⇒ EPERM/`PolicyTooWide`）；`update_network` 只绑新 exec + staleness 回报；per-child 网络按 pid 血缘、未归因 fail-closed | `exec_params.rs` + network 按 pgid 绑定 | ✅ commit `b58b634`、`9f959f1`、`c5d1108` + fixes `902e522`/`e5c7214` | per-child 正向收窄非内核可强制等 seam 见 follow-ups |
+| M2 per-exec 参数 + 子集校验（fork-plan F4） | per-exec `cwd/env/extra_writable/bind_ports`（execve 前 chdir/envp）；S9 单 choke point（越出实例上限 ⇒ EPERM/`PolicyTooWide`）。~~`update_network` 只绑新 exec + staleness 回报；per-child 网络按 pid 血缘、未归因 fail-closed~~ —— **网络这一半已被终态 B 取代**（2026-10-14，`7a53a18`）：`update_network` 写实例级收窄通道，对**全沙箱立即生效**（含在跑命令），无 staleness；per-exec 归属机制整体退役，见 `docs/CHANGELOG.md` 行为变化段 | `exec_params.rs` + network（实例级 `live_policy`） | ✅ commit `b58b634`、`9f959f1`、`c5d1108` + fixes `902e522`/`e5c7214`（网络部分后由终态 B 改写） | per-child 正向收窄非内核可强制等 seam 见 follow-ups |
 | M3 语义/默认/兜底（fork-plan F5） | 整箱 `max_processes` 默认 **256**（Q10）；多 child `checkpoint()` 显式拒绝；`pid_ns`+实例并存（PidKey 收窄 on-behalf /proc、init reaper）；统一 `InstanceDead`（FFI code 6 / python 消息）；idle `T_idle`/`T_max` | core + FFI/Python 错误面 | ✅ commit `b56fcbe`..`1321ba0`（F5.1–F5.5 + review fix） | **用户可见行为变化**已入 CHANGELOG（默认值/拒绝/Dead/寿命） |
 | SL-1/P1/P2 路径中介身份（fork-plan F6.1，**B3 硬删收口**） | A 档（同 uid 属主正确）+ B 档（两 supervise 不同 uid 真内核隔离硬证据）+ C 档 fail-closed（特权进程内中介 + 路径中介 ⇒ 建箱前拒绝，唯一修法是 route B）；**`mediation_run_as` 降级档整体删除**（builder/Policy/profile/FFI+cbindgen/CLI/Python/supervise/stats 全字段，B3 2026-09-11）；拒绝**条件触发**（`mediation_active`），无中介的纯 per-uid RunAs 与 host uid 0 / 同 uid 形态照旧可用 | notif/builder + 全栈 | ✅ commit `b62e201`、`dd5a7e8`、`7f81314` + fix `75bbe0b`；F10 `75bbe0b`；B3 本地提交（**ABI 破坏**，需同批更新 wheel/`.so`） | `--pid-ns` CLI 旧漏线等见 follow-ups |
 | P5 `fs_mount` 单节点 + `minimal_dev`（fork-plan F6.2；F13 收尾） | 单文件/chardev bind-mount（不再 ENOTDIR、ro 保持、写家族 EBUSY 防宿主源被删/移）；`minimal_dev()`（`ptmx/pts/null/urandom/zero/tty`）免整树挂 /dev 与 `/dev/shm` carve-out | core + FFI + CLI `--fs-mount` + Python | ✅ commit `de2f749`、`dc0edf3` + fix `6fcb8e2`（ffi 98、python 454）；**F13（2026-09-06）补 link 直击 pin + 目录挂载点 rmdir EBUSY（ffi 100，见 §3.1/§5 F13 行）** | 挂载点卸载能力不在本期语义（= 与真实 bind-mount 一致，禁止删除） |
@@ -581,7 +581,7 @@ socket，宿主只拿 fd）；Python 增量：`SandboxInstance.exec(...)` 返回
 | # | 待决 | 建议 |
 |---|---|---|
 | S1 | **`max_processes` 从"每命令 64"变"整箱 64"** ⇒ 现网可能立刻 fork 失败 | 同步上调默认（如 256），写进 release note；E2B 侧按沙箱显式配 |
-| S2 | **`update_network`**：实例长命后"下一条命令生效"不再自动成立（Landlock 只能加不能撤，deny→allow 做不到在线放宽） | 采用"新策略对**新 exec** 生效、已在跑的 child 保持原策略"，并在 API 上回报 staleness；在线收紧走已有 `PolicyFnState.live_policy` 路子 |
+| S2 | **`update_network`**：实例长命后"下一条命令生效"不再自动成立（Landlock 只能加不能撤，deny→allow 做不到在线放宽） | **终态 B（2026-10-14，`7a53a18`）定案**：在线收紧直接走已有的 `PolicyFnState.live_policy` 收窄通道，新策略对**全沙箱立即生效**（含**正在跑**的命令），**没有 staleness 回报**（FFI 少了三个出参）；放宽仍拒（409）。历史：M2 曾采用"新策略对**新 exec** 生效、已在跑的 child 保持原策略 + API 回报 staleness"，该形态已被取代（见 `docs/CHANGELOG.md` 行为变化段） |
 | S3 | **checkpoint 范围**：冻结已是整树，但内存快照目前面向单 address space | 多 child 时**显式拒绝**（禁止静默只存一条命令）；要支持得单独设计 |
 | S4 | **pid_ns**：ns pid 1 = 首个进程，它退出会带走整棵树 | 实例化后需要一个内部 reaper/init（或明确"共享 pidns 暂不支持"），否则不能和 `pid_ns=true` 同时用 |
 | S5 | **失败爆炸半径**：listener/runtime panic 现在会带走整箱而不是一条命令 | 定义 instance dead ⇒ 宿主见明确错误 ⇒ E2B 重建沙箱；不做静默重启 |
@@ -594,7 +594,9 @@ socket，宿主只拿 fd）；Python 增量：`SandboxInstance.exec(...)` 返回
   走一次性 instance）。验收：fork 三套全绿 + E2B 全量不变（当前 `867 passed / 1 skipped / 2 xfailed`）。
 - **M1**：`exec` + SCM_RIGHTS + child id + 按 child 的 wait/kill/resize（不开放 e2b 使用）。
   验收：lib/integration 新增并发 exec、fd 归属、双 wait 幂等、stdin 关闭不死锁的用例。
-- **M2**：per-exec `cwd/env/extra_writable/bind_ports`（Q4/S2 的 staleness 语义同时定死）。
+- **M2**：per-exec `cwd/env/extra_writable/bind_ports`（Q4/S2 的网络更新语义同时定死；S2 的
+  staleness 部分已由终态 B 退役 —— 收窄改为实例级立即生效、无 staleness 回报，见
+  `docs/CHANGELOG.md` 行为变化段）。
 - **M3**：S1 默认值调整、S3/S4 的拒绝或支持、S5/S6/S7 的生命周期与泄漏兜底。
 - **M4**：E2B 接线（`SandlockExecutor` 持 instance、`_CommandGate` 保留、控制目录名用 sandbox_id
   + 身份 token），并把 §3.8 的超卖探针从"记录"改成**断言**（第二条命令申请应被拒）。
@@ -618,8 +620,10 @@ socket，宿主只拿 fd）；Python 增量：`SandboxInstance.exec(...)` 返回
 instance 持有与释放时机（delete/kill/migrate/evict/worker 重启 → `close()` 幂等收口，
 closed/dead 重建一次）；`_build_sandbox` 的 per-command 字段改走 `exec` 参数
 （`cwd/env/clean_env/bind_ports`，PTY 用 `ExecStdio.PTY`）；`max_processes` 整箱默认
-256 与节点容量联动（`2048/256=8`）；`update_network` 按 S2 落地（D4=A：收窄可应用、
-放宽/翻转 409 不落库、staleness 日志）并同步契约测试；`minimal_dev` 替换整树 /dev；
+256 与节点容量联动（`2048/256=8`）；`update_network` 按 S2 落地（收窄可应用、放宽/翻转
+409 不落库）并同步契约测试 —— **2026-10-14 终态 B 取代当时的 D4=A 形态**：改成实例级
+立即生效通道（含正在跑的命令），staleness 日志与 `NetworkStaleness` 退役，见
+`docs/CHANGELOG.md` 行为变化段；`minimal_dev` 替换整树 /dev；
 `docs/SCALING.md` / `resource-contention.md` 的"按沙箱预留 = 按实例核算"一致性说明已随
 M4 关闭 §3.8。残余：T5（route-B 前置，strict xfail）与 E2B 侧 follow-up
 （pure-shape workspace 属主对齐、远程 pause/resume 投递），见 E2B `docs/task-backlog.md`。
