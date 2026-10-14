@@ -2611,3 +2611,106 @@ async fn test_chroot_hardlink_to_a_file_deleted_in_the_branch_is_enoent() {
 
     cleanup_rootfs(&rootfs);
 }
+
+/// The invariant the writable-rootfs route rests on, at the write call site:
+/// **a path the branch owns is served by the branch, never by a host operation
+/// on the lower.**
+///
+/// `symlinkat` is where that broke. The branch declines a symlink with an
+/// absolute (or `..`) target by design — its link text would name something
+/// outside the branch's own view — and the handler used to treat "declined"
+/// as "not COW's business" and fall through to `libc::symlink` on the resolved
+/// host path. The lower here *is* the shared image rootfs, so the entry was
+/// created there for real: a write into the cache every tenant shares.
+///
+/// The shape is the production one, minimally: the branch's workdir is the
+/// whole rootfs and the policy grants **no** write at all, so both writes below
+/// are admitted by the branch's grant alone (the policy would refuse them).
+/// The stageable half is the control — the grant still serves what the branch
+/// can stage — and both dispositions are `Keep` so the test can look inside the
+/// upper afterwards: `Abort` deletes the only evidence of *where* the write
+/// went, and the run ends on a refusal (`on_error`), so `on_exit` alone would
+/// not keep it.
+///
+/// One cage, one branch: the read-back has to happen in the same run as the
+/// write, since a second `run` would start a fresh branch with an empty upper.
+#[tokio::test]
+async fn test_chroot_cow_owned_writes_never_land_on_the_lower() {
+    let rootfs = build_test_rootfs("cow-owned-lower");
+    fs::create_dir_all(rootfs.join("usr/local")).unwrap();
+    let storage = temp_dir("cow-owned-lower-upper");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .workdir(&rootfs)
+        .fs_storage(&storage)
+        .on_exit(BranchAction::Keep)
+        .on_error(BranchAction::Keep)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            // Stage a link the branch can serve, read it back, then ask for the
+            // arm it declines (an absolute target) — all in one cage.
+            "ln -s rel-target /usr/local/rel-link && \
+             readlink /usr/local/rel-link && \
+             ln -s /etc/os-release /usr/local/abs-link",
+        ])
+        .await
+        .expect("the chroot sandbox must be creatable (N14 S5: the real root is the only shape)");
+
+    // The staged half: the branch served it, so the name reads back through the
+    // branch — and the lower has no such name, which is what makes the read a
+    // read of the *upper*.
+    assert_eq!(
+        result.stdout_str().unwrap_or_default(),
+        "rel-target",
+        "the staged symlink must read back through the branch, stderr={:?}",
+        result.stderr_str()
+    );
+    // The declined half: the mediator's own refusal (EPERM), and it is the last
+    // command of the chain, so it is also the run's exit code.
+    assert_eq!(
+        result.code(),
+        Some(1),
+        "an owned path the branch declines must be refused, stderr={:?}",
+        result.stderr_str()
+    );
+
+    let branch_dir = fs::read_dir(&storage)
+        .expect("the kept branch's storage")
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .expect("the kept branch directory");
+    let upper = branch_dir.join("upper");
+    assert_eq!(
+        fs::read_link(upper.join("usr/local/rel-link")).expect("the staged link lives in the upper"),
+        PathBuf::from("rel-target"),
+        "a write the branch serves lands in its upper"
+    );
+    assert!(
+        !upper.join("usr/local/abs-link").exists(),
+        "a refused symlink must not be staged either"
+    );
+    assert!(
+        !rootfs.join("usr/local/rel-link").exists(),
+        "the branch's lower is the shared rootfs and must gain no entry"
+    );
+    assert!(
+        !rootfs.join("usr/local/abs-link").exists(),
+        "a refused symlink must not be created on the lower"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&storage);
+}

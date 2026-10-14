@@ -1675,7 +1675,9 @@ pub(crate) async fn handle_chroot_write(
                     match cow.handle_unlink(&s, is_dir) {
                         Ok(true) => return NotifAction::ReturnValue(0),
                         Err(errno) => return NotifAction::Errno(errno),
-                        _ => {}
+                        // Owned and not staged: the mediator's own refusal,
+                        // never `unlink`/`rmdir` on the lower.
+                        _ => return NotifAction::Errno(libc::EPERM),
                     }
                 }
             }
@@ -1729,7 +1731,9 @@ pub(crate) async fn handle_chroot_write(
                     match cow.handle_mkdir(&s) {
                         Ok(true) => return NotifAction::ReturnValue(0),
                         Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
-                        _ => {}
+                        // Owned and not staged: the mediator's own refusal,
+                        // never `mkdir` on the lower.
+                        _ => return NotifAction::Errno(libc::EPERM),
                     }
                 }
             }
@@ -1788,11 +1792,23 @@ pub(crate) async fn handle_chroot_write(
             let mut cs = cow_state.lock().await;
             if let Some(cow) = cs.branch.as_mut() {
                 let old_str = old_host.to_string_lossy();
+                let new_str = new_host.to_string_lossy();
+                // A rename the branch owns on one side only cannot be staged:
+                // the other name lives on the side the branch promised to
+                // leave alone — staging in would create it in the lower, and
+                // staging out would take the lower's entry away. EXDEV is the
+                // kernel's own word for a rename that cannot span two sides,
+                // and the hard-link arm applies the same rule.
+                if cow.matches(&old_str) != cow.matches(&new_str) {
+                    return NotifAction::Errno(libc::EXDEV);
+                }
                 if cow.matches(&old_str) {
-                    match cow.handle_rename(&old_str, &new_host.to_string_lossy()) {
+                    match cow.handle_rename(&old_str, &new_str) {
                         Ok(true) => return NotifAction::ReturnValue(0),
                         Err(errno) => return NotifAction::Errno(errno),
-                        Ok(false) => {}
+                        // Owned and not staged: the mediator's own refusal,
+                        // never `rename` on the lower.
+                        Ok(false) => return NotifAction::Errno(libc::EPERM),
                     }
                 }
             }
@@ -1841,7 +1857,14 @@ pub(crate) async fn handle_chroot_write(
                     match cow.handle_symlink(&target, &s) {
                         Ok(true) => return NotifAction::ReturnValue(0),
                         Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
-                        _ => {}
+                        // Owned, and the branch declined to stage it: an
+                        // absolute (or `..`) target, whose link text would
+                        // name something outside the branch's own view. The
+                        // mediator's own refusal — falling through here issued
+                        // `symlink` on the resolved host path, which is the
+                        // lower, and the shared image rootfs gained the entry
+                        // for real.
+                        _ => return NotifAction::Errno(libc::EPERM),
                     }
                 }
             }
@@ -2022,7 +2045,9 @@ pub(crate) async fn handle_chroot_write(
                     match cow.handle_chmod(&s, mode) {
                         Ok(true) => return NotifAction::ReturnValue(0),
                         Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
-                        _ => {}
+                        // Owned and not staged: the mediator's own refusal,
+                        // never `chmod` on the lower.
+                        _ => return NotifAction::Errno(libc::EPERM),
                     }
                 }
             }
@@ -2057,7 +2082,9 @@ pub(crate) async fn handle_chroot_write(
                     match cow.handle_chown(&s, uid, gid) {
                         Ok(true) => return NotifAction::ReturnValue(0),
                         Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
-                        _ => {}
+                        // Owned and not staged: the mediator's own refusal,
+                        // never `chown`/`lchown` on the lower.
+                        _ => return NotifAction::Errno(libc::EPERM),
                     }
                 }
             }
@@ -2095,7 +2122,9 @@ pub(crate) async fn handle_chroot_write(
                     match cow.handle_truncate(&s, length) {
                         Ok(true) => return NotifAction::ReturnValue(0),
                         Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
-                        _ => {}
+                        // Owned and not staged: the mediator's own refusal,
+                        // never `truncate` on the lower.
+                        _ => return NotifAction::Errno(libc::EPERM),
                     }
                 }
             }
@@ -2523,15 +2552,13 @@ pub(crate) async fn handle_chroot_xattr(
         };
 
     let writing = matches!(op, XattrOp::Set | XattrOp::Remove);
-    // A write is admitted by the policy (virtual space) or by the branch that
-    // owns the resolved host path — the predicate `cow_resolve` below uses —
-    // but a hard refusal is final either way.
-    let allowed = if writing {
-        !ctx.write_hard_denied(&vp)
-            && (ctx.can_write(&vp) || cow_owns(cow_state, &host_path).await)
-    } else {
-        ctx.can_read(&vp)
-    };
+    // The writing ops take no COW grant: the branch does not serve them (they
+    // would have to copy the file up first, which this phase does not stage), so
+    // a path it owns stays refused exactly as it was before the writable-rootfs
+    // route. A grant here would fall through to `cow_resolve`, which answers
+    // with the *lower's* path when the upper holds no copy — the shared image
+    // rootfs — and the setxattr would land there.
+    let allowed = if writing { ctx.can_write(&vp) } else { ctx.can_read(&vp) };
     if !allowed {
         return NotifAction::Errno(libc::EACCES);
     }
@@ -2911,9 +2938,12 @@ pub(crate) async fn handle_chroot_utimensat(
         Ok(r) => r,
         Err(e) => return NotifAction::Errno(e),
     };
-    if ctx.write_hard_denied(&vp)
-        || (!ctx.can_write(&vp) && !cow_owns(cow_state, &host_path).await)
-    {
+    // The same rule as the xattr writes: the branch does not serve `utimensat`
+    // (it would have to copy the file up first, which this phase does not
+    // stage), so a path it owns stays refused — and the handler below, which
+    // resolves through the branch's *read* view, never reaches the lower with a
+    // host operation.
+    if !ctx.can_write(&vp) {
         return NotifAction::Errno(libc::EACCES);
     }
 

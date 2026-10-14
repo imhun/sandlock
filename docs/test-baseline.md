@@ -710,7 +710,21 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 573 # 2026-10-14 (netns-egress end-state B, tasks 1-4): 574 -> 573,
+core_integ = 574 # 2026-10-14 (writable rootfs COW, task 2): 573 -> 574, +1 --
+                 # `test_chroot::test_chroot_cow_owned_writes_never_land_on_
+                 # the_lower`: the write-call-site case the task review asked
+                 # for. A path the COW branch owns must be *served* by the
+                 # branch, never written by a host op on the lower (the shared
+                 # image rootfs). It drives the real dispatch with the branch's
+                 # workdir set to the whole rootfs and a policy that grants no
+                 # write at all, so both writes are admitted by the branch's
+                 # grant alone: a stageable relative symlink is served (it reads
+                 # back while the lower gains nothing, and it is in the upper),
+                 # and the arm the branch declines — an absolute target — is
+                 # refused by the mediator with the lower left untouched. RED
+                 # before the fix: the run exited 0 and the lower really held
+                 # `usr/local/abs-link -> /etc/os-release`.
+                 # 2026-10-14 (netns-egress end-state B, tasks 1-4): 574 -> 573,
                  # -1. `test_instance_exec_params::test_bound_child_pgid_entry_
                  # survives_leader_exit` pinned the pgid-entry lifetime of the
                  # deleted attribution maps; the four surviving cases in that
