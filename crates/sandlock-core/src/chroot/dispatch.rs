@@ -76,6 +76,15 @@ pub(crate) struct ChrootCtx<'a> {
     pub mounts: &'a [(PathBuf, PathBuf)],
     /// Virtual paths of read-only mounts: reads allowed, writes denied.
     pub mount_ro: &'a [PathBuf],
+    /// The COW branch's lower tree, when one is active: the sandbox's own
+    /// writable view of a root it does not own.
+    ///
+    /// The writable-rootfs route points a branch's `workdir` at the *shared*
+    /// image rootfs, so that root is deliberately absent from `fs_writable` —
+    /// granting it there would hand the sandbox the real cache. A write under
+    /// it is served by copy-up into the branch's private upper, so the
+    /// mediator admits it on the branch's account rather than the policy's.
+    pub cow_root: Option<&'a Path>,
     /// Per-process supervisor state, for handlers that track the caller's
     /// filesystem context rather than just resolving one path.
     pub processes: &'a Arc<ProcessIndex>,
@@ -108,6 +117,7 @@ impl<'a> ChrootCtx<'a> {
         processes: &'a Arc<ProcessIndex>,
         dirty: &'a Arc<crate::dirty::DirtyDirs>,
         write_fds: &'a Arc<crate::dirty::WriteFds>,
+        cow_root: Option<&'a Path>,
     ) -> Self {
         ChrootCtx {
             root: policy.chroot_root.as_ref().expect("chroot handlers are only registered with a chroot root"),
@@ -116,6 +126,7 @@ impl<'a> ChrootCtx<'a> {
             denied: &policy.chroot_denied,
             mounts: &policy.chroot_mounts,
             mount_ro: &policy.chroot_mount_ro,
+            cow_root,
             processes,
             dirty,
             write_fds,
@@ -217,6 +228,15 @@ impl ChrootCtx<'_> {
         // prefix such as a read-write rootfs granting "/".
         if self.is_mount_ro_any(virtual_path) {
             return false;
+        }
+        // The COW branch's lower tree is writable *through the mediator*: the
+        // write lands in the branch's private upper (copy-up), never in the
+        // lower itself, so it is admitted here even though the policy does not
+        // list it. Checked after the two refusals above, so neither a deny nor
+        // a read-only mount can be widened by a branch that happens to sit
+        // under it.
+        if self.cow_root.is_some_and(|r| virtual_path.starts_with(r)) {
+            return true;
         }
         if self.is_mounted(virtual_path) {
             return true;
@@ -3208,6 +3228,9 @@ mod mount_ro_tests {
             denied,
             mounts,
             mount_ro,
+            // These cases are about the policy's own verdicts: no COW branch
+            // is active, so the branch's tree is not an allowance.
+            cow_root: None,
             processes,
             dirty,
             write_fds,
@@ -3291,5 +3314,52 @@ mod mount_ro_tests {
             !c.can_write(Path::new("/legacy/mnt/data/x")),
             "…and refuses writes through every alias"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChrootCtx, ProcessIndex};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    /// The smallest `ChrootCtx` `can_write` reads: one writable prefix, an
+    /// optional COW root, everything else empty.
+    ///
+    /// `ChrootCtx::new` borrows its slices off a live notification policy,
+    /// which a policy-verdict test has no reason to build; the two ledgers are
+    /// leaked for the same reason `mount_ro_tests`' helper leaks them.
+    impl ChrootCtx<'static> {
+        fn for_test(writable: &[&str], cow_root: Option<&'static Path>) -> ChrootCtx<'static> {
+            let writable: &'static [PathBuf] = Box::leak(
+                writable.iter().map(PathBuf::from).collect::<Vec<_>>().into_boxed_slice(),
+            );
+            let processes: &'static Arc<ProcessIndex> =
+                Box::leak(Box::new(Arc::new(ProcessIndex::new())));
+            let dirty: &'static Arc<crate::dirty::DirtyDirs> =
+                Box::leak(Box::new(Arc::new(crate::dirty::DirtyDirs::new())));
+            let write_fds: &'static Arc<crate::dirty::WriteFds> =
+                Box::leak(Box::new(Arc::new(crate::dirty::WriteFds::new())));
+            ChrootCtx {
+                root: Path::new("/rootfs"),
+                readable: &[],
+                writable,
+                denied: &[],
+                mounts: &[],
+                mount_ro: &[],
+                cow_root,
+                processes,
+                dirty,
+                write_fds,
+                pid_ns: None,
+            }
+        }
+    }
+
+    #[test]
+    fn a_path_under_the_cow_root_is_writable_though_it_is_not_in_fs_writable() {
+        let ctx = ChrootCtx::for_test(&["/home/user"], Some(Path::new("/rootfs")));
+        assert!(ctx.can_write(Path::new("/rootfs/usr/local/x")));
+        assert!(!ctx.can_write(Path::new("/elsewhere/x"))); // control: outside the cow root it is still refused
     }
 }

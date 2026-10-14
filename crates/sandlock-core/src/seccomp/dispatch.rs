@@ -18,11 +18,12 @@
 
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::ctx::SupervisorCtx;
 use super::notif::{NotifAction, NotifPolicy};
-use super::state::ResourceState;
+use super::state::{CowState, ResourceState};
 use super::syscall::SyscallError;
 use crate::arch;
 use crate::sys::structs::SeccompNotif;
@@ -993,6 +994,21 @@ pub(crate) fn build_dispatch_table(
 // Chroot handler registration
 // ============================================================
 
+/// The tree a live COW branch makes writable through copy-up.
+///
+/// A branch's `workdir` is its lower: the sandbox's own workdir in the
+/// workspace shape, and the *shared image rootfs* in the writable-rootfs shape.
+/// Either way the policy does not have to list it in `fs_writable` — the write
+/// is served out of the branch's private upper — so `ChrootCtx` carries it
+/// separately and `can_write` admits it (see `ChrootCtx::cow_root`).
+///
+/// Read under the branch lock the handlers take anyway, and returned owned:
+/// the guard cannot outlive this call (the handlers lock it again for their own
+/// work), so the caller owns the `PathBuf` its `ChrootCtx` borrows.
+async fn cow_root_of(cow: &Arc<Mutex<CowState>>) -> Option<PathBuf> {
+    cow.lock().await.branch.as_ref().map(|branch| branch.workdir().to_path_buf())
+}
+
 fn register_chroot_handlers(
     table: &mut DispatchTable,
     policy: &Arc<NotifPolicy>,
@@ -1021,7 +1037,14 @@ fn register_chroot_handlers(
                 let notif_fd = cx.notif_fd;
                 let policy = Arc::clone(&policy);
                 async move {
-                    let chroot_ctx = ChrootCtx::new(&policy, &processes, &dirty, &write_fds);
+                    let cow_root = cow_root_of(&cow_state).await;
+                    let chroot_ctx = ChrootCtx::new(
+                        &policy,
+                        &processes,
+                        &dirty,
+                        &write_fds,
+                        cow_root.as_deref(),
+                    );
                     $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx).await
                 }
             }
@@ -1048,7 +1071,14 @@ fn register_chroot_handlers(
                 let notif_fd = cx.notif_fd;
                 let policy = Arc::clone(&policy);
                 async move {
-                    let chroot_ctx = ChrootCtx::new(&policy, &processes, &dirty, &write_fds);
+                    let cow_root = cow_root_of(&cow_state).await;
+                    let chroot_ctx = ChrootCtx::new(
+                        &policy,
+                        &processes,
+                        &dirty,
+                        &write_fds,
+                        cow_root.as_deref(),
+                    );
                     $handler(&notif, &chroot_state, &cow_state, notif_fd, &chroot_ctx).await
                 }
             }
@@ -1136,7 +1166,14 @@ fn register_chroot_handlers(
             let notif_fd = cx.notif_fd;
             let policy = Arc::clone(&policy_for_chown);
             async move {
-                let chroot_ctx = ChrootCtx::new(&policy, &sup.processes, &sup.dirty, &sup.write_fds);
+                let cow_root = cow_root_of(&sup.cow).await;
+                let chroot_ctx = ChrootCtx::new(
+                    &policy,
+                    &sup.processes,
+                    &sup.dirty,
+                    &sup.write_fds,
+                    cow_root.as_deref(),
+                );
                 crate::chroot::dispatch::handle_chroot_legacy_chown(&notif, &sup.chroot, &sup.cow, notif_fd, &chroot_ctx, false).await
             }
         });
@@ -1152,7 +1189,14 @@ fn register_chroot_handlers(
             let notif_fd = cx.notif_fd;
             let policy = Arc::clone(&policy_for_lchown);
             async move {
-                let chroot_ctx = ChrootCtx::new(&policy, &sup.processes, &sup.dirty, &sup.write_fds);
+                let cow_root = cow_root_of(&sup.cow).await;
+                let chroot_ctx = ChrootCtx::new(
+                    &policy,
+                    &sup.processes,
+                    &sup.dirty,
+                    &sup.write_fds,
+                    cow_root.as_deref(),
+                );
                 crate::chroot::dispatch::handle_chroot_legacy_chown(&notif, &sup.chroot, &sup.cow, notif_fd, &chroot_ctx, true).await
             }
         });
@@ -1237,11 +1281,13 @@ fn register_chroot_handlers(
             let sup = Arc::clone(&__sup);
             let notif_fd = cx.notif_fd;
             async move {
+                let cow_root = cow_root_of(&sup.cow).await;
                 let chroot_ctx = ChrootCtx::new(
                     &sup.policy,
                     &sup.processes,
                     &sup.dirty,
                     &sup.write_fds,
+                    cow_root.as_deref(),
                 );
                 crate::chroot::dispatch::handle_file_size_limit(&notif, notif_fd, &chroot_ctx)
                     .await
