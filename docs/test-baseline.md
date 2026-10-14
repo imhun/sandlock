@@ -359,8 +359,13 @@ core_lib = 950 # 2026-10-14 (writable rootfs COW, task 2): 949 -> 950, +1 --
                # write sites, where the resolved host path is in hand, rather
                # than in `ChrootCtx::can_write`, which speaks the child's
                # virtual space and can never name a branch (`can_write` itself
-               # is unchanged). See `docs/rootfs-writable-cow.md` and the
-               # phase-1 plan.
+               # is unchanged). A hard refusal still wins: the write sites ask
+               # `ChrootCtx::write_hard_denied` (`is_denied_any ||
+               # is_mount_ro_any`, split out of `can_write`, which reuses it)
+               # first, so the branch's allowance cannot resurrect an
+               # `fs_deny`/read-only-mount path — the `mount_ro_tests` cases
+               # pin both halves of that predicate. See
+               # `docs/rootfs-writable-cow.md` and the phase-1 plan.
                # 2026-10-14 (writable rootfs COW, task 1): 947 -> 949, +2 --
                # `cow::seccomp::tests::discard_refuses_to_merge_even_when_the_
                # caller_asks_to_commit` and

@@ -206,16 +206,29 @@ impl ChrootCtx<'_> {
         self.mount_ro.iter().any(|vp| virtual_path.starts_with(vp))
     }
 
+    /// The refusals no grant may override: an explicit `fs_deny`, or a
+    /// read-only mount.
+    ///
+    /// Split out of [`Self::can_write`] because the write sites have to ask it
+    /// *before* the COW branch's grant. `fs_denied` is the policy's explicit
+    /// "this path is not available", and a read-only mount says the same thing
+    /// (the rule [`crate::landlock::path_rule_rights`] applies to mounts). A
+    /// branch's tree is an *allowance* — copy-up into its own upper — and an
+    /// allowance must not resurrect a path the policy took away: `/sys` is a
+    /// directory inside the image rootfs and is named in `fs_denied`, so
+    /// without this the grant would quietly turn that deny into a copy-up.
+    ///
+    /// Read-only mounts deny writes even though they are mounted (and so
+    /// readable). Asking this before the `is_mounted` allow is what keeps a
+    /// read-only mount (e.g. the host procfs) from being made writable by a
+    /// broad writable prefix such as a read-write rootfs granting "/".
+    pub(crate) fn write_hard_denied(&self, virtual_path: &Path) -> bool {
+        self.is_denied_any(virtual_path) || self.is_mount_ro_any(virtual_path)
+    }
+
     /// Check if `virtual_path` is allowed for writing.
     fn can_write(&self, virtual_path: &Path) -> bool {
-        if self.is_denied_any(virtual_path) {
-            return false;
-        }
-        // Read-only mounts deny writes even though they are mounted (and so
-        // readable). Checked before the is_mounted allow so a read-only mount
-        // (e.g. the host procfs) can't be made writable by a broad writable
-        // prefix such as a read-write rootfs granting "/".
-        if self.is_mount_ro_any(virtual_path) {
+        if self.write_hard_denied(virtual_path) {
             return false;
         }
         if self.is_mounted(virtual_path) {
@@ -874,11 +887,15 @@ pub(crate) async fn handle_chroot_open(
     // Access check: writes need can_write, reads need can_read
     let is_write = (flags as i32 & (libc::O_WRONLY | libc::O_RDWR)) != 0;
     if is_write {
-        // The policy speaks the child's virtual space; a COW branch's tree is
-        // granted on its own account, through the predicate the redirection
-        // below uses (see `cow_owns`). Either admits the write; a write the
-        // branch owns lands in its upper, not in the file this names.
-        if !ctx.can_write(&virtual_path) && !cow_owns(cow_state, &host_path).await {
+        // A hard refusal (an `fs_deny` or a read-only mount) comes first and is
+        // final. Otherwise the policy speaks the child's virtual space and a
+        // COW branch's tree is granted on its own account, through the
+        // predicate the redirection below uses (see `cow_owns`); either admits
+        // the write, and a write the branch owns lands in its upper, not in the
+        // file this names.
+        if ctx.write_hard_denied(&virtual_path)
+            || (!ctx.can_write(&virtual_path) && !cow_owns(cow_state, &host_path).await)
+        {
             return NotifAction::Errno(libc::EACCES);
         }
     } else if !ctx.can_read(&virtual_path) {
@@ -1628,7 +1645,9 @@ pub(crate) async fn handle_chroot_write(
             Ok(r) => r,
             Err(a) => return a,
         };
-        if !ctx.can_write(&vp) && !cow_owns(cow_state, &host_path).await {
+        if ctx.write_hard_denied(&vp)
+            || (!ctx.can_write(&vp) && !cow_owns(cow_state, &host_path).await)
+        {
             return NotifAction::Errno(libc::EACCES);
         }
         ctx.mark_dirty(&host_path);
@@ -1687,7 +1706,9 @@ pub(crate) async fn handle_chroot_write(
             Ok(r) => r,
             Err(a) => return a,
         };
-        if !ctx.can_write(&vp) && !cow_owns(cow_state, &host_path).await {
+        if ctx.write_hard_denied(&vp)
+            || (!ctx.can_write(&vp) && !cow_owns(cow_state, &host_path).await)
+        {
             return NotifAction::Errno(libc::EACCES);
         }
         // Over budget: a directory is tree growth without a write, and the
@@ -1742,10 +1763,13 @@ pub(crate) async fn handle_chroot_write(
             Ok(r) => r,
             Err(e) => return NotifAction::Errno(e),
         };
-        // Either end is admitted by the policy or owned by the branch, through
-        // the same predicate the rename redirection below uses.
-        let old_allowed = ctx.can_write(&old_vp) || cow_owns(cow_state, &old_host).await;
-        let new_allowed = ctx.can_write(&new_vp) || cow_owns(cow_state, &new_host).await;
+        // Each end passes the same test the single-path sites use: a hard
+        // refusal is final, otherwise the policy's allowance or the branch's
+        // grant (the predicate the rename redirection below uses).
+        let old_allowed = !ctx.write_hard_denied(&old_vp)
+            && (ctx.can_write(&old_vp) || cow_owns(cow_state, &old_host).await);
+        let new_allowed = !ctx.write_hard_denied(&new_vp)
+            && (ctx.can_write(&new_vp) || cow_owns(cow_state, &new_host).await);
         if !old_allowed || !new_allowed {
             return NotifAction::Errno(libc::EACCES);
         }
@@ -1797,7 +1821,9 @@ pub(crate) async fn handle_chroot_write(
             Ok(r) => r,
             Err(e) => return NotifAction::Errno(e),
         };
-        if !ctx.can_write(&link_vp) && !cow_owns(cow_state, &host_link).await {
+        if ctx.write_hard_denied(&link_vp)
+            || (!ctx.can_write(&link_vp) && !cow_owns(cow_state, &host_link).await)
+        {
             return NotifAction::Errno(libc::EACCES);
         }
         // Over budget: a new name is tree growth, which no per-file ceiling
@@ -1893,10 +1919,13 @@ pub(crate) async fn handle_chroot_write(
         // keeps the weaker name from being upgraded, the same rule rename
         // already applies to the name it destroys. Off the chroot path
         // Landlock enforces this already: linking needs REFER on both sides.
-        // Either end is admitted by the policy or owned by the branch, through
-        // the same predicate the link redirection below uses.
-        let old_allowed = ctx.can_write(&old_vp) || cow_owns(cow_state, &old_host).await;
-        let new_allowed = ctx.can_write(&new_vp) || cow_owns(cow_state, &new_host).await;
+        // Each end passes the same test the single-path sites use: a hard
+        // refusal is final, otherwise the policy's allowance or the branch's
+        // grant (the predicate the link redirection below uses).
+        let old_allowed = !ctx.write_hard_denied(&old_vp)
+            && (ctx.can_write(&old_vp) || cow_owns(cow_state, &old_host).await);
+        let new_allowed = !ctx.write_hard_denied(&new_vp)
+            && (ctx.can_write(&new_vp) || cow_owns(cow_state, &new_host).await);
         if !old_allowed || !new_allowed {
             return NotifAction::Errno(libc::EACCES);
         }
@@ -1978,7 +2007,9 @@ pub(crate) async fn handle_chroot_write(
             Ok(r) => r,
             Err(a) => return a,
         };
-        if !ctx.can_write(&vp) && !cow_owns(cow_state, &host_path).await {
+        if ctx.write_hard_denied(&vp)
+            || (!ctx.can_write(&vp) && !cow_owns(cow_state, &host_path).await)
+        {
             return NotifAction::Errno(libc::EACCES);
         }
         let mode = (notif.data.args[2] & 0o7777) as u32;
@@ -2010,7 +2041,9 @@ pub(crate) async fn handle_chroot_write(
             Ok(r) => r,
             Err(a) => return a,
         };
-        if !ctx.can_write(&vp) && !cow_owns(cow_state, &host_path).await {
+        if ctx.write_hard_denied(&vp)
+            || (!ctx.can_write(&vp) && !cow_owns(cow_state, &host_path).await)
+        {
             return NotifAction::Errno(libc::EACCES);
         }
         let uid = notif.data.args[2] as u32;
@@ -2046,7 +2079,9 @@ pub(crate) async fn handle_chroot_write(
             Ok(r) => r,
             Err(e) => return NotifAction::Errno(e),
         };
-        if !ctx.can_write(&vp) && !cow_owns(cow_state, &host_path).await {
+        if ctx.write_hard_denied(&vp)
+            || (!ctx.can_write(&vp) && !cow_owns(cow_state, &host_path).await)
+        {
             return NotifAction::Errno(libc::EACCES);
         }
         ctx.mark_dirty(&host_path);
@@ -2489,9 +2524,11 @@ pub(crate) async fn handle_chroot_xattr(
 
     let writing = matches!(op, XattrOp::Set | XattrOp::Remove);
     // A write is admitted by the policy (virtual space) or by the branch that
-    // owns the resolved host path — the predicate `cow_resolve` below uses.
+    // owns the resolved host path — the predicate `cow_resolve` below uses —
+    // but a hard refusal is final either way.
     let allowed = if writing {
-        ctx.can_write(&vp) || cow_owns(cow_state, &host_path).await
+        !ctx.write_hard_denied(&vp)
+            && (ctx.can_write(&vp) || cow_owns(cow_state, &host_path).await)
     } else {
         ctx.can_read(&vp)
     };
@@ -2874,7 +2911,9 @@ pub(crate) async fn handle_chroot_utimensat(
         Ok(r) => r,
         Err(e) => return NotifAction::Errno(e),
     };
-    if !ctx.can_write(&vp) && !cow_owns(cow_state, &host_path).await {
+    if ctx.write_hard_denied(&vp)
+        || (!ctx.can_write(&vp) && !cow_owns(cow_state, &host_path).await)
+    {
         return NotifAction::Errno(libc::EACCES);
     }
 
@@ -3283,6 +3322,10 @@ mod mount_ro_tests {
         let processes = Arc::new(ProcessIndex::new());
         let c = ctx(&mounts, &ro, &writable, &processes);
         assert!(c.can_read(Path::new("/proc/version")));
+        assert!(
+            c.write_hard_denied(Path::new("/proc/version")),
+            "a read-only mount is a hard refusal: no grant writes through it"
+        );
         assert!(!c.can_write(Path::new("/proc/sys/kernel/core_pattern")));
         assert!(!c.can_write(Path::new("/proc/self/oom_score_adj")));
     }
@@ -3295,6 +3338,7 @@ mod mount_ro_tests {
         let processes = Arc::new(ProcessIndex::new());
         let c = ctx(&mounts, &ro, &writable, &processes);
         assert!(c.can_read(Path::new("/data/file")));
+        assert!(!c.write_hard_denied(Path::new("/data/file")));
         assert!(c.can_write(Path::new("/data/file")));
     }
 
@@ -3325,6 +3369,10 @@ mod mount_ro_tests {
         );
         assert!(!c.can_write(Path::new("/legacy/mnt/data/x")));
         assert!(
+            c.write_hard_denied(Path::new("/legacy/mnt/data/x")),
+            "an fs_deny is a hard refusal: no grant writes through it"
+        );
+        assert!(
             c.can_read(Path::new("/legacy/plain")),
             "the deny still covers only the denied subtree"
         );
@@ -3347,6 +3395,7 @@ mod mount_ro_tests {
             !c.can_write(Path::new("/legacy/mnt/data/x")),
             "…and refuses writes through every alias"
         );
+        assert!(c.write_hard_denied(Path::new("/legacy/mnt/data/x")));
     }
 }
 
