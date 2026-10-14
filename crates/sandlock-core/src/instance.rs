@@ -47,7 +47,6 @@ use crate::init::executor::{open_child_pidfd, ExecLink};
 use crate::init::{Req, Resp, CONTROL_FD};
 use crate::result::{ExitStatus, RunResult};
 use crate::sandbox::{BranchAction, SharedCow};
-use crate::seccomp::notif::{NetworkPolicy, PortAllow};
 
 pub use crate::exec_params::ExecParams;
 use crate::exec_params::ExecCeiling;
@@ -177,18 +176,6 @@ pub struct InstanceStats {
     /// `Draining` / `ShutDown`, plus exec-mode `Exited` (main-exit container
     /// end) and `Dead` (listener/reaper/channel failure, F5.4).
     pub instance_state: InstancePhase,
-}
-
-/// Result of a session network update (fork-plan F4.3/S2).
-///
-/// A session-level `update_network` binds to **new execs only**: the policy
-/// is captured per child at exec time (F4.4), so children already running
-/// keep the policy they were created under and are reported here as stale.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NetworkStaleness {
-    /// Child ids of running (not yet reaped) children that keep their
-    /// exec-time network policy — the update does not apply to them.
-    pub stale_child_ids: Vec<u64>,
 }
 
 /// A per-child token assigned by an exec-capable session's executor. Child
@@ -473,18 +460,6 @@ pub(crate) struct ExecSession {
     next_child_id: u64,
     /// Per-child registry: id -> pid/pidfd/exit cache.
     children: HashMap<u64, ExecChild>,
-    /// F4.3: the session network policy to bind to the **next** exec child
-    /// (set by `update_network`). `None` = children use the instance default
-    /// (shared live/static policy path). Running children are never rebound.
-    next_net_policy: Option<crate::seccomp::notif::NetworkPolicy>,
-    /// Generation of `next_net_policy`: bumped on every `update_network`.
-    /// Each exec child records the generation it was bound under; staleness
-    /// compares it to the current generation.
-    next_net_gen: u64,
-    /// Normalized (sorted, deduped) IP list of the last applied
-    /// `update_network`, so an identical no-op update does not bump the
-    /// generation or report running children stale.
-    next_net_ips: Option<Vec<IpAddr>>,
 }
 
 /// One registered child of an exec-capable session.
@@ -505,10 +480,6 @@ pub(crate) struct ExecChild {
     params: ExecParams,
     /// Reaped exit status, cached for idempotent `wait_child`.
     status: Option<ExitStatus>,
-    /// F4.3: session network-policy generation this child was bound under
-    /// (0 = instance default). `update_network` reports children whose
-    /// generation is older than the new one as stale.
-    net_gen: u64,
 }
 
 /// Which of a session's live children a capture represents.
@@ -702,9 +673,6 @@ impl SandboxInstance {
             link: link.clone(),
             next_child_id: 1,
             children: HashMap::new(),
-            next_net_policy: None,
-            next_net_gen: 0,
-            next_net_ips: None,
         }));
 
         // Register the main workload as child id 0 when the caller asked for
@@ -757,19 +725,8 @@ impl SandboxInstance {
                     pty: None,
                     params: ExecParams::default(),
                     status: None,
-                    net_gen: 0,
                 },
             );
-            // Reviewer R2: the main workload (child id 0) is an exec child
-            // too — attribute it as attributed-default so its lineage stays on
-            // the shared live/static policy after later exec-child
-            // announcements flip `has_exec_bindings()` on. Without this the
-            // main's next connect/send would hit the unattributed fail-closed
-            // arm (deny-all), silently contradicting the F4.3 contract that
-            // running children keep their exec-time policy.
-            if let Some(network) = rt.supervisor_network.as_ref() {
-                network.lock().await.bind_exec_child(pid, None);
-            }
         }
         rt.refresh_idle_state();
         Ok(rt)
@@ -1249,24 +1206,6 @@ impl SandboxInstance {
         {
             procs.set_virtual_cwd(pid, crate::chroot::resolve::confine(&cwd.to_string_lossy()));
         }
-        // F4.3/F4.4: attribute the announced child to the session network
-        // policy current at exec time (an `update_network` in flight between
-        // the request and the announcement applies to this exec — the
-        // request was sent under the policy generation we read here).
-        // `Some(policy)` binds a post-update child; `None` still attributes
-        // a default-policy child so its lineage can never fall back wide
-        // through an unattributed lookup. Running children are never rebound
-        // by a later update.
-        let (next_policy, net_gen) = {
-            let session = self
-                .exec_session
-                .as_ref()
-                .expect("exec session presence checked by callers");
-            (session.next_net_policy.clone(), session.next_net_gen)
-        };
-        if let Some(network) = self.supervisor_network.as_ref() {
-            network.lock().await.bind_exec_child(pid, next_policy);
-        }
         let session = self
             .exec_session
             .as_mut()
@@ -1287,7 +1226,6 @@ impl SandboxInstance {
                 pty: registry_pty,
                 params: params.clone(),
                 status: early_exit,
-                net_gen,
             },
         );
         self.refresh_idle_state();
@@ -1503,16 +1441,6 @@ impl SandboxInstance {
         // Register it like any other attached exec: that is what makes the
         // resumed process a child *of the session* (waitable, killable, counted)
         // instead of a stranger standing next to it.
-        let (next_policy, net_gen) = {
-            let session = self
-                .exec_session
-                .as_ref()
-                .expect("exec session presence checked by callers");
-            (session.next_net_policy.clone(), session.next_net_gen)
-        };
-        if let Some(network) = self.supervisor_network.as_ref() {
-            network.lock().await.bind_exec_child(pid, next_policy);
-        }
         let session = self
             .exec_session
             .as_mut()
@@ -1528,7 +1456,6 @@ impl SandboxInstance {
                 // request of ours; the default says so instead of pretending.
                 params: ExecParams::default(),
                 status: None,
-                net_gen,
             },
         );
         self.restore_skipped = plan.skipped;
@@ -1582,27 +1509,25 @@ impl SandboxInstance {
     /// F4.3 (S2): session-level outbound network update.
     ///
     /// `allowed_ips` is the new outbound IP allow set (any port; an empty set
-    /// denies all outbound destinations). The update binds to **new execs
-    /// only**: every child currently running keeps the policy it was created
-    /// under, and the returned [`NetworkStaleness`] names those children.
+    /// denies all outbound destinations). The narrowing is **instance-wide and
+    /// immediate** (end-state B): it is written into the sandbox's live policy
+    /// ([`crate::policy_fn::narrow_live_network`]) and every process — a
+    /// command already running as much as one exec'd later — is judged against
+    /// it from its next `connect`/`send` on. There is no per-exec attribution
+    /// left, so nothing is "stale" and no child ids are reported.
+    ///
     /// The request must be a subset of the instance-time destination ceiling
     /// (S9): a requested IP the static ceiling **explicitly denies** (any
     /// protocol's DenyList rule, any-IP port deny, or deny-all) is refused
     /// with the named EPERM-class `PolicyTooWide` error. Grant-based
     /// AllowList ceilings are composed per protocol at verdict time
     /// (reviewer I1), so a protocol that does not grant the IP keeps its
-    /// static policy — an update can never widen a protocol.
-    ///
-    /// Online tightening through `PolicyFnState.live_policy` (the policy-fn
-    /// `restrict_network` path) is deliberately untouched: it is the
-    /// instance-wide, event-driven tightening channel, while this verb is the
-    /// session-scoped, new-exec-only channel. Binding decisions for children
-    /// exec'd under an update come from their per-child policy (F4.4), never
-    /// from a sibling's or from later updates.
+    /// static policy — an update can never widen a protocol. Widening is
+    /// still refused before it is persisted (the control plane's 409).
     pub async fn update_network(
         &mut self,
         allowed_ips: &[IpAddr],
-    ) -> Result<NetworkStaleness, SandlockError> {
+    ) -> Result<(), SandlockError> {
         self.enter_exec_terminal_if_needed();
         if self.phase != InstancePhase::Live {
             return Err(self.closed_error().into());
@@ -1613,62 +1538,6 @@ impl SandboxInstance {
         if self.exec_session.is_none() {
             return Err(Self::not_exec_capable());
         }
-        let normalized = normalized_ips(allowed_ips);
-        // No-op update: an identical payload must not bump the generation or
-        // report running children stale (reviewer minor).
-        let identical = self
-            .exec_session
-            .as_ref()
-            .expect("exec session presence checked above")
-            .next_net_ips
-            .as_ref()
-            == Some(&normalized);
-        if identical {
-            return Ok(NetworkStaleness {
-                stale_child_ids: Vec::new(),
-            });
-        }
-        let binding = self.session_network_binding(&normalized).await?;
-        let gen = {
-            let session = self
-                .exec_session
-                .as_mut()
-                .expect("exec session presence checked above");
-            session.next_net_policy = Some(binding);
-            session.next_net_ips = Some(normalized);
-            session.next_net_gen += 1;
-            session.next_net_gen
-        };
-        let mut stale: Vec<u64> = self
-            .exec_session
-            .as_ref()
-            .expect("exec session presence checked above")
-            .children
-            .iter()
-            .filter(|(_, child)| child.status.is_none() && child.net_gen < gen)
-            .map(|(id, _)| *id)
-            .collect();
-        stale.sort_unstable();
-        Ok(NetworkStaleness {
-            stale_child_ids: stale,
-        })
-    }
-
-    /// Validate `allowed_ips` against the instance static ceilings and build
-    /// the per-child allowlist policy new execs will be bound to.
-    ///
-    /// Reviewer I1: an IP **explicitly denied** by any protocol's static
-    /// DenyList (a deny rule covering it, an any-IP port deny, or a deny-all
-    /// instance) is refused — the binding must never override an instance
-    /// deny. Grant-based AllowList ceilings are not refused here: the bound
-    /// policy is intersected with each protocol's ceiling at verdict time
-    /// ([`crate::seccomp::state::intersect_ceiling_grant`]), so a protocol
-    /// that does not grant the IP (e.g. a deny-all ICMP ceiling on a TCP
-    /// policy) simply keeps denying it instead of being widened.
-    async fn session_network_binding(
-        &self,
-        allowed_ips: &[IpAddr],
-    ) -> Result<NetworkPolicy, SandlockError> {
         let network = self
             .supervisor_network
             .as_ref()
@@ -1678,13 +1547,21 @@ impl SandboxInstance {
                 )
             })?
             .clone();
+        let normalized: HashSet<IpAddr> = allowed_ips.iter().copied().collect();
         let ns = network.lock().await;
-        for ip in allowed_ips {
-            for ceiling in [
-                &ns.tcp_policy,
-                &ns.udp_policy,
-                &ns.icmp_policy,
-            ] {
+        let live = Arc::clone(&ns.live_policy);
+        // No-op update: an identical payload produces no side effect.
+        if live
+            .read()
+            .ok()
+            .and_then(|l| l.narrowed_ips.clone())
+            .as_ref()
+            == Some(&normalized)
+        {
+            return Ok(());
+        }
+        for ip in &normalized {
+            for ceiling in [&ns.tcp_policy, &ns.udp_policy, &ns.icmp_policy] {
                 if crate::seccomp::state::update_network_denied_by_ceiling(ceiling, *ip) {
                     return Err(SandboxRuntimeError::PolicyTooWide {
                         field: "update_network",
@@ -1694,7 +1571,11 @@ impl SandboxInstance {
                 }
             }
         }
-        Ok(ip_only_allowlist(allowed_ips))
+        // Instance-wide narrowing: every process of the sandbox (running or
+        // exec'd later) is judged against this set from its next connect on.
+        let narrowed: Vec<IpAddr> = normalized.iter().copied().collect();
+        crate::policy_fn::narrow_live_network(&live, &narrowed);
+        Ok(())
     }
 
     /// I3: read the per-exec parameters a registered child was launched with
@@ -3183,29 +3064,6 @@ impl SandboxInstance {
     /// session is live and is released by [`SandboxInstance::shutdown`].
     pub fn dns_gateway_addr(&self) -> Option<std::net::Ipv4Addr> {
         self.dns_gateway_addr
-    }
-}
-
-/// Normalized update payload: sorted, deduped IP list used both for the
-/// no-op comparison and the binding construction.
-fn normalized_ips(ips: &[IpAddr]) -> Vec<IpAddr> {
-    let mut out: Vec<IpAddr> = ips.to_vec();
-    out.sort_unstable();
-    out.dedup();
-    out
-}
-
-/// IP-only allowlist policy (any port to each listed IP) used to bind an
-/// exec child to an `update_network` policy. Mirrors the legacy `policy_fn`
-/// IP-override representation so the existing verdict path applies unchanged.
-fn ip_only_allowlist(ips: &[IpAddr]) -> NetworkPolicy {
-    let per_ip = ips.iter().map(|&ip| (ip, PortAllow::Any)).collect();
-    NetworkPolicy::AllowList {
-        per_ip,
-        cidrs: Vec::new(),
-        any_ip_ports: HashSet::new(),
-        wildcard_domains: Vec::new(),
-        denied: Default::default(),
     }
 }
 

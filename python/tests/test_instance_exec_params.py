@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """F4 (M2) Python surface: per-exec parameters, S9 subset rejection,
-update_network staleness and per-exec bind ports on `SandboxInstance.exec`."""
+the instance-wide `update_network` narrowing and per-exec bind ports on
+`SandboxInstance.exec`."""
 
 from __future__ import annotations
 
@@ -126,20 +127,18 @@ def _sink_listener(ip: str):
     return port, seen
 
 
-def test_update_network_applies_to_new_exec_only_and_reports_staleness():
-    """update_network binds to new execs only; running children keep their
-    exec-time policy and are reported stale; siblings cannot bleed."""
+def test_update_network_narrows_a_running_child_immediately():
+    """update_network is instance-wide and immediate: a child exec'd before
+    the narrowing is judged against it from its next connect on, and the call
+    reports no staleness (it returns nothing)."""
     port_lo, seen_lo = _sink_listener("127.0.0.1")
     port_hi, seen_hi = _sink_listener("127.0.0.2")
     work = tempfile.mkdtemp(prefix="sandlock-f4-py-net-")
 
     with SandboxInstance(_policy(cwd="/tmp", net_allow=["*"])) as inst:
-        a_go1 = os.path.join(work, "a-go1")
-        a_go2 = os.path.join(work, "a-go2")
-        a_out = os.path.join(work, "a-out")
-        b_out = os.path.join(work, "b-out")
-        os.mkdir(a_out)
-        os.mkdir(b_out)
+        go = os.path.join(work, "go")
+        out = os.path.join(work, "out")
+        os.mkdir(out)
 
         def probe(ip, port, out):
             return (
@@ -155,51 +154,36 @@ def test_update_network_applies_to_new_exec_only_and_reports_staleness():
                 "    s.close()\n"
             ).format(ip=ip, port=port, out=out)
 
-        a_script = (
+        script = (
             "import os, time\n"
             "def wait(f):\n"
             "    while not os.path.exists(f):\n"
             "        time.sleep(0.05)\n"
-            f"wait('{a_go1}')\n"
-            + probe("127.0.0.1", port_lo, os.path.join(a_out, "lo"))
-            + f"wait('{a_go2}')\n"
-            + probe("127.0.0.2", port_hi, os.path.join(a_out, "hi"))
+            f"wait('{go}')\n"
+            + probe("127.0.0.1", port_lo, os.path.join(out, "lo"))
+            + probe("127.0.0.2", port_hi, os.path.join(out, "hi"))
         )
-        a = inst.exec(["/usr/bin/python3", "-c", a_script])
+        # The child runs *before* the narrowing and connects after it.
+        a = inst.exec(["/usr/bin/python3", "-c", script])
         assert a.pid is not None
 
-        stale = inst.update_network(["127.0.0.1"])
-        assert stale == [a.child_id], f"pre-update child A must be the exact stale set: {stale}"
-        noop = inst.update_network(["127.0.0.1"])
-        assert noop == [], f"identical update must be a no-op: {noop}"
+        assert inst.update_network(["127.0.0.1"]) is None
 
-        b_script = probe("127.0.0.1", port_lo, os.path.join(b_out, "lo")) + probe(
-            "127.0.0.2", port_hi, os.path.join(b_out, "hi")
-        )
-        b = inst.exec(["/usr/bin/python3", "-c", b_script])
-        assert b.wait().exit_code == 0
-        with open(os.path.join(b_out, "lo")) as f:
-            assert f.read() == "OK", "post-update child B reaches its bound IP"
-        with open(os.path.join(b_out, "hi")) as f:
-            assert f.read() == "ERR111", "post-update child B is denied the wide IP"
-
-        with open(a_go1, "w") as f:
-            f.write("go")
-        with open(a_go2, "w") as f:
+        with open(go, "w") as f:
             f.write("go")
         assert a.wait().exit_code == 0
-        with open(os.path.join(a_out, "lo")) as f:
-            assert f.read() == "OK", "pre-update child A keeps its low grant"
-        with open(os.path.join(a_out, "hi")) as f:
-            assert f.read() == "OK", "pre-update child A keeps its wide grant"
+        with open(os.path.join(out, "lo")) as f:
+            assert f.read() == "OK", "the narrowed-in destination stays reachable"
+        with open(os.path.join(out, "hi")) as f:
+            assert f.read() == "ERR111", "a running child is narrowed at once"
 
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            if len(seen_lo) == 2 and len(seen_hi) == 1:
+            if len(seen_lo) == 1:
                 break
             time.sleep(0.05)
-        assert len(seen_lo) == 2, f"low listener: A + B, saw {len(seen_lo)}"
-        assert len(seen_hi) == 1, f"high listener: A only, saw {len(seen_hi)}"
+        assert len(seen_lo) == 1, f"low listener: the running child, saw {len(seen_lo)}"
+        assert len(seen_hi) == 0, f"high listener: never reached, saw {len(seen_hi)}"
 
 
 def test_per_exec_bind_port_reaches_listener():

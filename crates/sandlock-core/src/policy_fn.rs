@@ -144,8 +144,19 @@ impl SyscallEvent {
 /// that can be dynamically adjusted at runtime.
 #[derive(Debug, Clone)]
 pub struct LivePolicy {
-    /// Allowed destination IPs for outbound connections.
+    /// Allowed destination IPs for outbound connections (the `policy_fn`
+    /// replacement set: a non-empty value replaces the static destination
+    /// policy, which is how `restrict_network` narrows at runtime).
     pub allowed_ips: HashSet<IpAddr>,
+    /// Instance-wide egress narrowing written by the session `update_network`
+    /// verb. `None` = not narrowed; `Some(set)` = only these destinations may
+    /// be dialled, by **every** process of the sandbox (already running or
+    /// exec'd later), from its next `connect`/`send` on. An empty set denies
+    /// all outbound. Unlike `allowed_ips` this is composed with each
+    /// protocol's static ceiling at verdict time, so it can only narrow —
+    /// never widen past the instance policy (see
+    /// [`crate::seccomp::state::NetworkState::effective_network_policy`]).
+    pub narrowed_ips: Option<HashSet<IpAddr>>,
     /// Maximum memory in bytes (0 = unlimited).
     pub max_memory_bytes: u64,
     /// Maximum number of forks.
@@ -228,6 +239,12 @@ impl PolicyContext {
     // ---- Restrict (permanent shrink) ----
 
     /// Permanently restrict allowed IPs. Cannot be granted back.
+    ///
+    /// This is the callback-facing *replacement* channel: the listed IPs
+    /// become the destination policy for the whole sandbox (any port), and a
+    /// later `grant_network` is refused. The session `update_network` verb
+    /// uses the sibling [`narrow_live_network`] channel instead, which is
+    /// composed with the static ceiling per protocol.
     pub fn restrict_network(&mut self, ips: &[IpAddr]) {
         self.restricted.insert("allowed_ips");
         let mut live = self.live.write().unwrap();
@@ -285,6 +302,21 @@ impl PolicyContext {
         } else {
             Ok(())
         }
+    }
+}
+
+/// Instance-wide narrowing channel — the session `update_network` verb.
+///
+/// Replaces [`LivePolicy::narrowed_ips`] with `ips`: every process of the
+/// sandbox (already running or exec'd later) is judged against the new set
+/// from its next `connect`/`send` on, and an empty `ips` denies all outbound.
+/// The set is composed with each protocol's static ceiling at verdict time,
+/// so it can only narrow the instance policy — never widen it. The caller
+/// (the `update_network` verb) validates the request against the ceiling's
+/// explicit denies before calling this.
+pub fn narrow_live_network(live: &Arc<RwLock<LivePolicy>>, ips: &[IpAddr]) {
+    if let Ok(mut lp) = live.write() {
+        lp.narrowed_ips = Some(ips.iter().copied().collect());
     }
 }
 
@@ -465,6 +497,7 @@ mod tests {
                 .iter()
                 .map(|s| s.parse().unwrap())
                 .collect(),
+            narrowed_ips: None,
             max_memory_bytes: 1024 * 1024 * 1024,
             max_processes: 64,
         }
@@ -474,6 +507,7 @@ mod tests {
     fn test_grant_within_ceiling() {
         let live = Arc::new(RwLock::new(LivePolicy {
             allowed_ips: HashSet::new(),
+            narrowed_ips: None,
             max_memory_bytes: 0,
             max_processes: 0,
         }));
@@ -491,6 +525,7 @@ mod tests {
     fn test_grant_capped_to_ceiling() {
         let live = Arc::new(RwLock::new(LivePolicy {
             allowed_ips: HashSet::new(),
+            narrowed_ips: None,
             max_memory_bytes: 0,
             max_processes: 0,
         }));

@@ -2182,14 +2182,14 @@ class SandboxInstance:
             pty_fd=out.pty_fd,
         )
 
-    def update_network(self, ips: Sequence[str]) -> list[int]:
+    def update_network(self, ips: Sequence[str]) -> None:
         """F4.3 (S2): session outbound network update.
 
         ``ips`` is the new outbound IP allow set (any port; an empty list
-        denies all outbound destinations). The update binds to **new execs
-        only**: children already running keep the policy they were created
-        under, and this method returns their child ids as the staleness
-        report.
+        denies all outbound destinations). The narrowing is **instance-wide
+        and immediate**: every process of the sandbox — a command already
+        running as much as one exec'd later — is judged against it from its
+        next connect on, so there is no staleness report to return.
 
         An IP outside the instance-time destination ceiling raises
         :class:`PermissionError` (EPERM) — the ceiling never widens.
@@ -2206,16 +2206,10 @@ class SandboxInstance:
             ip_ptr = arr
         else:
             ip_ptr = None
-        cap = 4096
-        stale = (ctypes.c_uint64 * cap)()
-        out_count = ctypes.c_size_t()
         rc = _lib.sandlock_instance_update_network(
             self._handle,
             ip_ptr,
             len(encoded),
-            stale,
-            cap,
-            ctypes.byref(out_count),
         )
         if rc == self._ERR_POLICY:
             raise PermissionError(
@@ -2223,8 +2217,6 @@ class SandboxInstance:
             )
         if rc != 0:
             raise self._error_for_code(rc, "update_network")
-        n = min(out_count.value, cap)
-        return list(stale[:n])
 
     def close(self) -> None:
         """Terminate the session and release the native handle.

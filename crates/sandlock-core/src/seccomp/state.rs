@@ -598,33 +598,15 @@ pub struct NetworkState {
     /// carry no ports, so every entry uses `PortAllow::Any` and the
     /// effective check is IP-only.
     pub icmp_policy: crate::seccomp::notif::NetworkPolicy,
-    /// F4.4 (fork-plan §4.5): per-child session network policies keyed by the
-    /// exec child's **process-group id** (init makes every exec child its own
-    /// pgid leader, and descendants stay in that group unless they setsid
-    /// away). A child exec'd after a session `update_network` is bound here
-    /// to its exec-time policy; siblings and later updates can never change
-    /// it. Processes with no entry (pre-update exec children and legacy M0
-    /// sessions) fall through to the instance default path. Entries live for
-    /// as long as the group has any member — a pgid must outlive its direct
-    /// child while descendants stay in the group — and are removed only when
-    /// a group-emptiness probe (`kill(-pgid, 0)`) reports ESRCH
-    /// ([`NetworkState::prune_pid`]). Reviewer C1: `getpgid(leader)` would
-    /// report the *leader* gone even while in-group descendants live, so it
-    /// must never gate removal.
-    pub child_policies: HashMap<i32, crate::seccomp::notif::NetworkPolicy>,
-    /// F4.4 follow-up (reviewer I2): per-**pid** lineage bindings. `Some(p)`
-    /// marks a pid in the lineage of a child bound by a session
-    /// `update_network`; `None` marks a pid in the lineage of an exec child
-    /// that runs the instance default (attributed, but not narrowed). Unlike
-    /// the pgid map, entries survive `setsid`/`setpgid` escapes: a descendant
-    /// that leaves its child's process group inherits the binding through its
-    /// ancestor chain, so it can never silently fall back to a wider
-    /// sibling's shared default (missing-entry fail-closed once any exec
-    /// binding exists). Interior-mutable so the lookup path can cache an
-    /// ancestor-resolved binding; entries are pruned when the pid exits
-    /// ([`NetworkState::prune_pid`]).
-    pub pid_policies:
-        std::sync::Arc<std::sync::RwLock<HashMap<i32, Option<crate::seccomp::notif::NetworkPolicy>>>>,
+    /// The sandbox's live policy handle — the instance-wide narrowing channel
+    /// (end-state B). It is shared with [`crate::seccomp::state::PolicyFnState`]
+    /// when a `policy_fn` callback is configured, so there is exactly one
+    /// handle: the session `update_network` verb writes
+    /// [`crate::policy_fn::LivePolicy::narrowed_ips`] into it (effective for
+    /// every process at once), and the callback writes `allowed_ips` through
+    /// its own [`crate::policy_fn::PolicyContext`]. A bare `NetworkState`
+    /// (tests) owns an unseeded handle: no narrowing, no replacement set.
+    pub live_policy: std::sync::Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>>,
     /// Port binding and remapping tracker.
     pub port_map: crate::port_remap::PortMap,
     /// `--net-deny-bind`: TCP ports the sandbox may NOT bind (default-allow
@@ -675,8 +657,14 @@ impl NetworkState {
             tcp_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
             udp_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
             icmp_policy: crate::seccomp::notif::NetworkPolicy::Unrestricted,
-            child_policies: HashMap::new(),
-            pid_policies: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
+            live_policy: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::policy_fn::LivePolicy {
+                    allowed_ips: HashSet::new(),
+                    narrowed_ips: None,
+                    max_memory_bytes: 0,
+                    max_processes: 0,
+                },
+            )),
             port_map: crate::port_remap::PortMap::new(),
             bind_deny_ports: HashSet::new(),
             pid_ip_overrides: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -703,11 +691,21 @@ impl NetworkState {
 
     /// Get the effective network policy for a PID and protocol.
     ///
-    /// Priority: per-PID override > live policy (from PolicyFnState) >
-    /// the per-protocol allowlist for `protocol`.
-    /// PID/live overrides are IP-only — any port is permitted to listed
-    /// IPs (legacy `policy_fn` semantics) — and they apply across all
-    /// protocols, since the legacy API didn't distinguish them.
+    /// The verdict depends only on the sandbox's **current** network policy —
+    /// never on which exec session a process belongs to (end-state B: no
+    /// per-pid / per-pgid / ancestor attribution exists). Priority:
+    ///
+    /// 1. a per-PID override registered for `pid` (`policy_fn`'s legacy
+    ///    `restrict_pid_network`) — IP-only, any port, across all protocols,
+    ///    unchanged by this round;
+    /// 2. the instance-wide narrowing (`update_network`), composed with the
+    ///    per-protocol static ceiling so it can never widen;
+    /// 3. the live replacement set of an active `policy_fn` callback, else
+    ///    the static per-protocol policy.
+    ///
+    /// `live_policy` is the caller's handle on the sandbox's live policy
+    /// (`None` = use this state's own handle, which is the same object in a
+    /// running sandbox — see [`NetworkState::live_policy`]).
     pub fn effective_network_policy(
         &self,
         pid: u32,
@@ -719,194 +717,30 @@ impl NetworkState {
                 return ip_only_allow_policy(ips);
             }
         }
-        self.live_or_static(protocol, live_policy)
-    }
-
-    /// F4.4: attribute one announced exec child. `binding == Some(policy)`
-    /// marks a child exec'd under a session `update_network` (both the pgid
-    /// map and the per-pid map get the policy, so in-group descendants and
-    /// the root pid itself resolve it); `binding == None` marks an exec child
-    /// running the instance default, so its lineage is attributed and a later
-    /// fail-closed lookup can distinguish it from an unattributed escapee.
-    pub fn bind_exec_child(
-        &mut self,
-        pid: i32,
-        binding: Option<crate::seccomp::notif::NetworkPolicy>,
-    ) {
-        let pid_entry = binding.clone();
-        if let Some(policy) = binding {
-            self.child_policies.insert(pid, policy);
-        }
-        if let Ok(mut m) = self.pid_policies.write() {
-            m.insert(pid, pid_entry);
-        }
-    }
-
-    /// F4.4: bind `policy` to the exec child whose process group is `pgid`.
-    /// Same attribution as [`NetworkState::bind_exec_child`] with a bound
-    /// policy; kept for the pgid-level unit tests.
-    pub fn bind_child_policy(&mut self, pgid: i32, policy: crate::seccomp::notif::NetworkPolicy) {
-        self.bind_exec_child(pgid, Some(policy));
-    }
-
-    /// Whether any exec child of this session has been attributed (bound or
-    /// explicitly default). When true, an unattributed pid — one with no
-    /// per-pid entry, no pgid entry and no bound ancestor — fails closed
-    /// rather than falling back to the shared wide default (fork-plan §4.5;
-    /// reviewer I2).
-    pub fn has_exec_bindings(&self) -> bool {
-        if !self.child_policies.is_empty() {
-            return true;
-        }
-        self.pid_policies
-            .read()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false)
-    }
-
-    /// Resolve the per-pid binding for `pid`, walking the ancestor chain when
-    /// the pid itself is not attributed (an escapee whose parent stayed in
-    /// the bound child's lineage). The resolved binding is cached under
-    /// `pid` so repeat syscalls do not re-read `/proc`.
-    ///
-    /// Returns `Some(Some(policy))` for a bound lineage, `Some(None)` for an
-    /// attributed-default lineage, and `None` when no ancestor is attributed.
-    fn resolve_pid_binding(
-        &self,
-        pid: u32,
-    ) -> Option<Option<crate::seccomp::notif::NetworkPolicy>> {
-        if let Some(binding) = self.pid_binding_for(pid) {
-            return Some(binding);
-        }
-        // Ancestor walk: `/proc/<pid>/stat` parent chain, bounded. The bound
-        // exec child is a process-group leader and can never setsid itself,
-        // so it is always an ancestor of its subtree while the chain is
-        // intact; orphans that escaped before their first attributed syscall
-        // are caught by the missing-entry fail-closed arm instead.
-        let mut ancestor = pid as i32;
-        for _ in 0..32 {
-            match read_ppid(ancestor) {
-                Some(pp) if pp > 1 => {
-                    if let Some(binding) = self.pid_binding_for(pp as u32) {
-                        self.cache_pid_binding(pid, binding.clone());
-                        return Some(binding);
-                    }
-                    ancestor = pp;
-                }
-                _ => break,
-            }
-        }
-        None
-    }
-
-    fn pid_binding_for(
-        &self,
-        pid: u32,
-    ) -> Option<Option<crate::seccomp::notif::NetworkPolicy>> {
-        self.pid_policies
+        let live_policy = live_policy.unwrap_or(&self.live_policy);
+        let narrowing = live_policy
             .read()
             .ok()
-            .and_then(|m| m.get(&(pid as i32)).cloned())
+            .and_then(|live| live.narrowed_ips.clone());
+        self.apply_live_tightening(
+            narrowing.map(|ips| ip_only_allow_policy(&ips)),
+            protocol,
+            Some(live_policy),
+        )
     }
 
-    fn cache_pid_binding(&self, pid: u32, binding: Option<crate::seccomp::notif::NetworkPolicy>) {
-        if let Ok(mut m) = self.pid_policies.write() {
-            m.insert(pid as i32, binding);
-        }
-    }
-
-    /// Prune one pid's per-pid binding on process exit. The pgid entry is
-    /// dropped only when the **group** is empty: `kill(-pgid, 0)` probes the
-    /// group's membership, so an entry survives a reaped leader whose
-    /// descendants still live in the group (reviewer C1). An uncached
-    /// in-group descendant's first mediated syscall after the leader's exit
-    /// must still resolve the bound policy, never the wide default.
-    pub fn prune_pid(&mut self, pid: i32) {
-        if let Ok(mut m) = self.pid_policies.write() {
-            m.remove(&pid);
-        }
-        if pid > 1 && self.child_policies.contains_key(&pid) {
-            let mut group_alive = unsafe { libc::kill(-pid, 0) } == 0;
-            if !group_alive {
-                let errno = std::io::Error::last_os_error().raw_os_error();
-                // Any error other than ESRCH means the probe could not prove
-                // emptiness (EPERM etc.) — keep the entry (fail safe).
-                group_alive = errno != Some(libc::ESRCH);
-            }
-            if !group_alive {
-                self.child_policies.remove(&pid);
-            }
-        }
-    }
-
-    /// Resolve the notif pid's process group (the pid of the exec child whose
-    /// subtree it belongs to; threads share their process's pgid) and return
-    /// that child's bound session policy, if any. `getpgid` runs on a frozen
-    /// notif target, so the pgid cannot race between the syscall and this
-    /// read.
-    pub fn child_policy_for_pid(&self, pid: u32) -> Option<crate::seccomp::notif::NetworkPolicy> {
-        let pgid = unsafe { libc::getpgid(pid as i32) };
-        if pgid <= 0 {
-            return None;
-        }
-        self.child_policy_for_pgid(pgid)
-    }
-
-    /// Lookup by an already-resolved process-group id (unit-testable and
-    /// used by the pid-resolving wrapper above).
-    pub fn child_policy_for_pgid(
-        &self,
-        pgid: i32,
-    ) -> Option<crate::seccomp::notif::NetworkPolicy> {
-        self.child_policies.get(&pgid).cloned()
-    }
-
-    /// Effective policy for a syscall made by `pid`, honoring the F4.4
-    /// per-child binding: per-PID policy-fn override > bound child policy >
-    /// live policy > instance static policy. A bound child's exec-time policy
-    /// is authoritative over the shared live/static state, so a session
-    /// `update_network` that narrows the *next* exec never bleeds into an
-    /// already-running child, and a wide sibling can never grant a narrow one
-    /// access through the shared state.
-    pub fn effective_network_policy_for_pid(
-        &self,
-        pid: u32,
-        protocol: crate::sandbox::Protocol,
-        live_policy: Option<&std::sync::Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>>>,
-    ) -> crate::seccomp::notif::NetworkPolicy {
-        if let Ok(overrides) = self.pid_ip_overrides.read() {
-            if let Some(ips) = overrides.get(&pid) {
-                return ip_only_allow_policy(ips);
-            }
-        }
-        // F4.4 follow-up (reviewer I2/I4): per-pid lineage binding first, then
-        // the pgid map for in-group processes that have not made a syscall
-        // yet. A bound lineage applies its exec-time policy; live-policy
-        // tightening (policy_fn `restrict_network`) still narrows it on top
-        // (deny wins — the live set can never widen past the instance
-        // ceiling). An unattributed pid in a session that has attributed
-        // children fails closed (deny all) instead of regaining a wide
-        // sibling's shared default.
-        if let Some(binding) = self.resolve_pid_binding(pid) {
-            return self.apply_live_tightening(binding, protocol, live_policy);
-        }
-        let pgid = unsafe { libc::getpgid(pid as i32) };
-        if pgid > 0 {
-            if let Some(bound) = self.child_policy_for_pgid(pgid) {
-                self.cache_pid_binding(pid, Some(bound.clone()));
-                return self.apply_live_tightening(Some(bound), protocol, live_policy);
-            }
-        }
-        if self.has_exec_bindings() {
-            return deny_all_policy();
-        }
-        self.effective_network_policy(pid, protocol, live_policy)
-    }
-
-    /// Apply the policy-fn live-policy tightening on top of a bound child's
-    /// exec-time policy: the effective allow set is the intersection (deny
-    /// wins). `live_policy` is seeded from the instance ceiling and can only
-    /// shrink at runtime, so this never widens the bound policy.
+    /// Apply the instance-wide narrowing and the policy-fn live replacement
+    /// on top of the static per-protocol policy: the effective allow set is
+    /// the intersection (deny wins).
+    ///
+    /// `binding` is the session `update_network` narrowing as an IP-any-port
+    /// allowlist (or `None` when the sandbox is not narrowed). It is composed
+    /// with the protocol's static ceiling ([`intersect_ceiling_grant`]), so a
+    /// narrowing can never widen a protocol — a request naming an IP the
+    /// ceiling does not grant leaves that protocol denying it. The policy-fn
+    /// live set (when non-empty) narrows the result further, and `live_policy`
+    /// is seeded from the instance ceiling and can only shrink at runtime, so
+    /// this never widens the instance policy either.
     fn apply_live_tightening(
         &self,
         binding: Option<crate::seccomp::notif::NetworkPolicy>,
@@ -914,8 +748,7 @@ impl NetworkState {
         live_policy: Option<&std::sync::Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>>>,
     ) -> crate::seccomp::notif::NetworkPolicy {
         let Some(bound) = binding else {
-            // Attributed-default lineage: the shared live/static instance
-            // policy applies unchanged.
+            // Not narrowed: the shared live/static instance policy applies.
             return self.live_or_static(protocol, live_policy);
         };
         let Some(lp) = live_policy else {
@@ -947,7 +780,8 @@ impl NetworkState {
     }
 
     /// Live policy (when restricting) over the instance per-protocol static
-    /// policy — the shared default path for attributed-default lineages.
+    /// policy — the un-narrowed default path (no session `update_network`
+    /// narrowing in force).
     fn live_or_static(
         &self,
         protocol: crate::sandbox::Protocol,
@@ -967,25 +801,6 @@ impl NetworkState {
         }
     }
 
-    /// Effective policy for a whole process group (the exec-child subtree):
-    /// bound child policy wins over the shared live/static instance policy;
-    /// an unbound group keeps the instance default.
-    pub fn effective_network_policy_for_pgid(
-        &self,
-        pgid: i32,
-        protocol: crate::sandbox::Protocol,
-    ) -> crate::seccomp::notif::NetworkPolicy {
-        if let Some(bound) = self.child_policy_for_pgid(pgid) {
-            return bound;
-        }
-        // No pid to check per-PID overrides against at group granularity;
-        // live/static remain the default for unbound groups.
-        match protocol {
-            crate::sandbox::Protocol::Tcp => self.tcp_policy.clone(),
-            crate::sandbox::Protocol::Udp => self.udp_policy.clone(),
-            crate::sandbox::Protocol::Icmp => self.icmp_policy.clone(),
-        }
-    }
 }
 
 /// Build the legacy IP-only allowlist policy (any port to each listed IP)
@@ -1004,8 +819,10 @@ fn ip_only_allow_policy(
     }
 }
 
-/// Deny-all policy used for unattributed pids in sessions that have
-/// attributed exec children (fail closed, §4.5).
+/// The deny-all allowlist (no destination matches). Used where a composition
+/// provably grants nothing — [`intersect_ceiling_grant`] against a ceiling
+/// that cannot express the requested subset, and the session narrowing set
+/// written empty by `update_network` (deny all outbound).
 fn deny_all_policy() -> crate::seccomp::notif::NetworkPolicy {
     ip_only_allow_policy(&HashSet::new())
 }
@@ -1559,7 +1376,8 @@ mod tests {
     }
 
     // ============================================================
-    // F4.4 per-child network binding (fork-plan §4.5)
+    // Instance-wide egress policy (end-state B): the verdict depends on the
+    // sandbox's current policy, never on which exec a process belongs to.
     // ============================================================
 
     fn tcp_allow(ips: &[&str]) -> crate::seccomp::notif::NetworkPolicy {
@@ -1578,33 +1396,75 @@ mod tests {
     }
 
     #[test]
-    fn bound_child_policy_wins_over_shared_static_policy() {
+    fn effective_policy_is_identical_for_every_pid() {
         let mut ns = NetworkState::new();
         ns.tcp_policy = tcp_allow(&["10.0.0.1", "10.0.0.2"]);
-        // The session update narrows child pgid 4242 to 10.0.0.1 only.
-        ns.bind_child_policy(4242, tcp_allow(&["10.0.0.1"]));
+        ns.live_policy
+            .write()
+            .unwrap()
+            .narrowed_ips = Some(HashSet::from(["10.0.0.1".parse().unwrap()]));
 
-        let bound =
-            ns.effective_network_policy_for_pgid(4242, crate::sandbox::Protocol::Tcp);
-        assert!(bound.allows("10.0.0.1".parse().unwrap(), 443));
+        // Two unrelated pids (an exec child and a stranger) read the same
+        // verdict: process identity is not part of the judgement any more.
+        let child = ns.effective_network_policy(4242, crate::sandbox::Protocol::Tcp, None);
+        let stranger = ns.effective_network_policy(999_999, crate::sandbox::Protocol::Tcp, None);
+        assert_eq!(
+            child.allows("10.0.0.1".parse().unwrap(), 443),
+            stranger.allows("10.0.0.1".parse().unwrap(), 443)
+        );
+        assert_eq!(
+            child.allows("10.0.0.2".parse().unwrap(), 443),
+            stranger.allows("10.0.0.2".parse().unwrap(), 443)
+        );
+        assert!(child.allows("10.0.0.1".parse().unwrap(), 443));
+        assert!(!child.allows("10.0.0.2".parse().unwrap(), 443));
+    }
+
+    #[test]
+    fn instance_narrowing_composes_with_the_protocol_ceiling() {
+        let mut ns = NetworkState::new();
+        // The narrowing names an IP the TCP ceiling does not grant: the
+        // composition keeps it denied instead of widening the protocol.
+        ns.tcp_policy = tcp_allow(&["10.0.0.1"]);
+        ns.live_policy.write().unwrap().narrowed_ips = Some(HashSet::from([
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+        ]));
+
+        let tcp = ns.effective_network_policy(4242, crate::sandbox::Protocol::Tcp, None);
+        assert!(tcp.allows("10.0.0.1".parse().unwrap(), 443));
         assert!(
-            !bound.allows("10.0.0.2".parse().unwrap(), 443),
-            "the bound child's exec-time policy must not be widened by the shared ceiling"
+            !tcp.allows("10.0.0.2".parse().unwrap(), 443),
+            "an IP outside the protocol ceiling must stay denied"
+        );
+
+        // An empty narrowing is deny-all, not "unrestricted".
+        ns.live_policy.write().unwrap().narrowed_ips = Some(HashSet::new());
+        assert!(
+            ns.effective_network_policy(4242, crate::sandbox::Protocol::Tcp, None)
+                .denies_everything(),
+            "an empty narrowing set must deny every outbound destination"
         );
     }
 
     #[test]
-    fn sibling_group_never_shares_a_bound_policy() {
+    fn pid_override_is_unchanged_by_the_instance_narrowing() {
         let mut ns = NetworkState::new();
         ns.tcp_policy = tcp_allow(&["10.0.0.1", "10.0.0.2"]);
-        ns.bind_child_policy(4242, tcp_allow(&["10.0.0.1"]));
+        ns.live_policy
+            .write()
+            .unwrap()
+            .narrowed_ips = Some(HashSet::from(["10.0.0.1".parse().unwrap()]));
+        // The legacy per-PID channel keeps its own set (unchanged semantics).
+        ns.pid_ip_overrides
+            .write()
+            .unwrap()
+            .insert(4242, HashSet::from(["10.0.0.2".parse().unwrap()]));
 
-        // Sibling group 4243 has no entry: it keeps the instance default and
-        // is never narrowed (or granted) by child 4242's binding.
-        let sibling =
-            ns.effective_network_policy_for_pgid(4243, crate::sandbox::Protocol::Tcp);
-        assert!(sibling.allows("10.0.0.2".parse().unwrap(), 443));
-        assert!(ns.child_policy_for_pgid(4243).is_none());
+        let overridden = ns.effective_network_policy(4242, crate::sandbox::Protocol::Tcp, None);
+        assert!(overridden.allows("10.0.0.2".parse().unwrap(), 443));
+        let other = ns.effective_network_policy(4243, crate::sandbox::Protocol::Tcp, None);
+        assert!(!other.allows("10.0.0.2".parse().unwrap(), 443));
     }
 
     // ============================================================
@@ -1703,106 +1563,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn attributed_default_child_prunes_on_exit() {
-        let mut ns = NetworkState::new();
-        assert!(!ns.has_exec_bindings());
-        ns.bind_exec_child(4242, None);
-        assert!(ns.has_exec_bindings(), "default-policy children are attributed");
-        assert!(
-            matches!(ns.pid_binding_for(4242), Some(None)),
-            "default-policy children are attributed with no bound policy"
-        );
-        ns.prune_pid(4242);
-        assert!(ns.pid_binding_for(4242).is_none());
-        assert!(
-            !ns.has_exec_bindings(),
-            "pruning the last attributed child ends fail-closed attribution"
-        );
-    }
-
-    /// Reviewer C1: a pgid entry is removed only when the **group** is empty.
-    /// With the leader reaped and no live member, `kill(-pgid, 0)` reports
-    /// ESRCH and the entry can go.
-    #[test]
-    fn pgid_entry_pruned_once_group_is_empty() {
-        let pid = unsafe { libc::fork() };
-        assert!(pid >= 0, "fork for empty-group prune test");
-        if pid == 0 {
-            unsafe {
-                libc::setpgid(0, 0);
-                libc::_exit(0);
-            }
-        }
-        let mut ns = NetworkState::new();
-        ns.bind_child_policy(pid, tcp_allow(&["10.0.0.1"]));
-        let mut status = 0;
-        unsafe {
-            libc::waitpid(pid, &mut status, 0);
-        }
-        ns.prune_pid(pid);
-        assert!(
-            ns.child_policy_for_pgid(pid).is_none(),
-            "an empty process group's pgid entry must be pruned"
-        );
-        assert!(ns.pid_binding_for(pid as u32).is_none());
-    }
-
-    /// Reviewer C1: a pgid entry must **survive** a reaped leader while an
-    /// in-group descendant still lives — `getpgid(leader)` would wrongly
-    /// report the group gone; `kill(-pgid, 0)` probes real membership.
-    #[test]
-    fn pgid_entry_survives_leader_exit_with_live_member() {
-        let leader = unsafe { libc::fork() };
-        assert!(leader >= 0, "fork for group-survival test");
-        if leader == 0 {
-            // Leader: create its own group, spawn one in-group descendant,
-            // and exit immediately — the descendant outlives the leader.
-            unsafe {
-                libc::setpgid(0, 0);
-            }
-            let member = unsafe { libc::fork() };
-            if member == 0 {
-                let ts = libc::timespec { tv_sec: 1, tv_nsec: 0 };
-                unsafe {
-                    libc::nanosleep(&ts, std::ptr::null_mut());
-                    libc::_exit(0);
-                }
-            }
-            unsafe {
-                libc::_exit(0);
-            }
-        }
-        let mut ns = NetworkState::new();
-        ns.bind_child_policy(leader, tcp_allow(&["10.0.0.1"]));
-        let mut status = 0;
-        unsafe {
-            libc::waitpid(leader, &mut status, 0);
-        }
-        // The leader is reaped but its group still has the sleeping member:
-        // pruning must keep the pgid entry.
-        ns.prune_pid(leader);
-        assert!(
-            ns.child_policy_for_pgid(leader).is_some(),
-            "a live in-group member must keep the pgid entry after leader exit"
-        );
-        // Once the member exits and the group empties, the entry is pruned.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let alive = unsafe { libc::kill(-leader, 0) } == 0;
-            if !alive {
-                let errno = std::io::Error::last_os_error().raw_os_error();
-                if errno == Some(libc::ESRCH) {
-                    break;
-                }
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "in-group member never exited"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        ns.prune_pid(leader);
-        assert!(ns.child_policy_for_pgid(leader).is_none());
-    }
 }

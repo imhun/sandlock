@@ -3352,6 +3352,16 @@ impl Sandbox {
             }
 
             if let Some(ref callback) = self.policy_fn {
+                // The policy-fn callback shares the network state's live
+                // policy handle (created in `NetworkState::new`, so the
+                // session `update_network` verb has the same instance-wide
+                // narrowing channel with or without a callback) and is the
+                // only writer of the replacement set `allowed_ips`. Seeding
+                // it from the destination ceiling is what makes
+                // `restrict_network` narrowing-only; a callback-less sandbox
+                // leaves it empty and stays on the static per-protocol
+                // policy, exactly as before.
+                let live = std::sync::Arc::clone(&net_state.live_policy);
                 let mut allowed_ips: std::collections::HashSet<std::net::IpAddr> =
                     std::collections::HashSet::new();
                 for p in [&net_state.tcp_policy, &net_state.udp_policy, &net_state.icmp_policy] {
@@ -3366,18 +3376,22 @@ impl Sandbox {
                         }
                     }
                 }
-                let live = crate::policy_fn::LivePolicy {
-                    allowed_ips,
-                    max_memory_bytes: notif_policy.max_memory_bytes,
-                    max_processes: notif_policy.max_processes,
+                let ceiling = {
+                    let mut lp = live.write().expect("live policy lock");
+                    lp.allowed_ips = allowed_ips;
+                    lp.max_memory_bytes = notif_policy.max_memory_bytes;
+                    lp.max_processes = notif_policy.max_processes;
+                    lp.clone()
                 };
-                let ceiling = live.clone();
-                let live = std::sync::Arc::new(std::sync::RwLock::new(live));
                 let denied = policy_fn_state.denied.clone();
                 let pid_overrides = net_state.pid_ip_overrides.clone();
-                policy_fn_state.live_policy = Some(live.clone());
+                policy_fn_state.live_policy = Some(std::sync::Arc::clone(&live));
                 let worker = crate::policy_fn::spawn_policy_fn(
-                    callback.clone(), live, ceiling, pid_overrides, denied,
+                    callback.clone(),
+                    std::sync::Arc::clone(&live),
+                    ceiling,
+                    pid_overrides,
+                    denied,
                 );
                 policy_fn_state.event_tx = Some(worker.sender());
                 self.rt_mut().policy_fn_worker = Some(worker);

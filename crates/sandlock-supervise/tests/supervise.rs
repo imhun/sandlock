@@ -1099,9 +1099,9 @@ fn test_supervise_fd_serve_launches_instance_and_serves_instance_verbs() {
         "the S9 ceiling refusal must carry the policy_denied code: {resp:?}"
     );
 
-    // update_network verb (F4.3): the main workload (child id 0) is still
-    // running under the pre-update policy, so the verb reports it stale;
-    // the update itself applies to new execs only.
+    // update_network verb (F4.3): the narrowing is instance-wide and applies
+    // to the running main workload (child id 0) at once, so the reply carries
+    // no staleness report — there is nothing left that keeps an old policy.
     let resp = roundtrip_frame(
         &mut worker,
         &serde_json::json!({
@@ -1112,9 +1112,9 @@ fn test_supervise_fd_serve_launches_instance_and_serves_instance_verbs() {
     );
     assert_eq!(resp["ok"], serde_json::Value::Bool(true), "update_network: {resp:?}");
     assert_eq!(
-        resp["data"]["stale_child_ids"],
-        serde_json::json!([0]),
-        "the running main child must be the stale pre-update child: {resp:?}"
+        resp["data"],
+        serde_json::json!({}),
+        "the update_network reply carries no staleness report: {resp:?}"
     );
 
     // The workload really ran and wrote its evidence.

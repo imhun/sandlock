@@ -415,10 +415,10 @@ impl Generation {
         }))
     }
 
-    /// Serve an `update_network` verb (F4.3/S2): the session's outbound IP
-    /// allow set changes for **new execs only**; running children keep their
-    /// exec-time policy and their child ids are returned as the staleness
-    /// report.
+    /// Serve an `update_network` verb (F4.3/S2): the sandbox's outbound IP
+    /// allow set is narrowed **instance-wide and immediately** — commands
+    /// already running are judged against it from their next connect on — so
+    /// the reply carries no staleness report.
     fn handle_update_network(
         &mut self,
         args: &serde_json::Value,
@@ -443,13 +443,10 @@ impl Generation {
                 "generation has no instance: update_network requires a launched session",
             )
         })?;
-        let report = self
-            .rt
+        self.rt
             .block_on(instance.update_network(&ips))
             .map_err(|e| Refusal::from_core("instance update_network failed", &e))?;
-        Ok(serde_json::json!({
-            "stale_child_ids": report.stale_child_ids,
-        }))
+        Ok(serde_json::json!({}))
     }
 
     /// Serve a `wait_child` verb: block until the named child exits and

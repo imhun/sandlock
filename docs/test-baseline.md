@@ -347,7 +347,19 @@
 # cut to zero (give up at once) the old pooled-thread shape failed 18 of 20
 # probe cycles on `PTRACE_SEIZE tid 68: Operation not permitted` while the
 # per-freeze thread passed the same shape in 6.2 s.
-core_lib = 949 # 2026-10-12 (N104): 948 -> 949, +1 --
+core_lib = 947 # 2026-10-14 (netns-egress end-state B, tasks 1-4): 949 -> 947,
+               # -2. The per-exec network attribution is deleted, so its five
+               # state.rs pins go with it
+               # (`bound_child_policy_wins_over_shared_static_policy`,
+               # `sibling_group_never_shares_a_bound_policy`,
+               # `attributed_default_child_prunes_on_exit`,
+               # `pgid_entry_pruned_once_group_is_empty`,
+               # `pgid_entry_survives_leader_exit_with_live_member`) and three
+               # instance-wide verdict cases take their place
+               # (`effective_policy_is_identical_for_every_pid`,
+               # `instance_narrowing_composes_with_the_protocol_ceiling`,
+               # `pid_override_is_unchanged_by_the_instance_narrowing`).
+               # 2026-10-12 (N104): 948 -> 949, +1 --
                # `freeze::tests::a_task_left_seized_is_released_when_its_tracer_
                # thread_exits`: the kernel detaches a thread's tracees when that
                # thread exits, which is what makes the freeze owner's
@@ -670,7 +682,15 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 574 # 2026-10-10 (N95): 573 -> 574, +1 --
+core_integ = 573 # 2026-10-14 (netns-egress end-state B, tasks 1-4): 574 -> 573,
+                 # -1. `test_instance_exec_params::test_bound_child_pgid_entry_
+                 # survives_leader_exit` pinned the pgid-entry lifetime of the
+                 # deleted attribution maps; the four surviving cases in that
+                 # family were converted to the new semantics in place (the
+                 # narrowing is instance-wide and immediate, so a running child,
+                 # a setsid escapee and a reparented orphan are all judged by
+                 # the sandbox's current policy).
+                 # 2026-10-10 (N95): 573 -> 574, +1 --
                  # `test_chroot::test_chroot_create_paths_answer_the_kernels_errno`:
                  # a create-capable path under a missing parent answers the
                  # kernel's ENOENT (2) for mkdir/symlink/readlink, while a
@@ -1471,6 +1491,13 @@ python = 465  # 2026-10-06: 466 -> 465 -- N79's `notify_rate_limit_stat` retired
               # (test_dropped_exec_process_is_reaped_on_del).
 
 # ---------------------------------------------------------------------------
+# 2026-10-14 (netns-egress end-state B, tasks 1-4): the two arm64 labels below
+# (`arm64_core_lib`, `arm64_core_integ`) were **not** re-measured -- the change
+# is architecture-independent (no syscall numbers, struct layouts or word
+# sizes), so they are expected to move by exactly the same deltas as the
+# x86_64 labels (core_lib -2, core_integ -1) on the next arm64 lane run. The
+# numbers below are the pre-change measurements and must be refreshed there.
+#
 # arm64 lane (2026-09-24): the S5 lane is a local Lima qemu VM (Ubuntu 24.04,
 # kernel 6.14.0-37-generic, 6 vCPU, host = amd64 Darwin). No test binary leaves
 # this machine; the aarch64 binaries are cross-built here with the wheel

@@ -1755,24 +1755,21 @@ int sandlock_instance_exec_params(sandlock_instance_t *h,
 
 /**
  * F4.3 (S2): session network update. `ips` is the new outbound IP allow set
- * (any port; an empty array denies all outbound). The update binds to new
- * execs only; running children are copied into the caller's `stale` buffer
- * (up to `stale_capacity` u64s) and the full count is written to
- * `out_stale_count`. Returns `SANDLOCK_INSTANCE_OK` on success, the stable
- * instance error code otherwise (a wider-than-ceiling request returns
+ * (any port; an empty array denies all outbound). The narrowing is
+ * instance-wide and immediate: every process of the sandbox -- one already
+ * running as much as one exec'd later -- is judged against it from its next
+ * connect on, so there is no staleness to report. Returns
+ * `SANDLOCK_INSTANCE_OK` on success, the stable instance error code
+ * otherwise (a wider-than-ceiling request returns
  * `SANDLOCK_INSTANCE_ERR_POLICY`).
  *
  * # Safety
  * `h` must be a valid instance handle; `ips` must point to `ip_count` C
- * strings (NULL with count 0 allowed); `stale`/`out_stale_count` must be
- * valid when `stale_capacity > 0` / always respectively.
+ * strings (NULL with count 0 allowed).
  */
 int sandlock_instance_update_network(sandlock_instance_t *h,
                                      const char *const *ips,
-                                     uintptr_t ip_count,
-                                     uint64_t *stale,
-                                     uintptr_t stale_capacity,
-                                     uintptr_t *out_stale_count);
+                                     uintptr_t ip_count);
 
 /**
  * Wait for an exec child to exit (blocking). `timeout_ms == 0` waits

@@ -3654,33 +3654,27 @@ pub unsafe extern "C" fn sandlock_instance_exec_params(
 }
 
 /// F4.3 (S2): session network update. `ips` is the new outbound IP allow set
-/// (any port; an empty array denies all outbound). The update binds to new
-/// execs only; running children are copied into the caller's `stale` buffer
-/// (up to `stale_capacity` u64s) and the full count is written to
-/// `out_stale_count`. Returns `SANDLOCK_INSTANCE_OK` on success, the stable
-/// instance error code otherwise (a wider-than-ceiling request returns
+/// (any port; an empty array denies all outbound). The narrowing is
+/// instance-wide and immediate: every process of the sandbox — one already
+/// running as much as one exec'd later — is judged against it from its next
+/// connect on, so there is no staleness to report. Returns
+/// `SANDLOCK_INSTANCE_OK` on success, the stable instance error code
+/// otherwise (a wider-than-ceiling request returns
 /// `SANDLOCK_INSTANCE_ERR_POLICY`).
 ///
 /// # Safety
 /// `h` must be a valid instance handle; `ips` must point to `ip_count` C
-/// strings (NULL with count 0 allowed); `stale`/`out_stale_count` must be
-/// valid when `stale_capacity > 0` / always respectively.
+/// strings (NULL with count 0 allowed).
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_instance_update_network(
     h: *mut sandlock_instance_t,
     ips: *const *const c_char,
     ip_count: usize,
-    stale: *mut u64,
-    stale_capacity: usize,
-    out_stale_count: *mut usize,
 ) -> c_int {
-    if h.is_null() || out_stale_count.is_null() {
+    if h.is_null() {
         return SANDLOCK_INSTANCE_ERR_CHILD;
     }
     if ip_count > 0 && ips.is_null() {
-        return SANDLOCK_INSTANCE_ERR_CHILD;
-    }
-    if stale_capacity > 0 && stale.is_null() {
         return SANDLOCK_INSTANCE_ERR_CHILD;
     }
     let mut allowed = Vec::with_capacity(ip_count);
@@ -3698,16 +3692,11 @@ pub unsafe extern "C" fn sandlock_instance_update_network(
     let result = block_on_runtime(&h.runtime, async {
         h.instance.update_network(&allowed).await
     });
-    let report = match result {
-        Some(Ok(report)) => report,
+    match result {
+        Some(Ok(())) => {}
         Some(Err(e)) => return instance_error_code(&e),
         None => return SANDLOCK_INSTANCE_ERR_CHILD,
-    };
-    let n = report.stale_child_ids.len().min(stale_capacity);
-    for (i, id) in report.stale_child_ids.iter().take(n).enumerate() {
-        *stale.add(i) = *id;
     }
-    *out_stale_count = report.stale_child_ids.len();
     SANDLOCK_INSTANCE_OK
 }
 

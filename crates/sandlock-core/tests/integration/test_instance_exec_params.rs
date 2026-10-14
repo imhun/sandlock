@@ -382,42 +382,36 @@ fn spawn_sink_listener(ip: IpAddr) -> (u16, Arc<Mutex<Vec<String>>>) {
     (port, log)
 }
 
-/// Matrix F4.3/F4.4 case: `update_network` binds to **new execs only** and
-/// reports staleness for running children; the child bound at exec keeps its
-/// own network policy, so a narrow sibling can never inherit (or be denied
-/// by) a wide sibling's decisions.
+/// End-state B: an `update_network` narrowing is **instance-wide and
+/// immediate**. A child that is already running is judged against it from its
+/// next connect on, exactly like one exec'd later — there is no exec-time
+/// policy to keep and no staleness to report. (D4=A, the shape this replaced,
+/// kept a running child on its exec-time policy and named it stale.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_update_network_applies_to_new_exec_only_and_reports_staleness() {
+async fn test_update_network_narrows_a_running_child_immediately() {
     let (port_lo, log_lo) = spawn_sink_listener("127.0.0.1".parse().unwrap());
     let (port_hi, log_hi) = spawn_sink_listener("127.0.0.2".parse().unwrap());
 
-    // Any-port destination ceiling over both loopback addresses:
-    // update_network may narrow it per child, and the pre-update child keeps
-    // the full ceiling.
-    let policy = base_policy()
-        .net_allow("127.0.0.1")
-        .net_allow("127.0.0.2");
+    // Any-port destination ceiling over both loopback addresses: the narrowing
+    // below is expressible, and it must bite the *running* child.
+    let policy = base_policy().net_allow("127.0.0.1").net_allow("127.0.0.2");
     let mut inst = launch_exec_only_tmp(policy).await;
 
-    let dir = scratch("net-update");
+    let dir = scratch("net-update-live");
     std::fs::create_dir_all(&dir).expect("create net-update dir");
-    let a_go1 = dir.join("a-go1");
-    let a_go2 = dir.join("a-go2");
-    let a_out = dir.join("a-out");
-    let b_out = dir.join("b-out");
-    std::fs::create_dir_all(&a_out).expect("create A output dir");
-    std::fs::create_dir_all(&b_out).expect("create B output dir");
+    let out_dir = dir.join("out");
+    std::fs::create_dir_all(&out_dir).expect("create out dir");
+    let go = dir.join("go");
+    let lo_out = out_dir.join("lo");
+    let hi_out = out_dir.join("hi");
 
-    // Child A runs *before* the update: it must keep the wide exec-time
-    // policy even after `update_network` narrows the session. Its connects
-    // are marker-gated so they happen after the update and after sibling B
-    // was bound to the narrow policy.
-    let a_script = format!(
+    // The child is exec'd *before* the update and connects only after the
+    // marker is released: both probes observe the narrowed policy.
+    let script = format!(
         concat!(
             "import os, socket, time\n",
-            "def wait(f):\n",
-            "    while not os.path.exists(f):\n",
-            "        time.sleep(0.05)\n",
+            "while not os.path.exists('{go}'):\n",
+            "    time.sleep(0.05)\n",
             "def probe(ip, port, out):\n",
             "    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
             "    s.settimeout(3)\n",
@@ -428,141 +422,70 @@ async fn test_update_network_applies_to_new_exec_only_and_reports_staleness() {
             "        open(out, 'w').write('ERR%d' % e.errno)\n",
             "    finally:\n",
             "        s.close()\n",
-            "wait('{go1}')\n",
             "probe('127.0.0.1', {p_lo}, '{o_lo}')\n",
-            "wait('{go2}')\n",
             "probe('127.0.0.2', {p_hi}, '{o_hi}')\n",
         ),
-        go1 = a_go1.display(),
-        go2 = a_go2.display(),
+        go = go.display(),
         p_lo = port_lo,
         p_hi = port_hi,
-        o_lo = a_out.join("lo").display(),
-        o_hi = a_out.join("hi").display(),
+        o_lo = lo_out.display(),
+        o_hi = hi_out.display(),
     );
-    let a = inst
-        .exec_params(&["/usr/bin/python3", "-c", &a_script], &ExecParams::default(), ExecStdio::Null)
-        .await
-        .expect("exec pre-update child A");
-
-    // A second concurrent pre-update child strengthens the exact-staleness
-    // assertion (both running children are reported, in child-id order).
-    let a2 = inst
+    let child = inst
         .exec_params(
-            &["/usr/bin/python3", "-c", "import time; time.sleep(60)"],
+            &["/usr/bin/python3", "-c", &script],
             &ExecParams::default(),
             ExecStdio::Null,
         )
         .await
-        .expect("exec second pre-update child A2");
+        .expect("exec pre-update child");
 
-    // Session-level update: new execs only. A and A2 are still running under
-    // the old policy, so the API must report both as stale.
-    let stale = inst
-        .update_network(&["127.0.0.1".parse::<IpAddr>().unwrap()])
+    // Session-level narrowing while the child runs: it applies at once.
+    inst.update_network(&["127.0.0.1".parse::<IpAddr>().unwrap()])
         .await
-        .expect("update_network narrows the session to loopback-low");
-    let mut expected_stale = vec![a.child_id, a2.child_id];
-    expected_stale.sort_unstable();
+        .expect("narrow the session to loopback-low");
+
+    std::fs::write(&go, b"go").expect("release the running child");
+    let status = inst.wait_child(child.child_id).await.expect("wait child");
+    assert_eq!(status, ExitStatus::Code(0));
     assert_eq!(
-        stale.stale_child_ids, expected_stale,
-        "every running pre-update child must be reported stale exactly"
-    );
-
-    // An identical update is a no-op: no generation bump, no stale report.
-    let noop = inst
-        .update_network(&["127.0.0.1".parse::<IpAddr>().unwrap()])
-        .await
-        .expect("identical update_network must be accepted");
-    assert!(
-        noop.stale_child_ids.is_empty(),
-        "identical update must not report running children stale, got {noop:?}"
-    );
-
-    // Child B execs after the update: bound to the narrow policy — loopback
-    // 127.0.0.1 only. Its connect to the wide sibling's 127.0.0.2 listener
-    // must be refused even though the *instance* ceiling still allows it.
-    let b_script = format!(
-        concat!(
-            "import socket\n",
-            "def probe(ip, port, out):\n",
-            "    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-            "    s.settimeout(3)\n",
-            "    try:\n",
-            "        s.connect((ip, port))\n",
-            "        open(out, 'w').write('OK')\n",
-            "    except OSError as e:\n",
-            "        open(out, 'w').write('ERR%d' % e.errno)\n",
-            "    finally:\n",
-            "        s.close()\n",
-            "probe('127.0.0.1', {p_lo}, '{o_lo}')\n",
-            "probe('127.0.0.2', {p_hi}, '{o_hi}')\n",
-        ),
-        p_lo = port_lo,
-        p_hi = port_hi,
-        o_lo = b_out.join("lo").display(),
-        o_hi = b_out.join("hi").display(),
-    );
-    let b = inst
-        .exec_params(&["/usr/bin/python3", "-c", &b_script], &ExecParams::default(), ExecStdio::Null)
-        .await
-        .expect("exec post-update child B");
-
-    let status_b = inst.wait_child(b.child_id).await.expect("wait child B");
-    assert_eq!(status_b, ExitStatus::Code(0));
-    assert_eq!(
-        std::fs::read_to_string(b_out.join("lo")).unwrap_or_default(),
+        std::fs::read_to_string(&lo_out).unwrap_or_default(),
         "OK",
-        "post-update child B may reach its bound 127.0.0.1 destination"
+        "the narrowed-in destination stays reachable for the running child"
     );
     assert_eq!(
-        std::fs::read_to_string(b_out.join("hi")).unwrap_or_default(),
+        std::fs::read_to_string(&hi_out).unwrap_or_default(),
         "ERR111",
-        "post-update child B must be denied the wide child's destination (ECONNREFUSED)"
+        "a running child must be refused the narrowed-away destination at once"
     );
 
-    // Release A's two marker gates: A connects after B's narrow binding is
-    // live, proving the running child kept its exec-time (wide) policy.
-    std::fs::write(&a_go1, b"go").expect("release A gate 1");
-    std::fs::write(&a_go2, b"go").expect("release A gate 2");
-    let status_a = inst.wait_child(a.child_id).await.expect("wait child A");
-    assert_eq!(status_a, ExitStatus::Code(0));
-    assert_eq!(
-        std::fs::read_to_string(a_out.join("lo")).unwrap_or_default(),
-        "OK",
-        "pre-update child A keeps its loopback-low grant"
-    );
-    assert_eq!(
-        std::fs::read_to_string(a_out.join("hi")).unwrap_or_default(),
-        "OK",
-        "pre-update child A keeps its wide 127.0.0.2 grant after the update"
-    );
-
-    // Both listeners were actually reached exactly as the policies allowed:
-    // low by A + B, high by A only.
+    // The refused connect never reached the listener: the answer came from the
+    // verdict, not from a dead port.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        let low = log_lo.lock().unwrap().len();
-        let high = log_hi.lock().unwrap().len();
-        if low == 2 && high == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    while Instant::now() < deadline && log_lo.lock().unwrap().len() < 1 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(log_lo.lock().unwrap().len(), 2, "low listener: A + B");
-    assert_eq!(log_hi.lock().unwrap().len(), 1, "high listener: A only");
+    assert_eq!(
+        log_lo.lock().unwrap().len(),
+        1,
+        "the narrowed-in listener must be reached exactly once"
+    );
+    assert_eq!(
+        log_hi.lock().unwrap().len(),
+        0,
+        "the narrowed-away listener must never be reached"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
     inst.shutdown().await.expect("shutdown");
 }
 
-/// Reviewer I2: a descendant of a *bound* child that escapes its process
-/// group (`setsid`) must not fall back to the shared wide default. The
-/// per-pid lineage binding follows the ancestor chain, so the escapee stays
-/// under the bound child's narrow policy (denied the sibling-wide
-/// destination).
+/// End-state B: a descendant that escapes its process group (`setsid`) is
+/// judged by the sandbox's current policy exactly like everything else — the
+/// narrowing is instance-wide, so an escapee is denied the narrowed-away
+/// destination without any ancestor attribution being consulted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_bound_lineage_escapee_is_denied_sibling_wide_destination() {
+async fn test_setsid_escapee_is_denied_the_narrowed_away_destination() {
     let (port_hi, log_hi) = spawn_sink_listener("127.0.0.2".parse().unwrap());
     let dir = scratch("escapee");
     let out_dir = dir.join("out");
@@ -612,15 +535,15 @@ async fn test_bound_lineage_escapee_is_denied_sibling_wide_destination() {
     let h = inst
         .exec_params(&["/usr/bin/python3", "-c", root_code], &params, ExecStdio::Null)
         .await
-        .expect("exec bound root child");
+        .expect("exec the escapee's root child");
 
     std::fs::write(&go, b"go").expect("release escapee");
-    let status = inst.wait_child(h.child_id).await.expect("wait bound root");
+    let status = inst.wait_child(h.child_id).await.expect("wait root child");
     assert_eq!(status, ExitStatus::Code(0));
     assert_eq!(
         std::fs::read_to_string(&esc_out).unwrap_or_default(),
         "ERR111",
-        "a setsid escapee of a bound child must stay under the bound policy"
+        "a setsid escapee must stay under the sandbox's current policy"
     );
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -631,7 +554,7 @@ async fn test_bound_lineage_escapee_is_denied_sibling_wide_destination() {
     }
     assert!(
         log_hi.lock().unwrap().is_empty(),
-        "the escapee must never reach the sibling-wide destination"
+        "the escapee must never reach the narrowed-away destination"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -639,11 +562,11 @@ async fn test_bound_lineage_escapee_is_denied_sibling_wide_destination() {
 }
 
 /// Reviewer I4: the policy-fn live-policy tightening channel still applies on
-/// top of an update-bound child (deny wins). A bound child whose exec-time
-/// policy allows an IP is denied it once a later event tightens `live_policy`
-/// — the incident-response deny path keeps working for bound children.
+/// top of the instance-wide `update_network` narrowing (deny wins). A running
+/// child whose narrowed policy allows an IP is denied it once a later event
+/// tightens `live_policy` — the incident-response deny path keeps working.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_live_policy_tightening_denies_bound_child() {
+async fn test_live_policy_tightening_denies_a_running_child() {
     use sandlock_core::policy_fn::Verdict;
 
     let (port_lo, _log_lo) = spawn_sink_listener("127.0.0.1".parse().unwrap());
@@ -682,12 +605,12 @@ async fn test_live_policy_tightening_denies_bound_child() {
         "127.0.0.2".parse::<IpAddr>().unwrap(),
     ])
     .await
-    .expect("bind new execs to loopback-low and loopback-high");
+    .expect("narrow the sandbox to loopback-low and loopback-high");
 
-    // A is bound (post-update) to both loopback destinations. It waits for a
-    // marker, then re-execs itself with an argv marker — the execve event
-    // triggers the policy-fn live restriction *while A is still running and
-    // bound* — and the inner process probes both destinations afterwards.
+    // A runs under the two-destination narrowing. It waits for a marker, then
+    // re-execs itself with an argv marker — the execve event triggers the
+    // policy-fn live restriction *while A is still running* — and the inner
+    // process probes both destinations afterwards.
     let inner = format!(
         concat!(
             "import socket\n",
@@ -730,20 +653,20 @@ async fn test_live_policy_tightening_denies_bound_child() {
             ExecStdio::Null,
         )
         .await
-        .expect("exec bound child A");
+        .expect("exec child A");
 
-    std::fs::write(&go, b"go").expect("release bound child A");
-    let status_a = inst.wait_child(a.child_id).await.expect("wait bound child A");
+    std::fs::write(&go, b"go").expect("release child A");
+    let status_a = inst.wait_child(a.child_id).await.expect("wait child A");
     assert_eq!(status_a, ExitStatus::Code(0));
     assert_eq!(
         std::fs::read_to_string(&lo_out).unwrap_or_default(),
         "OK",
-        "the live grant (loopback-low) still applies to the bound child"
+        "the live grant (loopback-low) still applies to the running child"
     );
     assert_eq!(
         std::fs::read_to_string(&hi_out).unwrap_or_default(),
         "ERR111",
-        "live_policy tightening must deny a bound child its pre-tightening IP"
+        "live_policy tightening must deny the running child its pre-tightening IP"
     );
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -754,119 +677,16 @@ async fn test_live_policy_tightening_denies_bound_child() {
     }
     assert!(
         log_hi.lock().unwrap().is_empty(),
-        "the tightened bound child must never reach loopback-high"
+        "the tightened running child must never reach loopback-high"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
     inst.shutdown().await.expect("shutdown");
 }
 
-/// Reviewer C1: a bound child's pgid entry must survive its leader's exit
-/// while an in-group descendant lives. The helper's *first* mediated syscall
-/// happens after the leader is reaped (and after the exit-cleanup prune ran),
-/// so it must still resolve the bound policy — never the wide default.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_bound_child_pgid_entry_survives_leader_exit() {
-    let (port_lo, _log_lo) = spawn_sink_listener("127.0.0.1".parse().unwrap());
-    let (port_hi, log_hi) = spawn_sink_listener("127.0.0.2".parse().unwrap());
-    let dir = scratch("pgid-survive");
-    let out_dir = dir.join("out");
-    std::fs::create_dir_all(&out_dir).expect("create pgid-survive out dir");
-    let go = dir.join("go");
-    let out = out_dir.join("helper");
-
-    // No policy_fn: the bound child lazily registers itself in ProcessIndex
-    // with its first mediated syscall (the loopback connect below), which
-    // spawns the pidfd watcher whose exit cleanup runs the prune C1
-    // exercises.
-    let policy = base_policy()
-        .net_allow("127.0.0.1")
-        .net_allow("127.0.0.2");
-    let mut inst = launch_exec_only_tmp(policy).await;
-    inst.update_network(&["127.0.0.1".parse::<IpAddr>().unwrap()])
-        .await
-        .expect("narrow the session to 127.0.0.1");
-
-    let helper_code = format!(
-        concat!(
-            "import os, socket, time\n",
-            "while not os.path.exists('{go}'):\n",
-            "    time.sleep(0.05)\n",
-            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-            "s.settimeout(3)\n",
-            "try:\n",
-            "    s.connect(('127.0.0.2', {port}))\n",
-            "    open('{out}', 'w').write('OK')\n",
-            "except OSError as e:\n",
-            "    open('{out}', 'w').write('ERR%d' % e.errno)\n",
-            "finally:\n",
-            "    s.close()\n",
-        ),
-        go = go.display(),
-        port = port_hi,
-        out = out.display(),
-    );
-    let root_code = format!(
-        concat!(
-            "import os, socket, subprocess, sys\n",
-            "# First mediated syscall: register this child (and its pidfd watcher)\n",
-            "# in the supervisor's ProcessIndex.\n",
-            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-            "s.settimeout(3)\n",
-            "try:\n",
-            "    s.connect(('127.0.0.1', {p_lo}))\n",
-            "except OSError:\n",
-            "    pass\n",
-            "finally:\n",
-            "    s.close()\n",
-            "p = subprocess.Popen([sys.executable, '-c', os.environ['F4_HELPER_CODE']])\n",
-            "# Exit immediately: the leader dies while the in-group helper lives.\n",
-            "sys.exit(0)\n",
-        ),
-        p_lo = port_lo,
-    );
-    let params = ExecParams {
-        env: vec![("F4_HELPER_CODE".to_string(), helper_code)],
-        ..Default::default()
-    };
-    let h = inst
-        .exec_params(&["/usr/bin/python3", "-c", &root_code], &params, ExecStdio::Null)
-        .await
-        .expect("exec bound leader child");
-    let status = inst.wait_child(h.child_id).await.expect("wait bound leader");
-    assert_eq!(status, ExitStatus::Code(0));
-
-    // Give the leader's exit cleanup (pidfd watcher -> prune_pid) time to
-    // run before the helper's first mediated syscall.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    std::fs::write(&go, b"go").expect("release in-group helper");
-
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut content = String::new();
-    while Instant::now() < deadline {
-        content = std::fs::read_to_string(&out).unwrap_or_default();
-        if !content.is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(
-        content, "ERR111",
-        "the in-group helper after leader exit must stay under the bound policy"
-    );
-    assert!(
-        log_hi.lock().unwrap().is_empty(),
-        "the helper must never reach the sibling-wide destination"
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-    inst.shutdown().await.expect("shutdown");
-}
-
-/// Reviewer R2: the main workload (child id 0) must stay network-attributed
-/// after exec-child announcements. Its lineage keeps the shared live/static
-/// policy (F4.3: running children are never rebound), so egress after an
-/// exec child announcement keeps working.
+/// Reviewer R2: the main workload (child id 0) keeps its egress after an
+/// exec-child announcement — there is no attribution left to lose, so the
+/// sandbox's shared live/static policy governs it throughout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_main_workload_egress_survives_exec_child_announcement() {
     let (port_hi, log_hi) = spawn_sink_listener("127.0.0.2".parse().unwrap());
@@ -905,7 +725,8 @@ async fn test_main_workload_egress_survives_exec_child_announcement() {
     .await
     .expect("launch exec session with main workload");
 
-    // Announce (and reap) an exec child: this flips has_exec_bindings on.
+    // Announce (and reap) an exec child: the main workload's verdict must not
+    // change because a sibling appeared and left.
     let child = inst
         .exec(&["true"], ExecStdio::Null)
         .await
@@ -913,8 +734,9 @@ async fn test_main_workload_egress_survives_exec_child_announcement() {
     let status = inst.wait_child(child.child_id).await.expect("wait child");
     assert_eq!(status, ExitStatus::Code(0));
 
-    // The main (child 0) is attributed-default, so its egress stays on the
-    // shared live/static policy and reaches the listener.
+    // The main (child 0) stays on the shared live/static policy — an exec
+    // child announcement changes nothing about its verdict — and reaches the
+    // listener.
     std::fs::write(&go, b"go").expect("release main workload");
     let status = inst.wait_child(0).await.expect("wait main workload");
     assert_eq!(status, ExitStatus::Code(0));
@@ -936,57 +758,53 @@ async fn test_main_workload_egress_survives_exec_child_announcement() {
     inst.shutdown().await.expect("shutdown");
 }
 
-/// End-to-end fail-closed pin: a helper that becomes truly unattributed (its
-/// attributed-default parent exits and the orphan reparents away before its
-/// first mediated syscall) is denied rather than regaining the wide shared
-/// default. A running *bound* child keeps `has_exec_bindings()` true, which
-/// is exactly the state where an unattributed pid must fail closed.
+/// End-state B / D8: a helper whose parent exits (so it reparents away before
+/// its first mediated syscall) is judged by the sandbox's **current** policy —
+/// no attribution is consulted, so it keeps egress to the allowed destination
+/// and is refused the narrowed-away one. (Under D4=A this shape was blanket
+/// `ECONNREFUSED`: the orphan was unattributed and failed closed.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_unattributed_orphan_is_denied_end_to_end() {
+async fn test_orphan_that_reparents_away_keeps_the_current_policy() {
+    let (port_lo, log_lo) = spawn_sink_listener("127.0.0.1".parse().unwrap());
     let (port_hi, log_hi) = spawn_sink_listener("127.0.0.2".parse().unwrap());
-    let dir = scratch("unattributed");
+    let dir = scratch("orphan-policy");
     let out_dir = dir.join("out");
-    std::fs::create_dir_all(&out_dir).expect("create unattributed out dir");
+    std::fs::create_dir_all(&out_dir).expect("create orphan out dir");
     let go = dir.join("go");
-    let out = out_dir.join("orphan");
+    let lo_out = out_dir.join("lo");
+    let hi_out = out_dir.join("hi");
 
     let policy = base_policy()
         .net_allow("127.0.0.1")
         .net_allow("127.0.0.2");
     let mut inst = launch_exec_only_tmp(policy).await;
-
-    // A running bound child keeps attribution on for the session.
     inst.update_network(&["127.0.0.1".parse::<IpAddr>().unwrap()])
         .await
-        .expect("bind the session to 127.0.0.1");
-    let bound = inst
-        .exec_params(
-            &["/usr/bin/python3", "-c", "import time; time.sleep(60)"],
-            &ExecParams::default(),
-            ExecStdio::Null,
-        )
-        .await
-        .expect("exec running bound child");
-    let _ = bound;
+        .expect("narrow the sandbox to 127.0.0.1");
 
     let helper_code = format!(
         concat!(
             "import os, socket, time\n",
             "while not os.path.exists('{go}'):\n",
             "    time.sleep(0.05)\n",
-            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
-            "s.settimeout(3)\n",
-            "try:\n",
-            "    s.connect(('127.0.0.2', {port}))\n",
-            "    open('{out}', 'w').write('OK')\n",
-            "except OSError as e:\n",
-            "    open('{out}', 'w').write('ERR%d' % e.errno)\n",
-            "finally:\n",
-            "    s.close()\n",
+            "def probe(ip, port, out):\n",
+            "    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n",
+            "    s.settimeout(3)\n",
+            "    try:\n",
+            "        s.connect((ip, port))\n",
+            "        open(out, 'w').write('OK')\n",
+            "    except OSError as e:\n",
+            "        open(out, 'w').write('ERR%d' % e.errno)\n",
+            "    finally:\n",
+            "        s.close()\n",
+            "probe('127.0.0.1', {p_lo}, '{o_lo}')\n",
+            "probe('127.0.0.2', {p_hi}, '{o_hi}')\n",
         ),
         go = go.display(),
-        port = port_hi,
-        out = out.display(),
+        p_lo = port_lo,
+        p_hi = port_hi,
+        o_lo = lo_out.display(),
+        o_hi = hi_out.display(),
     );
     let root_code = concat!(
         "import os, subprocess, sys\n",
@@ -1000,26 +818,40 @@ async fn test_unattributed_orphan_is_denied_end_to_end() {
     let h = inst
         .exec_params(&["/usr/bin/python3", "-c", root_code], &params, ExecStdio::Null)
         .await
-        .expect("exec attributed-default parent");
+        .expect("exec the orphan's parent");
     let status = inst.wait_child(h.child_id).await.expect("wait parent");
     assert_eq!(status, ExitStatus::Code(0));
 
+    // The parent is reaped; the helper has reparented away. Its first mediated
+    // syscall is the connect below.
     tokio::time::sleep(Duration::from_millis(300)).await;
     std::fs::write(&go, b"go").expect("release orphan");
     let deadline = Instant::now() + Duration::from_secs(15);
-    let mut content = String::new();
     while Instant::now() < deadline {
-        content = std::fs::read_to_string(&out).unwrap_or_default();
-        if !content.is_empty() {
+        if std::fs::read_to_string(&hi_out).is_ok() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(
-        content, "ERR111",
-        "a truly unattributed pid must fail closed, not regain the wide default"
+        std::fs::read_to_string(&lo_out).unwrap_or_default(),
+        "OK",
+        "an orphan keeps egress to the sandbox's current allow set"
     );
-    assert!(log_hi.lock().unwrap().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(&hi_out).unwrap_or_default(),
+        "ERR111",
+        "an orphan is refused the narrowed-away destination"
+    );
+    assert_eq!(
+        log_lo.lock().unwrap().len(),
+        1,
+        "the orphan's allowed connect must reach its listener"
+    );
+    assert!(
+        log_hi.lock().unwrap().is_empty(),
+        "the narrowed-away listener must never be reached"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
     inst.shutdown().await.expect("shutdown");
@@ -1080,10 +912,9 @@ async fn test_update_network_refuses_static_denylist_destination() {
     }
 
     // A destination outside the static denies can still be narrowed to.
-    let report = inst
+    inst
         .update_network(&["127.0.0.1".parse::<IpAddr>().unwrap()])
         .await
         .expect("non-denied destination update must succeed");
-    assert!(report.stale_child_ids.is_empty());
     inst.shutdown().await.expect("shutdown");
 }
