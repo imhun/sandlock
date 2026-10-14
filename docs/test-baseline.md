@@ -348,17 +348,19 @@
 # probe cycles on `PTRACE_SEIZE tid 68: Operation not permitted` while the
 # per-freeze thread passed the same shape in 6.2 s.
 core_lib = 950 # 2026-10-14 (writable rootfs COW, task 2): 949 -> 950, +1 --
-               # `chroot::dispatch::tests::a_path_under_the_cow_root_is_
-               # writable_though_it_is_not_in_fs_writable`: the chroot
-               # mediator's `can_write` admits paths under the COW branch's
-               # own tree. The writable-rootfs route points a branch's lower
-               # at the shared image rootfs, which must NOT be listed in
-               # `fs_writable` (that spelling also feeds Landlock, and a
-               # write grant there is a direct write path to the shared
-               # cache), so the branch's tree is carried separately
-               # (`ChrootCtx::cow_root`) and admitted on the branch's
-               # account. See `docs/rootfs-writable-cow.md` and the phase-1
-               # plan.
+               # `chroot::dispatch::tests::cow_owns_only_the_branch_s_own_
+               # tree`: the chroot write sites admit a write the COW branch
+               # owns, and the grant is `SeccompCowBranch::matches` -- the
+               # very predicate the redirection itself uses. The writable-
+               # rootfs route points a branch's lower at the shared image
+               # rootfs, so a grant the redirection did not honour would let
+               # the write fall through to the shared cache; one predicate
+               # makes that impossible. It is also why the grant sits at the
+               # write sites, where the resolved host path is in hand, rather
+               # than in `ChrootCtx::can_write`, which speaks the child's
+               # virtual space and can never name a branch (`can_write` itself
+               # is unchanged). See `docs/rootfs-writable-cow.md` and the
+               # phase-1 plan.
                # 2026-10-14 (writable rootfs COW, task 1): 947 -> 949, +2 --
                # `cow::seccomp::tests::discard_refuses_to_merge_even_when_the_
                # caller_asks_to_commit` and

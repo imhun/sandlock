@@ -76,15 +76,6 @@ pub(crate) struct ChrootCtx<'a> {
     pub mounts: &'a [(PathBuf, PathBuf)],
     /// Virtual paths of read-only mounts: reads allowed, writes denied.
     pub mount_ro: &'a [PathBuf],
-    /// The COW branch's lower tree, when one is active: the sandbox's own
-    /// writable view of a root it does not own.
-    ///
-    /// The writable-rootfs route points a branch's `workdir` at the *shared*
-    /// image rootfs, so that root is deliberately absent from `fs_writable` —
-    /// granting it there would hand the sandbox the real cache. A write under
-    /// it is served by copy-up into the branch's private upper, so the
-    /// mediator admits it on the branch's account rather than the policy's.
-    pub cow_root: Option<&'a Path>,
     /// Per-process supervisor state, for handlers that track the caller's
     /// filesystem context rather than just resolving one path.
     pub processes: &'a Arc<ProcessIndex>,
@@ -117,7 +108,6 @@ impl<'a> ChrootCtx<'a> {
         processes: &'a Arc<ProcessIndex>,
         dirty: &'a Arc<crate::dirty::DirtyDirs>,
         write_fds: &'a Arc<crate::dirty::WriteFds>,
-        cow_root: Option<&'a Path>,
     ) -> Self {
         ChrootCtx {
             root: policy.chroot_root.as_ref().expect("chroot handlers are only registered with a chroot root"),
@@ -126,7 +116,6 @@ impl<'a> ChrootCtx<'a> {
             denied: &policy.chroot_denied,
             mounts: &policy.chroot_mounts,
             mount_ro: &policy.chroot_mount_ro,
-            cow_root,
             processes,
             dirty,
             write_fds,
@@ -228,15 +217,6 @@ impl ChrootCtx<'_> {
         // prefix such as a read-write rootfs granting "/".
         if self.is_mount_ro_any(virtual_path) {
             return false;
-        }
-        // The COW branch's lower tree is writable *through the mediator*: the
-        // write lands in the branch's private upper (copy-up), never in the
-        // lower itself, so it is admitted here even though the policy does not
-        // list it. Checked after the two refusals above, so neither a deny nor
-        // a read-only mount can be widened by a branch that happens to sit
-        // under it.
-        if self.cow_root.is_some_and(|r| virtual_path.starts_with(r)) {
-            return true;
         }
         if self.is_mounted(virtual_path) {
             return true;
@@ -759,6 +739,30 @@ async fn cow_resolve(
     Ok(host_path.to_path_buf())
 }
 
+/// Whether the live COW branch owns `host_path` — i.e. whether a write there is
+/// served out of the branch's private upper instead of the file it names.
+///
+/// This is `SeccompCowBranch::matches`, the same call the redirection itself
+/// makes before it copy-ups, and it is deliberately the *same* predicate rather
+/// than a second rule that agrees with it by construction. The writable-rootfs
+/// route points a branch's lower at the *shared* image rootfs, so the two have
+/// to be one: a writability grant that the redirection did not honour would let
+/// the write fall through to the shared cache, which is the one outcome the
+/// route exists to prevent. `matches` also excludes the branch's own storage
+/// dir, so the upper is not reachable through the same grant.
+///
+/// Takes the *host* path: the branch's key is a host path, and the callers here
+/// have already resolved one (the policy check next to it reads the virtual
+/// spelling, which is a different space and can never name a branch).
+async fn cow_owns(cow_state: &Arc<Mutex<CowState>>, host_path: &Path) -> bool {
+    cow_state
+        .lock()
+        .await
+        .branch
+        .as_ref()
+        .is_some_and(|branch| branch.matches(&host_path.to_string_lossy()))
+}
+
 /// Read path arg at `arg_idx`, resolve chroot path using dirfd at `dirfd_idx`.
 /// Falls back to parent resolution for O_CREAT targets.
 /// Returns (path_string, host_path, virtual_path).
@@ -870,7 +874,11 @@ pub(crate) async fn handle_chroot_open(
     // Access check: writes need can_write, reads need can_read
     let is_write = (flags as i32 & (libc::O_WRONLY | libc::O_RDWR)) != 0;
     if is_write {
-        if !ctx.can_write(&virtual_path) {
+        // The policy speaks the child's virtual space; a COW branch's tree is
+        // granted on its own account, through the predicate the redirection
+        // below uses (see `cow_owns`). Either admits the write; a write the
+        // branch owns lands in its upper, not in the file this names.
+        if !ctx.can_write(&virtual_path) && !cow_owns(cow_state, &host_path).await {
             return NotifAction::Errno(libc::EACCES);
         }
     } else if !ctx.can_read(&virtual_path) {
@@ -1620,7 +1628,9 @@ pub(crate) async fn handle_chroot_write(
             Ok(r) => r,
             Err(a) => return a,
         };
-        if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
+        if !ctx.can_write(&vp) && !cow_owns(cow_state, &host_path).await {
+            return NotifAction::Errno(libc::EACCES);
+        }
         ctx.mark_dirty(&host_path);
         let is_dir = (notif.data.args[2] & libc::AT_REMOVEDIR as u64) != 0;
         // A mount point is a policy object, not a name the guest owns. Real
@@ -1677,7 +1687,9 @@ pub(crate) async fn handle_chroot_write(
             Ok(r) => r,
             Err(a) => return a,
         };
-        if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
+        if !ctx.can_write(&vp) && !cow_owns(cow_state, &host_path).await {
+            return NotifAction::Errno(libc::EACCES);
+        }
         // Over budget: a directory is tree growth without a write, and the
         // ceiling cannot reach it. The sandbox keeps running (and keeps being
         // able to delete), which is the point of refusing instead of freezing.
@@ -1730,7 +1742,11 @@ pub(crate) async fn handle_chroot_write(
             Ok(r) => r,
             Err(e) => return NotifAction::Errno(e),
         };
-        if !ctx.can_write(&old_vp) || !ctx.can_write(&new_vp) {
+        // Either end is admitted by the policy or owned by the branch, through
+        // the same predicate the rename redirection below uses.
+        let old_allowed = ctx.can_write(&old_vp) || cow_owns(cow_state, &old_host).await;
+        let new_allowed = ctx.can_write(&new_vp) || cow_owns(cow_state, &new_host).await;
+        if !old_allowed || !new_allowed {
             return NotifAction::Errno(libc::EACCES);
         }
         // N25/L2c: both ends change the tree's shape -- the name is added
@@ -1781,7 +1797,9 @@ pub(crate) async fn handle_chroot_write(
             Ok(r) => r,
             Err(e) => return NotifAction::Errno(e),
         };
-        if !ctx.can_write(&link_vp) { return NotifAction::Errno(libc::EACCES); }
+        if !ctx.can_write(&link_vp) && !cow_owns(cow_state, &host_link).await {
+            return NotifAction::Errno(libc::EACCES);
+        }
         // Over budget: a new name is tree growth, which no per-file ceiling
         // can express (see `WriteFds::is_exhausted`).
         if ctx.write_fds.is_exhausted() || ctx.write_fds.entries_exhausted() {
@@ -1875,7 +1893,11 @@ pub(crate) async fn handle_chroot_write(
         // keeps the weaker name from being upgraded, the same rule rename
         // already applies to the name it destroys. Off the chroot path
         // Landlock enforces this already: linking needs REFER on both sides.
-        if !ctx.can_write(&old_vp) || !ctx.can_write(&new_vp) {
+        // Either end is admitted by the policy or owned by the branch, through
+        // the same predicate the link redirection below uses.
+        let old_allowed = ctx.can_write(&old_vp) || cow_owns(cow_state, &old_host).await;
+        let new_allowed = ctx.can_write(&new_vp) || cow_owns(cow_state, &new_host).await;
+        if !old_allowed || !new_allowed {
             return NotifAction::Errno(libc::EACCES);
         }
         // Over budget: a second name is tree growth (see
@@ -1956,7 +1978,9 @@ pub(crate) async fn handle_chroot_write(
             Ok(r) => r,
             Err(a) => return a,
         };
-        if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
+        if !ctx.can_write(&vp) && !cow_owns(cow_state, &host_path).await {
+            return NotifAction::Errno(libc::EACCES);
+        }
         let mode = (notif.data.args[2] & 0o7777) as u32;
 
         {
@@ -1986,7 +2010,9 @@ pub(crate) async fn handle_chroot_write(
             Ok(r) => r,
             Err(a) => return a,
         };
-        if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
+        if !ctx.can_write(&vp) && !cow_owns(cow_state, &host_path).await {
+            return NotifAction::Errno(libc::EACCES);
+        }
         let uid = notif.data.args[2] as u32;
         let gid = notif.data.args[3] as u32;
 
@@ -2020,7 +2046,9 @@ pub(crate) async fn handle_chroot_write(
             Ok(r) => r,
             Err(e) => return NotifAction::Errno(e),
         };
-        if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
+        if !ctx.can_write(&vp) && !cow_owns(cow_state, &host_path).await {
+            return NotifAction::Errno(libc::EACCES);
+        }
         ctx.mark_dirty(&host_path);
         let length = notif.data.args[1] as i64;
 
@@ -2460,7 +2488,13 @@ pub(crate) async fn handle_chroot_xattr(
         };
 
     let writing = matches!(op, XattrOp::Set | XattrOp::Remove);
-    let allowed = if writing { ctx.can_write(&vp) } else { ctx.can_read(&vp) };
+    // A write is admitted by the policy (virtual space) or by the branch that
+    // owns the resolved host path — the predicate `cow_resolve` below uses.
+    let allowed = if writing {
+        ctx.can_write(&vp) || cow_owns(cow_state, &host_path).await
+    } else {
+        ctx.can_read(&vp)
+    };
     if !allowed {
         return NotifAction::Errno(libc::EACCES);
     }
@@ -2840,7 +2874,9 @@ pub(crate) async fn handle_chroot_utimensat(
         Ok(r) => r,
         Err(e) => return NotifAction::Errno(e),
     };
-    if !ctx.can_write(&vp) { return NotifAction::Errno(libc::EACCES); }
+    if !ctx.can_write(&vp) && !cow_owns(cow_state, &host_path).await {
+        return NotifAction::Errno(libc::EACCES);
+    }
 
     let real_path = match cow_resolve(cow_state, &host_path).await {
         Ok(p) => p,
@@ -3228,9 +3264,6 @@ mod mount_ro_tests {
             denied,
             mounts,
             mount_ro,
-            // These cases are about the policy's own verdicts: no COW branch
-            // is active, so the branch's tree is not an allowance.
-            cow_root: None,
             processes,
             dirty,
             write_fds,
@@ -3319,47 +3352,42 @@ mod mount_ro_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChrootCtx, ProcessIndex};
-    use std::path::{Path, PathBuf};
+    use super::{cow_owns, CowState};
+    use crate::cow::seccomp::SeccompCowBranch;
+    use std::path::Path;
     use std::sync::Arc;
+    use tokio::sync::Mutex;
 
-    /// The smallest `ChrootCtx` `can_write` reads: one writable prefix, an
-    /// optional COW root, everything else empty.
+    /// A live branch whose lower is `lower`, with its upper in a storage dir of
+    /// its own.
     ///
-    /// `ChrootCtx::new` borrows its slices off a live notification policy,
-    /// which a policy-verdict test has no reason to build; the two ledgers are
-    /// leaked for the same reason `mount_ro_tests`' helper leaks them.
-    impl ChrootCtx<'static> {
-        fn for_test(writable: &[&str], cow_root: Option<&'static Path>) -> ChrootCtx<'static> {
-            let writable: &'static [PathBuf] = Box::leak(
-                writable.iter().map(PathBuf::from).collect::<Vec<_>>().into_boxed_slice(),
-            );
-            let processes: &'static Arc<ProcessIndex> =
-                Box::leak(Box::new(Arc::new(ProcessIndex::new())));
-            let dirty: &'static Arc<crate::dirty::DirtyDirs> =
-                Box::leak(Box::new(Arc::new(crate::dirty::DirtyDirs::new())));
-            let write_fds: &'static Arc<crate::dirty::WriteFds> =
-                Box::leak(Box::new(Arc::new(crate::dirty::WriteFds::new())));
-            ChrootCtx {
-                root: Path::new("/rootfs"),
-                readable: &[],
-                writable,
-                denied: &[],
-                mounts: &[],
-                mount_ro: &[],
-                cow_root,
-                processes,
-                dirty,
-                write_fds,
-                pid_ns: None,
-            }
-        }
+    /// `create_with` canonicalizes the lower and builds `<storage>/<uuid>/upper`,
+    /// so both trees have to exist. The storage `TempDir` is leaked on purpose:
+    /// the branch outlives this call and reclaims that tree in its own `Drop`,
+    /// which a dropped `TempDir` would have deleted first.
+    fn cow_state_with_branch(lower: &Path) -> Arc<Mutex<CowState>> {
+        let storage = tempfile::tempdir().unwrap();
+        let branch = SeccompCowBranch::create_with(lower, Some(storage.path()), 0, false).unwrap();
+        std::mem::forget(storage);
+        Arc::new(Mutex::new(CowState { branch: Some(branch) }))
     }
 
-    #[test]
-    fn a_path_under_the_cow_root_is_writable_though_it_is_not_in_fs_writable() {
-        let ctx = ChrootCtx::for_test(&["/home/user"], Some(Path::new("/rootfs")));
-        assert!(ctx.can_write(Path::new("/rootfs/usr/local/x")));
-        assert!(!ctx.can_write(Path::new("/elsewhere/x"))); // control: outside the cow root it is still refused
+    /// The shape a sandbox without COW has: no branch, so nothing is owned.
+    fn no_branch_state() -> Arc<Mutex<CowState>> {
+        Arc::new(Mutex::new(CowState::new()))
+    }
+
+    #[tokio::test]
+    async fn cow_owns_only_the_branch_s_own_tree() {
+        // Stands in for the shared image rootfs: the branch's lower, spelled the
+        // way the mediator sees it (a host path, not the child's `/…`).
+        let dir = tempfile::tempdir().unwrap();
+        let rootfs = dir.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        let cow = cow_state_with_branch(&rootfs);
+
+        assert!(cow_owns(&cow, &rootfs.join("usr/local/x")).await);
+        assert!(!cow_owns(&cow, Path::new("/elsewhere/x")).await); // control: not the branch's
+        assert!(!cow_owns(&no_branch_state(), &rootfs.join("usr/local/x")).await);
     }
 }
