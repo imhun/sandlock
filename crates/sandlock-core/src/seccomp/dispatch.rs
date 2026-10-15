@@ -1164,7 +1164,15 @@ fn register_chroot_handlers(
     // only ever rewrote the kernel's own answer, at the price of a round trip
     // each (measured 26 us per `stat`). `readlinkat` is a *serving* handler and
     // stays registered below.
-    if policy.stat_metadata_mediated {
+    //
+    // A COW branch breaks N81's premise: its lower is the *shared* image
+    // rootfs, so "the kernel's own answer" is the lower's -- a file the sandbox
+    // just wrote lives only in the upper (`access`/`stat`/`test -e` answered
+    // ENOENT for a file `cat` read back, measured on the lane 2026-10-15), and
+    // a whiteouted path still reports the lower's metadata. The handlers below
+    // already resolve through the branch (`cow_resolve`), so with a branch they
+    // are the only thing that can answer at all.
+    if policy.stat_metadata_mediated || policy.cow {
         for &nr in &[
             libc::SYS_newfstatat,
             libc::SYS_faccessat,
@@ -1405,6 +1413,7 @@ mod handler_tests {
         NotifPolicy {
             max_memory_bytes: 0,
             stat_metadata_mediated: true,
+            cow: false,
             disk_stats_path: None,
             max_processes: 0,
             has_memory_limit: false,
@@ -1833,6 +1842,7 @@ mod handler_tests {
     fn policy_for(features: &crate::resolved::SandboxFeatures) -> NotifPolicy {
         let mut policy = policy_with_no_gates();
         policy.stat_metadata_mediated = features.stat_metadata_mediated;
+        policy.cow = features.cow;
         policy.has_memory_limit = features.memory_limit;
         policy.max_memory_bytes = if features.memory_limit { 64 << 20 } else { 0 };
         policy.disk_stats_path = features

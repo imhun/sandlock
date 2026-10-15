@@ -752,6 +752,60 @@ async fn cow_resolve(
     Ok(host_path.to_path_buf())
 }
 
+/// The host path a chroot **name** maps to, without requiring it to exist.
+///
+/// The read handlers resolve a name before they consult the branch, and
+/// `cow_resolve` is handed the *resolved* host path. Two of the branch's states
+/// need the name instead, both measured on the lane (2026-10-15):
+///
+/// * an **upper-only** path (a file the sandbox wrote) does not exist under the
+///   rootfs at all, so `resolve_*_in_root` answers ENOENT before the branch is
+///   ever asked: `cat` read the file back while `access`/`stat`/`test -e` said
+///   ENOENT for it;
+/// * a **whiteout** is recorded against the name `rm` was given, while the
+///   resolver may have followed a symlink to a target nobody deleted:
+///   `rm /etc/os-release; cat /etc/os-release` printed the target's contents.
+///
+/// Built from the child's virtual path, so a mount target (which the branch
+/// never owns — `matches` is rooted at the workdir) cannot be mistaken for one
+/// of its paths.
+fn cow_named_host(
+    notif: &SeccompNotif,
+    dirfd: i64,
+    path: &str,
+    ctx: &ChrootCtx<'_>,
+) -> Option<PathBuf> {
+    let virtual_path = build_virtual_path(notif, dirfd, path, ctx)?;
+    Some(
+        ctx.root
+            .join(virtual_path.strip_prefix('/').unwrap_or(&virtual_path)),
+    )
+}
+
+/// Whether the branch recorded the path the sandbox **named** as deleted.
+///
+/// The whiteout is keyed on the name `rm`/`unlinkat` was given, so this is the
+/// only spelling that answers for it. `false` when there is no branch, or when
+/// the name is outside it.
+async fn cow_named_is_deleted(
+    notif: &SeccompNotif,
+    dirfd: i64,
+    path: &str,
+    ctx: &ChrootCtx<'_>,
+    cow_state: &Arc<Mutex<CowState>>,
+) -> bool {
+    let Some(named) = cow_named_host(notif, dirfd, path, ctx) else {
+        return false;
+    };
+    let cs = cow_state.lock().await;
+    match cs.branch.as_ref() {
+        Some(branch) => branch
+            .safe_rel(&named.to_string_lossy())
+            .is_some_and(|rel| branch.is_deleted(&rel)),
+        None => false,
+    }
+}
+
 /// Whether the live COW branch owns `host_path` — i.e. whether a write there is
 /// served out of the branch's private upper instead of the file it names.
 ///
@@ -886,6 +940,16 @@ pub(crate) async fn handle_chroot_open(
 
     // Access check: writes need can_write, reads need can_read
     let is_write = (flags as i32 & (libc::O_WRONLY | libc::O_RDWR)) != 0;
+
+    // A read of a name the branch deleted must not be served by what that name
+    // resolves to: `resolve_chroot_path` follows a symlink to its target, while
+    // the whiteout is recorded against the link's own name (measured on the
+    // lane 2026-10-15: `rm /etc/os-release; cat /etc/os-release` printed the
+    // target's contents). A write is the other direction -- it is *creating*
+    // the entry, and the branch stages that below.
+    if !is_write && cow_named_is_deleted(notif, dirfd, &rel_path, ctx, cow_state).await {
+        return NotifAction::Errno(libc::ENOENT);
+    }
     if is_write {
         // A hard refusal (an `fs_deny` or a read-only mount) comes first and is
         // final. Otherwise the policy speaks the child's virtual space and a
@@ -2196,14 +2260,43 @@ pub(crate) async fn handle_chroot_stat(
         return NotifAction::Continue;
     }
 
+    let path = match read_path(notif, notif.data.args[1], notif_fd) {
+        Some(p) => p,
+        None => return NotifAction::Continue,
+    };
+    let dirfd = notif.data.args[0] as i64;
+
+    // The whiteout is recorded against the *name* (`cow_named_is_deleted`).
+    if cow_named_is_deleted(notif, dirfd, &path, ctx, cow_state).await {
+        return NotifAction::Errno(libc::ENOENT);
+    }
+
     let resolved = if (flags & libc::AT_SYMLINK_NOFOLLOW as u64) != 0 {
         read_and_resolve_nofollow(notif, notif_fd, ctx, 0, 1)
     } else {
         read_and_resolve_existing(notif, notif_fd, ctx, 0, 1)
     };
-    let (_, host_path, vp) = match resolved {
-        Ok(r) => r,
-        Err(a) => return a,
+    let (host_path, vp) = match resolved {
+        Ok((_, host_path, vp)) => (host_path, vp),
+        Err(action) => {
+            // The lower may not have this path even though the branch does: an
+            // upper-only file is one the sandbox wrote, and `..._existing`
+            // resolves under the rootfs, where it does not exist (measured:
+            // `cat` read it back while `stat`/`access` answered ENOENT). Ask
+            // the branch by name before answering.
+            let Some(named) = cow_named_host(notif, dirfd, &path, ctx) else {
+                return action;
+            };
+            match cow_resolve(cow_state, &named).await {
+                Ok(real) if real != named && (real.exists() || real.is_symlink()) => (
+                    real,
+                    PathBuf::from(
+                        build_virtual_path(notif, dirfd, &path, ctx).unwrap_or_default(),
+                    ),
+                ),
+                _ => return action,
+            }
+        }
     };
     if !ctx.can_read(&vp) { return NotifAction::Errno(libc::EACCES); }
 
@@ -2250,6 +2343,11 @@ pub(crate) async fn handle_chroot_statx(
         _ => return NotifAction::Continue,
     };
 
+    // The whiteout is recorded against the *name* (`cow_named_is_deleted`).
+    if cow_named_is_deleted(notif, dirfd, &path, ctx, cow_state).await {
+        return NotifAction::Errno(libc::ENOENT);
+    }
+
     let resolved = if (flags & libc::AT_SYMLINK_NOFOLLOW) != 0 {
         resolve_chroot_path_nofollow(notif, dirfd, &path, ctx)
     } else {
@@ -2257,7 +2355,22 @@ pub(crate) async fn handle_chroot_statx(
     };
     let (host_path, vp) = match resolved {
         Ok(r) => r,
-        Err(e) => return NotifAction::Errno(e),
+        Err(errno) => {
+            // The lower may not have this path even though the branch does
+            // (`cow_named_is_deleted`'s sibling case: an upper-only file).
+            let Some(named) = cow_named_host(notif, dirfd, &path, ctx) else {
+                return NotifAction::Errno(errno);
+            };
+            match cow_resolve(cow_state, &named).await {
+                Ok(real) if real != named && (real.exists() || real.is_symlink()) => (
+                    real,
+                    PathBuf::from(
+                        build_virtual_path(notif, dirfd, &path, ctx).unwrap_or_default(),
+                    ),
+                ),
+                _ => return NotifAction::Errno(errno),
+            }
+        }
     };
     if !ctx.can_read(&vp) { return NotifAction::Errno(libc::EACCES); }
 

@@ -837,6 +837,14 @@ pub struct NotifPolicy {
     /// own tree (no root, or a `/proc` that is a separate mount). See
     /// `resolved::stat_metadata_mediated`, which is where it is decided.
     pub stat_metadata_mediated: bool,
+    /// A COW branch exists for this sandbox (`Sandbox::workdir`), so the stat
+    /// family has to be intercepted *even where N81's gate says the kernel's
+    /// answer would be the sandbox's own tree*: the branch's lower is the
+    /// shared image rootfs, so the kernel answers from the lower -- a file the
+    /// sandbox just wrote (upper only) reads ENOENT, and a whiteouted path
+    /// still reports the lower's metadata. `crate::seccomp_plan`'s registration
+    /// reads it next to `stat_metadata_mediated`.
+    pub cow: bool,
     /// Host-maintained ``<total_bytes> <used_bytes>`` file for ``statfs(2)``.
     /// `None` leaves `statfs` to the kernel.
     pub disk_stats_path: Option<std::path::PathBuf>,

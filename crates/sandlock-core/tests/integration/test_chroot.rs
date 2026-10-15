@@ -2714,3 +2714,153 @@ async fn test_chroot_cow_owned_writes_never_land_on_the_lower() {
     cleanup_rootfs(&rootfs);
     let _ = fs::remove_dir_all(&storage);
 }
+
+/// The metadata family has to be served out of the branch too.
+///
+/// The writable-rootfs route makes the branch's lower the **shared** image
+/// rootfs, so the kernel's own answer for a rootfs path is the *lower* one: a
+/// file the sandbox just wrote lives only in the upper, and a file it deleted
+/// is masked by a whiteout. Measured on the lane (2026-10-15): `stat`/`ls -l`/
+/// `test -e` answered ENOENT for a file the same shell had just written with
+/// `echo`, while `cat` read it back — i.e. the branch served `open` but not
+/// `stat`.
+///
+/// The chroot stat handlers already resolve through the branch (`cow_resolve`),
+/// but N81 gates that whole family on `stat_metadata_mediated`, which is false
+/// for a rootfs of the sandbox's own. With a branch that gate is wrong: the
+/// kernel would answer for the lower, and the branch is the only thing that can
+/// serve the upper. This pins the shape.
+///
+/// Every probe prints through the helper's buffered `echo`/`access` (`puts`), so
+/// stdout's order is the script's; the `cat`s are redirected, and a failure
+/// shows up as its own missing marker plus the helper's stderr line.
+#[tokio::test]
+async fn test_chroot_cow_stat_serves_the_upper_and_the_whiteout() {
+    let rootfs = build_test_rootfs("cow-stat");
+    fs::create_dir_all(rootfs.join("usr/local")).unwrap();
+    fs::write(rootfs.join("etc/cow-victim"), b"victim\n").unwrap();
+    let storage = temp_dir("cow-stat-upper");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .workdir(&rootfs)
+        .fs_storage(&storage)
+        .on_exit(BranchAction::Keep)
+        .on_error(BranchAction::Keep)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            // Write into the rootfs and ask for its metadata. `access` is the
+            // probe because the helper's `stat` prints a mode the umask decides
+            // and `sh` has no way to filter it; the *lane* reading
+            // (`deploy/scripts/acceptance/probe_rootfs_cow.py` plus the manual
+            // `stat`/`ls -l` diagnostics in Task 5's report) covers the rest of
+            // the family. The helper's `sh` aborts the chain on the first `&&`
+            // that fails, so a missing marker is the diagnosis.
+            "echo probe > /usr/local/cow-stat && echo WROTE \
+             && access /usr/local/cow-stat && echo ACCESS_OK",
+        ])
+        .await
+        .expect("the chroot sandbox must be creatable (N14 S5: the real root is the only shape)");
+
+    assert_eq!(
+        result.stdout_str().unwrap_or_default(),
+        "WROTE\nOK\nACCESS_OK",
+        "a file the branch wrote must be visible to the metadata family; stderr={:?}",
+        result.stderr_str()
+    );
+    assert_eq!(
+        result.stderr_str().unwrap_or_default(),
+        "",
+        "no probe may fail"
+    );
+    assert!(
+        !rootfs.join("usr/local/cow-stat").exists(),
+        "the write must stay in the branch's upper, not the shared lower"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&storage);
+}
+
+/// A whiteout covers the name the sandbox deleted, symlink or not.
+///
+/// `cow_resolve` answers for the path it is handed, and the read handlers hand
+/// it the **resolved** one: a symlink in the lower resolves to its target, so a
+/// whiteout recorded against the *link's* name was never consulted and the
+/// target stayed readable through it. Measured on the lane (2026-10-15):
+/// `rm /etc/os-release; cat /etc/os-release` printed the target's contents
+/// (that image's `/etc/os-release` is a symlink), while the same two steps on a
+/// regular file answered ENOENT.
+#[tokio::test]
+async fn test_chroot_cow_whiteout_masks_the_deleted_symlink() {
+    let rootfs = build_test_rootfs("cow-link-whiteout");
+    fs::write(rootfs.join("etc/cow-target"), b"secret\n").unwrap();
+    std::os::unix::fs::symlink("cow-target", rootfs.join("etc/cow-link")).unwrap();
+    let storage = temp_dir("cow-link-whiteout-upper");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .workdir(&rootfs)
+        .fs_storage(&storage)
+        .on_exit(BranchAction::Keep)
+        .on_error(BranchAction::Keep)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            // Read through the link, delete the *link*, read again. The target
+            // itself is never deleted, so anything but a whiteout on the name
+            // leaves it readable.
+            "cat /etc/cow-link && echo LINK_READ \
+             && rm /etc/cow-link && echo RM_OK \
+             && cat /etc/cow-link && echo LINK_STILL_READABLE",
+        ])
+        .await
+        .expect("the chroot sandbox must be creatable (N14 S5: the real root is the only shape)");
+
+    assert_eq!(
+        result.stdout_str().unwrap_or_default(),
+        "secret\nLINK_READ\nRM_OK",
+        "deleting a symlink must mask the name, not just its target; stderr={:?}",
+        result.stderr_str()
+    );
+    assert_eq!(
+        result.stderr_str().unwrap_or_default(),
+        "cat: /etc/cow-link: No such file or directory",
+        "the second read is the one that must fail"
+    );
+    assert!(
+        rootfs.join("etc/cow-link").exists(),
+        "the link belongs to the shared lower and must not be deleted there"
+    );
+    assert_eq!(
+        fs::read(rootfs.join("etc/cow-target")).unwrap(),
+        b"secret\n",
+        "the target is not what was deleted"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&storage);
+}

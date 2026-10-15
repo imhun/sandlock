@@ -732,7 +732,22 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 574 # 2026-10-14 (writable rootfs COW, task 2): 573 -> 574, +1 --
+core_integ = 576 # 2026-10-15 (writable rootfs COW, task 5): 574 -> 576, +2 --
+                 # `test_chroot::test_chroot_cow_stat_serves_the_upper_and_
+                 # the_whiteout` and `::test_chroot_cow_whiteout_masks_the_
+                 # deleted_symlink`: the two readings Task 5's lane run
+                 # produced. (1) The metadata family has to be served out of
+                 # the branch: with a COW branch the kernel answers from the
+                 # *lower* (the shared image rootfs), so a file the sandbox
+                 # wrote reads ENOENT for `stat`/`access`/`test -e` while
+                 # `cat` reads it back — the chroot stat handlers were gated
+                 # out by N81's `stat_metadata_mediated`, which is false for a
+                 # rootfs of the sandbox's own. (2) A whiteout is keyed on the
+                 # name `rm` was given, while the read resolver follows a
+                 # symlink to a target nobody deleted, so deleting a link left
+                 # its target readable through it. Both RED first on the lane
+                 # (2026-10-15, `local/e2b/*:cowp1`) and in the fixture.
+                 # 2026-10-14 (writable rootfs COW, task 2): 573 -> 574, +1 --
                  # `test_chroot::test_chroot_cow_owned_writes_never_land_on_
                  # the_lower`: the write-call-site case the task review asked
                  # for. A path the COW branch owns must be *served* by the

@@ -1090,6 +1090,7 @@ mod tests {
         NotifPolicy {
             max_memory_bytes: 0,
             stat_metadata_mediated: true,
+            cow: false,
             disk_stats_path: None,
             max_processes: 0,
             has_memory_limit: false,
