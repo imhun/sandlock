@@ -176,6 +176,21 @@ static int cmd_write(int argc, char **argv) {
     return 0;
 }
 
+/* ── exec: run a path, with the remaining argv ──────────────── */
+/*
+ * The only way this fixture can exec an arbitrary binary: everything else in
+ * the table is a built-in, and `sh -c "path"` dispatches *this* binary's
+ * table rather than the kernel's, so a written file could never be run. The
+ * COW-exec cases need exactly that (a file the sandbox staged into the upper
+ * and then executed), so the path form has to exist here.
+ */
+static int cmd_exec(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "exec: missing path\n"); return 1; }
+    execv(argv[0], argv);
+    fprintf(stderr, "exec: %s: %s\n", argv[0], strerror(errno));
+    return 127;
+}
+
 /* ── rm (unlink) ────────────────────────────────────────────── */
 static int cmd_rm(int argc, char **argv) {
     if (argc < 1) { fprintf(stderr, "rm: missing operand\n"); return 1; }
@@ -931,6 +946,7 @@ static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "chmod") == 0)          return cmd_chmod(argc, argv);
     if (strcmp(cmd, "write") == 0)          return cmd_write(argc, argv);
     if (strcmp(cmd, "rm") == 0)             return cmd_rm(argc, argv);
+    if (strcmp(cmd, "exec") == 0)           return cmd_exec(argc, argv);
     if (strcmp(cmd, "mv") == 0)             return cmd_mv(argc, argv);
     if (strcmp(cmd, "ln") == 0) {
         /* ln -s target link (symlink), ln target link (hard link) */

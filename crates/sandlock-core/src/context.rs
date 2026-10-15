@@ -883,7 +883,12 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         };
         crate::realroot::note("real_root: begin");
         let mounts = crate::chroot::resolve::resolve_chroot_mounts(&sandbox.fs_mount);
-        if let Err(e) = crate::realroot::real_root(chroot_root, &mounts, pid_ns) {
+        if let Err(e) = crate::realroot::real_root(
+            chroot_root,
+            &mounts,
+            pid_ns,
+            sandbox.cow_upper.as_deref(),
+        ) {
             fail!(format!("real root: {}", e));
         }
         crate::realroot::note("real_root: pivoted");

@@ -732,7 +732,22 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 576 # 2026-10-15 (writable rootfs COW, task 5): 574 -> 576, +2 --
+core_integ = 577 # 2026-10-15 (writable rootfs COW, exec in a real root): 576 -> 577, +1 --
+                 # `test_chroot::test_chroot_cow_exec_runs_a_binary_staged_in_
+                 # the_upper`: the Phase-2 item Task 3 measured. The real-root
+                 # shape hands `execve` back to the kernel, which resolves the
+                 # path in the *rootfs* -- so a binary the sandbox staged into
+                 # the branch's upper answered ENOENT (`cp` rc=0, `cat`
+                 # 962920 bytes, "not found") while the same file read back
+                 # fine. The upper is inside the sandbox's own tree, so the
+                 # mediator rewrites the exec path to the upper's *virtual*
+                 # spelling and the kernel runs the very same inode. RED before
+                 # the fix: `exec: /usr/local/bin/cow-elf: No such file or
+                 # directory` (the fixture's new `exec` built-in is what makes
+                 # this reachable at all -- everything else in the helper's
+                 # table is a built-in, so `sh -c <path>` could never exec a
+                 # written file).
+                 # 2026-10-15 (writable rootfs COW, task 5): 574 -> 576, +2 --
                  # `test_chroot::test_chroot_cow_stat_serves_the_upper_and_
                  # the_whiteout` and `::test_chroot_cow_whiteout_masks_the_
                  # deleted_symlink`: the two readings Task 5's lane run

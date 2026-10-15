@@ -2715,6 +2715,91 @@ async fn test_chroot_cow_owned_writes_never_land_on_the_lower() {
     let _ = fs::remove_dir_all(&storage);
 }
 
+/// A binary the branch staged into its upper must be executable.
+///
+/// The real-root shape hands `execve` back to the kernel, which resolves the
+/// path in the **rootfs** -- and a file the sandbox wrote lives only in the
+/// branch's upper, so `execve` answers ENOENT for a file `cat` reads back
+/// (measured on the lane 2026-10-15: `cp` rc=0, `cat` 962920 bytes,
+/// `/usr/local/bin/cow-elf: not found`).
+///
+/// The upper is inside the sandbox's own tree (`<workspace>/.rootfs/<uuid>/upper`
+/// -- visible through the `/workspace` mount, which is what design D1 buys), so
+/// the mediator can spell it the way the *child* can resolve it and let the
+/// kernel exec the very same inode: no copy, no `/proc/self/fd` indirection,
+/// and the file the kernel runs is the one the branch staged.
+#[tokio::test]
+async fn test_chroot_cow_exec_runs_a_binary_staged_in_the_upper() {
+    let rootfs = build_test_rootfs("cow-exec-upper");
+    fs::create_dir_all(rootfs.join("usr/local/bin")).unwrap();
+    fs::create_dir_all(rootfs.join("workspace")).unwrap();
+    // The alias the fork bind-mounts the upper at (`realroot::EXEC_ALIAS_DIR`);
+    // the worker materializes it with the other mount targets in production.
+    fs::create_dir_all(rootfs.join(".u")).unwrap();
+    let ws = temp_dir("cow-exec-ws");
+    let storage = ws.join(".rootfs");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write("/workspace")
+        .fs_mount("/workspace", &ws)
+        .workdir(&rootfs)
+        .fs_storage(&storage)
+        .on_exit(BranchAction::Keep)
+        .on_error(BranchAction::Keep)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            // Stage a copy of this very binary into the rootfs (the branch
+            // keeps it in the upper), make it executable, then exec it. The
+            // copy prints its usage on stderr and exits 1 -- which is the
+            // proof that it ran, and which only the *kernel* can produce.
+            "cat /usr/bin/rootfs-helper > /usr/local/bin/cow-elf && \
+             chmod 755 /usr/local/bin/cow-elf && \
+             exec /usr/local/bin/cow-elf",
+        ])
+        .await
+        .expect("the chroot sandbox must be creatable (N14 S5: the real root is the only shape)");
+
+    assert_eq!(
+        result.stderr_str().unwrap_or_default(),
+        "usage: rootfs-helper <command> [args...]",
+        "the staged binary must be the thing that ran; stdout={:?} code={:?}",
+        result.stdout_str(),
+        result.code()
+    );
+    assert_eq!(result.code(), Some(1), "the staged binary's own exit code");
+
+    // ...and it stayed in the branch: the lower is the shared image rootfs.
+    assert!(
+        !rootfs.join("usr/local/bin/cow-elf").exists(),
+        "the staged binary must not be written into the shared lower"
+    );
+    let branch_dir = fs::read_dir(&storage)
+        .expect("the kept branch's storage")
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .expect("the kept branch directory");
+    assert!(
+        branch_dir.join("upper/usr/local/bin/cow-elf").exists(),
+        "the staged binary lives in the branch's upper"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&ws);
+}
+
 /// The metadata family has to be served out of the branch too.
 ///
 /// The writable-rootfs route makes the branch's lower the **shared** image

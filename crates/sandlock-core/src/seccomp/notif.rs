@@ -1648,9 +1648,40 @@ pub(crate) fn rewrite_exec_path_to_fd(
     envp_ptr: u64,
     child_fd: i32,
 ) -> Result<(), NotifError> {
-    let fd_path = format!("/proc/self/fd/{}\0", child_fd);
+    rewrite_exec_path(
+        notif_fd,
+        id,
+        pid,
+        path_ptr,
+        argv_ptr,
+        envp_ptr,
+        &format!("/proc/self/fd/{}", child_fd),
+    )
+}
+
+/// Rewrite the child's exec path to `new_path`, relocating `argv[0]` when it
+/// aliases the path buffer (see [`plan_exec_rewrite`]).
+///
+/// The write is forced past read-only page protections -- a `.rodata` literal
+/// is the common case for a caller -- and may extend past the original buffer:
+/// `execve` replaces the address space on success, so a longer path is
+/// harmless. That is what lets a caller name a path the child can resolve when
+/// the one it asked for is not in the child's own view (the COW upper, whose
+/// spelling through the sandbox's `/workspace` mount is longer than the rootfs
+/// path the sandbox used).
+pub(crate) fn rewrite_exec_path(
+    notif_fd: RawFd,
+    id: u64,
+    pid: u32,
+    path_ptr: u64,
+    argv_ptr: u64,
+    envp_ptr: u64,
+    new_path: &str,
+) -> Result<(), NotifError> {
+    let mut bytes = new_path.as_bytes().to_vec();
+    bytes.push(0);
     let mut read = |addr: u64, len: usize| read_child_mem(notif_fd, id, pid, addr, len);
-    let plan = plan_exec_rewrite(&mut read, path_ptr, fd_path.as_bytes(), argv_ptr, envp_ptr)?;
+    let plan = plan_exec_rewrite(&mut read, path_ptr, &bytes, argv_ptr, envp_ptr)?;
     write_child_mem_force(notif_fd, id, pid, path_ptr, &plan.buf)?;
     for (slot, new_ptr) in plan.patches {
         write_child_mem_force(notif_fd, id, pid, slot, &new_ptr.to_ne_bytes())?;

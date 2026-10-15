@@ -782,6 +782,35 @@ fn cow_named_host(
     )
 }
 
+/// The short alias path (`/.u/<rel>`) of the branch's upper copy of
+/// `virtual_path`, when the branch has one — the path the *child* can resolve
+/// for a file that exists only in the upper.
+///
+/// `None` when there is no branch, the path is not the branch's, the branch
+/// deleted it, or the branch has no upper copy (the kernel resolves the lower by
+/// itself) — in which case the caller leaves the syscall to the kernel, which is
+/// the shape's behaviour without a staged file.
+///
+/// The alias is where `realroot` bind-mounts the upper (`read-only`), and it is
+/// deliberately short: the rewrite happens inside the child's own path buffer,
+/// so the fewer characters it adds the fewer argv/envp layouts it cannot fit.
+async fn cow_exec_alias(
+    cow_state: &Arc<Mutex<CowState>>,
+    ctx: &ChrootCtx<'_>,
+    virtual_path: &Path,
+) -> Option<PathBuf> {
+    let host = ctx
+        .root
+        .join(virtual_path.strip_prefix("/").unwrap_or(virtual_path));
+    let cs = cow_state.lock().await;
+    let branch = cs.branch.as_ref()?;
+    let rel = branch.safe_rel(&host.to_string_lossy())?;
+    if branch.is_deleted(&rel) || !branch.upper_dir().join(&rel).exists() {
+        return None;
+    }
+    Some(Path::new(crate::realroot::EXEC_ALIAS_DIR).join(rel))
+}
+
 /// Whether the branch recorded the path the sandbox **named** as deleted.
 ///
 /// The whiteout is keyed on the name `rm`/`unlinkat` was given, so this is the
@@ -1592,7 +1621,7 @@ fn resolve_self_fd_magic(ctx: &ChrootCtx<'_>, child_pid: u32, virtual_path: &str
 pub(crate) async fn handle_chroot_exec(
     notif: &SeccompNotif,
     chroot_state: &Arc<Mutex<ChrootState>>,
-    _cow_state: &Arc<Mutex<CowState>>,
+    cow_state: &Arc<Mutex<CowState>>,
     notif_fd: RawFd,
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
@@ -1677,6 +1706,38 @@ pub(crate) async fn handle_chroot_exec(
         // path does, then let the kernel run the exec.
         let mut cs = chroot_state.lock().await;
         cs.chroot_exe = Some(virtual_path.clone());
+        drop(cs);
+
+        // ...unless the file the sandbox named lives only in the branch's
+        // upper: the kernel resolves the path in the *rootfs* (the shared
+        // image), so `execve` answers ENOENT for a file `cat` reads back
+        // (measured on the lane 2026-10-15: the copy succeeded, `cat` read
+        // 962920 bytes, `/usr/local/bin/cow-elf: not found`). `realroot` mounts
+        // the upper read-only at `EXEC_ALIAS_DIR`, so the mediator can name the
+        // staged file with a path the child resolves -- the very same inode,
+        // the image's own interpreter, and no `/proc/self/fd` indirection
+        // (which a root without a real procfs cannot resolve).
+        if let Some(target) = cow_exec_alias(cow_state, ctx, &virtual_path).await {
+            if crate::seccomp::notif::rewrite_exec_path(
+                notif_fd,
+                notif.id,
+                notif.pid,
+                path_ptr,
+                argv_ptr,
+                envp_ptr,
+                &target.to_string_lossy(),
+            )
+            .is_err()
+            {
+                // The rewrite plans before it writes, so a refusal leaves the
+                // child's memory untouched: fall back to letting the kernel
+                // resolve the path, which is this shape's behaviour without a
+                // staged file.
+                crate::realroot::note(
+                    "exec rewrite refused (argv/envp layout); the kernel resolves the path",
+                );
+            }
+        }
         return NotifAction::Continue;
     }
 

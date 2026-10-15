@@ -211,6 +211,19 @@ pub fn enter_guest_cwd(path: &Path) -> Result<(), String> {
 /// `root` is the host path of the image rootfs; `mounts` are the policy's
 /// (virtual, host) pairs, the same shape `Sandbox::fs_mount` carries.
 ///
+/// Where the COW branch's upper is bind-mounted inside the sandbox's root.
+///
+/// One path component, deliberately: `handle_chroot_exec` rewrites a staged
+/// binary's exec path to `<this>/<rel>` and the rewrite happens *inside the
+/// child's own path buffer*, so every character it adds is a character the
+/// argv/envp layout may not have room for (`plan_exec_rewrite` refuses rather
+/// than corrupt the pointer arrays). `/.u` is the shortest spelling that is
+/// still a directory of its own.
+///
+/// Read-only: the sandbox reaches its layer through the mediator, never by
+/// name.
+pub const EXEC_ALIAS_DIR: &str = "/.u";
+
 /// `mount_ns_ready` says the calling process already lives in its own mount
 /// namespace — a PID-namespace sandbox gets one from the same `clone3` call
 /// that created it — so `build` only unshares for the other shapes.
@@ -218,15 +231,21 @@ pub fn real_root(
     root: &Path,
     mounts: &[(PathBuf, PathBuf)],
     mount_ns_ready: bool,
+    cow_upper: Option<&Path>,
 ) -> Result<(), String> {
-    let outcome = build(root, mounts, mount_ns_ready);
+    let outcome = build(root, mounts, mount_ns_ready, cow_upper);
     if let Err(ref e) = outcome {
         record_failure(e);
     }
     outcome
 }
 
-fn build(root: &Path, mounts: &[(PathBuf, PathBuf)], mount_ns_ready: bool) -> Result<(), String> {
+fn build(
+    root: &Path,
+    mounts: &[(PathBuf, PathBuf)],
+    mount_ns_ready: bool,
+    cow_upper: Option<&Path>,
+) -> Result<(), String> {
     // 1. Our own mount namespace, owned by our own user namespace: every mount
     //    below is invisible to the host and dies with this process, and no
     //    propagation can leak them outward.
@@ -264,6 +283,36 @@ fn build(root: &Path, mounts: &[(PathBuf, PathBuf)], mount_ns_ready: bool) -> Re
         mount(Some(host_path), &target, None, flags, None)?;
         note(&format!("bind {} -> {}", host_path.display(), target.display()));
     }
+    // 3b. The COW branch's upper, read-only, at `EXEC_ALIAS_DIR`. It is what
+    //     lets the mediator name a staged binary with a path the *child* can
+    //     resolve (see `handle_chroot_exec`): the kernel resolves an exec path
+    //     itself, and a file the branch staged exists nowhere in the rootfs.
+    //     Taken *before* the self-bind below, so it travels into the mount the
+    //     pivot moves.
+    //
+    //     A read-only bind needs the remount: the kernel ignores the access
+    //     flags of the initial `MS_BIND`. Read-only so the sandbox cannot reach
+    //     its own layer by name -- writes there go through the mediator, which
+    //     is the invariant Task 2 pinned.
+    if let Some(upper) = cow_upper {
+        let target = root.join(EXEC_ALIAS_DIR.trim_start_matches('/'));
+        if target.is_dir() {
+            mount(Some(upper), &target, None, MS_BIND | MS_REC, None)?;
+            mount(
+                None,
+                &target,
+                None,
+                MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+                None,
+            )?;
+            note(&format!(
+                "bind (ro) {} -> {}",
+                upper.display(),
+                target.display()
+            ));
+        }
+    }
+
     // 4. The new root has to be a mount point for `pivot_root`, and it has to be
     //    the mount that *carries* the policy mounts just created. A recursive
     //    self-bind taken after them does both: `MS_BIND|MS_REC` replicates the
