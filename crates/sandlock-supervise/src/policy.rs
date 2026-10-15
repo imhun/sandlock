@@ -40,6 +40,7 @@
 //! | `uid`/`gid` | `[program].uid/gid` | `user` (`RunAs`) | same |
 //! | `workdir`/`cwd`/`fs_storage` | `[config].workdir/fs_storage`; `[program].cwd` | same | same |
 //! | `on_exit`/`on_error` | `[filesystem].on_exit/on_error` | `on_exit`/`on_error` | same |
+//! | `cow_discard` | not in profile | `cow_discard` | `cow_discard` |
 //! | `allow_degraded`/`disable` | not in profile | `protection_policy` | same |
 //!
 //! Deliberately **not** wire fields (each would be rejected by name as
@@ -91,6 +92,7 @@ pub const POLICY_FIELDS: &[&str] = &[
     "allow_degraded",
     "chroot",
     "clean_env",
+    "cow_discard",
     "cpu_cores",
     "cwd",
     "deterministic_dirs",
@@ -229,6 +231,11 @@ pub struct SupervisePolicy {
     pub uid: Option<u32>,
     pub gid: Option<u32>,
     pub workdir: Option<PathBuf>,
+    /// The COW branch releases its upper instead of merging it into the lower
+    /// (see `SandboxBuilder::cow_discard`). The writable-rootfs route needs it
+    /// because its lower *is* the shared image cache: a merge there would write
+    /// one sandbox's changes into every sandbox's rootfs.
+    pub cow_discard: bool,
     pub cwd: Option<PathBuf>,
     pub fs_storage: Option<PathBuf>,
     pub on_exit: Option<BranchActionWire>,
@@ -660,6 +667,9 @@ fn apply(parsed: &ParsedPolicy) -> Result<SandboxBuilder, String> {
         if let Some(w) = &p.workdir {
             b = b.workdir(w.clone());
         }
+    }
+    if prov.contains("cow_discard") && p.cow_discard {
+        b = b.cow_discard(true);
     }
     if prov.contains("cwd") {
         if let Some(c) = &p.cwd {
@@ -1349,6 +1359,9 @@ fn verify(sandbox: &Sandbox, parsed: &ParsedPolicy) -> Result<(), String> {
         }
     }
     check!("workdir", &p.workdir, &sandbox.workdir);
+    if prov.contains("cow_discard") {
+        check!("cow_discard", &p.cow_discard, &sandbox.cow_discard);
+    }
     check!("cwd", &p.cwd, &sandbox.cwd);
     check!("fs_storage", &p.fs_storage, &sandbox.fs_storage);
     if prov.contains("on_exit") {
@@ -1468,6 +1481,7 @@ pub fn example_policy_json(secret_path: &Path) -> String {
         "uid": 1234,
         "gid": 1234,
         "workdir": "/workdir",
+        "cow_discard": true,
         "cwd": "/cwd",
         "fs_storage": "/storage",
         "disk_stats_path": "/tmp/e2b-disk-stats",
