@@ -96,6 +96,15 @@ pub(crate) struct ChrootCtx<'a> {
     /// or nothing and the append watch never read a single descriptor. The
     /// map is the same one the `/proc` view and the teardown sweep use.
     pub pid_ns: Option<&'a Arc<std::sync::RwLock<crate::procfs::PidNsMap>>>,
+    /// The COW branch's upper layer, when this sandbox has one.
+    ///
+    /// The *resolve* layer needs it, and only it: a directory the sandbox
+    /// created lives in the upper alone, so the lower cannot be walked through
+    /// a name it does not have (`mkdir X && write into X` answered ENOENT —
+    /// measured on the lane 2026-10-16). Nothing else reads this field; the
+    /// branch's own keying is still the lower-spelled host path the resolvers
+    /// return.
+    pub cow_upper: Option<&'a Path>,
 }
 
 impl<'a> ChrootCtx<'a> {
@@ -120,6 +129,7 @@ impl<'a> ChrootCtx<'a> {
             dirty,
             write_fds,
             pid_ns: policy.pid_ns.as_ref(),
+            cow_upper: policy.cow_upper.as_deref(),
         }
     }
 
@@ -310,7 +320,7 @@ impl ChrootCtx<'_> {
     fn resolve_mount_with(
         &self,
         virtual_path: &str,
-        resolver: fn(&Path, &str) -> Result<(PathBuf, PathBuf), i32>,
+        resolver: fn(&Path, &str, Option<&Path>) -> Result<(PathBuf, PathBuf), i32>,
     ) -> Result<(PathBuf, PathBuf), i32> {
         let confined = confine(virtual_path);
         // No mount matches: that is not a verdict about the path either, and
@@ -324,7 +334,11 @@ impl ChrootCtx<'_> {
             // bound object is the leaf, so return it directly.
             return Ok((mount_target.to_path_buf(), confined));
         }
-        resolver(mount_target, &sub_path).map(|(host, _)| (host, confined))
+        // `None` for the COW upper on purpose: this arm resolves a *mount
+        // source* (the sandbox's workspace, a volume), and the upper mirrors
+        // the **rootfs** layout, not the mount source's. Only the in-root arm
+        // below may fall back to it.
+        resolver(mount_target, &sub_path, None).map(|(host, _)| (host, confined))
     }
 
     /// Resolve against mounts for paths that may not exist yet (O_CREAT).
@@ -682,7 +696,7 @@ fn resolve_chroot_path(
     if let Ok(result) = ctx.resolve_mount(&full_path) {
         return Ok(result);
     }
-    resolve_in_root(ctx.root, &full_path)
+    resolve_in_root(ctx.root, &full_path, ctx.cow_upper)
 }
 
 /// Resolve a child path without following a final symlink.
@@ -700,7 +714,7 @@ fn resolve_chroot_path_nofollow(
     if let Ok(result) = ctx.resolve_mount_nofollow(&full_path) {
         return Ok(result);
     }
-    resolve_in_root_nofollow(ctx.root, &full_path)
+    resolve_in_root_nofollow(ctx.root, &full_path, ctx.cow_upper)
 }
 
 /// Resolve a child path that must already exist within the chroot.
@@ -719,7 +733,7 @@ fn resolve_chroot_path_existing(
     if let Ok(result) = ctx.resolve_mount_existing(&full_path) {
         return Ok(result);
     }
-    resolve_existing_in_root(ctx.root, &full_path)
+    resolve_existing_in_root(ctx.root, &full_path, ctx.cow_upper)
 }
 
 /// Convert a Path to CString, returning Errno on failure.
@@ -3520,6 +3534,9 @@ mod mount_ro_tests {
             // These tests describe the policy halves, not a namespace: with no
             // map the pid translation is the identity.
             pid_ns: None,
+            // No branch in these policy-half tests: the resolver's COW fallback
+            // stays off, which is what they are pinning.
+            cow_upper: None,
         }
     }
 

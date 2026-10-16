@@ -714,6 +714,24 @@ impl SeccompCowBranch {
         &self.upper
     }
 
+    /// Whether `rel` is a directory the **upper** holds and the lower does not.
+    ///
+    /// Confined (`statat_in_root`) on both sides: `safe_rel` passes an interior
+    /// `..` through on purpose — it is not the confinement boundary — so a
+    /// plain `join` used as the *test* would let a crafted relative path point
+    /// the answer at something outside the branch's trees.
+    ///
+    /// This is the shape `mkdir X && …` leaves behind: the sandbox created the
+    /// directory, so the lower has no such name and nothing to fall through to.
+    fn upper_only_dir(&self, rel: &str) -> bool {
+        let is_dir = |root: &Path| {
+            crate::sys::fs::statat_in_root(root, rel, false)
+                .map(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
+                .unwrap_or(false)
+        };
+        is_dir(&self.upper) && !is_dir(&self.workdir)
+    }
+
     /// The original workdir (lower layer).
     pub fn workdir(&self) -> &Path {
         &self.workdir
@@ -1102,6 +1120,18 @@ impl SeccompCowBranch {
             // is ENOENT.
             if self.is_deleted(&rel) {
                 return Err(BranchError::Deleted);
+            }
+            // A directory the upper holds and the lower does not is one the
+            // sandbox created (`mkdir X && ls X`): falling through would have
+            // the caller open a name the lower has never heard of, which is
+            // ENOENT (measured on the lane 2026-10-16 -- `mkdir` succeeded,
+            // `ls X` answered "No such file or directory"). Hand back the
+            // upper's copy instead. `handle_cow_getdents` already understands
+            // an fd that points inside the upper (`strip_prefix(upper_dir)`),
+            // and a directory the lower *does* have still opens there, which is
+            // what keeps its merged listing merged.
+            if self.upper_only_dir(&rel) {
+                return Ok(Some(self.upper.join(&rel)));
             }
             return Ok(None);
         }

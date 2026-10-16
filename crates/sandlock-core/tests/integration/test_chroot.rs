@@ -2715,6 +2715,90 @@ async fn test_chroot_cow_owned_writes_never_land_on_the_lower() {
     let _ = fs::remove_dir_all(&storage);
 }
 
+#[tokio::test]
+async fn test_chroot_cow_a_directory_created_in_the_rootfs_is_usable() {
+    // `mkdir X && write into X` is the shape of every install that creates its
+    // own directory (`pip install` -> `site-packages/<pkg>/`), and it is the
+    // one shape the mediator's *resolve* could not serve: the parent exists
+    // only in the branch's upper, while `resolve_in_root_nofollow` walks the
+    // parent with `openat2_in_root(chroot_root, …)` -- the shared image rootfs.
+    // Measured on the lane 2026-10-16: the write answered ENOENT while the
+    // directory was demonstrably in the upper, and the shared lower had nothing.
+    let rootfs = build_test_rootfs("cow-newdir");
+    fs::create_dir_all(rootfs.join("usr/local")).unwrap();
+    let storage = temp_dir("cow-newdir-upper");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .workdir(&rootfs)
+        .fs_storage(&storage)
+        .on_exit(BranchAction::Keep)
+        .on_error(BranchAction::Keep)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            // Create the directory, write into it, read it back, list it. All
+            // four need the parent walked, and all four answered ENOENT before
+            // this (the helper's `mkdir` has no `-p`, so the new directory's
+            // parent is the lower's own `usr/local`).
+            "mkdir /usr/local/cowdir && \
+             echo hello > /usr/local/cowdir/f && \
+             cat /usr/local/cowdir/f && \
+             ls /usr/local/cowdir",
+        ])
+        .await
+        .expect("the chroot sandbox must be creatable (N14 S5: the real root is the only shape)");
+
+    assert_eq!(
+        result.stdout_str().unwrap_or_default(),
+        // "hello" is `cat`'s copy of the file, "f" is `ls`'s listing of the
+        // directory the sandbox just created (the helper's `ls` emits no
+        // trailing newline).
+        "hello\nf",
+        "a directory created in the sandbox must be writable, readable and listable; \
+         stderr={:?} code={:?}",
+        result.stderr_str(),
+        result.code()
+    );
+    assert_eq!(result.code(), Some(0), "stderr={:?}", result.stderr_str());
+
+    // The lower is the shared image rootfs: it gains nothing, and the branch
+    // holds the new directory and its file.
+    assert!(
+        !rootfs.join("usr/local/cowdir").exists(),
+        "a directory the sandbox created must not be written into the shared lower"
+    );
+    let branch_dir = fs::read_dir(&storage)
+        .expect("the kept branch's storage")
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .expect("the kept branch directory");
+    let upper = branch_dir.join("upper");
+    assert!(
+        upper.join("usr/local/cowdir").is_dir(),
+        "the new directory lives in the branch's upper"
+    );
+    assert_eq!(
+        fs::read_to_string(upper.join("usr/local/cowdir/f"))
+            .expect("the file staged in the upper"),
+        "hello\n"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&storage);
+}
+
 /// A binary the branch staged into its upper must be executable.
 ///
 /// The real-root shape hands `execve` back to the kernel, which resolves the

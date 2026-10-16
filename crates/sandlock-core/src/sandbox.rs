@@ -3187,6 +3187,7 @@ impl Sandbox {
                 max_memory_bytes: self.max_memory.map(|m| m.0).unwrap_or(0),
                 stat_metadata_mediated: resolved.features.stat_metadata_mediated,
                 cow: resolved.features.cow,
+                cow_upper: self.cow_upper.clone(),
                 disk_stats_path: self.disk_stats_path.clone(),
                 max_processes: self.max_processes,
                 has_memory_limit: resolved.features.memory_limit,

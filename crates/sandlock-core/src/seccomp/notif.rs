@@ -845,6 +845,12 @@ pub struct NotifPolicy {
     /// still reports the lower's metadata. `crate::seccomp_plan`'s registration
     /// reads it next to `stat_metadata_mediated`.
     pub cow: bool,
+    /// The COW branch's upper layer, when the sandbox has one
+    /// (`Sandbox::cow_upper`). The chroot resolvers fall back to it when the
+    /// *lower* cannot walk a path's parent — a directory the sandbox created
+    /// exists only there, and without this `mkdir X && write into X` answers
+    /// ENOENT (measured on the lane 2026-10-16).
+    pub cow_upper: Option<std::path::PathBuf>,
     /// Host-maintained ``<total_bytes> <used_bytes>`` file for ``statfs(2)``.
     /// `None` leaves `statfs` to the kernel.
     pub disk_stats_path: Option<std::path::PathBuf>,

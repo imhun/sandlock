@@ -347,7 +347,18 @@
 # cut to zero (give up at once) the old pooled-thread shape failed 18 of 20
 # probe cycles on `PTRACE_SEIZE tid 68: Operation not permitted` while the
 # per-freeze thread passed the same shape in 6.2 s.
-core_lib = 954 # 2026-10-16 (writable rootfs COW, exec in a real root): 952 -> 954,
+core_lib = 955 # 2026-10-16 (writable rootfs COW, a directory only the upper has):
+               # 954 -> 955, +1 -- `chroot::resolve::tests::test_resolve_in_root_
+               # walks_a_parent_that_only_the_upper_has`. The chroot resolvers
+               # take the branch's upper as a third argument and fall back to it
+               # when the *lower* cannot walk a path's parent: a directory the
+               # sandbox created lives in the upper alone, so `mkdir X && write
+               # into X` answered ENOENT (measured on the lane 2026-10-16). The
+               # test pins both halves -- with no upper the lower's ENOENT
+               # stands, and with one the answer is the *lower* spelling (the
+               # branch's key), never `<upper>/<rel>`, which would make
+               # `cow_owns` say no and refuse the write.
+               # 2026-10-16 (writable rootfs COW, exec in a real root): 952 -> 954,
                # +2 -- `seccomp::notif::tests::exec_rewrite_replaces_an_aliased_
                # argv0_when_the_arrays_sit_past_the_path` and
                # `..._replacing_argv0_still_fails_closed_on_an_overlapping_array`.
@@ -748,7 +759,17 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 577 # 2026-10-15 (writable rootfs COW, exec in a real root): 576 -> 577, +1 --
+core_integ = 578 # 2026-10-16 (writable rootfs COW, a directory only the upper has):
+                 # 577 -> 578, +1 -- `test_chroot::test_chroot_cow_a_directory_
+                 # created_in_the_rootfs_is_usable`. `mkdir X && write into X` is
+                 # the shape of every install that creates its own directory
+                 # (`pip install` -> `site-packages/<pkg>/`), and the mediator's
+                 # resolve walked the parent in the *lower* only, so the write
+                 # answered ENOENT while the directory was demonstrably in the
+                 # upper (lane, 2026-10-16). The case drives mkdir, a write, a
+                 # read and a listing, and pins that the shared lower gains
+                 # nothing while the upper holds both entries.
+                 # 2026-10-15 (writable rootfs COW, exec in a real root): 576 -> 577, +1 --
                  # `test_chroot::test_chroot_cow_exec_runs_a_binary_staged_in_
                  # the_upper`: the Phase-2 item Task 3 measured. The real-root
                  # shape hands `execve` back to the kernel, which resolves the

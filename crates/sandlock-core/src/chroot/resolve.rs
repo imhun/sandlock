@@ -171,6 +171,60 @@ pub fn mount_walk_path_bounded(
     virtual_path.to_path_buf()
 }
 
+/// Walk `parent` (an absolute, already-confined virtual path) inside `root`,
+/// returning its real host path and its virtual spelling.
+///
+/// The kernel does the walking (`openat2` + `RESOLVE_IN_ROOT`), so symlinks and
+/// `..` stay confined to `root` — this is the same primitive the two resolvers
+/// below use, factored out because the COW fallback has to run it against a
+/// *second* root.
+fn walk_parent_in_root(root: &Path, parent: &Path) -> Result<(PathBuf, PathBuf), i32> {
+    let fd = openat2_in_root(
+        root,
+        parent.to_str().ok_or(libc::EINVAL)?,
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    )?;
+    let host_path = std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok();
+    unsafe { libc::close(fd) };
+    // Internal failures below are not verdicts about the caller's path: the
+    // parent *did* open, so what is left is the supervisor failing to name
+    // what it opened (EIO) or a parent that resolved outside the root
+    // (EXDEV — the same answer `openat2` gives for an escape).
+    let host_path = host_path.ok_or(libc::EIO)?;
+    let virtual_path = to_virtual_path(root, &host_path).ok_or(libc::EXDEV)?;
+    Ok((host_path, virtual_path))
+}
+
+/// The COW fallback: the parent of a path that the *lower* cannot resolve may
+/// exist only in the branch's upper — a directory the sandbox itself created.
+///
+/// The branch's upper mirrors the lower's layout (`<upper>/<rel>` for
+/// `<lower>/<rel>`), so the parent can be walked there; what comes back is the
+/// parent's **lower spelling** — `(chroot_root/<rel>, /<rel>)`, with the
+/// caller appending the final component — because that spelling is the
+/// branch's key (`SeccompCowBranch::matches`/`safe_rel`), and returning
+/// `<upper>/<rel>` would make the caller's `cow_owns` answer "no" and refuse
+/// the very write this exists to admit.
+///
+/// `Err` when there is no upper (no branch), when the lower's failure was not
+/// "the parent is not there" (a policy refusal stays a refusal), or when the
+/// upper does not hold that parent either.
+fn resolve_parent_through_upper(
+    chroot_root: &Path,
+    upper: Option<&Path>,
+    parent: &Path,
+    lower_error: i32,
+) -> Result<(PathBuf, PathBuf), i32> {
+    if lower_error != libc::ENOENT {
+        return Err(lower_error);
+    }
+    let upper = upper.ok_or(lower_error)?;
+    let (_upper_host, rel_parent) = walk_parent_in_root(upper, parent)?;
+    let rel = rel_parent.strip_prefix("/").unwrap_or(&rel_parent);
+    Ok((chroot_root.join(rel), rel_parent))
+}
+
 /// Resolve a virtual path within the chroot using `openat2(RESOLVE_IN_ROOT)`.
 ///
 /// The kernel resolves all symlinks and `..` components, keeping the result
@@ -191,8 +245,9 @@ pub fn mount_walk_path_bounded(
 pub fn resolve_in_root(
     chroot_root: &Path,
     child_path: &str,
+    upper: Option<&Path>,
 ) -> Result<(PathBuf, PathBuf), i32> {
-    if let Ok(result) = resolve_existing_in_root(chroot_root, child_path) {
+    if let Ok(result) = resolve_existing_in_root(chroot_root, child_path, upper) {
         return Ok(result);
     }
 
@@ -201,7 +256,7 @@ pub fn resolve_in_root(
     // component will be created.  The errno that comes back is the parent
     // open's: `ENOENT` when the parent itself is missing, which is what the
     // caller's walk-up expects.
-    resolve_in_root_nofollow(chroot_root, child_path)
+    resolve_in_root_nofollow(chroot_root, child_path, upper)
 }
 
 /// Resolve a virtual path *without* following a final symlink.
@@ -218,31 +273,26 @@ pub fn resolve_in_root(
 pub fn resolve_in_root_nofollow(
     chroot_root: &Path,
     child_path: &str,
+    upper: Option<&Path>,
 ) -> Result<(PathBuf, PathBuf), i32> {
     let confined = confine(child_path);
     // "/" has no final component to leave unresolved.
     let Some(file_name) = confined.file_name() else {
-        return resolve_existing_in_root(chroot_root, child_path);
+        return resolve_existing_in_root(chroot_root, child_path, upper);
     };
     let parent = confined.parent().unwrap_or(Path::new("/"));
 
-    let fd = openat2_in_root(
-        chroot_root,
-        parent.to_str().ok_or(libc::EINVAL)?,
-        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        0,
-    )?;
-    let parent_host = std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok();
-    unsafe { libc::close(fd) };
-    // Internal failures below are not verdicts about the caller's path: the
-    // parent *did* open, so what is left is the supervisor failing to name
-    // what it opened (EIO) or a parent that resolved outside the root
-    // (EXDEV — the same answer `openat2` gives for an escape).
-    let parent_host = parent_host.ok_or(libc::EIO)?;
-    let host_path = parent_host.join(file_name);
-    let parent_virtual = to_virtual_path(chroot_root, &parent_host).ok_or(libc::EXDEV)?;
-    let virtual_path = parent_virtual.join(file_name);
-    Ok((host_path, virtual_path))
+    let (parent_host, parent_virtual) = match walk_parent_in_root(chroot_root, parent) {
+        Ok(found) => found,
+        // The parent is not in the lower. If the branch staged it — a
+        // directory the sandbox created — walk that copy instead, keeping the
+        // lower spelling of the result (see `resolve_parent_through_upper`).
+        Err(e) => resolve_parent_through_upper(chroot_root, upper, parent, e)?,
+    };
+    Ok((
+        parent_host.join(file_name),
+        parent_virtual.join(file_name),
+    ))
 }
 
 /// Resolve a virtual path that must already exist within the chroot.
@@ -257,18 +307,31 @@ pub fn resolve_in_root_nofollow(
 pub fn resolve_existing_in_root(
     chroot_root: &Path,
     child_path: &str,
+    upper: Option<&Path>,
 ) -> Result<(PathBuf, PathBuf), i32> {
-    let fd = openat2_in_root(
-        chroot_root,
-        child_path,
-        libc::O_PATH | libc::O_CLOEXEC,
-        0,
-    )?;
-    let host_path = std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok();
-    unsafe { libc::close(fd) };
-    let host_path = host_path.ok_or(libc::EIO)?;
-    let virtual_path = to_virtual_path(chroot_root, &host_path).ok_or(libc::EXDEV)?;
-    Ok((host_path, virtual_path))
+    let walk = |root: &Path| -> Result<(PathBuf, PathBuf), i32> {
+        let fd = openat2_in_root(root, child_path, libc::O_PATH | libc::O_CLOEXEC, 0)?;
+        let host_path = std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok();
+        unsafe { libc::close(fd) };
+        let host_path = host_path.ok_or(libc::EIO)?;
+        let virtual_path = to_virtual_path(root, &host_path).ok_or(libc::EXDEV)?;
+        Ok((host_path, virtual_path))
+    };
+    match walk(chroot_root) {
+        Ok(found) => Ok(found),
+        // A path that exists only in the branch's upper (inside a directory the
+        // sandbox created): the lower cannot walk it, the upper can. The host
+        // path stays the lower's spelling — the branch's key.
+        Err(e) => {
+            let upper = upper.ok_or(e)?;
+            if e != libc::ENOENT {
+                return Err(e);
+            }
+            let (host_path, virtual_path) = walk(upper)?;
+            let rel = virtual_path.strip_prefix("/").unwrap_or(&virtual_path);
+            Ok((chroot_root.join(rel), virtual_path))
+        }
+    }
 }
 
 /// Resolve the configured chroot root to a canonical, on-disk path.
@@ -585,7 +648,7 @@ mod tests {
         std::fs::create_dir_all(root.join("usr/bin")).unwrap();
         std::fs::write(root.join("usr/bin/hello"), "").unwrap();
 
-        let result = resolve_in_root(root, "/usr/bin/hello");
+        let result = resolve_in_root(root, "/usr/bin/hello", None);
         assert!(result.is_ok());
         let (host, virt) = result.unwrap();
         assert_eq!(virt, PathBuf::from("/usr/bin/hello"));
@@ -600,7 +663,7 @@ mod tests {
         std::fs::write(root.join("usr/lib64/foo"), "").unwrap();
         symlink("/usr/lib64", root.join("lib")).unwrap();
 
-        let result = resolve_in_root(root, "/lib/foo");
+        let result = resolve_in_root(root, "/lib/foo", None);
         assert!(result.is_ok());
         let (host, virt) = result.unwrap();
         assert_eq!(virt, PathBuf::from("/usr/lib64/foo"));
@@ -614,7 +677,7 @@ mod tests {
         std::fs::create_dir_all(root.join("tmp")).unwrap();
 
         // File doesn't exist but parent does — should resolve via parent.
-        let result = resolve_in_root(root, "/tmp/newfile");
+        let result = resolve_in_root(root, "/tmp/newfile", None);
         assert!(result.is_ok());
         let (host, virt) = result.unwrap();
         assert_eq!(virt, PathBuf::from("/tmp/newfile"));
@@ -630,7 +693,7 @@ mod tests {
         // Symlink to absolute path — must stay confined.
         symlink("/etc/shadow", root.join("evil")).unwrap();
 
-        let result = resolve_in_root(root, "/evil");
+        let result = resolve_in_root(root, "/evil", None);
         assert!(result.is_ok());
         let (host, virt) = result.unwrap();
         assert_eq!(virt, PathBuf::from("/etc/shadow"));
@@ -643,7 +706,7 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir_all(root.join("a")).unwrap();
 
-        let result = resolve_in_root(root, "/a/../../etc/group");
+        let result = resolve_in_root(root, "/a/../../etc/group", None);
         // Either resolves within root or is refused — never escapes.
         if let Ok((host, _)) = result {
             assert!(host.starts_with(root));
@@ -655,7 +718,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
 
-        let result = resolve_in_root(root, "/");
+        let result = resolve_in_root(root, "/", None);
         assert!(result.is_ok());
         let (host, virt) = result.unwrap();
         assert_eq!(virt, PathBuf::from("/"));
@@ -672,7 +735,7 @@ mod tests {
 
         // resolve_existing_in_root should follow the symlink and return
         // the resolved target path, not the symlink itself.
-        let result = resolve_existing_in_root(root, "/usr/local/bin/python3");
+        let result = resolve_existing_in_root(root, "/usr/local/bin/python3", None);
         match result {
             Ok((host, virt)) => {
                 assert!(host.starts_with(root));
@@ -696,7 +759,7 @@ mod tests {
         // Absolute symlink — must stay confined to chroot root.
         symlink("/usr/bin/python3.12", root.join("usr/local/bin/python3")).unwrap();
 
-        let result = resolve_existing_in_root(root, "/usr/local/bin/python3");
+        let result = resolve_existing_in_root(root, "/usr/local/bin/python3", None);
         match result {
             Ok((host, virt)) => {
                 assert!(host.starts_with(root),
@@ -716,13 +779,68 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir_all(root.join("usr/bin")).unwrap();
 
-        let result = resolve_existing_in_root(root, "/usr/bin/nonexistent");
+        let result = resolve_existing_in_root(root, "/usr/bin/nonexistent", None);
         // openat2 may not be available, but if it is, a missing file is an
         // ENOENT *errno* — not a nameless failure (N95: the handlers now hand
         // the caller's own errno back, so the resolver has to say which one).
-        if resolve_existing_in_root(root, "/usr/bin").is_ok() {
+        if resolve_existing_in_root(root, "/usr/bin", None).is_ok() {
             assert_eq!(result.unwrap_err(), libc::ENOENT);
         }
+    }
+
+    /// The COW fallback: a parent that exists only in the branch's upper.
+    ///
+    /// `mkdir X && write into X` is the shape of every install that creates its
+    /// own directory (`pip install` -> `site-packages/<pkg>/`), and the lower
+    /// has never heard of `X` — so the resolver has to walk the *upper*, while
+    /// still answering with the lower's spelling, which is the branch's key
+    /// (`SeccompCowBranch::matches`/`safe_rel`). Without an upper the lower's
+    /// own verdict stands, and a path neither side has is still ENOENT.
+    #[test]
+    fn test_resolve_in_root_walks_a_parent_that_only_the_upper_has() {
+        let lower = TempDir::new().unwrap();
+        let upper = TempDir::new().unwrap();
+        std::fs::create_dir_all(lower.path().join("usr/local")).unwrap();
+        std::fs::create_dir_all(upper.path().join("usr/local/cowdir")).unwrap();
+
+        // No upper: the lower's verdict stands, on both resolvers.
+        assert_eq!(
+            resolve_in_root(lower.path(), "/usr/local/cowdir/f", None).unwrap_err(),
+            libc::ENOENT,
+            "the lower has no `cowdir`, so the parent walk must say ENOENT"
+        );
+        assert_eq!(
+            resolve_existing_in_root(lower.path(), "/usr/local/cowdir", None).unwrap_err(),
+            libc::ENOENT
+        );
+
+        // With the upper: it resolves, and the host path is the *lower*
+        // spelling — never the upper's, which would make the caller's
+        // `cow_owns` answer "no" and refuse the write.
+        let (host, virt) =
+            resolve_in_root(lower.path(), "/usr/local/cowdir/f", Some(upper.path())).unwrap();
+        assert_eq!(virt, PathBuf::from("/usr/local/cowdir/f"));
+        assert_eq!(host, lower.path().join("usr/local/cowdir/f"));
+        assert!(
+            !host.exists(),
+            "the lower really does not have it, so this is a spelling, not a walk: {host:?}"
+        );
+
+        let (host, virt) =
+            resolve_existing_in_root(lower.path(), "/usr/local/cowdir", Some(upper.path())).unwrap();
+        assert_eq!(virt, PathBuf::from("/usr/local/cowdir"));
+        assert_eq!(host, lower.path().join("usr/local/cowdir"));
+
+        // A parent neither side has is still ENOENT...
+        assert_eq!(
+            resolve_in_root(lower.path(), "/usr/local/absent/f", Some(upper.path())).unwrap_err(),
+            libc::ENOENT
+        );
+        // ...and a lower-only path is untouched by the upper.
+        std::fs::write(lower.path().join("usr/local/plain"), "").unwrap();
+        let (host, _) =
+            resolve_in_root(lower.path(), "/usr/local/plain", Some(upper.path())).unwrap();
+        assert_eq!(host, lower.path().join("usr/local/plain"));
     }
 
     /// N95: the errno a create-capable resolve answers for "the parent is not
@@ -737,16 +855,16 @@ mod tests {
         std::fs::create_dir_all(root.join("home/user")).unwrap();
 
         // Sanity: the parent exists, so this one resolves.
-        assert!(resolve_in_root(root, "/home/user/one").is_ok());
+        assert!(resolve_in_root(root, "/home/user/one", None).is_ok());
 
         // The parent does not exist: ENOENT, twice deep.
-        let err = resolve_in_root(root, "/home/user/missing/inner").unwrap_err();
+        let err = resolve_in_root(root, "/home/user/missing/inner", None).unwrap_err();
         assert_eq!(err, libc::ENOENT, "missing parent must answer ENOENT");
-        let err = resolve_in_root_nofollow(root, "/home/user/missing/inner").unwrap_err();
+        let err = resolve_in_root_nofollow(root, "/home/user/missing/inner", None).unwrap_err();
         assert_eq!(err, libc::ENOENT, "no-follow must answer the same");
 
         // And the "must exist" resolver says the same thing for a missing leaf.
-        let err = resolve_existing_in_root(root, "/home/user/missing").unwrap_err();
+        let err = resolve_existing_in_root(root, "/home/user/missing", None).unwrap_err();
         assert_eq!(err, libc::ENOENT);
     }
 }
