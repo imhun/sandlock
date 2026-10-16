@@ -759,7 +759,29 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 578 # 2026-10-16 (writable rootfs COW, a directory only the upper has):
+core_integ = 580 # 2026-10-16 (writable rootfs COW, the alias is read-only):
+                 # 579 -> 580, +1 -- `test_chroot::test_chroot_cow_the_exec_alias_
+                 # is_read_only`. The alias had to be declared read-only
+                 # (`fs_mount_ro`) as well as registered as a mount: `can_write`
+                 # treats "under any mount" as writable, so the first cut made
+                 # `/.u/…` a second, *writable* spelling of the upper -- measured
+                 # on the lane 2026-10-16, `echo evil > /.u/usr/local/cow-x`
+                 # returned 0, and an `fs_deny` for `/sys` was reachable as
+                 # `/.u/sys/…`. The case reads through the alias, writes through
+                 # it (exactly `Permission denied`), and re-reads to prove the
+                 # file was left alone.
+                 # 2026-10-16 (writable rootfs COW, a `#!` script the branch staged):
+                 # 578 -> 579, +1 -- `test_chroot::test_chroot_cow_exec_runs_a_
+                 # script_staged_in_the_upper`. The kernel resolves an exec path
+                 # itself (that is the `/.u` alias), but a script makes the
+                 # *interpreter* open the script by path, and that open is
+                 # mediated: the mediator's own view of `/.u/…` was the rootfs's
+                 # empty `.u` directory, so it answered ENOENT (lane, 2026-10-16:
+                 # `sh: 0: cannot open /.u/usr/local/cow-s: No such file`). The
+                 # alias is now registered as a mount of the branch's upper, so
+                 # reads resolve through it and a write is refused by the same
+                 # gate that always kept the alias read-only.
+                 # 2026-10-16 (writable rootfs COW, a directory only the upper has):
                  # 577 -> 578, +1 -- `test_chroot::test_chroot_cow_a_directory_
                  # created_in_the_rootfs_is_usable`. `mkdir X && write into X` is
                  # the shape of every install that creates its own directory

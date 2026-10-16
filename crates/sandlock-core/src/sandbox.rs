@@ -3183,6 +3183,24 @@ impl Sandbox {
                 .unwrap_or(0);
 
             let rt_name = self.rt().name.clone();
+            // The fork's own exec alias, as the mediator has to see it: a mount
+            // of the branch's upper at `EXEC_ALIAS_DIR`, **and a read-only one**
+            // -- `ChrootCtx::can_write` treats "under any mount" as writable
+            // unless `mount_ro` says otherwise, and the alias is a read-only
+            // bind (`realroot` remounts it `MS_RDONLY`). Without the `ro` half
+            // the alias becomes a second, *writable* spelling of the upper:
+            // measured on the lane 2026-10-16, `echo evil > /.u/usr/local/cow-x`
+            // returned 0 through the mediator's own open, which is also how a
+            // `fs_deny` written for `/sys` would have been reachable as
+            // `/.u/sys/…`.
+            let cow_alias: Option<(std::path::PathBuf, std::path::PathBuf)> =
+                match (self.chroot.as_ref(), self.cow_upper.as_ref()) {
+                    (Some(_), Some(upper)) => Some((
+                        std::path::PathBuf::from(crate::realroot::EXEC_ALIAS_DIR),
+                        upper.clone(),
+                    )),
+                    _ => None,
+                };
             let notif_policy = NotifPolicy {
                 max_memory_bytes: self.max_memory.map(|m| m.0).unwrap_or(0),
                 stat_metadata_mediated: resolved.features.stat_metadata_mediated,
@@ -3212,8 +3230,29 @@ impl Sandbox {
                 chroot_readable: self.fs_readable.clone(),
                 chroot_writable: self.fs_writable.clone(),
                 chroot_denied: self.fs_denied.clone(),
-                chroot_mounts: crate::chroot::resolve::resolve_chroot_mounts(&self.fs_mount),
-                chroot_mount_ro: self.fs_mount_ro.clone(),
+                chroot_mounts: {
+                    let mut mounts =
+                        crate::chroot::resolve::resolve_chroot_mounts(&self.fs_mount);
+                    // The alias, as a mount the *mediator* can resolve:
+                    // `realroot` binds the branch's upper read-only at
+                    // `EXEC_ALIAS_DIR` for the child (the kernel resolves an exec
+                    // path itself), and without the same mapping here a `#!`
+                    // script's interpreter — which opens the script by path —
+                    // got the rootfs's empty `.u` directory and ENOENT
+                    // (measured on the lane 2026-10-16: `sh: 0: cannot open
+                    // /.u/usr/local/cow-s: No such file`). `realroot` takes its
+                    // mounts from `fs_mount` (this list is the mediator's), so
+                    // nothing binds twice.
+                    mounts.extend(cow_alias.clone());
+                    mounts
+                },
+                chroot_mount_ro: {
+                    let mut ro = self.fs_mount_ro.clone();
+                    if let Some((virtual_path, _)) = cow_alias.as_ref() {
+                        ro.push(virtual_path.clone());
+                    }
+                    ro
+                },
                 deterministic_dirs: self.deterministic_dirs,
                 virtual_hostname: Some(rt_name),
                 has_http_acl: resolved.features.http_acl,

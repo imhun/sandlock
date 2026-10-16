@@ -2799,6 +2799,148 @@ async fn test_chroot_cow_a_directory_created_in_the_rootfs_is_usable() {
     let _ = fs::remove_dir_all(&storage);
 }
 
+/// The alias is a **read-only** window onto the branch's upper.
+///
+/// Registering it as a mount is what lets an interpreter open a staged script
+/// by path, and `ChrootCtx::can_write` treats "under any mount" as writable
+/// unless the mount is declared read-only — so the alias has to be in
+/// `fs_mount_ro` as well, or it becomes a second, *writable* spelling of the
+/// upper (and an `fs_deny` written for `/sys` would be reachable as
+/// `/.u/sys/…`). Measured on the lane 2026-10-16: without the `ro` half,
+/// `echo evil > /.u/usr/local/cow-x` returned 0 through the mediator's own open.
+#[tokio::test]
+async fn test_chroot_cow_the_exec_alias_is_read_only() {
+    let rootfs = build_test_rootfs("cow-alias-ro");
+    fs::create_dir_all(rootfs.join("usr/local")).unwrap();
+    fs::create_dir_all(rootfs.join(".u")).unwrap();
+    let storage = temp_dir("cow-alias-ro-upper");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .workdir(&rootfs)
+        .fs_storage(&storage)
+        .on_exit(BranchAction::Keep)
+        .on_error(BranchAction::Keep)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            // `;` (not `&&`): the refused write must not stop the run, and the
+            // last `cat` is what proves the file was left alone.
+            "echo hello > /usr/local/cow-x ; \
+             cat /.u/usr/local/cow-x ; \
+             echo evil > /.u/usr/local/cow-x ; \
+             cat /usr/local/cow-x",
+        ])
+        .await
+        .expect("the chroot sandbox must be creatable (N14 S5: the real root is the only shape)");
+
+    assert_eq!(
+        result.stdout_str().unwrap_or_default(),
+        "hello\nhello",
+        "the alias reads the staged file and must not have changed it; stderr={:?}",
+        result.stderr_str()
+    );
+    assert_eq!(
+        result.stderr_str().unwrap_or_default().trim(),
+        "sh: cannot open /.u/usr/local/cow-x: Permission denied",
+        "a write through the alias must be refused"
+    );
+    assert_eq!(result.code(), Some(0), "stderr={:?}", result.stderr_str());
+    assert!(
+        !rootfs.join("usr/local/cow-x").exists(),
+        "the staged file must not be written into the shared lower"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&storage);
+}
+
+/// A `#!` script the branch staged must run — which means the *interpreter*
+/// must be able to open the script by path.
+///
+/// The kernel resolves the exec path itself (that is what the alias is for), but
+/// a script makes the interpreter open the script **again**, and that open is
+/// mediated. The mediator's own view of `/.u/…` is the rootfs's empty `.u`
+/// directory, so it answered ENOENT (lane, 2026-10-16: `sh: 0: cannot open
+/// /.u/usr/local/cow-s: No such file`). The alias is the fork's own read-only
+/// bind of the branch's upper, so the mediator gets it as a **mount**: reads
+/// come from the upper, and a write there is refused by the same gate that has
+/// always kept the alias read-only (`can_write` is false for `/.u/…` and
+/// `cow_owns(<upper>/<rel>)` is false, because the branch's key never names its
+/// own storage).
+#[tokio::test]
+async fn test_chroot_cow_exec_runs_a_script_staged_in_the_upper() {
+    let rootfs = build_test_rootfs("cow-script");
+    fs::create_dir_all(rootfs.join("usr/local")).unwrap();
+    // The alias's mount target: `realroot` binds the upper at `/.u` when it
+    // exists, and the worker materializes it with the other mount targets.
+    fs::create_dir_all(rootfs.join(".u")).unwrap();
+    let storage = temp_dir("cow-script-upper");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .workdir(&rootfs)
+        .fs_storage(&storage)
+        .on_exit(BranchAction::Keep)
+        .on_error(BranchAction::Keep)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            // The shebang names the helper's own `cat`, so the "interpreter" is
+            // a process that opens the script by path — what a real `#!` does,
+            // without needing a real dash in this synthetic rootfs (`usr/bin/sh`
+            // here is the helper, whose `sh` only takes `-c`).
+            // The helper's tokenizer knows `"` (not `'`), so the shebang line
+            // has to be quoted that way to land as one argument.
+            "echo \"#!/usr/bin/rootfs-helper cat\" > /usr/local/cow-s && \
+             chmod 755 /usr/local/cow-s && \
+             exec /usr/local/cow-s",
+        ])
+        .await
+        .expect("the chroot sandbox must be creatable (N14 S5: the real root is the only shape)");
+
+    assert_eq!(
+        result.stdout_str().unwrap_or_default(),
+        // The script's one line, as `cat` printed it (`stdout_str` trims the
+        // trailing newline the helper's `echo` wrote).
+        "#!/usr/bin/rootfs-helper cat",
+        "the interpreter must be able to open the staged script by path; \
+         stderr={:?} code={:?}",
+        result.stderr_str(),
+        result.code()
+    );
+    assert_eq!(result.code(), Some(0), "stderr={:?}", result.stderr_str());
+    assert!(
+        !rootfs.join("usr/local/cow-s").exists(),
+        "the staged script must not be written into the shared lower"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&storage);
+}
+
 /// A binary the branch staged into its upper must be executable.
 ///
 /// The real-root shape hands `execve` back to the kernel, which resolves the
