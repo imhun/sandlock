@@ -2616,21 +2616,20 @@ async fn test_chroot_hardlink_to_a_file_deleted_in_the_branch_is_enoent() {
 /// **a path the branch owns is served by the branch, never by a host operation
 /// on the lower.**
 ///
-/// `symlinkat` is where that broke. The branch declines a symlink with an
-/// absolute (or `..`) target by design — its link text would name something
-/// outside the branch's own view — and the handler used to treat "declined"
-/// as "not COW's business" and fall through to `libc::symlink` on the resolved
-/// host path. The lower here *is* the shared image rootfs, so the entry was
-/// created there for real: a write into the cache every tenant shares.
+/// `symlinkat` is where that broke. The handler used to treat a branch's
+/// refusal as "not COW's business" and fall through to `libc::symlink` on the
+/// resolved host path. The lower here *is* the shared image rootfs, so the
+/// entry was created there for real: a write into the cache every tenant
+/// shares.
 ///
 /// The shape is the production one, minimally: the branch's workdir is the
 /// whole rootfs and the policy grants **no** write at all, so both writes below
 /// are admitted by the branch's grant alone (the policy would refuse them).
-/// The stageable half is the control — the grant still serves what the branch
-/// can stage — and both dispositions are `Keep` so the test can look inside the
-/// upper afterwards: `Abort` deletes the only evidence of *where* the write
-/// went, and the run ends on a refusal (`on_error`), so `on_exit` alone would
-/// not keep it.
+/// Both targets are staged now — an absolute one included, which the branch
+/// used to decline and the chroot mediator now follows in the merged view
+/// (`SeccompCowBranch::handle_symlink_in_view`) — and both dispositions are
+/// `Keep` so the test can look inside the upper afterwards: `Abort` deletes the
+/// only evidence of *where* the write went.
 ///
 /// One cage, one branch: the read-back has to happen in the same run as the
 /// write, since a second `run` would start a fresh branch with an empty upper.
@@ -2660,30 +2659,28 @@ async fn test_chroot_cow_owned_writes_never_land_on_the_lower() {
             "rootfs-helper",
             "sh",
             "-c",
-            // Stage a link the branch can serve, read it back, then ask for the
-            // arm it declines (an absolute target) — all in one cage.
+            // Stage a relative link, read it back, then stage an absolute one —
+            // all in one cage.
             "ln -s rel-target /usr/local/rel-link && \
              readlink /usr/local/rel-link && \
-             ln -s /etc/os-release /usr/local/abs-link",
+             ln -s /etc/os-release /usr/local/abs-link && \
+             readlink /usr/local/abs-link",
         ])
         .await
         .expect("the chroot sandbox must be creatable (N14 S5: the real root is the only shape)");
 
-    // The staged half: the branch served it, so the name reads back through the
-    // branch — and the lower has no such name, which is what makes the read a
-    // read of the *upper*.
+    // Both names read back through the branch — and the lower has neither,
+    // which is what makes the read a read of the *upper*.
     assert_eq!(
         result.stdout_str().unwrap_or_default(),
-        "rel-target",
-        "the staged symlink must read back through the branch, stderr={:?}",
+        "rel-target\n/etc/os-release",
+        "a staged symlink must read back through the branch, stderr={:?}",
         result.stderr_str()
     );
-    // The declined half: the mediator's own refusal (EPERM), and it is the last
-    // command of the chain, so it is also the run's exit code.
     assert_eq!(
         result.code(),
-        Some(1),
-        "an owned path the branch declines must be refused, stderr={:?}",
+        Some(0),
+        "an owned write must be served by the branch, stderr={:?}",
         result.stderr_str()
     );
 
@@ -2698,9 +2695,10 @@ async fn test_chroot_cow_owned_writes_never_land_on_the_lower() {
         PathBuf::from("rel-target"),
         "a write the branch serves lands in its upper"
     );
-    assert!(
-        !upper.join("usr/local/abs-link").exists(),
-        "a refused symlink must not be staged either"
+    assert_eq!(
+        fs::read_link(upper.join("usr/local/abs-link")).expect("the absolute link is staged too"),
+        PathBuf::from("/etc/os-release"),
+        "the link text is recorded verbatim, whoever ends up following it"
     );
     assert!(
         !rootfs.join("usr/local/rel-link").exists(),
@@ -2708,7 +2706,7 @@ async fn test_chroot_cow_owned_writes_never_land_on_the_lower() {
     );
     assert!(
         !rootfs.join("usr/local/abs-link").exists(),
-        "a refused symlink must not be created on the lower"
+        "a staged symlink must not be created on the lower either"
     );
 
     cleanup_rootfs(&rootfs);
@@ -3435,6 +3433,281 @@ async fn test_chroot_cow_a_mkdirat_through_a_branch_owned_dirfd_is_staged() {
         .find(|p| p.is_dir())
         .unwrap();
     assert!(branch_dir.join("upper/usr/local/cowdir/inner").is_dir());
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&storage);
+}
+
+/// A read through a link the **image** carries never leaves the sandbox.
+///
+/// `resolve_in_root` falls back to "resolve the parent, append the leaf" when
+/// the lower cannot walk the whole path, and that leaf is left unresolved on
+/// purpose (a name that does not exist yet cannot be walked). Every caller that
+/// then runs a *following* host syscall — `libc::open` above all — had the
+/// **host** resolve the link text, against the host's own `/`. Measured
+/// 2026-10-16: an image symlink `usr/local/hostlink -> /etc/hostname`, with no
+/// `/etc/hostname` inside the rootfs, printed the *worker's* hostname.
+#[tokio::test]
+async fn test_chroot_cow_a_read_through_an_image_link_never_reaches_the_host() {
+    let rootfs = build_test_rootfs("cow-image-link");
+    fs::create_dir_all(rootfs.join("usr/local")).unwrap();
+    // The target is deliberately absent *inside* the rootfs and present on the
+    // host: `/etc/hostname` is what the worker's own container has.
+    std::os::unix::fs::symlink("/etc/hostname", rootfs.join("usr/local/hostlink")).unwrap();
+    assert!(
+        !rootfs.join("etc/hostname").exists(),
+        "the fixture must not carry the link's target, or the test proves nothing"
+    );
+    let storage = temp_dir("cow-image-link-layer");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .workdir(&rootfs)
+        .fs_storage(&storage)
+        .on_exit(BranchAction::Keep)
+        .on_error(BranchAction::Keep)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&["rootfs-helper", "sh", "-c", "cat /usr/local/hostlink"])
+        .await
+        .expect("the chroot sandbox must be creatable (N14 S5: the real root is the only shape)");
+
+    assert_eq!(
+        result.stdout_str().unwrap_or_default(),
+        "",
+        "a link whose target the sandbox does not have must read as nothing, not as the \
+         host's file; stderr={:?}",
+        result.stderr_str()
+    );
+    assert_eq!(
+        result.stderr_str().unwrap_or_default(),
+        "cat: /usr/local/hostlink: No such file or directory",
+        "the errno is the merged view's ENOENT, not a leak and not a refusal"
+    );
+    assert_eq!(result.code(), Some(1), "stderr={:?}", result.stderr_str());
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&storage);
+}
+
+/// The same link, with its target **inside** the sandbox, resolves to it.
+///
+/// This is the other half of the fixture above: the follow must not turn every
+/// image link into ENOENT. `/etc/os-release` is the rootfs's own file, so a
+/// link to it reads the rootfs's bytes.
+#[tokio::test]
+async fn test_chroot_cow_an_image_link_is_followed_inside_the_view() {
+    let rootfs = build_test_rootfs("cow-image-link-in");
+    fs::create_dir_all(rootfs.join("usr/local")).unwrap();
+    fs::write(rootfs.join("etc/os-release"), b"ID=in-rootfs\n").unwrap();
+    std::os::unix::fs::symlink("/etc/os-release", rootfs.join("usr/local/inlink")).unwrap();
+    let storage = temp_dir("cow-image-link-in-layer");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .workdir(&rootfs)
+        .fs_storage(&storage)
+        .on_exit(BranchAction::Keep)
+        .on_error(BranchAction::Keep)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&["rootfs-helper", "sh", "-c", "cat /usr/local/inlink"])
+        .await
+        .expect("the chroot sandbox must be creatable (N14 S5: the real root is the only shape)");
+
+    assert_eq!(
+        result.stdout_str().unwrap_or_default(),
+        "ID=in-rootfs",
+        "a link to a file the sandbox has must read that file; stderr={:?} code={:?}",
+        result.stderr_str(),
+        result.code()
+    );
+    assert_eq!(result.code(), Some(0), "stderr={:?}", result.stderr_str());
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&storage);
+}
+
+/// The bin link `npm install -g` ends on, and the escape it must not open.
+///
+/// `@larksuite/cli`'s install finishes with
+/// `../lib/node_modules/@larksuite/cli/scripts/run.js -> /usr/bin/lark-cli`
+/// (`#createBinLinks`), which the chroot mediator used to refuse with EPERM —
+/// after which npm rolled the whole install back (measured on the lane
+/// 2026-10-16, BytePlan's `sandbox-base` image). The refusal belonged to the
+/// legacy COW dispatcher, which hands a staged link's *host* path to a syscall
+/// and lets the host resolve the text; the chroot mediator resolves it in the
+/// merged view instead, so the same link is served — and a link whose target
+/// the sandbox does **not** have answers ENOENT, never the host's file.
+#[tokio::test]
+async fn test_chroot_cow_a_link_the_sandbox_stages_is_followed_in_the_view() {
+    let rootfs = build_test_rootfs("cow-staged-link");
+    fs::create_dir_all(rootfs.join("usr/lib/mod")).unwrap();
+    fs::write(rootfs.join("usr/lib/mod/run.js"), b"module\n").unwrap();
+    let storage = temp_dir("cow-staged-link-layer");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .workdir(&rootfs)
+        .fs_storage(&storage)
+        .on_exit(BranchAction::Keep)
+        .on_error(BranchAction::Keep)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            // npm's link (relative, climbing), the same link written absolute,
+            // and a link to something the sandbox does not have at all. The
+            // last one is deliberately after a `;`: it must fail without
+            // stopping the chain, and its errno is the run's exit code.
+            "ln -s ../lib/mod/run.js /usr/bin/cli && \
+             cat /usr/bin/cli && \
+             ln -s /usr/lib/mod/run.js /usr/bin/abcli && \
+             cat /usr/bin/abcli; \
+             ln -s /etc/hostname /usr/bin/hostlink && cat /usr/bin/hostlink",
+        ])
+        .await
+        .expect("the chroot sandbox must be creatable (N14 S5: the real root is the only shape)");
+
+    assert_eq!(
+        result.stdout_str().unwrap_or_default(),
+        "module\nmodule",
+        "both staged links must read the file they name, stderr={:?} code={:?}",
+        result.stderr_str(),
+        result.code()
+    );
+    assert_eq!(
+        result.stderr_str().unwrap_or_default(),
+        "cat: /usr/bin/hostlink: No such file or directory",
+        "a link whose target the sandbox does not have must not reach the host's file"
+    );
+    assert_eq!(result.code(), Some(1), "stderr={:?}", result.stderr_str());
+
+    let branch_dir = fs::read_dir(&storage)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.is_dir())
+        .unwrap();
+    let upper = branch_dir.join("upper");
+    assert_eq!(
+        fs::read_link(upper.join("usr/bin/cli")).unwrap(),
+        PathBuf::from("../lib/mod/run.js"),
+        "npm's link text is recorded verbatim"
+    );
+    assert_eq!(
+        fs::read_link(upper.join("usr/bin/abcli")).unwrap(),
+        PathBuf::from("/usr/lib/mod/run.js"),
+        "an absolute target is recorded verbatim too"
+    );
+    assert_eq!(
+        fs::read_link(upper.join("usr/bin/hostlink")).unwrap(),
+        PathBuf::from("/etc/hostname"),
+        "even the link that reaches nothing is the sandbox's own entry"
+    );
+    for name in ["usr/bin/cli", "usr/bin/abcli", "usr/bin/hostlink"] {
+        assert!(
+            !rootfs.join(name).exists(),
+            "the shared lower must gain no entry: {name}"
+        );
+    }
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&storage);
+}
+
+/// `cd` into a directory the sandbox just created, and `pwd` afterwards.
+///
+/// The chdir existence proof opened the directory in the lower alone, and the
+/// handler then handed the syscall to the kernel — which resolves it against a
+/// root that has never heard of the name — so `mkdir /usr/local/t1 && cd
+/// /usr/local/t1` answered "can't cd to t1" (measured on the lane 2026-10-16,
+/// BytePlan's `sandbox-base`). The mediator now proves the name in the merged
+/// view, serves the chdir itself when the kernel could not have made it, and
+/// answers `getcwd` from the same bookkeeping, so the two never disagree in
+/// front of the child. The relative `mkdir` at the end is what proves the new
+/// cwd is the one every later relative path resolves against.
+#[tokio::test]
+async fn test_chroot_cow_chdir_into_a_directory_the_branch_created() {
+    let rootfs = build_test_rootfs("cow-chdir-newdir");
+    fs::create_dir_all(rootfs.join("usr/local")).unwrap();
+    let storage = temp_dir("cow-chdir-newdir-layer");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .workdir(&rootfs)
+        .fs_storage(&storage)
+        .on_exit(BranchAction::Keep)
+        .on_error(BranchAction::Keep)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "mkdir /usr/local/cowcd && chdir /usr/local/cowcd && pwd && mkdir inner && fork-pwd",
+        ])
+        .await
+        .expect("the chroot sandbox must be creatable (N14 S5: the real root is the only shape)");
+
+    assert_eq!(
+        result.stdout_str().unwrap_or_default(),
+        // `chdir` prints the `getcwd` it read back, `pwd` prints it again, and
+        // `fork-pwd` prints it from a **forked child** — which is where the
+        // record's second half has to be inherited (see `CwdRecord`).
+        "OK /usr/local/cowcd\n/usr/local/cowcd\n/usr/local/cowcd",
+        "the child must be able to enter the directory it just made, and `pwd` must agree — \
+         in this process and in a forked one; stderr={:?} code={:?}",
+        result.stderr_str(),
+        result.code()
+    );
+    assert_eq!(result.code(), Some(0), "stderr={:?}", result.stderr_str());
+    assert!(
+        !rootfs.join("usr/local/cowcd").exists(),
+        "the lower gains nothing"
+    );
+    let branch_dir = fs::read_dir(&storage)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.is_dir())
+        .unwrap();
+    assert!(
+        branch_dir.join("upper/usr/local/cowcd/inner").is_dir(),
+        "the relative mkdir must land in the directory the sandbox entered"
+    );
 
     cleanup_rootfs(&rootfs);
     let _ = fs::remove_dir_all(&storage);

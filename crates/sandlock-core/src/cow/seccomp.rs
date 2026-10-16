@@ -1589,14 +1589,48 @@ impl SeccompCowBranch {
     /// Handle symlinkat.
     ///
     /// Returns `Err(QuotaExceeded)` when the symlink would exceed `max_disk`.
+    ///
+    /// Refuses a target that is absolute or walks up with `..`. That refusal
+    /// belongs to *this* entry point, not to the branch: see
+    /// [`Self::handle_symlink_in_view`] for the caller that can do better.
     pub fn handle_symlink(&mut self, target: &str, linkpath: &str) -> Result<bool, BranchError> {
+        if std::path::Path::new(target).is_absolute() || target.split('/').any(|c| c == "..") {
+            return Ok(false);
+        }
+        self.stage_symlink(target, linkpath)
+    }
+
+    /// Handle symlinkat for a caller whose **view** follows the link text.
+    ///
+    /// A link's target is data: whoever follows it decides where it points. The
+    /// refusal in [`Self::handle_symlink`] exists because that dispatcher hands
+    /// the staged path to a syscall and lets the **host** resolve the text
+    /// against the host's `/`, so a target that leaves the branch's own subtree
+    /// leaves the sandbox with it.
+    ///
+    /// The chroot mediator does not work that way. It resolves the child's path
+    /// in the merged view (`chroot::resolve::follow_final_symlink`), so a link
+    /// whose text names `/etc/os-release`, or climbs with `..`, is followed
+    /// inside the sandbox and answers what the merged view says — and a target
+    /// the sandbox does not have answers ENOENT rather than the host's file.
+    /// That is what `npm install -g` needs: its last step is the bin link
+    /// `../lib/node_modules/@larksuite/cli/scripts/run.js -> /usr/bin/lark-cli`
+    /// (measured on the lane 2026-10-16), which this dispatcher used to refuse
+    /// with EPERM, after which npm rolled the whole install back.
+    pub fn handle_symlink_in_view(
+        &mut self,
+        target: &str,
+        linkpath: &str,
+    ) -> Result<bool, BranchError> {
+        self.stage_symlink(target, linkpath)
+    }
+
+    /// Record a symlink in the upper, verbatim, after the quota check.
+    fn stage_symlink(&mut self, target: &str, linkpath: &str) -> Result<bool, BranchError> {
         let rel = match self.safe_rel(linkpath) {
             Some(r) => r,
             None => return Ok(false),
         };
-        if std::path::Path::new(target).is_absolute() || target.split('/').any(|c| c == "..") {
-            return Ok(false);
-        }
         self.check_quota(256)?;
         self.has_changes = true;
         if let Some(p) = parent_rel(&rel) {

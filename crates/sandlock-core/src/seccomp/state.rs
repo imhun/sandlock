@@ -226,7 +226,32 @@ pub struct ProcessIndex {
 /// shares `fs_struct`, so a chdir in one thread is seen by its
 /// siblings. Kept outside `PerProcessState` (and behind a std mutex)
 /// because path resolution reads it from synchronous helpers.
-pub type SharedCwd = Arc<std::sync::Mutex<Option<PathBuf>>>;
+pub struct CwdRecord {
+    /// The spelling the sandbox believes the task is in, or `None` when the
+    /// task has never moved and the kernel's own cwd is the only answer.
+    pub path: Option<PathBuf>,
+    /// Whether the **kernel's** cwd still names the same directory.
+    ///
+    /// It stops doing so the moment a chdir is served without moving the
+    /// kernel's own — a name only the branch's upper has, which the kernel
+    /// cannot resolve at all (`chroot::dispatch::handle_chroot_chdir`). `getcwd`
+    /// then has to answer from `path`, because the kernel's answer would name
+    /// the directory it never left.
+    pub kernel_in_sync: bool,
+}
+
+impl Default for CwdRecord {
+    fn default() -> Self {
+        // A record that has never been written is a task that has never moved:
+        // the kernel's own cwd is still the authority on where it is.
+        Self {
+            path: None,
+            kernel_in_sync: true,
+        }
+    }
+}
+
+pub type SharedCwd = Arc<std::sync::Mutex<CwdRecord>>;
 
 #[derive(Clone)]
 struct ProcessEntry {
@@ -347,10 +372,22 @@ impl ProcessIndex {
                 return Arc::clone(&leader.cwd);
             }
         }
-        let parent_cwd = ppid
+        // `fork(2)` copies the `fs_struct`, so the child starts on the parent's
+        // kernel cwd **and** on whatever the parent's record said about it: a
+        // parent whose last chdir was served without moving the kernel's own
+        // (`handle_chroot_chdir`) leaves a child whose kernel cwd is just as
+        // stale, and a record that claimed otherwise would make the child's
+        // `getcwd` answer the directory the parent never left. Measured on the
+        // lane 2026-10-16: `npm install -g` spawns its lifecycle script with a
+        // cwd the kernel could not make, and the script's `node
+        // scripts/install.js` resolved against `/home/user` instead.
+        let inherited = ppid
             .and_then(|p| guard.get(&p))
-            .and_then(|e| e.cwd.lock().ok().and_then(|c| c.clone()));
-        Arc::new(std::sync::Mutex::new(parent_cwd))
+            .and_then(|e| e.cwd.lock().ok().map(|c| CwdRecord {
+                path: c.path.clone(),
+                kernel_in_sync: c.kernel_in_sync,
+            }));
+        Arc::new(std::sync::Mutex::new(inherited.unwrap_or_default()))
     }
 
     /// The cwd cell to read or write for `pid`.
@@ -379,8 +416,16 @@ impl ProcessIndex {
     /// untracked or has never moved.
     pub fn virtual_cwd(&self, pid: i32) -> Option<PathBuf> {
         let cell = self.cwd_cell(pid)?;
-        let cwd = cell.lock().ok()?.clone();
-        cwd
+        let guard = cell.lock().ok()?;
+        guard.path.clone()
+    }
+
+    /// Whether the kernel's own cwd still names the directory this task
+    /// believes it is in. `None` when the task is untracked.
+    pub fn kernel_cwd_in_sync(&self, pid: i32) -> Option<bool> {
+        let cell = self.cwd_cell(pid)?;
+        let guard = cell.lock().ok()?;
+        Some(guard.kernel_in_sync)
     }
 
     /// Record where this task now believes it is. Silently does nothing
@@ -398,9 +443,18 @@ impl ProcessIndex {
     /// the kernel's `/proc/<pid>/cwd` — that one still points at the launch
     /// directory, since the supervisor services chdir by recording it.
     pub fn set_virtual_cwd(&self, pid: i32, cwd: PathBuf) {
+        self.set_virtual_cwd_with(pid, cwd, true)
+    }
+
+    /// [`Self::set_virtual_cwd`] plus what the *kernel* did with the same
+    /// syscall: `kernel_in_sync` is false when the supervisor answered a chdir
+    /// the kernel could not make, so the two now disagree until an absolute
+    /// chdir (or an `fchdir`) hands the kernel one it can.
+    pub fn set_virtual_cwd_with(&self, pid: i32, cwd: PathBuf, kernel_in_sync: bool) {
         if let Some(cell) = self.cwd_cell(pid) {
             if let Ok(mut slot) = cell.lock() {
-                *slot = Some(cwd);
+                slot.path = Some(cwd);
+                slot.kernel_in_sync = kernel_in_sync;
             }
         }
     }

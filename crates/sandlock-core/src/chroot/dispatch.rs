@@ -560,6 +560,28 @@ fn set_virtual_cwd(notif: &SeccompNotif, ctx: &ChrootCtx<'_>, cwd: PathBuf) {
     }
 }
 
+/// Record the calling task's new virtual cwd **and** whether the kernel's own
+/// still names the same directory (see `CwdRecord::kernel_in_sync`).
+fn set_virtual_cwd_with(
+    notif: &SeccompNotif,
+    ctx: &ChrootCtx<'_>,
+    cwd: PathBuf,
+    kernel_in_sync: bool,
+) {
+    if let Ok(pid) = i32::try_from(notif.pid) {
+        ctx.processes.set_virtual_cwd_with(pid, cwd, kernel_in_sync);
+    }
+}
+
+/// Whether the kernel's own cwd still names the directory this task believes
+/// it is in. An untracked task has never moved, so the kernel's is right.
+fn kernel_cwd_in_sync(notif: &SeccompNotif, ctx: &ChrootCtx<'_>) -> bool {
+    match i32::try_from(notif.pid) {
+        Ok(pid) => ctx.processes.kernel_cwd_in_sync(pid).unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
 /// `RESOLVE_NO_MAGICLINKS`: refuse traversal through a /proc magic link.
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 /// `RESOLVE_NO_SYMLINKS`: refuse traversal through any symlink.
@@ -769,6 +791,58 @@ fn last_errno(fallback: i32) -> i32 {
     std::io::Error::last_os_error()
         .raw_os_error()
         .unwrap_or(fallback)
+}
+
+/// Prove that `path` is a directory reachable inside `root`, and hand back the
+/// kernel's errno when it is not.
+///
+/// `openat2(RESOLVE_IN_ROOT)` is what makes this a proof rather than a guess:
+/// the kernel walks the components, follows the links, and keeps the result
+/// inside `root`. `chdir` uses it against the lower and then against the
+/// branch's upper; nothing else about the descriptor matters.
+fn open_dir_proof(root: &Path, path: &str) -> Result<(), i32> {
+    let fd = openat2_in_root(
+        root,
+        path,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    )?;
+    unsafe { libc::close(fd) };
+    Ok(())
+}
+
+/// Answer `getcwd` from the supervisor's own bookkeeping.
+///
+/// Only reached when the kernel's cwd is not the one the sandbox believes it is
+/// in (`handle_chroot_chdir` serves a chdir the kernel cannot make), and the
+/// caller's buffer is where the path has to land: the libc wrapper hands the
+/// caller *that* pointer, not the one the syscall returns. `getcwd(NULL, 0)`
+/// asks the *kernel* to allocate, and there is nothing to write into before it
+/// does — that spelling keeps the kernel's answer, which is why the handler
+/// only takes over when the child passed a buffer.
+fn answer_getcwd(notif: &SeccompNotif, notif_fd: RawFd, spelling: &Path) -> NotifAction {
+    let buf = notif.data.args[0];
+    let size = notif.data.args[1] as usize;
+    if buf == 0 {
+        return NotifAction::Continue;
+    }
+    let mut bytes = spelling.as_os_str().as_encoded_bytes().to_vec();
+    bytes.push(0);
+    // `getcwd`'s own ERANGE: the path plus its NUL does not fit.
+    if bytes.len() > size {
+        return NotifAction::Errno(libc::ERANGE);
+    }
+    if write_child_mem(notif_fd, notif.id, notif.pid, buf, &bytes).is_err() {
+        // The write failed (the child unmapped the buffer under us): the
+        // kernel's own answer is a worse one, but it is still an answer to a
+        // syscall this handler must not fail on its own account.
+        return NotifAction::Continue;
+    }
+    // The **length**, not the buffer pointer: that is what the `getcwd` syscall
+    // returns (the libc wrapper is what hands the caller its pointer), and a
+    // wrapper that reads the value as an `int` -- musl's does -- would take a
+    // pointer with a high bit set for a negative errno and answer NULL.
+    NotifAction::ReturnValue(bytes.len() as i64)
 }
 
 /// Resolve host_path through COW (handle_stat), returning the real path.
@@ -2023,16 +2097,21 @@ pub(crate) async fn handle_chroot_write(
             if let Some(cow) = cs.branch.as_mut() {
                 let s = host_link.to_string_lossy();
                 if cow.matches(&s) {
-                    match cow.handle_symlink(&target, &s) {
+                    // The chroot mediator resolves the child's paths in the
+                    // merged view, so it can stage a link whatever its text
+                    // names: the text is followed inside the sandbox (see
+                    // `SeccompCowBranch::handle_symlink_in_view`). The legacy
+                    // COW dispatcher, which lets the host follow the staged
+                    // path, keeps the narrower `handle_symlink`.
+                    match cow.handle_symlink_in_view(&target, &s) {
                         Ok(true) => return NotifAction::ReturnValue(0),
                         Err(crate::error::BranchError::QuotaExceeded) => return NotifAction::Errno(libc::ENOSPC),
                         // Owned, and the branch declined to stage it: an
-                        // absolute (or `..`) target, whose link text would
-                        // name something outside the branch's own view. The
-                        // mediator's own refusal — falling through here issued
-                        // `symlink` on the resolved host path, which is the
-                        // lower, and the shared image rootfs gained the entry
-                        // for real.
+                        // unusable name (an escape out of the rootfs, or a
+                        // quota the branch could not reserve). The mediator's
+                        // own refusal — falling through here issued `symlink`
+                        // on the resolved host path, which is the lower, and
+                        // the shared image rootfs gained the entry for real.
                         _ => return NotifAction::Errno(libc::EPERM),
                     }
                 }
@@ -2899,16 +2978,27 @@ pub(crate) async fn handle_chroot_chdir(
     } else {
         (ctx.root.to_path_buf(), full_path.clone())
     };
-    let src_fd = match openat2_in_root(
-        &chdir_root,
-        &chdir_path,
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        0,
-    ) {
-        Ok(fd) => fd,
-        Err(errno) => return NotifAction::Errno(errno),
+    // The proof runs in the **merged** view: the lower (or the mount source)
+    // first, then the branch's upper, because a directory the sandbox created
+    // lives there alone and the lower cannot walk a name it has never had.
+    // Measured on the lane 2026-10-16: `mkdir /usr/local/t1 && cd /usr/local/t1`
+    // answered "can't cd to t1".
+    let lower_resolved = match open_dir_proof(&chdir_root, &chdir_path) {
+        Ok(()) => true,
+        Err(errno) => {
+            // Only the in-root arm has an upper to fall back to: the upper
+            // mirrors the rootfs layout, not a mount source's.
+            let from_upper = ctx.mount_target(&confined).is_none()
+                && ctx
+                    .cow_upper
+                    .map(|upper| open_dir_proof(upper, &confined.to_string_lossy()).is_ok())
+                    .unwrap_or(false);
+            if !from_upper {
+                return NotifAction::Errno(errno);
+            }
+            false
+        }
     };
-    unsafe { libc::close(src_fd) };
 
     // Record the path the caller asked for, not a host->virtual reverse
     // lookup: when one host directory is mounted at several virtual paths
@@ -2929,17 +3019,27 @@ pub(crate) async fn handle_chroot_chdir(
     // here instead serves every spelling, and it drops both a TOCTOU window
     // (the kernel re-read the path we wrote) and a force-write through
     // /proc/<pid>/mem that permanently corrupted a .rodata path literal.
-    set_virtual_cwd(notif, ctx, confined);
-    // A child with a real root (crate::realroot) has to have the kernel move its
-    // cwd: the resolutions the mediator never sees -- its `execve` of a relative
-    // path above all -- read the task's own `fs_struct`, not this bookkeeping,
-    // and inside a real root the guest's spelling is already the right one, so
-    // the kernel can just run the syscall. The emulated shape could not do that
-    // (the recorded path is virtual while the kernel's view is the host's, and
-    // rewriting the buffer does not fit the short ones -- issue #178) and is
-    // retired: `do_create_stdio` refuses a chroot root without `real_root`, so
-    // a mediated child is always pivoted.
-    NotifAction::Continue
+    // Hand the syscall back only when the kernel's own resolution cannot
+    // disagree with the one just proved:
+    //   * an **absolute** path is resolved from the task's root, so the cwd
+    //     plays no part;
+    //   * a **relative** one is resolved against the kernel's cwd, which agrees
+    //     with this bookkeeping only while it still holds the directory the
+    //     supervisor believes it is in;
+    //   * a name the lower does not have is one the kernel cannot resolve at
+    //     all -- the upper is not in the child's root, only at the read-only
+    //     exec alias.
+    // Everything else is served here, and `handle_chroot_getcwd` answers from
+    // the same bookkeeping so the two never disagree in front of the child.
+    let kernel_in_sync = kernel_cwd_in_sync(notif, ctx);
+    let absolute = Path::new(&path).is_absolute();
+    let hand_back = lower_resolved && (absolute || kernel_in_sync);
+    set_virtual_cwd_with(notif, ctx, confined, hand_back);
+    if hand_back {
+        NotifAction::Continue
+    } else {
+        NotifAction::ReturnValue(0)
+    }
 }
 
 // ============================================================
@@ -2995,7 +3095,20 @@ pub(crate) async fn handle_chroot_getcwd(
     // cwd into the caller's buffer, with its own ERANGE window) is gone with
     // that shape: `do_create_stdio` refuses a chroot root without `real_root`,
     // so every mediated child answers for itself.
-    NotifAction::Continue
+    //
+    // One case the kernel cannot answer: a cwd the supervisor entered without
+    // moving the kernel's own, because the name exists only in the branch's
+    // upper (`handle_chroot_chdir`). There the tracked spelling is the only
+    // right answer, and it goes into the caller's buffer.
+    if kernel_cwd_in_sync(notif, ctx) {
+        return NotifAction::Continue;
+    }
+    match virtual_cwd_of(notif, ctx) {
+        Some(spelling) => answer_getcwd(notif, notif_fd, &spelling),
+        // Out of sync with nothing recorded: the kernel's answer is still the
+        // only one there is.
+        None => NotifAction::Continue,
+    }
 }
 
 // ============================================================

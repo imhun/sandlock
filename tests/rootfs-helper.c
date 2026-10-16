@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
@@ -77,6 +78,42 @@ static int cmd_pwd(void) {
     }
     perror("pwd");
     return 1;
+}
+
+/* ── fork-pwd: the same `pwd`, in a forked child ────────────────── */
+/*
+ * `fork(2)` copies the task's `fs_struct`, so a child starts on the parent's
+ * cwd -- and on whatever the supervisor's record of it said. That record has
+ * two halves (the spelling, and whether the kernel's own cwd still names the
+ * same directory), and a child that inherits only the first answers `getcwd`
+ * from the directory the parent never left. Measured on the lane 2026-10-16:
+ * `npm install -g` spawns its lifecycle script with a cwd the kernel could not
+ * make, and `node scripts/install.js` then resolved against `/home/user`.
+ */
+static int cmd_fork_pwd(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    // stdout is a pipe here, so it is block-buffered: without this the child
+    // inherits the parent's unflushed output and writes it a second time.
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork-pwd: fork");
+        return 1;
+    }
+    if (pid == 0) {
+        int rc = cmd_pwd();
+        // `_exit` skips the stdio flush, and `puts` is buffered: without this
+        // the child's `pwd` reaches the parent's pipe as nothing at all.
+        fflush(NULL);
+        _exit(rc);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        perror("fork-pwd: waitpid");
+        return 1;
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
 
 /* ── readlink ───────────────────────────────────────────────── */
@@ -964,6 +1001,7 @@ static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "cat") == 0)            return cmd_cat(argc, argv);
     if (strcmp(cmd, "ls") == 0)             return cmd_ls(argc, argv);
     if (strcmp(cmd, "pwd") == 0)            return cmd_pwd();
+    if (strcmp(cmd, "fork-pwd") == 0)       return cmd_fork_pwd(argc, argv);
     if (strcmp(cmd, "readlink") == 0)       return cmd_readlink(argc, argv);
     if (strcmp(cmd, "stat") == 0)           return cmd_stat(argc, argv);
     if (strcmp(cmd, "mkdir") == 0)          return cmd_mkdir(argc, argv);

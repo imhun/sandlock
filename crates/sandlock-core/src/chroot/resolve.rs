@@ -256,7 +256,90 @@ pub fn resolve_in_root(
     // component will be created.  The errno that comes back is the parent
     // open's: `ENOENT` when the parent itself is missing, which is what the
     // caller's walk-up expects.
-    resolve_in_root_nofollow(chroot_root, child_path, upper)
+    let (host, spelling) = resolve_in_root_nofollow(chroot_root, child_path, upper)?;
+    follow_final_symlink(chroot_root, upper, host, spelling)
+}
+
+/// How many link hops [`follow_final_symlink`] takes before it gives up.
+///
+/// The kernel's own bound is 40; this one only ever walks the links a *single*
+/// resolution meets, and the merged view can make a chain longer than the
+/// kernel would have seen (a link in the upper naming a path the lower owns,
+/// and back), so it is deliberately generous but finite.
+const MERGED_FOLLOW_HOPS: usize = 24;
+
+/// The object a **following** resolution of `(host, virtual)` reaches, with the
+/// final component followed in the merged view.
+///
+/// [`resolve_in_root_nofollow`] leaves the last component unresolved on purpose
+/// — a name that does not exist yet cannot be walked, which is exactly what an
+/// `O_CREAT` target needs — and the no-follow family is right to want that.
+/// The *following* family is not: every caller that then runs a host syscall
+/// which follows — `libc::open` above all — has the **host** resolve the link
+/// text, against the host's own `/`. Measured on the lane 2026-10-16: an image
+/// symlink `usr/local/hostlink -> /etc/hostname`, with no `/etc/hostname`
+/// inside the rootfs, printed the *worker's* hostname.
+///
+/// So a leaf that is a symlink is followed here instead, in the merged view: the
+/// text is resolved against the link's own directory (or from `/` when it is
+/// absolute), `..` is clamped, and the answer is the spelling the link finally
+/// names — which is what the kernel-resolved branch of [`resolve_in_root`]
+/// answers too, so both branches of the following family agree.
+///
+/// The entry tested for "is this a link" is the one the **merged** view picks —
+/// the upper's copy when the branch has one, the lower's otherwise — so a link
+/// the branch staged is followed by its own text rather than by whatever the
+/// lower happens to have at the same name.
+fn follow_final_symlink(
+    chroot_root: &Path,
+    upper: Option<&Path>,
+    host: PathBuf,
+    spelling: PathBuf,
+) -> Result<(PathBuf, PathBuf), i32> {
+    let mut host = host;
+    let mut spelling = spelling;
+    for _ in 0..MERGED_FOLLOW_HOPS {
+        let rel = spelling.strip_prefix("/").unwrap_or(&spelling);
+        let entry = match upper {
+            Some(upper) if std::fs::symlink_metadata(upper.join(rel)).is_ok() => upper.join(rel),
+            _ => host.clone(),
+        };
+        let is_link = std::fs::symlink_metadata(&entry)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_link {
+            return Ok((host, spelling));
+        }
+        let text = std::fs::read_link(&entry).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+        let target = link_target_spelling(&spelling, &text);
+        let (next_host, next_virtual) = match resolve_existing_in_root(chroot_root, &target, upper) {
+            Ok(resolved) => resolved,
+            Err(_) => resolve_in_root_nofollow(chroot_root, &target, upper)?,
+        };
+        host = next_host;
+        spelling = next_virtual;
+    }
+    // A chain longer than the bound is a loop as far as the child is concerned;
+    // ELOOP is what the kernel answers for one, and it is not a path.
+    Err(libc::ELOOP)
+}
+
+/// The virtual spelling a link at `link_virtual` names when its text is
+/// `text`: absolute targets start from `/`, relative ones from the link's own
+/// directory, and `..` is clamped at `/` (the same rule the confined walks
+/// apply).
+fn link_target_spelling(link_spelling: &Path, text: &Path) -> String {
+    let joined = if text.is_absolute() {
+        text.to_path_buf()
+    } else {
+        link_spelling
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .join(text)
+    };
+    confine(joined.to_string_lossy().as_ref())
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Resolve a virtual path *without* following a final symlink.

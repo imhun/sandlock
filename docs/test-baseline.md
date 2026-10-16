@@ -787,7 +787,16 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 584 # 2026-10-16 (writable rootfs COW, the dirfd shape): 582 -> 584,
+core_integ = 588 # 2026-10-16 (writable rootfs COW, links and the cwd):
+                 # 584 -> 588, +4 -- `test_chroot::test_chroot_cow_a_read_through_
+                 # an_image_link_never_reaches_the_host` (the merged view follows a
+                 # link the image carries; the host used to follow it instead, and
+                 # printed its own `/etc/hostname`), `..._an_image_link_is_followed_
+                 # inside_the_view` (the control for it), `..._a_link_the_sandbox_
+                 # stages_is_followed_in_the_view` (npm's bin link, `..` and
+                 # absolute targets, and a link that must answer ENOENT),
+                 # and `..._chdir_into_a_directory_the_branch_created`.
+                 # 2026-10-16 (writable rootfs COW, the dirfd shape): 582 -> 584,
                  # +2 -- `test_chroot::test_chroot_cow_mkdir_p_two_levels_in_one_
                  # process` (the same two levels, path by path: it is the control
                  # for the pair) and `test_chroot::test_chroot_cow_a_mkdirat_
