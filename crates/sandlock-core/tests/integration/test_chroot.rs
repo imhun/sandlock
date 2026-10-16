@@ -2715,6 +2715,89 @@ async fn test_chroot_cow_owned_writes_never_land_on_the_lower() {
     let _ = fs::remove_dir_all(&storage);
 }
 
+/// A **named** layer is adopted: the tree's carried layer is what the sandbox
+/// sees.
+///
+/// The writable-rootfs route names its layer (`<ws>/.rootfs/layer`) so that a
+/// tree restored from a snapshot — or migrated from another node — re-attaches
+/// to the layer it already carries: the staged files *and* the whiteouts. The
+/// failing behaviour was measured on the lane 2026-10-16: after
+/// `Sandbox.create(A.create_snapshot())` the restored sandbox could not see the
+/// file A wrote into the rootfs, saw `/etc/hostname` again, and its tree held
+/// both the carried layer and a fresh empty one.
+#[tokio::test]
+async fn test_chroot_cow_a_named_layer_is_adopted_from_the_tree() {
+    let rootfs = build_test_rootfs("cow-adopt");
+    fs::create_dir_all(rootfs.join("usr/local")).unwrap();
+    fs::write(rootfs.join("etc/hostname"), "from-the-image\n").unwrap();
+    let storage = temp_dir("cow-adopt-layer");
+
+    // What a previous sandbox left in the tree: one staged file, one whiteout.
+    // (`deleted.log` is the fork's own format — one escaped path per line.)
+    let layer = storage.join("layer");
+    fs::create_dir_all(layer.join("upper/usr/local")).unwrap();
+    fs::write(layer.join("upper/usr/local/staged"), "staged\n").unwrap();
+    fs::write(layer.join("deleted.log"), "etc/hostname\n").unwrap();
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .workdir(&rootfs)
+        .fs_storage(&storage)
+        .cow_layer_name("layer")
+        .cow_discard(true)
+        .on_exit(BranchAction::Keep)
+        .on_error(BranchAction::Keep)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            // The staged file must read back (it lives in the adopted upper) and
+            // the whiteouted one must be gone (`;`, so the second command runs
+            // even though the first one fails).
+            "cat /usr/local/staged ; cat /etc/hostname",
+        ])
+        .await
+        .expect("the chroot sandbox must be creatable (N14 S5: the real root is the only shape)");
+
+    assert_eq!(
+        result.stdout_str().unwrap_or_default(),
+        "staged",
+        "the adopted upper is the sandbox's upper; stderr={:?}",
+        result.stderr_str()
+    );
+    assert_eq!(
+        result.stderr_str().unwrap_or_default().trim(),
+        "cat: /etc/hostname: No such file or directory",
+        "the adopted whiteout log is in effect"
+    );
+    assert_eq!(result.code(), Some(1), "the last command is the failed `cat`");
+    // The layer the tree carried is still the only one: nothing was re-minted
+    // beside it, and the lower was not touched.
+    let entries: Vec<String> = fs::read_dir(&storage)
+        .expect("the layer's storage")
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(entries, vec!["layer".to_string()], "one layer, adopted");
+    assert_eq!(
+        fs::read_to_string(rootfs.join("etc/hostname")).unwrap(),
+        "from-the-image\n",
+        "the lower keeps its bytes"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&storage);
+}
+
 /// The layer's budget is a **named** refusal all the way out to the child.
 ///
 /// `max_disk` bounds what the branch stages, and the writable-rootfs route is

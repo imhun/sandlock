@@ -193,6 +193,24 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_cow_discard(
     Box::into_raw(Box::new(builder.cow_discard(v)))
 }
 
+/// Name the COW layer directory under `fs_storage` and adopt it when it exists;
+/// see `SandboxBuilder::cow_layer_name`.
+///
+/// # Safety
+/// `b` and `name` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_cow_layer_name(
+    b: *mut SandboxBuilder,
+    name: *const c_char,
+) -> *mut SandboxBuilder {
+    if b.is_null() || name.is_null() {
+        return b;
+    }
+    let name = CStr::from_ptr(name).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.cow_layer_name(name)))
+}
+
 /// # Safety
 /// `b` and `path` must be valid pointers.
 #[no_mangle]

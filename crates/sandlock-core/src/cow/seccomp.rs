@@ -674,8 +674,70 @@ impl SeccompCowBranch {
             )?,
         };
         let branch_id = uuid::Uuid::new_v4().to_string();
-        let branch_dir = storage_base.join(&branch_id);
+        Self::create_at_layer(workdir, &storage_base.join(&branch_id), max_disk_bytes, discard)
+    }
+
+    /// Create — or **adopt** — the branch at a *named* layer directory,
+    /// `<storage>/<name>`.
+    ///
+    /// This is the carried-layer shape. The writable-rootfs route names its
+    /// layer so that a tree restored from a snapshot (or migrated from another
+    /// node) re-attaches to the layer that tree already carries: the layer's
+    /// `upper` and its `deleted.log` come back with it, instead of the sandbox
+    /// minting a fresh empty layer and leaving the carried one orphaned.
+    /// `create_with` above keeps the uuid-per-branch layout for every other
+    /// caller, so nothing that does not ask for a name changes.
+    ///
+    /// **Discard only, by name.** An adopted layer's `deleted.log` is its full
+    /// whiteout history and has to be replayed (`DeletionSet::load`), which is
+    /// sound exactly when the layer was never merged -- the branch that wrote it
+    /// released it rather than merging. A *mergeable* branch's preserved layer
+    /// can already have drained entries (they landed in the lower), and
+    /// re-applying those would destroy work that landed; that is why `load` had
+    /// no production caller before this shape.
+    ///
+    /// The name is one path component under `storage`, never a path: the layer
+    /// belongs *inside* the sandbox tree (design D1), and a caller that could
+    /// point it elsewhere could put it where migration does not carry it.
+    pub fn create_with_layer_name(
+        workdir: &Path,
+        storage: &Path,
+        name: &str,
+        max_disk_bytes: u64,
+        discard: bool,
+    ) -> Result<Self, BranchError> {
+        if !discard {
+            return Err(BranchError::Operation(
+                "a named COW layer is the carried-layer shape, and only a discard branch may adopt \
+                 one: replaying a mergeable branch's whiteout log can re-delete entries that \
+                 already landed in the lower"
+                    .to_string(),
+            ));
+        }
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            return Err(BranchError::Operation(format!(
+                "a COW layer name must be a single path component under the storage directory, \
+                 got {name:?}"
+            )));
+        }
+        Self::create_at_layer(workdir, &storage.join(name), max_disk_bytes, discard)
+    }
+
+    /// The one construction path: `layer_dir` is the branch directory (it holds
+    /// `upper/` and `deleted.log`), whether it was just minted or is being
+    /// adopted from the tree.
+    fn create_at_layer(
+        workdir: &Path,
+        layer_dir: &Path,
+        max_disk_bytes: u64,
+        discard: bool,
+    ) -> Result<Self, BranchError> {
+        let branch_dir = layer_dir.to_path_buf();
         let upper = branch_dir.join("upper");
+        // An existing directory is a layer this branch is *adopting*: the
+        // accounting starts from what is in it, and the whiteout log is
+        // replayed rather than started fresh.
+        let adopted = branch_dir.exists();
 
         // Canonicalize the workdir BEFORE creating the branch dir, so a failure
         // here (e.g. the workdir was removed between validation and now) can't
@@ -690,8 +752,24 @@ impl SeccompCowBranch {
         // `DeletionSet::create` swallows the open error by design (it degrades to
         // a RAM-only set). Opening it before the directory exists would silently
         // cost every branch its durable whiteout record.
-        let deleted =
-            crate::cow::deletions::DeletionSet::create(Some(&branch_dir.join("deleted.log")));
+        let log = branch_dir.join("deleted.log");
+        let deleted = if adopted {
+            crate::cow::deletions::DeletionSet::load(&log)
+        } else {
+            crate::cow::deletions::DeletionSet::create(Some(&log))
+        };
+
+        // One walk, at creation only -- never per open (design D3 rejected the
+        // O(upper) `recalc_disk_used` on a write path). A fresh layer walks an
+        // empty directory; an adopted one starts its accounting from what the
+        // tree carried, which is what makes the layer's `max_disk` bound mean
+        // something across a restore.
+        let disk_used = if adopted { dir_size(&upper) } else { 0 };
+        // The same question the disk figure answers, for the handlers that gate
+        // on `has_changes` (stat/readlink/getdents ask before consulting the
+        // branch): an adopted layer with entries -- files *or* whiteouts -- is a
+        // change set, and answering "no changes" would serve the lower.
+        let has_changes = adopted && (disk_used > 0 || deleted.iter().next().is_some());
 
         Ok(Self {
             workdir_str: workdir.to_string_lossy().into_owned(),
@@ -700,11 +778,11 @@ impl SeccompCowBranch {
             storage_dir: branch_dir,
             deleted,
             applied_deletions: HashSet::new(),
-            has_changes: false,
+            has_changes,
             state: BranchState::Open,
             keep_if_abandoned: false,
             max_disk_bytes,
-            disk_used: 0,
+            disk_used,
             discard,
         })
     }
@@ -2575,6 +2653,129 @@ mod tests {
 
         assert_eq!(fs::read(&f).unwrap(), b"lower", "the lower must not be written");
         assert!(!dir.exists(), "a discard branch releases its upper on commit");
+    }
+
+    /// A named layer is **adopted**, not re-minted.
+    ///
+    /// A tree that already carries a layer (a snapshot restore, a migration)
+    /// comes back with its files *and* its whiteouts in effect -- the whiteout
+    /// log is replayed, which is sound here because a discard branch never
+    /// merged -- and with its bytes already on the account, so the layer's
+    /// `max_disk` bound means the same thing across the restore.
+    ///
+    /// The failing behaviour this replaces was measured on the lane: after
+    /// `Sandbox.create(A.create_snapshot())`, the restored sandbox could not see
+    /// the file A wrote into the rootfs and saw `/etc/hostname` again, while the
+    /// tree held both the carried layer and a fresh empty one.
+    #[test]
+    fn a_named_layer_is_adopted_with_its_upper_its_whiteouts_and_its_bytes() {
+        let lower = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::write(lower.path().join("kept"), b"lower").unwrap();
+        fs::write(lower.path().join("gone"), b"lower").unwrap();
+
+        // What a previous sandbox left in the tree: a staged file, a whiteout,
+        // and a `deleted.log` to replay. 64 KiB, so the cap below is already
+        // spent when the branch starts.
+        let layer = storage.path().join("layer");
+        fs::create_dir_all(layer.join("upper/usr/local")).unwrap();
+        fs::write(layer.join("upper/usr/local/staged"), vec![0u8; 64 * 1024]).unwrap();
+        {
+            let mut log = crate::cow::deletions::DeletionSet::create(Some(&layer.join("deleted.log")));
+            log.insert("gone");
+        }
+
+        let mut branch = SeccompCowBranch::create_with_layer_name(
+            lower.path(),
+            storage.path(),
+            "layer",
+            1024,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            branch.upper_dir().join("usr/local/staged").is_file(),
+            "the carried upper *is* this branch's upper"
+        );
+        assert!(branch.is_deleted("gone"), "the carried whiteout log is replayed");
+        assert!(!branch.is_deleted("kept"), "and only the entries it names");
+        assert!(
+            branch.has_changes(),
+            "an adopted layer with entries is a change set -- the handlers gate on this"
+        );
+        assert!(branch.disk_used >= 64 * 1024, "the adopted bytes are on the account");
+        // ...which is what makes the bound mean the same thing across a restore:
+        // the adopted layer is already over its 1 KiB budget.
+        assert!(
+            matches!(
+                branch.handle_open(
+                    lower.path().join("kept").to_str().unwrap(),
+                    libc::O_WRONLY as u64
+                ),
+                Err(BranchError::QuotaExceeded)
+            ),
+            "an adopted layer's bytes count against the cap"
+        );
+    }
+
+    /// The name is one component under the storage, and the shape is discard
+    /// only. Both refusals are by name, and two names never share a layer.
+    #[test]
+    fn a_named_layer_refuses_a_bad_name_and_a_mergeable_branch() {
+        let lower = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+
+        let err = SeccompCowBranch::create_with_layer_name(
+            lower.path(),
+            storage.path(),
+            "layer",
+            0,
+            false,
+        )
+        .err()
+        .expect("a mergeable branch must not adopt a layer");
+        assert!(
+            matches!(&err, BranchError::Operation(m) if m.contains("only a discard branch")),
+            "a mergeable branch must not adopt a whiteout log it may have drained: {err:?}"
+        );
+
+        for bad in ["", ".", "..", "a/b"] {
+            assert!(
+                SeccompCowBranch::create_with_layer_name(
+                    lower.path(),
+                    storage.path(),
+                    bad,
+                    0,
+                    true
+                )
+                .is_err(),
+                "layer name {bad:?} is not a single component"
+            );
+        }
+
+        let a = SeccompCowBranch::create_with_layer_name(
+            lower.path(),
+            storage.path(),
+            "a",
+            0,
+            true,
+        )
+        .unwrap();
+        let b = SeccompCowBranch::create_with_layer_name(
+            lower.path(),
+            storage.path(),
+            "b",
+            0,
+            true,
+        )
+        .unwrap();
+        assert_ne!(a.upper_dir(), b.upper_dir(), "two names are two layers");
+        assert!(a.upper_dir().is_dir() && b.upper_dir().is_dir());
+        assert!(
+            !a.has_changes() && !b.has_changes(),
+            "a layer that was just created is not a change set"
+        );
     }
 
     /// The layer's bytes are bounded on this route too, and the refusal has to

@@ -670,6 +670,9 @@ pub struct Sandbox {
     pub workdir: Option<PathBuf>,
     /// Create the COW branch in discard mode (see `SandboxBuilder::cow_discard`).
     pub cow_discard: bool,
+    /// Name the COW layer directory under `fs_storage` and adopt it when it
+    /// exists (see `SandboxBuilder::cow_layer_name`).
+    pub cow_layer_name: Option<String>,
     pub cwd: Option<PathBuf>,
     pub fs_storage: Option<PathBuf>,
     pub max_disk: Option<ByteSize>,
@@ -883,6 +886,7 @@ impl Clone for Sandbox {
             cow_upper: self.cow_upper.clone(),
             workdir: self.workdir.clone(),
             cow_discard: self.cow_discard,
+            cow_layer_name: self.cow_layer_name.clone(),
             cwd: self.cwd.clone(),
             fs_storage: self.fs_storage.clone(),
             max_disk: self.max_disk,
@@ -2384,12 +2388,27 @@ impl Sandbox {
             let workdir = self.workdir.as_ref().unwrap().clone();
             let storage = self.fs_storage.clone();
             let max_disk = self.max_disk.map(|b| b.0).unwrap_or(0);
-            match crate::cow::seccomp::SeccompCowBranch::create_with(
-                &workdir,
-                storage.as_deref(),
-                max_disk,
-                self.cow_discard,
-            ) {
+            // A *named* layer is the carried-layer shape: it adopts the layer
+            // the tree already has (see `create_with_layer_name`). `build()`
+            // has already refused a name without `cow_discard`/`fs_storage`.
+            let created = match (self.cow_layer_name.as_deref(), storage.as_deref()) {
+                (Some(name), Some(base)) => {
+                    crate::cow::seccomp::SeccompCowBranch::create_with_layer_name(
+                        &workdir,
+                        base,
+                        name,
+                        max_disk,
+                        self.cow_discard,
+                    )
+                }
+                _ => crate::cow::seccomp::SeccompCowBranch::create_with(
+                    &workdir,
+                    storage.as_deref(),
+                    max_disk,
+                    self.cow_discard,
+                ),
+            };
+            match created {
                 Ok(mut branch) => {
                     // `Keep` must survive a sandbox that is never `wait()`ed:
                     // the branch only reaches `Sandbox`'s own disposition after

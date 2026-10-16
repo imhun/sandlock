@@ -41,6 +41,7 @@
 //! | `workdir`/`cwd`/`fs_storage` | `[config].workdir/fs_storage`; `[program].cwd` | same | same |
 //! | `on_exit`/`on_error` | `[filesystem].on_exit/on_error` | `on_exit`/`on_error` | same |
 //! | `cow_discard` | not in profile | `cow_discard` | `cow_discard` |
+//! | `cow_layer_name` | not in profile | `cow_layer_name` | `cow_layer_name` |
 //! | `allow_degraded`/`disable` | not in profile | `protection_policy` | same |
 //!
 //! Deliberately **not** wire fields (each would be rejected by name as
@@ -93,6 +94,7 @@ pub const POLICY_FIELDS: &[&str] = &[
     "chroot",
     "clean_env",
     "cow_discard",
+    "cow_layer_name",
     "cpu_cores",
     "cwd",
     "deterministic_dirs",
@@ -236,6 +238,11 @@ pub struct SupervisePolicy {
     /// because its lower *is* the shared image cache: a merge there would write
     /// one sandbox's changes into every sandbox's rootfs.
     pub cow_discard: bool,
+    /// The COW layer's directory name under `fs_storage`, adopted when the tree
+    /// already carries one (see `SandboxBuilder::cow_layer_name`). The
+    /// writable-rootfs route names its layer so a restored or migrated tree
+    /// re-attaches to the layer it already holds.
+    pub cow_layer_name: Option<String>,
     pub cwd: Option<PathBuf>,
     pub fs_storage: Option<PathBuf>,
     pub on_exit: Option<BranchActionWire>,
@@ -670,6 +677,11 @@ fn apply(parsed: &ParsedPolicy) -> Result<SandboxBuilder, String> {
     }
     if prov.contains("cow_discard") && p.cow_discard {
         b = b.cow_discard(true);
+    }
+    if prov.contains("cow_layer_name") {
+        if let Some(n) = &p.cow_layer_name {
+            b = b.cow_layer_name(n.clone());
+        }
     }
     if prov.contains("cwd") {
         if let Some(c) = &p.cwd {
@@ -1362,6 +1374,7 @@ fn verify(sandbox: &Sandbox, parsed: &ParsedPolicy) -> Result<(), String> {
     if prov.contains("cow_discard") {
         check!("cow_discard", &p.cow_discard, &sandbox.cow_discard);
     }
+    check!("cow_layer_name", &p.cow_layer_name, &sandbox.cow_layer_name);
     check!("cwd", &p.cwd, &sandbox.cwd);
     check!("fs_storage", &p.fs_storage, &sandbox.fs_storage);
     if prov.contains("on_exit") {
@@ -1482,6 +1495,7 @@ pub fn example_policy_json(secret_path: &Path) -> String {
         "gid": 1234,
         "workdir": "/workdir",
         "cow_discard": true,
+        "cow_layer_name": "layer",
         "cwd": "/cwd",
         "fs_storage": "/storage",
         "disk_stats_path": "/tmp/e2b-disk-stats",

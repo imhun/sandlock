@@ -606,6 +606,20 @@ class Sandbox:
     does NOT set the child's working directory.  Use ``cwd`` for that."""
 
     cow_discard: bool = False
+    cow_layer_name: str | None = None
+    """Name the COW layer directory under ``fs_storage``, and adopt it if it is
+    already there.
+
+    The carried-layer shape: a tree restored from a snapshot or migrated from
+    another node already holds a layer, and naming it makes the new branch
+    re-attach to that one -- its ``upper`` and its whiteout log -- instead of
+    starting an empty layer beside it.  One path component, never a path (the
+    layer belongs inside the sandbox tree, which is what migration carries).
+
+    Requires ``cow_discard=True`` and ``fs_storage``; both are refused by name
+    otherwise, because only a never-merging branch may replay a layer's whiteout
+    log.  ``None`` keeps the default uuid-per-branch layout.
+    """
     """Release the COW upper on exit instead of merging it into ``workdir``.
 
     For a ``workdir`` the sandbox must not write — the writable-rootfs route

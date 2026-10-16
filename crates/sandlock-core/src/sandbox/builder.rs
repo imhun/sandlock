@@ -224,6 +224,24 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "cow-discard"))]
     pub cow_discard: bool,
 
+    /// Name the COW branch's layer directory (`<fs_storage>/<name>`) and
+    /// **adopt** it when it already exists; see
+    /// `SeccompCowBranch::create_with_layer_name`.
+    ///
+    /// The carried-layer shape: the writable-rootfs route names its layer so a
+    /// tree restored from a snapshot (or migrated from another node)
+    /// re-attaches to the layer it already carries, instead of minting a fresh
+    /// empty one and leaving the carried layer orphaned. `None` — the default —
+    /// keeps the uuid-per-branch layout, so nothing that does not ask for a name
+    /// changes.
+    ///
+    /// Requires `cow_discard` (only a never-merging layer's whiteout log may be
+    /// replayed) and `fs_storage` (the name is one component under it), and the
+    /// name itself must be a single path component; `build()` refuses the rest
+    /// by name.
+    #[cfg_attr(feature = "cli", arg(long = "cow-layer-name", value_name = "NAME"))]
+    pub cow_layer_name: Option<String>,
+
     #[cfg_attr(feature = "cli", arg(long = "cwd"))]
     pub cwd: Option<PathBuf>,
 
@@ -454,6 +472,7 @@ impl Default for SandboxBuilder {
             deterministic_dirs: false,
             workdir: None,
             cow_discard: false,
+            cow_layer_name: None,
             cwd: None,
             fs_storage: None,
             max_disk: None,
@@ -534,6 +553,7 @@ impl Clone for SandboxBuilder {
             deterministic_dirs: self.deterministic_dirs,
             workdir: self.workdir.clone(),
             cow_discard: self.cow_discard,
+            cow_layer_name: self.cow_layer_name.clone(),
             cwd: self.cwd.clone(),
             fs_storage: self.fs_storage.clone(),
             max_disk: self.max_disk,
@@ -927,6 +947,13 @@ impl SandboxBuilder {
         self
     }
 
+    /// Name the COW layer directory under `fs_storage` and adopt it if present;
+    /// see the field's note.
+    pub fn cow_layer_name(mut self, name: impl Into<String>) -> Self {
+        self.cow_layer_name = Some(name.into());
+        self
+    }
+
     pub fn cwd(mut self, path: impl Into<PathBuf>) -> Self {
         self.cwd = Some(path.into());
         self
@@ -1219,6 +1246,35 @@ impl SandboxBuilder {
             }
         }
 
+        // Validate the carried-layer shape: a *named* COW layer is adopted, so
+        // it needs the discard flag (only a never-merging layer's whiteout log
+        // may be replayed) and the storage directory it lives under, and the
+        // name has to be one path component rather than a path.
+        if let Some(name) = self.cow_layer_name.as_deref() {
+            if !self.cow_discard {
+                return Err(SandboxError::Invalid(
+                    "cow_layer_name is the carried-layer shape, and only a discard branch may \
+                     adopt a layer: replaying a mergeable branch's whiteout log can re-delete \
+                     entries that already landed in the lower. Set cow_discard(true), or leave \
+                     cow_layer_name unset for a fresh uuid-per-branch layer."
+                        .into(),
+                ));
+            }
+            if self.fs_storage.is_none() {
+                return Err(SandboxError::Invalid(
+                    "cow_layer_name names a directory *under* fs_storage, so fs_storage has to be \
+                     set with it (the layer must stay inside the sandbox tree: migration and \
+                     snapshots carry the tree)."
+                        .into(),
+                ));
+            }
+            if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+                return Err(SandboxError::Invalid(format!(
+                    "cow_layer_name must be a single path component under fs_storage, got {name:?}"
+                )));
+            }
+        }
+
         // Validate: max_open_files must be non-zero. A zero cap cannot be
         // honoured: the child needs descriptors to reach `main` at all, so it
         // would die before it and exit 127 with an errno far from the setting
@@ -1488,6 +1544,7 @@ impl SandboxBuilder {
             deterministic_dirs: self.deterministic_dirs,
             workdir: self.workdir,
             cow_discard: self.cow_discard,
+            cow_layer_name: self.cow_layer_name.clone(),
             cwd: self.cwd,
             fs_storage: self.fs_storage,
             max_disk: self.max_disk,

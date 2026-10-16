@@ -327,7 +327,7 @@ pub fn resolve_existing_in_root(
             if e != libc::ENOENT {
                 return Err(e);
             }
-            let (host_path, virtual_path) = walk(upper)?;
+            let (_host_path, virtual_path) = walk(upper)?;
             let rel = virtual_path.strip_prefix("/").unwrap_or(&virtual_path);
             Ok((chroot_root.join(rel), virtual_path))
         }

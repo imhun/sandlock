@@ -347,7 +347,21 @@
 # cut to zero (give up at once) the old pooled-thread shape failed 18 of 20
 # probe cycles on `PTRACE_SEIZE tid 68: Operation not permitted` while the
 # per-freeze thread passed the same shape in 6.2 s.
-core_lib = 956 # 2026-10-16 (writable rootfs COW, the layer's budget is enforced):
+core_lib = 958 # 2026-10-16 (writable rootfs COW, a named layer is adopted):
+               # 956 -> 958, +2 -- `cow::seccomp::tests::a_named_layer_is_adopted_
+               # with_its_upper_its_whiteouts_and_its_bytes` and
+               # `..._refuses_a_bad_name_and_a_mergeable_branch`. The writable-
+               # rootfs route now names its layer (`<fs_storage>/<name>`) and the
+               # branch **adopts** it when the tree already carries one, so a
+               # snapshot restore or a migration re-attaches to the layer instead
+               # of minting a fresh empty one beside it (lane 2026-10-16: the
+               # restored sandbox could not see the file the first one wrote, and
+               # saw a deleted file again). The first case pins the adopted upper,
+               # the replayed whiteout log, `has_changes` (the handlers gate on
+               # it) and the seeded `disk_used`; the second pins the two named
+               # refusals (a mergeable branch, a name that is not one component)
+               # and that two names are two layers.
+               # 2026-10-16 (writable rootfs COW, the layer's budget is enforced):
                # 955 -> 956, +1 net -- `cow::seccomp::tests::a_discard_branch_bounds_
                # its_layer_with_a_named_quota_refusal` replaces
                # `a_discard_branch_ignores_max_disk` (which pinned the old
@@ -773,7 +787,15 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 581 # 2026-10-16 (writable rootfs COW, ENOSPC reaches the child):
+core_integ = 582 # 2026-10-16 (writable rootfs COW, the named layer end to end):
+                 # 581 -> 582, +1 -- `test_chroot::test_chroot_cow_a_named_layer_
+                 # is_adopted_from_the_tree`. The unit cases pin the branch; this
+                 # one hands the policy a tree that already carries
+                 # `<storage>/layer/{upper,deleted.log}` and checks what the child
+                 # sees: the staged file reads back, the whiteouted one is gone,
+                 # exactly one layer directory exists (nothing was re-minted), and
+                 # the lower keeps its bytes.
+                 # 2026-10-16 (writable rootfs COW, ENOSPC reaches the child):
                  # 580 -> 581, +1 -- `test_chroot::test_chroot_cow_a_write_past_the_
                  # layers_budget_is_enospc`. The unit cases pin the branch; this one
                  # pins the whole path: a policy with `cow_discard(true)` and a 1 KiB

@@ -174,6 +174,7 @@ _b_fs_storage = _builder_fn("sandlock_sandbox_builder_fs_storage", ctypes.c_char
 _b_gpu_devices = _builder_fn("sandlock_sandbox_builder_gpu_devices", ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32)
 _b_workdir = _builder_fn("sandlock_sandbox_builder_workdir", ctypes.c_char_p)
 _b_cow_discard = _builder_fn("sandlock_sandbox_builder_cow_discard", ctypes.c_bool)
+_b_cow_layer_name = _builder_fn("sandlock_sandbox_builder_cow_layer_name", ctypes.c_char_p)
 _b_cwd = _builder_fn("sandlock_sandbox_builder_cwd", ctypes.c_char_p)
 _b_chroot = _builder_fn("sandlock_sandbox_builder_chroot", ctypes.c_char_p)
 _b_fs_mount = _builder_fn("sandlock_sandbox_builder_fs_mount", ctypes.c_char_p, ctypes.c_char_p)
@@ -1345,7 +1346,7 @@ class _NativePolicy:
     _HANDLED_FIELDS: set[str] = {
         "fs_writable", "fs_readable", "fs_denied", "fs_storage",
         "workdir", "cwd", "chroot", "fs_mount", "on_exit", "on_error",
-        "cow_discard",
+        "cow_discard", "cow_layer_name",
         "max_memory", "max_disk", "disk_stats_path", "max_processes", "max_cpu", "num_cpus",
         "cpu_cores", "gpu_devices",
         "net_allow", "net_deny", "net_allow_bind", "net_deny_bind",
@@ -1398,6 +1399,8 @@ class _NativePolicy:
             b = _b_workdir(b, _encode(str(policy.workdir)))
         if policy.cow_discard:
             b = _b_cow_discard(b, True)
+        if policy.cow_layer_name:
+            b = _b_cow_layer_name(b, _encode(str(policy.cow_layer_name)))
         if policy.cwd:
             b = _b_cwd(b, _encode(str(policy.cwd)))
         if policy.chroot:
