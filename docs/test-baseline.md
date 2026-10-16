@@ -787,7 +787,17 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 582 # 2026-10-16 (writable rootfs COW, the named layer end to end):
+core_integ = 584 # 2026-10-16 (writable rootfs COW, the dirfd shape): 582 -> 584,
+                 # +2 -- `test_chroot::test_chroot_cow_mkdir_p_two_levels_in_one_
+                 # process` (the same two levels, path by path: it is the control
+                 # for the pair) and `test_chroot::test_chroot_cow_a_mkdirat_
+                 # through_a_branch_owned_dirfd_is_staged` (the shape every
+                 # recursive installer uses, `mkdir -p X/Y` and `npm install -g`
+                 # staging `node_modules`: the parent arrives as
+                 # `/proc/<pid>/fd/N`, and the mediator's reverse lookup answered
+                 # the read-only `/.u` alias for the branch's own copy, so the
+                 # write gate refused a name the branch owns).
+                 # 2026-10-16 (writable rootfs COW, the named layer end to end):
                  # 581 -> 582, +1 -- `test_chroot::test_chroot_cow_a_named_layer_
                  # is_adopted_from_the_tree`. The unit cases pin the branch; this
                  # one hands the policy a tree that already carries

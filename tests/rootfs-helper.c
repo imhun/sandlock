@@ -903,6 +903,30 @@ static int cmd_dirfd_probe(int argc, char **argv) {
     return 0;
 }
 
+/* ── mkdirat-dirfd (mkdir a name relative to a directory descriptor) ─ */
+/*
+ * `mkdirat(open(dir, O_DIRECTORY), name)` is the shape every recursive
+ * installer uses: `mkdir -p X/Y`, `npm install -g` staging its package tree,
+ * `pip` creating `site-packages/<pkg>/`. It differs from `mkdir("X/Y")` in the
+ * one way that matters to the mediator: the parent is named by a *descriptor*,
+ * so the handler has to turn `/proc/<pid>/fd/N` back into a sandbox path.
+ */
+static int cmd_mkdirat_dirfd(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "mkdirat-dirfd: need <dir> <name>\n"); return 2; }
+    int dfd = open(argv[0], O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) {
+        fprintf(stderr, "mkdirat-dirfd: open %s: %s\n", argv[0], strerror(errno));
+        return 1;
+    }
+    if (mkdirat(dfd, argv[1], 0755) < 0) {
+        fprintf(stderr, "mkdirat-dirfd: %s/%s: %s\n", argv[0], argv[1], strerror(errno));
+        close(dfd);
+        return 1;
+    }
+    close(dfd);
+    return 0;
+}
+
 /* ── write-fd-link (open a path that resolves to a magic fd link) ─ */
 /*
  * Open <path> for writing and write <text> to it. Used to exercise paths that
@@ -934,6 +958,7 @@ static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "chdir-self") == 0)     return cmd_chdir_self(argc, argv);
     if (strcmp(cmd, "proc-dirfd") == 0)     return cmd_proc_dirfd(argc, argv);
     if (strcmp(cmd, "dirfd-probe") == 0)    return cmd_dirfd_probe(argc, argv);
+    if (strcmp(cmd, "mkdirat-dirfd") == 0)  return cmd_mkdirat_dirfd(argc, argv);
     if (strcmp(cmd, "write-fd-link") == 0)  return cmd_write_fd_link(argc, argv);
     if (strcmp(cmd, "echo") == 0)           return cmd_echo(argc, argv);
     if (strcmp(cmd, "cat") == 0)            return cmd_cat(argc, argv);

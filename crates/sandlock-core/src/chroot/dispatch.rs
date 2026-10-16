@@ -357,8 +357,31 @@ impl ChrootCtx<'_> {
     }
 
     /// Inverse: given a host path, return the virtual path.
-    /// Checks mount targets first, then falls back to chroot root.
+    ///
+    /// The branch's **own copy** answers with the branch's key — the lower
+    /// spelling — before the mount table is consulted. `realroot` binds the
+    /// upper read-only at the exec alias (`/.u`), so that alias is a mount
+    /// whose source *is* the upper, and without this the reverse lookup for a
+    /// descriptor the mediator injected on the branch's own copy comes back as
+    /// the read-only alias. Measured on the lane 2026-10-16 (`npm install -g`
+    /// on BytePlan's `sandbox-base`): `mkdir -p /usr/local/c/d` made `c` and
+    /// then answered EACCES for `d`, because `d`'s parent arrived as
+    /// `/proc/<pid>/fd/N` on the branch's copy of `c` — a name the branch
+    /// owns, judged by a spelling it may not write through.
+    ///
+    /// The lower spelling is the convention the rest of this module already
+    /// uses for the branch's copy (`resolve_existing_in_root` returns it when
+    /// it walks the upper for a name the lower cannot walk), and it is the key
+    /// the write gate reads (`cow_owns`). A path the child *names* as
+    /// `/.u/…` is untouched: that spelling is built from the argument, not
+    /// from this lookup, and the mount's `ro` half still refuses a write
+    /// through it.
     fn host_to_virtual(&self, host_path: &Path) -> Option<PathBuf> {
+        if let Some(upper) = self.cow_upper {
+            if let Ok(rel) = host_path.strip_prefix(upper) {
+                return Some(PathBuf::from("/").join(rel));
+            }
+        }
         crate::chroot::resolve::host_to_virtual(self.root, self.mounts, host_path)
     }
 

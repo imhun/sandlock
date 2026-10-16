@@ -3328,3 +3328,114 @@ async fn test_chroot_cow_whiteout_masks_the_deleted_symlink() {
     cleanup_rootfs(&rootfs);
     let _ = fs::remove_dir_all(&storage);
 }
+
+/// A directory created by the branch, then another inside it, **in one
+/// process**: `mkdir -p X/Y` is one process making two `mkdirat` calls, and it
+/// is what `npm install -g` and every recursive installer does.
+#[tokio::test]
+async fn test_chroot_cow_mkdir_p_two_levels_in_one_process() {
+    let rootfs = build_test_rootfs("cow-mkdirp");
+    fs::create_dir_all(rootfs.join("usr/local")).unwrap();
+    let storage = temp_dir("cow-mkdirp-layer");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .workdir(&rootfs)
+        .fs_storage(&storage)
+        .on_exit(BranchAction::Keep)
+        .on_error(BranchAction::Keep)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&["rootfs-helper", "sh", "-c", "mkdir /usr/local/zz1 && mkdir /usr/local/zz1/zz2"])
+        .await
+        .expect("the chroot sandbox must be creatable (N14 S5: the real root is the only shape)");
+
+    assert_eq!(
+        result.stderr_str().unwrap_or_default(),
+        "",
+        "a second mkdir inside a directory this branch just made must be allowed; code={:?}",
+        result.code()
+    );
+    assert_eq!(result.code(), Some(0), "stderr={:?}", result.stderr_str());
+    assert!(!rootfs.join("usr/local/zz1").exists(), "the lower gains nothing");
+    let branch_dir = fs::read_dir(&storage)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.is_dir())
+        .unwrap();
+    assert!(branch_dir.join("upper/usr/local/zz1/zz2").is_dir());
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&storage);
+}
+
+/// A name created **relative to a descriptor the branch owns**.
+///
+/// `mkdir -p X/Y` and every recursive installer (`npm install -g` staging its
+/// package tree, `pip` creating `site-packages/<pkg>/`) make the second level
+/// *relative to a descriptor they opened on the first*, so the parent reaches
+/// the mediator as `/proc/<pid>/fd/N` rather than as a path. Measured on the
+/// lane 2026-10-16 on BytePlan's `sandbox-base` image: `mkdir /usr/local/r1`
+/// returned 0 and the very next `mkdirat(dirfd_of_r1, "r2")` answered EACCES,
+/// while the same two levels written path-by-path were fine.
+#[tokio::test]
+async fn test_chroot_cow_a_mkdirat_through_a_branch_owned_dirfd_is_staged() {
+    let rootfs = build_test_rootfs("cow-mkdirat-dirfd");
+    fs::create_dir_all(rootfs.join("usr/local")).unwrap();
+    let storage = temp_dir("cow-mkdirat-dirfd-layer");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .workdir(&rootfs)
+        .fs_storage(&storage)
+        .on_exit(BranchAction::Keep)
+        .on_error(BranchAction::Keep)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "mkdir /usr/local/cowdir && mkdirat-dirfd /usr/local/cowdir inner",
+        ])
+        .await
+        .expect("the chroot sandbox must be creatable (N14 S5: the real root is the only shape)");
+
+    assert_eq!(
+        result.stderr_str().unwrap_or_default(),
+        "",
+        "a name created relative to a descriptor on a directory this branch just made \
+         must be allowed; code={:?}",
+        result.code()
+    );
+    assert_eq!(result.code(), Some(0), "stderr={:?}", result.stderr_str());
+    assert!(
+        !rootfs.join("usr/local/cowdir").exists(),
+        "the lower gains nothing"
+    );
+    let branch_dir = fs::read_dir(&storage)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.is_dir())
+        .unwrap();
+    assert!(branch_dir.join("upper/usr/local/cowdir/inner").is_dir());
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&storage);
+}
