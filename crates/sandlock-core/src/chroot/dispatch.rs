@@ -1718,7 +1718,7 @@ pub(crate) async fn handle_chroot_exec(
         // the image's own interpreter, and no `/proc/self/fd` indirection
         // (which a root without a real procfs cannot resolve).
         if let Some(target) = cow_exec_alias(cow_state, ctx, &virtual_path).await {
-            if crate::seccomp::notif::rewrite_exec_path(
+            if let Err(refusal) = crate::seccomp::notif::rewrite_exec_path(
                 notif_fd,
                 notif.id,
                 notif.pid,
@@ -1726,16 +1726,23 @@ pub(crate) async fn handle_chroot_exec(
                 argv_ptr,
                 envp_ptr,
                 &target.to_string_lossy(),
+                // The alias names the same file, so an argv[0] that aliases
+                // the path buffer may become the alias spelling: preserving
+                // it would append the old path to the window, and the lane's
+                // measured layout (dash's argv array 48 bytes past the
+                // string) is only 25 bytes wide -- the rewrite would land on
+                // the array and be refused, which is exactly the ENOENT this
+                // alias exists to remove.
+                false,
             )
-            .is_err()
             {
                 // The rewrite plans before it writes, so a refusal leaves the
                 // child's memory untouched: fall back to letting the kernel
                 // resolve the path, which is this shape's behaviour without a
                 // staged file.
-                crate::realroot::note(
-                    "exec rewrite refused (argv/envp layout); the kernel resolves the path",
-                );
+                crate::realroot::note(&format!(
+                    "exec rewrite refused ({refusal}); the kernel resolves the path"
+                ));
             }
         }
         return NotifAction::Continue;

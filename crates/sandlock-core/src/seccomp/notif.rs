@@ -1530,12 +1530,24 @@ fn read_exec_cstr(
 /// Fails if the argv/envp pointer arrays themselves fall inside the final
 /// window: the kernel reads those arrays after we return, and they cannot be
 /// moved because their addresses live in syscall registers.
+///
+/// `preserve_argv0` decides what happens to a string that *is* the path buffer
+/// (`path_ptr` itself), which is the common shell layout. `true` relocates it,
+/// so the exec'd program still reads the spelling it was invoked with -- what
+/// the `/proc/self/fd/N` redirect needs, because a multicall binary dispatches
+/// on `basename(argv[0])` and would read `N`. `false` lets the slot keep
+/// pointing at the path buffer and therefore see the *new* spelling, which is
+/// right when the new path names the same file (the COW upper's `/.u` alias
+/// keeps the basename), and load-bearing for layouts whose argv array starts
+/// just past the string: relocating the old path would grow the window onto
+/// that array, and a refused rewrite is an ENOENT for a file that is there.
 fn plan_exec_rewrite(
     read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>, NotifError>,
     path_ptr: u64,
     fd_path: &[u8],
     argv_ptr: u64,
     envp_ptr: u64,
+    preserve_argv0: bool,
 ) -> Result<ExecRewritePlan, NotifError> {
     let argv = read_exec_ptr_array(read, argv_ptr)?;
     let envp = read_exec_ptr_array(read, envp_ptr)?;
@@ -1585,7 +1597,11 @@ fn plan_exec_rewrite(
         let end = path_ptr + buf.len() as u64;
         let mut grew = false;
         for &(_, p) in &slots {
-            if !relocated.contains_key(&p) && p >= path_ptr && p < end {
+            // `p == path_ptr` is the path buffer itself: with `preserve_argv0`
+            // it is relocated like any other string, without it the slot keeps
+            // pointing at the buffer and reads the new path.
+            let aliases_path = p == path_ptr && !preserve_argv0;
+            if !aliases_path && !relocated.contains_key(&p) && p >= path_ptr && p < end {
                 relocate(&mut buf, &mut relocated, read, p)?;
                 grew = true;
             }
@@ -1598,9 +1614,12 @@ fn plan_exec_rewrite(
     let end = path_ptr + buf.len() as u64;
     for (base, n) in [(argv_ptr, argv.len()), (envp_ptr, envp.len())] {
         if base != 0 && base < end && base + 8 * (n as u64 + 1) > path_ptr {
-            return Err(NotifError::Supervisor(
-                "execve argv/envp pointer array overlaps the path rewrite window".into(),
-            ));
+            return Err(NotifError::Supervisor(format!(
+                "execve argv/envp pointer array overlaps the path rewrite window \
+                 (path={path_ptr:#x} window_end={end:#x} array={base:#x} entries={n} \
+                 new_path_len={})",
+                buf.len()
+            )));
         }
     }
 
@@ -1656,6 +1675,7 @@ pub(crate) fn rewrite_exec_path_to_fd(
         argv_ptr,
         envp_ptr,
         &format!("/proc/self/fd/{}", child_fd),
+        true,
     )
 }
 
@@ -1677,11 +1697,23 @@ pub(crate) fn rewrite_exec_path(
     argv_ptr: u64,
     envp_ptr: u64,
     new_path: &str,
+    preserve_argv0: bool,
 ) -> Result<(), NotifError> {
     let mut bytes = new_path.as_bytes().to_vec();
     bytes.push(0);
     let mut read = |addr: u64, len: usize| read_child_mem(notif_fd, id, pid, addr, len);
-    let plan = plan_exec_rewrite(&mut read, path_ptr, &bytes, argv_ptr, envp_ptr)?;
+    // The plan is all-or-nothing and the caller's fallback is to leave the
+    // child's memory alone and let the kernel resolve the original path, so
+    // every refusal has to say *why* -- the layout numbers are the only way to
+    // tell "this caller's argv sits in the window" from "the read failed".
+    let plan = plan_exec_rewrite(&mut read, path_ptr, &bytes, argv_ptr, envp_ptr, preserve_argv0)
+        .map_err(|e| {
+            NotifError::Supervisor(format!(
+                "exec rewrite to {new_path:?} at {path_ptr:#x} (new_len={}, argv={argv_ptr:#x}, \
+                 envp={envp_ptr:#x}): {e}",
+                bytes.len()
+            ))
+        })?;
     write_child_mem_force(notif_fd, id, pid, path_ptr, &plan.buf)?;
     for (slot, new_ptr) in plan.patches {
         write_child_mem_force(notif_fd, id, pid, slot, &new_ptr.to_ne_bytes())?;
@@ -3045,6 +3077,17 @@ mod tests {
         argv_ptr: u64,
         envp_ptr: u64,
     ) -> Result<ExecRewritePlan, NotifError> {
+        plan_with(mem, path_ptr, FD, argv_ptr, envp_ptr, true)
+    }
+
+    fn plan_with(
+        mem: &[u8],
+        path_ptr: u64,
+        new_path: &[u8],
+        argv_ptr: u64,
+        envp_ptr: u64,
+        preserve_argv0: bool,
+    ) -> Result<ExecRewritePlan, NotifError> {
         let mut read = |addr: u64, len: usize| {
             let off = addr
                 .checked_sub(FAKE_BASE)
@@ -3054,7 +3097,7 @@ mod tests {
                 .map(|s| s.to_vec())
                 .ok_or_else(|| NotifError::Supervisor("read past fake memory".into()))
         };
-        plan_exec_rewrite(&mut read, path_ptr, FD, argv_ptr, envp_ptr)
+        plan_exec_rewrite(&mut read, path_ptr, new_path, argv_ptr, envp_ptr, preserve_argv0)
     }
 
     #[test]
@@ -3160,6 +3203,43 @@ mod tests {
         put_ptrs(&mut mem, FAKE_BASE + 8, &[FAKE_BASE + 0x200]);
         put(&mut mem, FAKE_BASE + 0x200, b"prog\0");
         assert!(plan(&mem, FAKE_BASE, FAKE_BASE + 8, 0).is_err());
+    }
+
+    #[test]
+    fn exec_rewrite_replaces_an_aliased_argv0_when_the_arrays_sit_past_the_path() {
+        // The lane's measured layout (2026-10-16): dash's argv array starts 48
+        // bytes past the path string. Relocating the aliased argv[0] -- the
+        // *old* path, 23 more bytes -- grows the window to 49 and lands it on
+        // the array, so the whole rewrite is refused and the kernel answers
+        // ENOENT for a file that is really there. The COW upper's `/.u` alias
+        // names the *same* file, so the slot can keep pointing at the path
+        // buffer and see the alias spelling instead.
+        let mut mem = vec![0u8; 4096];
+        put(&mut mem, FAKE_BASE, b"/usr/local/bin/cow-elf\0");
+        put_ptrs(&mut mem, FAKE_BASE + 0x30, &[FAKE_BASE]);
+        put_ptrs(&mut mem, FAKE_BASE + 0x40, &[FAKE_BASE + 0x100]);
+        put(&mut mem, FAKE_BASE + 0x100, b"PATH=/usr/bin\0");
+        let alias = b"/.u/usr/local/bin/cow-elf\0";
+
+        assert!(
+            plan_with(&mem, FAKE_BASE, alias, FAKE_BASE + 0x30, FAKE_BASE + 0x40, true).is_err(),
+            "preserving argv[0] cannot fit this layout -- the array is in the way"
+        );
+        let p = plan_with(&mem, FAKE_BASE, alias, FAKE_BASE + 0x30, FAKE_BASE + 0x40, false)
+            .expect("the alias spelling must be writable in place");
+        assert_eq!(p.buf, alias);
+        assert!(p.patches.is_empty(), "argv[0] keeps pointing at the path buffer");
+    }
+
+    #[test]
+    fn exec_rewrite_replacing_argv0_still_fails_closed_on_an_overlapping_array() {
+        // Dropping the relocation shrinks the window; it does not make an
+        // array that sits *under* the path itself writable.
+        let mut mem = vec![0u8; 4096];
+        put(&mut mem, FAKE_BASE, b"./m\0");
+        put_ptrs(&mut mem, FAKE_BASE + 8, &[FAKE_BASE + 0x200]);
+        put(&mut mem, FAKE_BASE + 0x200, b"prog\0");
+        assert!(plan_with(&mem, FAKE_BASE, FD, FAKE_BASE + 8, 0, false).is_err());
     }
 
     #[test]

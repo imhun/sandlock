@@ -347,7 +347,23 @@
 # cut to zero (give up at once) the old pooled-thread shape failed 18 of 20
 # probe cycles on `PTRACE_SEIZE tid 68: Operation not permitted` while the
 # per-freeze thread passed the same shape in 6.2 s.
-core_lib = 952 # 2026-10-14 (writable rootfs COW, task 3): 950 -> 952, +2 --
+core_lib = 954 # 2026-10-16 (writable rootfs COW, exec in a real root): 952 -> 954,
+               # +2 -- `seccomp::notif::tests::exec_rewrite_replaces_an_aliased_
+               # argv0_when_the_arrays_sit_past_the_path` and
+               # `..._replacing_argv0_still_fails_closed_on_an_overlapping_array`.
+               # `plan_exec_rewrite` now takes `preserve_argv0`. The COW upper's
+               # `/.u` alias names the same file, so a caller can let an argv[0]
+               # that aliases the path buffer become the alias spelling instead
+               # of being relocated past it; relocating it appends the *old*
+               # path to the window, and the lane's measured layout (dash's argv
+               # array 48 bytes past the string) leaves only 25 bytes, so the
+               # window landed on the array and the whole rewrite was refused --
+               # which the kernel answers as ENOENT for a file that is there.
+               # The fd redirect keeps `true` (a multicall binary dispatches on
+               # `basename(argv[0])` and would read `N`), and the second case
+               # pins that the smaller window still fails closed when an array
+               # sits under the path itself.
+               # 2026-10-14 (writable rootfs COW, task 3): 950 -> 952, +2 --
                # `landlock::tests::the_cow_upper_dir_is_readable_and_executabl
                # e_by_the_sandbox` and `landlock::tests::a_branchless_policy_
                # installs_exactly_its_declared_host_grants`. The writable-
