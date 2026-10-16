@@ -347,7 +347,21 @@
 # cut to zero (give up at once) the old pooled-thread shape failed 18 of 20
 # probe cycles on `PTRACE_SEIZE tid 68: Operation not permitted` while the
 # per-freeze thread passed the same shape in 6.2 s.
-core_lib = 955 # 2026-10-16 (writable rootfs COW, a directory only the upper has):
+core_lib = 956 # 2026-10-16 (writable rootfs COW, the layer's budget is enforced):
+               # 955 -> 956, +1 net -- `cow::seccomp::tests::a_discard_branch_bounds_
+               # its_layer_with_a_named_quota_refusal` replaces
+               # `a_discard_branch_ignores_max_disk` (which pinned the old
+               # behaviour: a discard branch had nothing to bound), and
+               # `..._does_not_rescan_the_upper_for_its_accounting` is new. The
+               # writable-rootfs route's layer used to be unbounded by the
+               # branch: a copy-up that outgrew the disk was found by the
+               # *filesystem*, whose ENOSPC arrives inside a copy-up and
+               # surfaces as `BranchError::Operation` -> EIO, naming nothing.
+               # Now `check_quota` bounds a discard branch too, from the
+               # incremental accounting (reservations at copy-up, releases on
+               # delete) -- the O(upper) `recalc_disk_used` D3 rejected stays
+               # rejected, and the second case pins exactly that.
+               # 2026-10-16 (writable rootfs COW, a directory only the upper has):
                # 954 -> 955, +1 -- `chroot::resolve::tests::test_resolve_in_root_
                # walks_a_parent_that_only_the_upper_has`. The chroot resolvers
                # take the branch's upper as a third argument and fall back to it
@@ -759,7 +773,15 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 580 # 2026-10-16 (writable rootfs COW, the alias is read-only):
+core_integ = 581 # 2026-10-16 (writable rootfs COW, ENOSPC reaches the child):
+                 # 580 -> 581, +1 -- `test_chroot::test_chroot_cow_a_write_past_the_
+                 # layers_budget_is_enospc`. The unit cases pin the branch; this one
+                 # pins the whole path: a policy with `cow_discard(true)` and a 1 KiB
+                 # `max_disk` over a 64 KiB lower file answers the child with
+                 # `sh: cannot open /usr/local/big: No space left on device`, and the
+                 # copy-up is refused before it stages anything (the lower keeps its
+                 # bytes and the upper has no entry).
+                 # 2026-10-16 (writable rootfs COW, the alias is read-only):
                  # 579 -> 580, +1 -- `test_chroot::test_chroot_cow_the_exec_alias_
                  # is_read_only`. The alias had to be declared read-only
                  # (`fs_mount_ro`) as well as registered as a mount: `can_write`

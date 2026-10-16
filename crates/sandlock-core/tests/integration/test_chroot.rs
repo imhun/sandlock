@@ -2715,6 +2715,76 @@ async fn test_chroot_cow_owned_writes_never_land_on_the_lower() {
     let _ = fs::remove_dir_all(&storage);
 }
 
+/// The layer's budget is a **named** refusal all the way out to the child.
+///
+/// `max_disk` bounds what the branch stages, and the writable-rootfs route is
+/// `cow_discard` (its lower is the shared image rootfs, so it must never merge).
+/// Its layer used to be unbounded: the first thing to notice was the
+/// filesystem, whose ENOSPC arrives *inside a copy-up* and surfaces as `EIO`
+/// (`BranchError::Operation`), naming nothing. With the cap enforced on a
+/// discard branch the child gets `ENOSPC` and the copy-up is refused before it
+/// stages anything -- which matters here because a one-byte change to a lower
+/// file stages the whole file.
+#[tokio::test]
+async fn test_chroot_cow_a_write_past_the_layers_budget_is_enospc() {
+    let rootfs = build_test_rootfs("cow-quota");
+    fs::create_dir_all(rootfs.join("usr/local")).unwrap();
+    // 64 KiB in the *lower*: the copy-up is what the 1 KiB budget cannot afford.
+    fs::write(rootfs.join("usr/local/big"), vec![0u8; 64 * 1024]).unwrap();
+    let storage = temp_dir("cow-quota-upper");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .workdir(&rootfs)
+        .fs_storage(&storage)
+        .max_disk(sandlock_core::sandbox::ByteSize(1024))
+        .cow_discard(true)
+        .on_exit(BranchAction::Keep)
+        .on_error(BranchAction::Keep)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&["rootfs-helper", "sh", "-c", "echo x > /usr/local/big"])
+        .await
+        .expect("the chroot sandbox must be creatable (N14 S5: the real root is the only shape)");
+
+    assert_eq!(
+        result.stderr_str().unwrap_or_default().trim(),
+        "sh: cannot open /usr/local/big: No space left on device",
+        "the layer's budget must reach the child as ENOSPC; stdout={:?} code={:?}",
+        result.stdout_str(),
+        result.code()
+    );
+    assert_eq!(result.code(), Some(1));
+
+    // The refusal is a reservation: nothing was staged, and the shared lower is
+    // untouched.
+    assert_eq!(
+        fs::metadata(rootfs.join("usr/local/big")).unwrap().len(),
+        64 * 1024,
+        "the lower file must keep its bytes"
+    );
+    let branch_dir = fs::read_dir(&storage)
+        .expect("the kept branch's storage")
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .expect("the kept branch directory");
+    assert!(
+        !branch_dir.join("upper/usr/local/big").exists(),
+        "a refused copy-up must not be staged"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&storage);
+}
+
 #[tokio::test]
 async fn test_chroot_cow_a_directory_created_in_the_rootfs_is_usable() {
     // `mkdir X && write into X` is the shape of every install that creates its

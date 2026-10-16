@@ -811,11 +811,23 @@ impl SeccompCowBranch {
     /// When `additional` is 0 the check uses `>=` — meaning "quota is
     /// already exhausted, don't allow any new allocations".
     fn check_quota(&self, additional: u64) -> Result<(), BranchError> {
-        if self.discard {
-            // There is nothing to bound: a discard branch is a scratch layer the
-            // sandbox alone reads, and it is released rather than merged.
-            return Ok(());
-        }
+        // A **discard** branch is bounded too, and for the same reason: its
+        // layer is a scratch tree the sandbox alone reads, but "scratch" is not
+        // "free". The writable-rootfs route points this branch at the shared
+        // image rootfs, and a one-byte change to a lower file stages the whole
+        // file -- so a workload that touches a few large image files can spend
+        // the sandbox's whole budget without writing much of its own. Refusing
+        // here is a *named* refusal (`QuotaExceeded` -> ENOSPC in the handlers);
+        // the alternative is the filesystem finding out mid-copy-up, which
+        // surfaces as `BranchError::Operation` -> EIO and names nothing.
+        //
+        // This is a **reservation** bound, not a byte-exact one: it counts what
+        // the branch stages (a copy-up's size, `+4096`/`+256` for a directory or
+        // symlink) and releases what it removes, and it deliberately does *not*
+        // walk the upper (`recalc_disk_used` below stays a no-op for a discard
+        // branch -- design D3 rejected the O(upper) walk at 8 ms per write-open
+        // with 5200 entries). The tree's XFS project quota remains the hard
+        // bound underneath.
         if self.max_disk_bytes > 0 {
             if additional == 0 {
                 if self.disk_used >= self.max_disk_bytes {
@@ -829,6 +841,12 @@ impl SeccompCowBranch {
     }
 
     /// Recalculate `disk_used` by walking the upper directory.
+    ///
+    /// Never for a discard branch: its accounting is maintained incrementally
+    /// (`prepare_copy` reserves, the deletes release), and the walk is the cost
+    /// D3 rejected for this route. The trade is named in `check_quota`: bytes
+    /// that appear in the upper without this branch staging them are not
+    /// counted, so the bound is a reservation one.
     fn recalc_disk_used(&mut self) {
         if self.discard {
             return;
@@ -2559,24 +2577,77 @@ mod tests {
         assert!(!dir.exists(), "a discard branch releases its upper on commit");
     }
 
-    /// The quota is a statement about the *workdir* this branch would merge into.
-    /// A discard branch never merges, so it neither walks the upper for an
-    /// accounting figure nor refuses a write on it (design doc D3: the O(upper)
-    /// `recalc_disk_used` is what makes a write-open cost 8 ms at 5200 entries).
+    /// The layer's bytes are bounded on this route too, and the refusal has to
+    /// be **named**.
+    ///
+    /// A copy-up that would push the layer past `max_disk_bytes` answers
+    /// `BranchError::QuotaExceeded` -- the handlers turn that into `ENOSPC` --
+    /// instead of letting the *filesystem* find out first: a filesystem ENOSPC
+    /// inside a copy-up surfaces as `BranchError::Operation`, which the handlers
+    /// report as `EIO`, and that names nothing (measured on the lane 2026-10-16:
+    /// a one-byte change to a lower file stages the whole file, so "the disk is
+    /// full" arrives as a copy-up, not as a user write).
+    ///
+    /// The accounting stays incremental -- the O(upper) `recalc_disk_used` that
+    /// design D3 rejected (8 ms per write-open at 5200 entries) stays rejected --
+    /// so this is a *reservation* bound on what the branch stages, and the tree's
+    /// XFS quota is still the hard one.
     #[test]
-    fn a_discard_branch_ignores_max_disk() {
+    fn a_discard_branch_bounds_its_layer_with_a_named_quota_refusal() {
         let lower = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         fs::write(lower.path().join("big"), vec![0u8; 64 * 1024]).unwrap();
 
-        // One byte of "quota": a merging branch would refuse the second open.
+        // One byte of quota: staging the 64 KiB lower file is already over it.
         let mut branch =
             SeccompCowBranch::create_with(lower.path(), Some(storage.path()), 1, true).unwrap();
         let big = lower.path().join("big");
-        branch.handle_open(big.to_str().unwrap(), libc::O_WRONLY as u64).unwrap();
         assert!(
-            branch.handle_open(big.to_str().unwrap(), libc::O_WRONLY as u64).is_ok(),
-            "a discard branch has no workdir to bound"
+            matches!(
+                branch.handle_open(big.to_str().unwrap(), libc::O_WRONLY as u64),
+                Err(BranchError::QuotaExceeded)
+            ),
+            "a copy-up the layer cannot afford must be refused by name"
+        );
+        assert!(
+            !branch.upper_dir().join("big").exists(),
+            "the refusal is a reservation: nothing may be staged"
+        );
+    }
+
+    /// ...and the accounting stays incremental, which is the trade D3 named.
+    ///
+    /// A write-open does not walk the upper, so bytes that appeared there
+    /// without this branch staging them are not counted: the branch trusts its
+    /// own reservations (`prepare_copy`'s size, `+4096`/`+256` for a directory
+    /// or a symlink) and its own releases. That is what keeps a write-open at a
+    /// constant cost, and the tree's XFS project quota is what still bounds the
+    /// disk underneath.
+    #[test]
+    fn a_discard_branch_does_not_rescan_the_upper_for_its_accounting() {
+        let lower = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        fs::write(lower.path().join("small"), b"abcd").unwrap();
+
+        let mut branch = SeccompCowBranch::create_with(
+            lower.path(),
+            Some(storage.path()),
+            1 << 20,
+            true,
+        )
+        .unwrap();
+        // Bytes the branch never staged (a peer, or a leftover from an earlier
+        // sandbox): a rescan would count them, the incremental accounting does
+        // not.
+        fs::write(branch.upper_dir().join("direct"), vec![0u8; 4096]).unwrap();
+
+        let small = lower.path().join("small");
+        branch
+            .handle_open(small.to_str().unwrap(), libc::O_WRONLY as u64)
+            .unwrap();
+        assert_eq!(
+            branch.disk_used, 4,
+            "only the copy-up the branch staged is counted"
         );
     }
 
