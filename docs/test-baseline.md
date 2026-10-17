@@ -347,7 +347,9 @@
 # cut to zero (give up at once) the old pooled-thread shape failed 18 of 20
 # probe cycles on `PTRACE_SEIZE tid 68: Operation not permitted` while the
 # per-freeze thread passed the same shape in 6.2 s.
-core_lib = 964 # 2026-10-17 (overlay dir manifest): 961 -> 964, +3 for the
+core_lib = 965 # 2026-10-17 (create-time skeleton prewarm): 964 -> 965, +1 for
+# the ready-marker expiry case in realroot::tests.
+# 2026-10-17 (overlay dir manifest): 961 -> 964, +3 for the
 # manifest/descriptor-walk cases in realroot::tests.
 # 2026-10-17 (overlay write pre-staging): 958 -> 961, +3 for
 # the FICLONE/parent-dir staging cases in chroot::dispatch.

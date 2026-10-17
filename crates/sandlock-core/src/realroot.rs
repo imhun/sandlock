@@ -464,6 +464,14 @@ fn validate_overlay_layer(
 /// then `touch merged/usr/local/new`). The files themselves stay lazy: the
 /// mediator reflinks one only when the sandbox writes it.
 fn build_overlay_dir_skeleton(lower: &Path, upper: &Path) -> Result<(), String> {
+    // The create-time prewarm (worker -> a slot child as the sandbox uid)
+    // writes this marker after the same set of directories has been built.
+    // Checking it first turns every later command's build into one `stat`
+    // instead of ~11 k `mkdirat` calls that all answer EEXIST.
+    if overlay_skeleton_is_current(lower, upper) {
+        note("overlay dir skeleton: ready marker");
+        return Ok(());
+    }
     // `mkdirat(..., 0755)` goes through the umask; the old path chmod-ed every
     // directory afterwards. Pin the mask for the walk and put the workload's
     // own mask back before it inherits this process.
@@ -482,6 +490,9 @@ fn build_overlay_dir_skeleton(lower: &Path, upper: &Path) -> Result<(), String> 
         }
     };
     unsafe { libc::umask(previous_umask) };
+    if outcome.is_ok() {
+        write_overlay_skeleton_marker(lower, upper);
+    }
     outcome
 }
 
@@ -493,6 +504,89 @@ const OVERLAY_DIR_FLAGS: libc::c_int =
 const DIR_MANIFEST_NAME: &str = ".dirs";
 const DIR_MANIFEST_HEADER: &[u8] = b"sandlock-dirs-v1\n";
 const DIR_MANIFEST_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Written next to `upper` after a complete skeleton build.
+///
+/// Format (whitespace separated, one line):
+/// `sandlock-skeleton-v1 <top-level entries> <manifest bytes> <manifest
+/// mtime_ns>`. The two manifest fields tie the marker to the immutable image
+/// entry; the top-level count catches a sandbox that deleted or added a
+/// top-level entry through its own tree. A marker that does not parse is a
+/// miss, never a reason to fail: the walk simply runs.
+const OVERLAY_SKELETON_MARKER_NAME: &str = ".skeleton-ready";
+const OVERLAY_SKELETON_MARKER_HEADER: &str = "sandlock-skeleton-v1";
+
+fn overlay_manifest_identity(lower: &Path) -> (u64, i128) {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(entry) = lower.parent() else {
+        return (0, 0);
+    };
+    let manifest = entry.join(DIR_MANIFEST_NAME);
+    let Ok(metadata) = std::fs::symlink_metadata(&manifest) else {
+        return (0, 0);
+    };
+    if !metadata.file_type().is_file() {
+        return (0, 0);
+    }
+    (
+        metadata.len(),
+        metadata.mtime() as i128 * 1_000_000_000 + metadata.mtime_nsec() as i128,
+    )
+}
+
+fn overlay_skeleton_top_level(upper: &Path) -> usize {
+    std::fs::read_dir(upper)
+        .map(|entries| entries.count())
+        .unwrap_or(0)
+}
+
+fn overlay_skeleton_is_current(lower: &Path, upper: &Path) -> bool {
+    let Some(layer) = upper.parent() else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(layer.join(OVERLAY_SKELETON_MARKER_NAME))
+    else {
+        return false;
+    };
+    let mut fields = text.split_whitespace();
+    if fields.next() != Some(OVERLAY_SKELETON_MARKER_HEADER) {
+        return false;
+    }
+    let (Some(count), Some(len), Some(mtime)) =
+        (fields.next(), fields.next(), fields.next())
+    else {
+        return false;
+    };
+    if fields.next().is_some() {
+        return false;
+    }
+    let (Ok(count), Ok(len), Ok(mtime)) = (
+        count.parse::<usize>(),
+        len.parse::<u64>(),
+        mtime.parse::<i128>(),
+    ) else {
+        return false;
+    };
+    if overlay_manifest_identity(lower) != (len, mtime) {
+        return false;
+    }
+    overlay_skeleton_top_level(upper) == count
+}
+
+fn write_overlay_skeleton_marker(lower: &Path, upper: &Path) {
+    let Some(layer) = upper.parent() else {
+        return;
+    };
+    let (len, mtime) = overlay_manifest_identity(lower);
+    let count = overlay_skeleton_top_level(upper);
+    // Best effort: a layer whose marker cannot be written (or a restored tree
+    // whose marker is stale) only costs the next command a rebuild.
+    let _ = std::fs::write(
+        layer.join(OVERLAY_SKELETON_MARKER_NAME),
+        format!("{OVERLAY_SKELETON_MARKER_HEADER} {count} {len} {mtime}\n"),
+    );
+}
 
 fn open_overlay_dir(path: &Path) -> Result<std::fs::File, std::io::Error> {
     use std::os::fd::FromRawFd;
@@ -943,6 +1037,39 @@ mod tests {
             &root.join("upper")
         )
         .is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_ready_marker_expires_when_a_top_level_directory_disappears() {
+        let root = scratch("ready-marker");
+        std::fs::write(
+            root.join(".dirs"),
+            manifest(&[
+                (1, b"usr"),
+                (2, b"lib"),
+                (1, b"opt"),
+                (2, b"one"),
+                (3, b"two"),
+            ]),
+        )
+        .unwrap();
+        let lower = root.join("lower");
+        let upper = root.join("upper");
+        build_overlay_dir_skeleton(&lower, &upper).unwrap();
+        assert!(root.join(".skeleton-ready").is_file());
+        assert!(overlay_skeleton_is_current(&lower, &upper));
+
+        // A sandbox that removes a top-level entry through its own tree must
+        // get it back on the next command; the marker's count catches that.
+        std::fs::remove_dir_all(upper.join("usr")).unwrap();
+        assert!(!overlay_skeleton_is_current(&lower, &upper));
+        build_overlay_dir_skeleton(&lower, &upper).unwrap();
+        assert!(upper.join("usr/lib").is_dir());
+        assert!(overlay_skeleton_is_current(&lower, &upper));
+
+        std::fs::write(root.join(".skeleton-ready"), "not a marker\n").unwrap();
+        assert!(!overlay_skeleton_is_current(&lower, &upper));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
