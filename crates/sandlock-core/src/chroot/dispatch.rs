@@ -58,7 +58,8 @@ use crate::chroot::resolve::{
 };
 use crate::sys::fs::{openat2_in_root, openat2_in_root_with_resolve};
 use crate::seccomp::notif::{
-    decode_open_args, read_child_mem, write_child_mem, NotifAction, NotifPolicy, OnInjectSuccess,
+    decode_open_args, read_child_mem, write_child_mem, write_child_mem_force, NotifAction,
+    NotifPolicy, OnInjectSuccess,
 };
 use crate::seccomp::state::{ChrootState, CowState, ProcessIndex};
 use crate::sys::structs::{SeccompNotif, SeccompNotifAddfd, SECCOMP_IOCTL_NOTIF_ADDFD};
@@ -791,6 +792,117 @@ fn last_errno(fallback: i32) -> i32 {
     std::io::Error::last_os_error()
         .raw_os_error()
         .unwrap_or(fallback)
+}
+
+/// How many `argv` entries [`canonicalize_argv_aliases`] looks at.
+///
+/// `execve` takes an unbounded array, so the scan has to stop somewhere; this
+/// is far past any real command line and the walk stops at the first NULL
+/// anyway.
+const ARGV_SCAN_LIMIT: usize = 4096;
+
+/// Read a NUL-terminated string from the child, bounded.
+fn read_child_string(notif_fd: RawFd, id: u64, pid: u32, addr: u64) -> Option<String> {
+    let mut out: Vec<u8> = Vec::with_capacity(256);
+    while out.len() < 4096 {
+        let want = 256.min(4096 - out.len());
+        let chunk = read_child_mem(notif_fd, id, pid, addr + out.len() as u64, want).ok()?;
+        if chunk.is_empty() {
+            break;
+        }
+        match chunk.iter().position(|b| *b == 0) {
+            Some(nul) => {
+                out.extend_from_slice(&chunk[..nul]);
+                return String::from_utf8(out).ok();
+            }
+            None => out.extend_from_slice(&chunk),
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Rewrite `/.u/<rel>` spellings in the child's `argv` back to `/<rel>`.
+///
+/// `realroot` mounts the branch's upper read-only at `EXEC_ALIAS_DIR`, and that
+/// is the only spelling the **kernel** can resolve for a file the sandbox
+/// staged — so an exec of such a file has to name the alias, and the kernel
+/// hands that same spelling on as the script's own path (a `#!` script's
+/// `argv[1]`). Everything the program then derives from it is a name the
+/// sandbox does not use: measured 2026-10-16, `npm install -g` on BytePlan's
+/// `sandbox-base` ran `#!/usr/bin/env node`, node's `process.argv[1]` was
+/// `/.u/usr/lib/node_modules/@larksuite/cli/scripts/run.js`, and the package's
+/// own installer derived that directory and got EACCES from the read-only
+/// alias.
+///
+/// The alias is a mediator-internal spelling: no program can have meant to see
+/// it, and the canonical name is three bytes shorter, so the rewrite fits the
+/// buffer it replaces. Two entries are left alone: the exec path buffer itself
+/// (which has to stay the alias, or the kernel cannot resolve it at all), and
+/// any string whose name the branch's upper does not actually hold (that one
+/// never came from this mediator).
+fn canonicalize_argv_aliases(
+    notif: &SeccompNotif,
+    notif_fd: RawFd,
+    argv_ptr: u64,
+    path_ptr: u64,
+    ctx: &ChrootCtx<'_>,
+) {
+    let Some(upper) = ctx.cow_upper else {
+        return;
+    };
+    if argv_ptr == 0 {
+        return;
+    }
+    let alias_dir = crate::realroot::EXEC_ALIAS_DIR;
+    let mut index = 0usize;
+    'slots: while index < ARGV_SCAN_LIMIT {
+        // One read per chunk of slots rather than one per entry: a command line
+        // is short and contiguous, and this runs on every exec.
+        let want = 64.min(ARGV_SCAN_LIMIT - index) * 8;
+        let Ok(chunk) = read_child_mem(
+            notif_fd,
+            notif.id,
+            notif.pid,
+            argv_ptr + (index * 8) as u64,
+            want,
+        ) else {
+            return;
+        };
+        for raw in chunk.chunks_exact(8) {
+            let ptr = u64::from_ne_bytes(raw.try_into().unwrap_or([0; 8]));
+            if ptr == 0 {
+                break 'slots;
+            }
+            index += 1;
+            // The exec path buffer is the one string that must keep the alias.
+            if ptr == path_ptr {
+                continue;
+            }
+            // Four bytes to rule out every ordinary argument before paying for
+            // the string itself.
+            let Ok(head) = read_child_mem(notif_fd, notif.id, notif.pid, ptr, 4) else {
+                continue;
+            };
+            if head.as_slice() != b"/.u/" {
+                continue;
+            }
+            let Some(spelling) = read_child_string(notif_fd, notif.id, notif.pid, ptr) else {
+                continue;
+            };
+            let Some(rel) = spelling.strip_prefix(alias_dir) else {
+                continue;
+            };
+            let rel = rel.strip_prefix('/').unwrap_or(rel);
+            if rel.is_empty() || std::fs::symlink_metadata(upper.join(rel)).is_err() {
+                continue;
+            }
+            let mut canonical = format!("/{rel}").into_bytes();
+            canonical.push(0);
+            // `_force`: the string is usually a `.rodata` literal, and the
+            // rewrite is shorter than what it replaces either way.
+            let _ = write_child_mem_force(notif_fd, notif.id, notif.pid, ptr, &canonical);
+        }
+    }
 }
 
 /// Prove that `path` is a directory reachable inside `root`, and hand back the
@@ -1856,6 +1968,12 @@ pub(crate) async fn handle_chroot_exec(
                 ));
             }
         }
+        // The alias is what the *kernel* needs; the program must not have to
+        // live with it (see `canonicalize_argv_aliases`). This runs whether or
+        // not the path itself was rewritten: the leak travels through programs
+        // that pass their own path on, which is exactly what `#!/usr/bin/env`
+        // does.
+        canonicalize_argv_aliases(notif, notif_fd, argv_ptr, path_ptr, ctx);
         return NotifAction::Continue;
     }
 

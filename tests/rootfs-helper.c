@@ -81,6 +81,29 @@ static int cmd_pwd(void) {
 }
 
 /* ── fork-pwd: the same `pwd`, in a forked child ────────────────── */
+/* ── relay: exec this helper's `echo` with the paths it was handed ─ */
+/*
+ * The `#!` shape a real CLI ships (`#!/usr/bin/env node`): the kernel hands the
+ * interpreter the script's own path, and the interpreter then **execs** another
+ * program with that path in its argv. The second exec is where the mediator can
+ * rewrite an alias spelling, and this is the smallest program that has it.
+ */
+static int cmd_relay(int argc, char **argv) {
+    const char *prog = "/usr/bin/rootfs-helper";
+    char **next = calloc((size_t)argc + 3, sizeof(char *));
+    if (!next) {
+        fprintf(stderr, "relay: out of memory\n");
+        return 127;
+    }
+    next[0] = (char *)prog;
+    next[1] = (char *)"echo";
+    for (int i = 0; i < argc; i++) next[i + 2] = argv[i];
+    execv(prog, next);
+    fprintf(stderr, "relay: %s: %s\n", prog, strerror(errno));
+    return 127;
+}
+
+/* ── fork-pwd: the same `pwd`, in a forked child ────────────────── */
 /*
  * `fork(2)` copies the task's `fs_struct`, so a child starts on the parent's
  * cwd -- and on whatever the supervisor's record of it said. That record has
@@ -1002,6 +1025,7 @@ static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "ls") == 0)             return cmd_ls(argc, argv);
     if (strcmp(cmd, "pwd") == 0)            return cmd_pwd();
     if (strcmp(cmd, "fork-pwd") == 0)       return cmd_fork_pwd(argc, argv);
+    if (strcmp(cmd, "relay") == 0)          return cmd_relay(argc, argv);
     if (strcmp(cmd, "readlink") == 0)       return cmd_readlink(argc, argv);
     if (strcmp(cmd, "stat") == 0)           return cmd_stat(argc, argv);
     if (strcmp(cmd, "mkdir") == 0)          return cmd_mkdir(argc, argv);

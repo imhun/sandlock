@@ -787,7 +787,15 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 588 # 2026-10-16 (writable rootfs COW, links and the cwd):
+core_integ = 589 # 2026-10-16 (writable rootfs COW, the exec alias out of argv):
+                 # 588 -> 589, +1 -- `test_chroot::test_chroot_cow_a_script_is_
+                 # handed_its_own_canonical_path`. A staged `#!` script can only
+                 # be named to the kernel through the read-only exec alias, and
+                 # the kernel hands that spelling on as the script's own path;
+                 # the mediator now rewrites it back to the sandbox's spelling in
+                 # the `argv` of every exec it handles (which is where
+                 # `#!/usr/bin/env node` passes it on).
+                 # 2026-10-16 (writable rootfs COW, links and the cwd):
                  # 584 -> 588, +4 -- `test_chroot::test_chroot_cow_a_read_through_
                  # an_image_link_never_reaches_the_host` (the merged view follows a
                  # link the image carries; the host used to follow it instead, and

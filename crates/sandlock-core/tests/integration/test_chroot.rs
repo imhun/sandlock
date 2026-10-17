@@ -2713,6 +2713,70 @@ async fn test_chroot_cow_owned_writes_never_land_on_the_lower() {
     let _ = fs::remove_dir_all(&storage);
 }
 
+/// A `#!` script's path reaches the program in the **sandbox's** spelling.
+///
+/// `realroot` mounts the branch's upper read-only at `/.u`, and that is the only
+/// spelling the **kernel** can resolve for a file the sandbox staged — so an
+/// exec of such a file has to name the alias, and the kernel hands that same
+/// spelling on as the script's own path. Everything a program derives from it
+/// is then a name the sandbox does not use: measured 2026-10-16, `npm install
+/// -g` on BytePlan's `sandbox-base` ran `#!/usr/bin/env node`, node's
+/// `process.argv[1]` was `/.u/usr/lib/node_modules/@larksuite/cli/scripts/
+/// run.js`, and the package's own installer derived that directory and got
+/// EACCES from the read-only alias.
+///
+/// The fixture is that chain in miniature: the staged script's interpreter is
+/// the helper's `relay`, which *execs* the helper's `echo` with the path it was
+/// handed — the same second exec `env` performs, and the point where the
+/// mediator can rewrite the spelling.
+#[tokio::test]
+async fn test_chroot_cow_a_script_is_handed_its_own_canonical_path() {
+    let rootfs = build_test_rootfs("cow-script-path");
+    fs::create_dir_all(rootfs.join("usr/local")).unwrap();
+    fs::create_dir_all(rootfs.join(".u")).unwrap();
+    let storage = temp_dir("cow-script-path-upper");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .workdir(&rootfs)
+        .fs_storage(&storage)
+        .on_exit(BranchAction::Keep)
+        .on_error(BranchAction::Keep)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "echo \"#!/usr/bin/rootfs-helper relay\" > /usr/local/cow-s && \
+             chmod 755 /usr/local/cow-s && \
+             exec /usr/local/cow-s",
+        ])
+        .await
+        .expect("the chroot sandbox must be creatable (N14 S5: the real root is the only shape)");
+
+    assert_eq!(
+        result.stdout_str().unwrap_or_default(),
+        "/usr/local/cow-s",
+        "the interpreter's second exec must hand the program the sandbox's own spelling, \
+         not the exec alias; stderr={:?} code={:?}",
+        result.stderr_str(),
+        result.code()
+    );
+    assert_eq!(result.code(), Some(0), "stderr={:?}", result.stderr_str());
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&storage);
+}
+
 /// A **named** layer is adopted: the tree's carried layer is what the sandbox
 /// sees.
 ///
