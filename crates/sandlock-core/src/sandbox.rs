@@ -3354,6 +3354,13 @@ impl Sandbox {
                 cow_enabled: resolved.features.cow,
                 chroot_root: chroot_root.clone(),
                 chroot_overlay: self.rootfs_canonical == RootfsCanonical::Overlay,
+                overlay_upper: (self.rootfs_canonical == RootfsCanonical::Overlay)
+                    .then(|| {
+                        self.rootfs_layer
+                            .as_ref()
+                            .map(|layer| layer.join("upper"))
+                    })
+                    .flatten(),
                 chroot_readable: self.fs_readable.clone(),
                 chroot_writable: self.fs_writable.clone(),
                 chroot_denied: self.fs_denied.clone(),

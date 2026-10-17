@@ -3995,6 +3995,63 @@ async fn test_chroot_overlay_mkdir_targets_the_upper_and_not_the_lower() {
     let _ = fs::remove_dir_all(&layer);
 }
 
+/// A directory the sandbox just created is writable through the overlay.
+///
+/// The resolver walks the *lower*; a directory that exists only in the overlay
+/// upper is invisible to that walk, so `mkdir X && write X/f` answered ENOENT
+/// on the layer (measured on the multinode lane, 2026-10-17) until the overlay
+/// upper was passed as the resolver's fallback.
+#[tokio::test]
+async fn test_chroot_overlay_a_directory_created_in_the_rootfs_is_usable() {
+    let rootfs = build_test_rootfs("overlay-newdir");
+    fs::create_dir_all(rootfs.join("usr/local")).unwrap();
+    let layer = fresh_overlay_layer("overlay-newdir-layer");
+    fs::create_dir_all(layer.join("upper")).unwrap();
+    fs::create_dir_all(layer.join("work")).unwrap();
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/")
+        .fs_write("/")
+        .rootfs_canonical(RootfsCanonical::Overlay)
+        .rootfs_layer(&layer)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "/usr/bin/rootfs-helper",
+            "sh",
+            "-c",
+            "mkdir /usr/local/overlay-dir && \
+             echo hello > /usr/local/overlay-dir/f && \
+             cat /usr/local/overlay-dir/f && \
+             ls /usr/local/overlay-dir",
+        ])
+        .await
+        .expect("the overlay sandbox must be creatable");
+
+    assert_eq!(result.code(), Some(0), "stderr={:?}", result.stderr_str());
+    assert_eq!(
+        result.stdout_str().unwrap_or_default(),
+        "hello\nf",
+        "stderr={:?}",
+        result.stderr_str()
+    );
+    assert!(
+        !rootfs.join("usr/local/overlay-dir").exists(),
+        "the shared lower must remain unchanged"
+    );
+    assert!(
+        layer.join("upper/usr/local/overlay-dir/f").is_file(),
+        "the write must land in the overlay upper"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&layer);
+}
+
 /// The default alias shape keeps the read-only `/.u` view of its branch upper.
 #[tokio::test]
 async fn test_chroot_alias_default_keeps_the_exec_alias() {

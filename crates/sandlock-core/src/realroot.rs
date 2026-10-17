@@ -280,6 +280,7 @@ fn build(
         let upper = layer.join("upper");
         let work = layer.join("work");
         validate_overlay_layer(root, layer, &upper, &work)?;
+        build_overlay_dir_skeleton(root, &upper)?;
         let lower = overlay_option_path("lower", root)?;
         let upper = overlay_option_path("upper", &upper)?;
         let work = overlay_option_path("work", &work)?;
@@ -450,6 +451,65 @@ fn validate_overlay_layer(
             "overlay work must be empty at mount time: {}",
             work.display()
         ));
+    }
+    Ok(())
+}
+
+/// Create the lower's directory tree in the upper **before** the overlay is
+/// mounted.
+///
+/// Creating a parent directory in the upper after the overlay is mounted makes
+/// the kernel answer `ENOTEMPTY` for the next create in the merged directory
+/// (measured 2026-10-17 on a tmpfs: `mkdir upper/usr/local` after the mount,
+/// then `touch merged/usr/local/new`). The files themselves stay lazy: the
+/// mediator reflinks one only when the sandbox writes it.
+fn build_overlay_dir_skeleton(lower: &Path, upper: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut stack: Vec<(std::path::PathBuf, String)> =
+        vec![(lower.to_path_buf(), String::new())];
+    while let Some((dir, rel)) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // A directory the sandbox cannot read needs no upper copy either;
+            // its own lookup will answer EACCES.
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            // `file_type` does not follow symlinks: `/lib -> usr/lib` is not a
+            // directory to clone, and following it could leave `lower`.
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let child_rel = if rel.is_empty() {
+                name.to_string_lossy().into_owned()
+            } else {
+                format!("{rel}/{}", name.to_string_lossy())
+            };
+            let dest = upper.join(&child_rel);
+            match std::fs::create_dir(&dest) {
+                Ok(()) => {
+                    // The child runs with the sandbox's umask; the alias route
+                    // creates upper parents 0755, so keep the shapes equal.
+                    let _ = std::fs::set_permissions(
+                        &dest,
+                        std::fs::Permissions::from_mode(0o755),
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    return Err(format!(
+                        "overlay dir skeleton {}: {e}",
+                        dest.display()
+                    ))
+                }
+            }
+            stack.push((entry.path(), child_rel));
+        }
     }
     Ok(())
 }

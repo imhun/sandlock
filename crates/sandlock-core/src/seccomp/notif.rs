@@ -932,6 +932,11 @@ pub struct NotifPolicy {
     /// are not the lower inode at `chroot_root`, so path handlers hand normal
     /// opens/writes back to the kernel after applying the policy gates.
     pub chroot_overlay: bool,
+    /// The overlay layer's upper directory. The mediator pre-stages a write
+    /// target here with `FICLONE` before handing the syscall to the kernel, so
+    /// the kernel never performs the copy-up that would preserve the lower's
+    /// (unmapped) owner.
+    pub overlay_upper: Option<std::path::PathBuf>,
     /// Virtual paths allowed for reading under chroot (original user-specified paths).
     pub chroot_readable: Vec<std::path::PathBuf>,
     /// Virtual paths allowed for writing under chroot (original user-specified paths).

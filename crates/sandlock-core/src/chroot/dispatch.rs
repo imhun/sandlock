@@ -109,6 +109,10 @@ pub(crate) struct ChrootCtx<'a> {
     /// The child's root is the overlay merge, not the lower directory named by
     /// `root`.
     pub overlay_root: bool,
+    /// The overlay layer's upper directory. Writes are pre-staged here (with
+    /// `FICLONE`) so the kernel never copy-ups from the shared lower, whose
+    /// owner is not mapped into the sandbox's user namespace.
+    pub overlay_upper: Option<&'a Path>,
 }
 
 impl<'a> ChrootCtx<'a> {
@@ -135,6 +139,7 @@ impl<'a> ChrootCtx<'a> {
             pid_ns: policy.pid_ns.as_ref(),
             cow_upper: policy.cow_upper.as_deref(),
             overlay_root: policy.chroot_overlay,
+            overlay_upper: policy.overlay_upper.as_deref(),
         }
     }
 
@@ -765,7 +770,10 @@ fn resolve_chroot_path(
     if let Ok(result) = ctx.resolve_mount(&full_path) {
         return Ok(result);
     }
-    resolve_in_root(ctx.root, &full_path, ctx.cow_upper)
+    // Overlay mode has no COW branch, but its upper is the same kind of
+    // fallback: a directory the sandbox created lives only there, and the
+    // lower walk must not answer ENOENT for a child of it.
+    resolve_in_root(ctx.root, &full_path, ctx.cow_upper.or(ctx.overlay_upper))
 }
 
 /// Resolve a child path without following a final symlink.
@@ -783,7 +791,7 @@ fn resolve_chroot_path_nofollow(
     if let Ok(result) = ctx.resolve_mount_nofollow(&full_path) {
         return Ok(result);
     }
-    resolve_in_root_nofollow(ctx.root, &full_path, ctx.cow_upper)
+    resolve_in_root_nofollow(ctx.root, &full_path, ctx.cow_upper.or(ctx.overlay_upper))
 }
 
 /// Resolve a child path that must already exist within the chroot.
@@ -802,7 +810,7 @@ fn resolve_chroot_path_existing(
     if let Ok(result) = ctx.resolve_mount_existing(&full_path) {
         return Ok(result);
     }
-    resolve_existing_in_root(ctx.root, &full_path, ctx.cow_upper)
+    resolve_existing_in_root(ctx.root, &full_path, ctx.cow_upper.or(ctx.overlay_upper))
 }
 
 /// Convert a Path to CString, returning Errno on failure.
@@ -1182,6 +1190,187 @@ fn exec_on_host(f: impl FnOnce(*const libc::c_char) -> libc::c_int, host: &Path)
 // openat handler
 // ============================================================
 
+/// `_IOW(0x94, 9, int)` — clone one file's data extents into another.
+const FICLONE: libc::c_ulong = 0x4004_9409;
+
+/// The upper spelling of a path that lives in the shared overlay lower.
+///
+/// Mounts are bind-mounted on top of the overlay after it is built; a write
+/// there lands in the mount source, not in the layer, so those paths get no
+/// staging.
+fn overlay_upper_rel(ctx: &ChrootCtx<'_>, host_path: &Path) -> Option<String> {
+    ctx.overlay_upper?;
+    let rel = host_path.strip_prefix(ctx.root).ok()?;
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+    Some(rel.to_string_lossy().into_owned())
+}
+
+fn overlay_upper_has(ctx: &ChrootCtx<'_>, rel: &str) -> bool {
+    ctx.overlay_upper
+        .is_some_and(|upper| crate::sys::fs::statat_in_root(upper, rel, false).is_ok())
+}
+
+/// Make sure every parent of `rel` exists in the upper.
+///
+/// The mediator creates them as the sandbox's own host uid, which is exactly
+/// the ownership the kernel's copy-up fails to produce for a lower directory.
+fn ensure_overlay_upper_parent(ctx: &ChrootCtx<'_>, rel: &str) -> Result<(), i32> {
+    let upper = ctx.overlay_upper.ok_or(libc::EIO)?;
+    let parent = rel.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+    if parent.is_empty() {
+        return Ok(());
+    }
+    crate::sys::fs::mkdirp_in_root(upper, parent, 0o755)
+}
+
+/// Copy one regular file into the upper as the mediator.
+///
+/// `FICLONE` shares the lower's data extents; a filesystem without reflink
+/// (or a cross-device pair) falls back to a byte copy. The destination's mode
+/// is the lower's, but its owner is the mediator — the sandbox's host uid —
+/// which is the whole point: the sandbox can write what it copied.
+fn copy_up_regular(
+    ctx: &ChrootCtx<'_>,
+    rel: &str,
+    st: &libc::stat,
+) -> Result<(), i32> {
+    let upper = ctx.overlay_upper.ok_or(libc::EIO)?;
+    let mode = (st.st_mode & 0o7777) as u32;
+    let src = crate::sys::fs::openat2_in_root(ctx.root, rel, libc::O_RDONLY | libc::O_CLOEXEC, 0)?;
+    let dst = match crate::sys::fs::openat2_in_root(
+        upper,
+        rel,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+        mode,
+    ) {
+        Ok(fd) => fd,
+        Err(libc::EEXIST) => {
+            unsafe { libc::close(src) };
+            return Ok(());
+        }
+        Err(e) => {
+            unsafe { libc::close(src) };
+            return Err(e);
+        }
+    };
+    // SAFETY: both descriptors are owned by this function and are not shared.
+    let src = unsafe { OwnedFd::from_raw_fd(src) };
+    let dst = unsafe { OwnedFd::from_raw_fd(dst) };
+    let cloned = unsafe { libc::ioctl(dst.as_raw_fd(), FICLONE, src.as_raw_fd()) } == 0;
+    if cloned {
+        if unsafe { libc::fchmod(dst.as_raw_fd(), mode as libc::mode_t) } != 0 {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+            let _ = crate::sys::fs::unlinkat_in_root(upper, rel, false);
+            return Err(err);
+        }
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO);
+    if !matches!(
+        err,
+        libc::EOPNOTSUPP | libc::EXDEV | libc::EINVAL | libc::ENOTTY
+    ) {
+        let _ = crate::sys::fs::unlinkat_in_root(upper, rel, false);
+        return Err(err);
+    }
+    // No reflink here: fall back to the old byte-for-byte copy. The source was
+    // just opened and FICLONE does not advance its offset.
+    let mut src = std::fs::File::from(src);
+    let mut dst = std::fs::File::from(dst);
+    if let Err(e) = src.seek(SeekFrom::Start(0)) {
+        let _ = crate::sys::fs::unlinkat_in_root(upper, rel, false);
+        return Err(e.raw_os_error().unwrap_or(libc::EIO));
+    }
+    if let Err(e) = std::io::copy(&mut src, &mut dst) {
+        let _ = crate::sys::fs::unlinkat_in_root(upper, rel, false);
+        return Err(e.raw_os_error().unwrap_or(libc::EIO));
+    }
+    if unsafe { libc::fchmod(dst.as_raw_fd(), mode as libc::mode_t) } != 0 {
+        let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
+        let _ = crate::sys::fs::unlinkat_in_root(upper, rel, false);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Stage one write target (or its parent) in the overlay upper.
+///
+/// Called before `Continue`, so the kernel resolves the merged view to the
+/// upper copy instead of performing a copy-up from the lower.
+fn prestage_overlay_path(ctx: &ChrootCtx<'_>, rel: &str) -> Result<(), i32> {
+    if overlay_upper_has(ctx, rel) {
+        return Ok(());
+    }
+    ensure_overlay_upper_parent(ctx, rel)?;
+    let st = match crate::sys::fs::statat_in_root(ctx.root, rel, false) {
+        Ok(st) => st,
+        Err(libc::ENOENT) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    match st.st_mode & libc::S_IFMT {
+        libc::S_IFREG => copy_up_regular(ctx, rel, &st),
+        libc::S_IFDIR => {
+            let upper = ctx.overlay_upper.ok_or(libc::EIO)?;
+            match crate::sys::fs::mkdirp_in_root(upper, rel, 0o755) {
+                Ok(()) | Err(libc::EEXIST) => Ok(()),
+                Err(e) => Err(e),
+            }
+        }
+        // Symlinks have no data to clone; their parent is enough for the
+        // operations that act on the name (unlink/rename), and a following
+        // resolution already handed us the target.
+        _ => Ok(()),
+    }
+}
+
+/// Stage only a regular file. Used where materializing an empty upper
+/// directory would be wrong (rename/link sources).
+fn prestage_overlay_regular(ctx: &ChrootCtx<'_>, rel: &str) -> Result<(), i32> {
+    if overlay_upper_has(ctx, rel) {
+        return Ok(());
+    }
+    ensure_overlay_upper_parent(ctx, rel)?;
+    match crate::sys::fs::statat_in_root(ctx.root, rel, false) {
+        Ok(st) if st.st_mode & libc::S_IFMT == libc::S_IFREG => {
+            copy_up_regular(ctx, rel, &st)
+        }
+        Ok(_) | Err(libc::ENOENT) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// `fchown(fd, uid, gid)` on a file the overlay layer owns.
+///
+/// The descriptor's file was created by the sandbox (host uid 10000), so the
+/// kernel's chown to a uid outside its user namespace answers EINVAL. The alias
+/// route already treats chown on a branch-owned file as a best-effort no-op;
+/// the overlay's upper is the same kind of object. A workspace descriptor is
+/// left to the kernel.
+fn soften_overlay_fchown(notif: &SeccompNotif, ctx: &ChrootCtx<'_>) -> NotifAction {
+    let fd = notif.data.args[0] as i32;
+    let host = match std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, fd)) {
+        Ok(path) => path,
+        Err(err) => return NotifAction::Errno(err.raw_os_error().unwrap_or(libc::EBADF)),
+    };
+    // A descriptor on a mount source (workspace, a volume, /dev) keeps the
+    // kernel's chown. Everything else is a file the overlay layer owns; the
+    // sandbox's user namespace cannot name the archive's host uid, and the
+    // alias route already treats that chown as a best-effort no-op.
+    let in_mount = ctx
+        .mounts
+        .iter()
+        .any(|(_, mount)| host.starts_with(mount) || mount.starts_with(&host));
+    if in_mount {
+        NotifAction::Continue
+    } else {
+        NotifAction::ReturnValue(0)
+    }
+}
+
 pub(crate) async fn handle_chroot_open(
     notif: &SeccompNotif,
     _chroot_state: &Arc<Mutex<ChrootState>>,
@@ -1214,6 +1403,24 @@ pub(crate) async fn handle_chroot_open(
             }
         } else if !ctx.can_read(&virtual_path) {
             return NotifAction::Errno(libc::EACCES);
+        }
+        let creates = (flags as i32 & libc::O_CREAT) != 0;
+        if is_write || creates {
+            let (host_path, _virtual_path) =
+                match resolve_chroot_path(notif, dirfd, &rel_path, ctx) {
+                    Ok(r) => r,
+                    Err(e) => return NotifAction::Errno(e),
+                };
+            if let Some(rel) = overlay_upper_rel(ctx, &host_path) {
+                let staged = if is_write {
+                    prestage_overlay_path(ctx, &rel)
+                } else {
+                    ensure_overlay_upper_parent(ctx, &rel)
+                };
+                if let Err(e) = staged {
+                    return NotifAction::Errno(e);
+                }
+            }
         }
         // The kernel resolves the merged overlay view. Injecting a lower-path
         // descriptor here would write through to the shared image.
@@ -2042,33 +2249,56 @@ pub(crate) async fn handle_chroot_write(
     let nr = notif.data.nr as i64;
 
     if ctx.overlay_root {
-        let paths: Vec<(i64, u64)> = match nr {
-            n if n == libc::SYS_unlinkat
-                || n == libc::SYS_mkdirat
-                || n == libc::SYS_fchmodat
+        #[derive(Clone, Copy)]
+        enum Stage {
+            /// Only the parent directories need to exist in the upper.
+            Parent,
+            /// Materialize the target: a regular file is reflinked, a
+            /// directory is created empty.
+            File,
+            /// Materialize a regular file only; never an empty directory
+            /// (a rename/link source directory must keep its contents).
+            Regular,
+        }
+        let paths: Vec<(i64, u64, Stage, bool)> = match nr {
+            n if n == libc::SYS_unlinkat => {
+                vec![(notif.data.args[0] as i64, notif.data.args[1], Stage::Parent, true)]
+            }
+            n if n == libc::SYS_mkdirat => {
+                vec![(notif.data.args[0] as i64, notif.data.args[1], Stage::Parent, false)]
+            }
+            n if n == libc::SYS_fchmodat
                 || n == libc::SYS_fchownat
                 || n == crate::arch::SYS_FCHMODAT2 =>
             {
-                vec![(notif.data.args[0] as i64, notif.data.args[1])]
+                vec![(notif.data.args[0] as i64, notif.data.args[1], Stage::File, false)]
             }
-            n if n == libc::SYS_renameat2 => vec![
-                (notif.data.args[0] as i64, notif.data.args[1]),
-                (notif.data.args[2] as i64, notif.data.args[3]),
+            n if n == libc::SYS_renameat2 || n == libc::SYS_renameat => vec![
+                (notif.data.args[0] as i64, notif.data.args[1], Stage::Regular, true),
+                (notif.data.args[2] as i64, notif.data.args[3], Stage::Parent, true),
             ],
             n if n == libc::SYS_symlinkat => {
-                vec![(notif.data.args[2] as i64, notif.data.args[1])]
+                // symlinkat(target, newdirfd, linkpath): args[1] is the
+                // descriptor, args[2] the path pointer. The previous order
+                // read the descriptor as a pointer and refused every link.
+                vec![(notif.data.args[1] as i64, notif.data.args[2], Stage::Parent, false)]
             }
             n if n == libc::SYS_linkat => vec![
-                (notif.data.args[0] as i64, notif.data.args[1]),
-                (notif.data.args[2] as i64, notif.data.args[3]),
+                (notif.data.args[0] as i64, notif.data.args[1], Stage::Regular, false),
+                (notif.data.args[2] as i64, notif.data.args[3], Stage::Parent, true),
             ],
-            n if n == libc::SYS_truncate => {
-                vec![(libc::AT_FDCWD as i64, notif.data.args[0])]
+            n if n == libc::SYS_truncate => vec![(
+                libc::AT_FDCWD as i64,
+                notif.data.args[0],
+                Stage::Regular,
+                false,
+            )],
+            n if n == libc::SYS_fchown => {
+                return soften_overlay_fchown(notif, ctx)
             }
-            n if n == libc::SYS_fchown => return NotifAction::Continue,
             _ => vec![],
         };
-        for (dirfd, path_ptr) in paths {
+        for (dirfd, path_ptr, stage, nofollow) in paths {
             let Some(path) = read_path(notif, path_ptr, notif_fd) else {
                 return NotifAction::Errno(libc::EACCES);
             };
@@ -2078,6 +2308,32 @@ pub(crate) async fn handle_chroot_write(
             let virtual_path = PathBuf::from(virtual_path);
             if ctx.write_hard_denied(&virtual_path) || !ctx.can_write(&virtual_path) {
                 return NotifAction::Errno(libc::EACCES);
+            }
+            let resolved = if nofollow {
+                resolve_chroot_path_nofollow(notif, dirfd, &path, ctx)
+            } else {
+                resolve_chroot_path(notif, dirfd, &path, ctx)
+            };
+            let (host_path, _virtual_path) = match resolved {
+                Ok(r) => r,
+                Err(e) => return NotifAction::Errno(e),
+            };
+            if let Some(rel) = overlay_upper_rel(ctx, &host_path) {
+                let staged = match stage {
+                    Stage::Parent => ensure_overlay_upper_parent(ctx, &rel),
+                    Stage::File => prestage_overlay_path(ctx, &rel),
+                    Stage::Regular => prestage_overlay_regular(ctx, &rel),
+                };
+                if let Err(e) = staged {
+                    return NotifAction::Errno(e);
+                }
+                // A chown on a layer-owned file is best-effort, as it is on
+                // the alias branch: the sandbox's user namespace cannot name
+                // an arbitrary host uid, and the sandbox owns the copy either
+                // way.
+                if nr == libc::SYS_fchownat {
+                    return NotifAction::ReturnValue(0);
+                }
             }
         }
         return NotifAction::Continue;
@@ -2713,6 +2969,20 @@ pub(crate) async fn handle_chroot_stat(
     };
     let dirfd = notif.data.args[0] as i64;
 
+    if ctx.overlay_root {
+        // The overlay merge is the authority for an upper-only entry (a file
+        // or directory the sandbox just created). Resolving through the lower
+        // here is what made `readlink`/`stat` answer ENOENT for the npm bin
+        // link while the kernel could see it.
+        let Some(vp) = build_virtual_path(notif, dirfd, &path, ctx) else {
+            return NotifAction::Errno(libc::EACCES);
+        };
+        if !ctx.can_read(Path::new(&vp)) {
+            return NotifAction::Errno(libc::EACCES);
+        }
+        return NotifAction::Continue;
+    }
+
     // The whiteout is recorded against the *name* (`cow_named_is_deleted`).
     if cow_named_is_deleted(notif, dirfd, &path, ctx, cow_state).await {
         return NotifAction::Errno(libc::ENOENT);
@@ -2789,6 +3059,16 @@ pub(crate) async fn handle_chroot_statx(
         Some(p) if !p.is_empty() => p,
         _ => return NotifAction::Continue,
     };
+
+    if ctx.overlay_root {
+        let Some(vp) = build_virtual_path(notif, dirfd, &path, ctx) else {
+            return NotifAction::Errno(libc::EACCES);
+        };
+        if !ctx.can_read(Path::new(&vp)) {
+            return NotifAction::Errno(libc::EACCES);
+        }
+        return NotifAction::Continue;
+    }
 
     // The whiteout is recorded against the *name* (`cow_named_is_deleted`).
     if cow_named_is_deleted(notif, dirfd, &path, ctx, cow_state).await {
@@ -2954,6 +3234,18 @@ pub(crate) async fn handle_chroot_readlink(
 
     // readlink must read the link itself, never what it points at, which is
     // exactly what the no-follow resolver gives.
+    if ctx.overlay_root {
+        let Some(vp) = build_virtual_path(notif, dirfd, &path, ctx) else {
+            return NotifAction::Errno(libc::EACCES);
+        };
+        if !ctx.can_read(Path::new(&vp)) {
+            return NotifAction::Errno(libc::EACCES);
+        }
+        // The kernel reads the link in the merged view; a link the sandbox
+        // created exists only in the upper.
+        return NotifAction::Continue;
+    }
+
     let (host_path, _) = match resolve_chroot_path_nofollow(notif, dirfd, &path, ctx) {
         Ok(r) => r,
         Err(e) => return NotifAction::Errno(e),
@@ -3254,6 +3546,7 @@ pub(crate) async fn handle_chroot_chdir(
             let from_upper = ctx.mount_target(&confined).is_none()
                 && ctx
                     .cow_upper
+                    .or(ctx.overlay_upper)
                     .map(|upper| open_dir_proof(upper, &confined.to_string_lossy()).is_ok())
                     .unwrap_or(false);
             if !from_upper {
@@ -3539,6 +3832,18 @@ pub(crate) async fn handle_chroot_utimensat(
     // host operation.
     if !ctx.can_write(&vp) {
         return NotifAction::Errno(libc::EACCES);
+    }
+
+    if ctx.overlay_root {
+        // The kernel applies the timestamps in its merged view. Stage the
+        // target first, or the kernel's copy-up would hand the operation an
+        // inode owned by the (unmapped) lower owner.
+        if let Some(rel) = overlay_upper_rel(ctx, &host_path) {
+            if let Err(e) = prestage_overlay_path(ctx, &rel) {
+                return NotifAction::Errno(e);
+            }
+        }
+        return NotifAction::Continue;
     }
 
     let real_path = match cow_resolve(cow_state, &host_path).await {
@@ -3937,7 +4242,103 @@ mod mount_ro_tests {
             // stays off, which is what they are pinning.
             cow_upper: None,
             overlay_root: false,
+            overlay_upper: None,
         }
+    }
+
+    fn ctx_overlay<'a>(
+        root: &'a Path,
+        upper: &'a Path,
+        writable: &'a [PathBuf],
+        processes: &'a Arc<ProcessIndex>,
+    ) -> ChrootCtx<'a> {
+        let dirty: &'static Arc<crate::dirty::DirtyDirs> =
+            Box::leak(Box::new(Arc::new(crate::dirty::DirtyDirs::new())));
+        let write_fds: &'static Arc<crate::dirty::WriteFds> =
+            Box::leak(Box::new(Arc::new(crate::dirty::WriteFds::new())));
+        ChrootCtx {
+            root,
+            readable: &[],
+            writable,
+            denied: &[],
+            mounts: &[],
+            mount_ro: &[],
+            processes,
+            dirty,
+            write_fds,
+            pid_ns: None,
+            cow_upper: None,
+            overlay_root: true,
+            overlay_upper: Some(upper),
+        }
+    }
+
+    #[test]
+    fn overlay_prestage_clones_a_lower_file_as_the_mediator() {
+        use std::os::unix::fs::MetadataExt;
+
+        let lower = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(lower.path().join("usr/local")).unwrap();
+        std::fs::write(lower.path().join("usr/local/f"), b"lower").unwrap();
+        let writable = vec![PathBuf::from("/")];
+        let processes = Arc::new(ProcessIndex::new());
+        let c = ctx_overlay(lower.path(), upper.path(), &writable, &processes);
+
+        super::prestage_overlay_path(&c, "usr/local/f").unwrap();
+
+        assert_eq!(
+            std::fs::read(upper.path().join("usr/local/f")).unwrap(),
+            b"lower"
+        );
+        assert_eq!(
+            std::fs::read(lower.path().join("usr/local/f")).unwrap(),
+            b"lower",
+            "the shared lower must keep its bytes"
+        );
+        let md = std::fs::metadata(upper.path().join("usr/local/f")).unwrap();
+        assert_eq!(
+            md.uid(),
+            unsafe { libc::getuid() },
+            "the upper copy is owned by the mediator, not by the lower's owner"
+        );
+        assert_eq!(md.mode() & 0o777, 0o644, "the lower mode is preserved");
+        assert!(
+            upper.path().join("usr/local").is_dir(),
+            "the parent directories are staged in the upper"
+        );
+    }
+
+    #[test]
+    fn overlay_prestage_only_stages_parents_for_a_new_file() {
+        let lower = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(lower.path().join("usr/local")).unwrap();
+        let writable = vec![PathBuf::from("/")];
+        let processes = Arc::new(ProcessIndex::new());
+        let c = ctx_overlay(lower.path(), upper.path(), &writable, &processes);
+
+        super::prestage_overlay_path(&c, "usr/local/new").unwrap();
+
+        assert!(upper.path().join("usr/local").is_dir());
+        assert!(!upper.path().join("usr/local/new").exists());
+    }
+
+    #[test]
+    fn overlay_prestage_regular_never_materializes_a_directory() {
+        let lower = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(lower.path().join("usr/local/d")).unwrap();
+        let writable = vec![PathBuf::from("/")];
+        let processes = Arc::new(ProcessIndex::new());
+        let c = ctx_overlay(lower.path(), upper.path(), &writable, &processes);
+
+        super::prestage_overlay_regular(&c, "usr/local/d").unwrap();
+
+        assert!(
+            !upper.path().join("usr/local/d").exists(),
+            "rename/link sources must not become an empty upper directory"
+        );
     }
 
     #[test]

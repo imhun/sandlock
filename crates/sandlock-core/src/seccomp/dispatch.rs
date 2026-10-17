@@ -1443,6 +1443,7 @@ mod handler_tests {
             cow_enabled: false,
             chroot_root: None,
             chroot_overlay: false,
+            overlay_upper: None,
             chroot_readable: Vec::new(),
             chroot_writable: Vec::new(),
             chroot_denied: Vec::new(),
