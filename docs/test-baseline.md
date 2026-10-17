@@ -1409,7 +1409,9 @@ cli = 100     # 2026-10-07: 98 -> 100, +2 for N87's nails
               # after F0.4 wiring (cli suite includes net_bind_map tests);
               # F5.1 updates the no-supervisor default validation to
               # DEFAULT_MAX_PROCESSES (256), no count change
-supervise = 57 # (2026-10-05: 56 -> 57, one case added by earlier work; see the
+supervise = 58 # 2026-10-18 (overlay dirty ledger): 57 -> 58, +1 for
+               # `test_overlay_dirty_dirs_reports_the_upper_directory`.
+               # (2026-10-05: 56 -> 57, one case added by earlier work; see the
                # stale-table note at the top of this file)
                # 2026-09-26: 55 -> 56, +1: the checkpoint reply names the captured program
                # (`test_the_checkpoint_reply_names_the_captured_program`) —— FUP-30 的教训是

@@ -1411,7 +1411,7 @@ pub(crate) async fn handle_chroot_open(
                     Ok(r) => r,
                     Err(e) => return NotifAction::Errno(e),
                 };
-            if let Some(rel) = overlay_upper_rel(ctx, &host_path) {
+            let tree_path = if let Some(rel) = overlay_upper_rel(ctx, &host_path) {
                 let staged = if is_write {
                     prestage_overlay_path(ctx, &rel)
                 } else {
@@ -1420,6 +1420,33 @@ pub(crate) async fn handle_chroot_open(
                 if let Err(e) = staged {
                     return NotifAction::Errno(e);
                 }
+                ctx.overlay_upper
+                    .map(|upper| upper.join(&rel))
+                    .unwrap_or_else(|| host_path.clone())
+            } else {
+                // A workspace/volume path: the kernel opens it, but its
+                // directory still has to enter the incremental ledger.
+                host_path.clone()
+            };
+            // N25/L2c: an open that can change bytes or existence makes its
+            // directory worth re-walking. The overlay used to return here
+            // without this, so the incremental report saw nothing even with
+            // E2B_DISK_ENFORCE_DIRTY on. The append watch is not registered
+            // (the kernel owns this open); the dirty-dir re-walk carries the
+            // size, and the N31 entry cap is still checked/credited below.
+            ctx.mark_dirty(&tree_path);
+            let creating_entry = is_write
+                && (flags as i32 & (libc::O_CREAT | libc::O_TMPFILE)) != 0
+                && !tree_path.exists();
+            if creating_entry
+                && (ctx.write_fds.is_exhausted() || ctx.write_fds.entries_exhausted())
+            {
+                return NotifAction::Errno(libc::ENOSPC);
+            }
+            if creating_entry {
+                // Best effort: the kernel may still refuse the create; over-
+                // crediting one entry is the conservative direction for a cap.
+                ctx.write_fds.credit_entry_created();
             }
         }
         // The kernel resolves the merged overlay view. Injecting a lower-path
@@ -2327,6 +2354,11 @@ pub(crate) async fn handle_chroot_write(
                 if let Err(e) = staged {
                     return NotifAction::Errno(e);
                 }
+                let tree_path = ctx
+                    .overlay_upper
+                    .map(|upper| upper.join(&rel))
+                    .unwrap_or_else(|| host_path.clone());
+                ctx.mark_dirty(&tree_path);
                 // A chown on a layer-owned file is best-effort, as it is on
                 // the alias branch: the sandbox's user namespace cannot name
                 // an arbitrary host uid, and the sandbox owns the copy either
@@ -2334,6 +2366,10 @@ pub(crate) async fn handle_chroot_write(
                 if nr == libc::SYS_fchownat {
                     return NotifAction::ReturnValue(0);
                 }
+            } else {
+                // A workspace/volume name: no overlay staging, but the
+                // incremental ledger still needs its directory.
+                ctx.mark_dirty(&host_path);
             }
         }
         return NotifAction::Continue;

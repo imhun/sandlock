@@ -2083,6 +2083,111 @@ fn test_dirty_dirs_reports_the_directory_a_write_landed_in() {
 }
 
 #[test]
+fn test_overlay_dirty_dirs_reports_the_upper_directory() {
+    // The overlay's openat/write handlers used to return to the kernel before
+    // the N25 hooks, so even with E2B_DISK_ENFORCE_DIRTY on the worker got an
+    // empty ledger and fell back to walking the whole tree. The upper side of
+    // the layer is what changed; the lower is the shared image and must never
+    // appear.
+    isolate_ctl_root();
+    // The layer's upper/work cannot live on the container's overlay root
+    // (mount(2) answers EINVAL); /dev/shm is a tmpfs, like the integration
+    // suite's overlay fixture.
+    let workdir = std::path::PathBuf::from(format!(
+        "/dev/shm/sandlock-overlay-dirty-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&workdir).expect("create overlay dirty workdir");
+    let rootfs = chroot_rootfs(&workdir);
+    let layer = workdir.join("layer");
+    std::fs::create_dir_all(layer.join("upper")).expect("create upper");
+    std::fs::create_dir_all(layer.join("work")).expect("create work");
+    // The host's /tmp bind is deliberately absent: the write has to land in
+    // the image's /tmp, which the overlay owns.
+    let mut mounts = chroot_mounts();
+    mounts.retain(|mount| !mount.starts_with("/tmp:"));
+    let policy = write_policy(
+        "overlay-dirty-verb",
+        &serde_json::json!({
+            "chroot": rootfs,
+            "real_root": true,
+            "rootfs_canonical": "overlay",
+            "rootfs_layer": layer,
+            "fs_mount": mounts,
+            "fs_readable": ["/"],
+            "fs_writable": ["/"],
+        })
+        .to_string(),
+    );
+    let script = "mkdir -p /tmp/sub && printf hi > /tmp/sub/blob.bin && exec sleep 30";
+    let program = write_policy(
+        "overlay-dirty-program",
+        &serde_json::json!({ "argv": ["/bin/sh", "-c", script] }).to_string(),
+    );
+    let (mut child, mut worker, _events) =
+        spawn_serve_supervisor_with_events(&policy, &program, &[]);
+    std::thread::sleep(Duration::from_millis(300));
+    if let Some(status) = child.try_wait().expect("supervisor try_wait") {
+        use std::io::Read;
+        let mut error = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut error);
+        }
+        panic!("the overlay supervisor exited {status}: {error}");
+    }
+    let stats = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "stats", "args": {} }),
+    );
+    if !stats["ok"].as_bool().unwrap_or(false) {
+        let out = child.wait_with_output().expect("supervisor output");
+        panic!(
+            "the overlay supervisor did not start: {stats:?}; stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let upper_sub = layer.join("upper").join("tmp").join("sub");
+    let written = upper_sub.join("blob.bin");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    wait_until(deadline, "the overlay workload to write its file", || {
+        written.exists()
+    });
+
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "dirty_dirs", "args": {} }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "dirty_dirs: {resp:?}");
+    let dirs: Vec<String> = resp["data"]["dirs"]
+        .as_array()
+        .expect("dirs array")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    let expected = upper_sub.to_string_lossy().into_owned();
+    assert!(
+        dirs.contains(&expected),
+        "the upper directory the file landed in must be reported; got {dirs:?}"
+    );
+    let lower = rootfs.join("tmp").join("sub").to_string_lossy().into_owned();
+    assert!(
+        !dirs.iter().any(|dir| dir == &lower),
+        "the shared lower must never enter the ledger; got {dirs:?}"
+    );
+
+    let resp = roundtrip_frame(
+        &mut worker,
+        &serde_json::json!({ "v": 1, "verb": "shutdown", "args": {} }),
+    );
+    assert_eq!(resp["ok"], serde_json::Value::Bool(true), "shutdown: {resp:?}");
+    let _ = child.wait_with_output();
+    let _ = std::fs::remove_file(&policy);
+    let _ = std::fs::remove_file(&program);
+    let _ = std::fs::remove_dir_all(&workdir);
+}
+
+#[test]
 fn test_events_fd_reports_a_running_writers_growth() {
     isolate_ctl_root();
     let workdir =
