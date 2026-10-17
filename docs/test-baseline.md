@@ -347,7 +347,9 @@
 # cut to zero (give up at once) the old pooled-thread shape failed 18 of 20
 # probe cycles on `PTRACE_SEIZE tid 68: Operation not permitted` while the
 # per-freeze thread passed the same shape in 6.2 s.
-core_lib = 961 # 2026-10-17 (overlay write pre-staging): 958 -> 961, +3 for
+core_lib = 964 # 2026-10-17 (overlay dir manifest): 961 -> 964, +3 for the
+# manifest/descriptor-walk cases in realroot::tests.
+# 2026-10-17 (overlay write pre-staging): 958 -> 961, +3 for
 # the FICLONE/parent-dir staging cases in chroot::dispatch.
 # 2026-10-16 (writable rootfs COW, a named layer is adopted):
                # 956 -> 958, +2 -- `cow::seccomp::tests::a_named_layer_is_adopted_
@@ -789,7 +791,9 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 596 # 2026-10-17 (overlay write pre-staging): 595 -> 596, +1 for
+core_integ = 597 # 2026-10-17 (overlay dir manifest): 596 -> 597, +1 for
+# `test_chroot_overlay_builds_the_skeleton_from_the_dir_manifest`.
+# 2026-10-17 (overlay write pre-staging): 595 -> 596, +1 for
 # `test_chroot_overlay_a_directory_created_in_the_rootfs_is_usable`.
 # (overlayfs S1: +5 overlay/alias shape cases.)
                  # 589 -> 590, +1 -- `test_chroot::test_chroot_cow_fchown_on_a_

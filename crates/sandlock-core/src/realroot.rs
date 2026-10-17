@@ -464,54 +464,326 @@ fn validate_overlay_layer(
 /// then `touch merged/usr/local/new`). The files themselves stay lazy: the
 /// mediator reflinks one only when the sandbox writes it.
 fn build_overlay_dir_skeleton(lower: &Path, upper: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
+    // `mkdirat(..., 0755)` goes through the umask; the old path chmod-ed every
+    // directory afterwards. Pin the mask for the walk and put the workload's
+    // own mask back before it inherits this process.
+    let previous_umask = unsafe { libc::umask(0o022) };
+    let outcome = match build_overlay_dir_skeleton_from_manifest(lower, upper) {
+        Ok(()) => {
+            note("overlay dir skeleton: manifest");
+            Ok(())
+        }
+        Err(_) => {
+            // No manifest (an entry published before the sidecar existed, or a
+            // test rootfs) is the normal fallback, not a failure: the walk is
+            // what every sandbox did before this cache.
+            note("overlay dir skeleton: walk");
+            walk_overlay_dir_skeleton(lower, upper)
+        }
+    };
+    unsafe { libc::umask(previous_umask) };
+    outcome
+}
 
-    let mut stack: Vec<(std::path::PathBuf, String)> =
-        vec![(lower.to_path_buf(), String::new())];
-    while let Some((dir, rel)) = stack.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            // A directory the sandbox cannot read needs no upper copy either;
-            // its own lookup will answer EACCES.
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            // `file_type` does not follow symlinks: `/lib -> usr/lib` is not a
-            // directory to clone, and following it could leave `lower`.
-            if !file_type.is_dir() {
-                continue;
+const OVERLAY_DIR_FLAGS: libc::c_int =
+    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+/// The image resolver writes this next to `<entry>/rootfs` (see
+/// `envd_service/runtime/image_resolver.py::_write_dir_manifest`).
+const DIR_MANIFEST_NAME: &str = ".dirs";
+const DIR_MANIFEST_HEADER: &[u8] = b"sandlock-dirs-v1\n";
+const DIR_MANIFEST_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+fn open_overlay_dir(path: &Path) -> Result<std::fs::File, std::io::Error> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let fd = unsafe { libc::openat(libc::AT_FDCWD, c.as_ptr(), OVERLAY_DIR_FLAGS) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Build the upper's directory skeleton from the image resolver's sidecar.
+///
+/// The file is a strict preorder of `(depth, name)` pairs, depth 1 being the
+/// root's children. A descriptor stack mirrors the current path, so the walk
+/// costs one `openat` + one `mkdirat` per directory and never re-reads the
+/// lower; `O_NOFOLLOW` everywhere keeps a restored upper from steering a
+/// component elsewhere. Any malformed row returns `Err` and the caller falls
+/// back to the live walk, so a missing or truncated sidecar is never fatal.
+fn build_overlay_dir_skeleton_from_manifest(
+    lower: &Path,
+    upper: &Path,
+) -> Result<(), String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let entry = lower.parent().ok_or_else(|| {
+        format!("overlay dir manifest: {} has no parent entry", lower.display())
+    })?;
+    let manifest = entry.join(DIR_MANIFEST_NAME);
+    let metadata = std::fs::symlink_metadata(&manifest)
+        .map_err(|e| format!("overlay dir manifest {}: {e}", manifest.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "overlay dir manifest {} is not a regular file",
+            manifest.display()
+        ));
+    }
+    if metadata.len() > DIR_MANIFEST_MAX_BYTES {
+        return Err(format!(
+            "overlay dir manifest {} is {} bytes, over the {} limit",
+            manifest.display(),
+            metadata.len(),
+            DIR_MANIFEST_MAX_BYTES
+        ));
+    }
+    let data = std::fs::read(&manifest)
+        .map_err(|e| format!("overlay dir manifest {}: {e}", manifest.display()))?;
+    let body = data.strip_prefix(DIR_MANIFEST_HEADER).ok_or_else(|| {
+        format!("overlay dir manifest {}: bad header", manifest.display())
+    })?;
+
+    let upper_root = open_overlay_dir(upper).map_err(|e| {
+        format!("overlay dir manifest upper {}: {e}", upper.display())
+    })?;
+    // First pass: row slices only. The second pass peeks at the next depth to
+    // decide whether this directory needs a descriptor at all -- 6 k of the
+    // base image's 11 k directories are leaves, and a leaf is created without
+    // ever being reopened.
+    let mut rows: Vec<(usize, &[u8])> = Vec::new();
+    let mut offset = 0usize;
+    while offset < body.len() {
+        if body.len() - offset < 4 {
+            return Err(format!(
+                "overlay dir manifest {}: truncated row",
+                manifest.display()
+            ));
+        }
+        let depth =
+            u16::from_le_bytes([body[offset], body[offset + 1]]) as usize;
+        let name_len =
+            u16::from_le_bytes([body[offset + 2], body[offset + 3]]) as usize;
+        offset += 4;
+        if depth == 0 || depth > 4096 {
+            return Err(format!(
+                "overlay dir manifest {}: depth {depth} out of range",
+                manifest.display()
+            ));
+        }
+        let end = offset
+            .checked_add(name_len)
+            .ok_or_else(|| "overlay dir manifest: length overflow".to_string())?;
+        if end > body.len() {
+            return Err(format!(
+                "overlay dir manifest {}: truncated name",
+                manifest.display()
+            ));
+        }
+        let name = &body[offset..end];
+        offset = end;
+        if name.is_empty()
+            || name.contains(&b'/')
+            || name == b"."
+            || name == b".."
+        {
+            return Err(format!(
+                "overlay dir manifest {}: bad name at byte {offset}",
+                manifest.display()
+            ));
+        }
+        rows.push((depth, name));
+    }
+    if rows.is_empty() {
+        return Err(format!(
+            "overlay dir manifest {} lists no directories",
+            manifest.display()
+        ));
+    }
+
+    let mut stack: Vec<std::fs::File> = Vec::new();
+    for (index, &(depth, name)) in rows.iter().enumerate() {
+        if stack.len() + 1 < depth {
+            return Err(format!(
+                "overlay dir manifest {}: depth {depth} skips a parent",
+                manifest.display()
+            ));
+        }
+        stack.truncate(depth - 1);
+        let parent_fd = stack
+            .last()
+            .map(|file| file.as_raw_fd())
+            .unwrap_or_else(|| upper_root.as_raw_fd());
+        let name_c = std::ffi::CString::new(name).map_err(|_| {
+            format!(
+                "overlay dir manifest {}: NUL in a name",
+                manifest.display()
+            )
+        })?;
+        if unsafe { libc::mkdirat(parent_fd, name_c.as_ptr(), 0o755) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EEXIST) {
+                return Err(format!(
+                    "overlay dir manifest {}: {e}",
+                    manifest.display()
+                ));
             }
-            let name = entry.file_name();
-            let child_rel = if rel.is_empty() {
-                name.to_string_lossy().into_owned()
-            } else {
-                format!("{rel}/{}", name.to_string_lossy())
+        }
+        let has_child = rows
+            .get(index + 1)
+            .map(|&(next, _)| next == depth + 1)
+            .unwrap_or(false);
+        if has_child {
+            let child = unsafe {
+                libc::openat(parent_fd, name_c.as_ptr(), OVERLAY_DIR_FLAGS)
             };
-            let dest = upper.join(&child_rel);
-            match std::fs::create_dir(&dest) {
-                Ok(()) => {
-                    // The child runs with the sandbox's umask; the alias route
-                    // creates upper parents 0755, so keep the shapes equal.
-                    let _ = std::fs::set_permissions(
-                        &dest,
-                        std::fs::Permissions::from_mode(0o755),
-                    );
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => {
-                    return Err(format!(
-                        "overlay dir skeleton {}: {e}",
-                        dest.display()
-                    ))
-                }
+            if child < 0 {
+                return Err(format!(
+                    "overlay dir manifest {}: cannot open a directory with \
+                     children: {}",
+                    manifest.display(),
+                    std::io::Error::last_os_error()
+                ));
             }
-            stack.push((entry.path(), child_rel));
+            stack.push(unsafe { std::fs::File::from_raw_fd(child) });
         }
     }
     Ok(())
+}
+
+/// The walk itself, one `openat`/`mkdirat` per directory and no per-directory
+/// `chmod`.
+///
+/// The path-shaped version (`create_dir(upper.join(rel))` +
+/// `set_permissions`) resolves the whole relative path twice for every one of
+/// the base image's ~11 k directories. Holding the parent's descriptor and
+/// naming the child once cuts that to one lookup, and the mode comes from the
+/// pinned umask instead of a second syscall. Descending through descriptors
+/// also refuses to follow a component the upper may have grown (a restored
+/// tree can carry a symlink where the lower has a directory); the path shape
+/// would have followed it.
+fn walk_overlay_dir_skeleton(lower: &Path, upper: &Path) -> Result<(), String> {
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    /// Owns the `DIR*` `fdopendir` took the descriptor for.
+    struct DirStream(*mut libc::DIR);
+
+    impl DirStream {
+        fn from_fd(fd: std::os::fd::RawFd) -> Option<Self> {
+            let dir = unsafe { libc::fdopendir(fd) };
+            if dir.is_null() {
+                unsafe { libc::close(fd) };
+                return None;
+            }
+            Some(Self(dir))
+        }
+
+        fn fd(&self) -> std::os::fd::RawFd {
+            unsafe { libc::dirfd(self.0) }
+        }
+    }
+
+    impl Drop for DirStream {
+        fn drop(&mut self) {
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+
+    /// Depth-first, one directory at a time: two descriptors per depth level,
+    /// never one per pending sibling (`/opt/venv/...` has thousands of
+    /// package directories in one level).
+    fn walk(
+        src: &DirStream,
+        dst: std::os::fd::RawFd,
+        dst_path: &Path,
+        depth: usize,
+    ) -> Result<(), String> {
+        if depth > 4096 {
+            return Err(format!(
+                "overlay dir skeleton is deeper than 4096 levels at {}",
+                dst_path.display()
+            ));
+        }
+        loop {
+            let entry = unsafe { libc::readdir(src.0) };
+            if entry.is_null() {
+                break;
+            }
+            let d_type = unsafe { (*entry).d_type };
+            if d_type != libc::DT_DIR && d_type != libc::DT_UNKNOWN {
+                continue;
+            }
+            // `d_name` is only valid until the next `readdir`; everything that
+            // needs it happens before that call.
+            let name_c = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            // `readdir` hands back `.` and `..`; `std::fs::read_dir` filtered
+            // them, and following `..` would walk the tree forever.
+            if matches!(name_c.to_bytes(), b"." | b"..") {
+                continue;
+            }
+            if d_type == libc::DT_UNKNOWN {
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let rc = unsafe {
+                    libc::fstatat(
+                        src.fd(),
+                        name_c.as_ptr(),
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                if rc != 0 || st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                    continue;
+                }
+            }
+            let name = std::ffi::OsStr::from_bytes(name_c.to_bytes());
+            let dest = dst_path.join(name);
+            if unsafe { libc::mkdirat(dst, name_c.as_ptr(), 0o755) } != 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(format!(
+                        "overlay dir skeleton {}: {e}",
+                        dest.display()
+                    ));
+                }
+            }
+            let child_src =
+                unsafe { libc::openat(src.fd(), name_c.as_ptr(), OVERLAY_DIR_FLAGS) };
+            if child_src < 0 {
+                continue;
+            }
+            let child_dst =
+                unsafe { libc::openat(dst, name_c.as_ptr(), OVERLAY_DIR_FLAGS) };
+            if child_dst < 0 {
+                unsafe { libc::close(child_src) };
+                continue;
+            }
+            let child_src = match DirStream::from_fd(child_src) {
+                Some(child) => child,
+                None => {
+                    unsafe { libc::close(child_dst) };
+                    continue;
+                }
+            };
+            let child_dst = unsafe { std::fs::File::from_raw_fd(child_dst) };
+            walk(&child_src, child_dst.as_raw_fd(), &dest, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    let lower_root = open_overlay_dir(lower).map_err(|e| {
+        format!("overlay dir skeleton lower {}: {e}", lower.display())
+    })?;
+    let upper_root = open_overlay_dir(upper).map_err(|e| {
+        format!("overlay dir skeleton upper {}: {e}", upper.display())
+    })?;
+    let lower_root = DirStream::from_fd(lower_root.into_raw_fd()).ok_or_else(|| {
+        format!("overlay dir skeleton lower {}: fdopendir", lower.display())
+    })?;
+    walk(&lower_root, upper_root.as_raw_fd(), upper, 0)
 }
 
 fn overlay_option_path(role: &str, path: &Path) -> Result<String, String> {
@@ -594,5 +866,83 @@ mod tests {
         assert_eq!(MS_REC, 16384);
         assert_eq!(MS_PRIVATE, 262144);
         assert_eq!(MNT_DETACH, 2);
+    }
+
+    fn manifest(rows: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut out = DIR_MANIFEST_HEADER.to_vec();
+        for (depth, name) in rows {
+            out.extend_from_slice(&depth.to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(name);
+        }
+        out
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "sandlock-realroot-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(path.join("lower/usr/lib")).unwrap();
+        std::fs::create_dir_all(path.join("lower/opt/one/two")).unwrap();
+        std::fs::create_dir_all(path.join("upper")).unwrap();
+        path
+    }
+
+    #[test]
+    fn the_manifest_builds_every_directory_without_reading_the_lower() {
+        let root = scratch("manifest-ok");
+        std::fs::write(
+            root.join(".dirs"),
+            manifest(&[
+                (1, b"usr"),
+                (2, b"lib"),
+                (1, b"opt"),
+                (2, b"one"),
+                (3, b"two"),
+            ]),
+        )
+        .unwrap();
+        build_overlay_dir_skeleton(&root.join("lower"), &root.join("upper"))
+            .expect("the manifest walk must succeed");
+        for relative in ["usr", "usr/lib", "opt", "opt/one", "opt/one/two"] {
+            assert!(
+                root.join("upper").join(relative).is_dir(),
+                "{relative} must exist in the upper"
+            );
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(root.join("upper/usr"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_truncated_manifest_falls_back_to_the_lower_walk() {
+        let root = scratch("manifest-truncated");
+        let mut bytes = manifest(&[(1, b"usr"), (2, b"lib")]);
+        bytes.truncate(bytes.len() - 1);
+        std::fs::write(root.join(".dirs"), bytes).unwrap();
+        build_overlay_dir_skeleton(&root.join("lower"), &root.join("upper"))
+            .expect("the walk must still build the tree");
+        assert!(root.join("upper/usr/lib").is_dir());
+        assert!(root.join("upper/opt/one/two").is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_manifest_that_skips_a_parent_is_refused() {
+        let root = scratch("manifest-depth");
+        std::fs::write(root.join(".dirs"), manifest(&[(2, b"lib")])).unwrap();
+        assert!(build_overlay_dir_skeleton_from_manifest(
+            &root.join("lower"),
+            &root.join("upper")
+        )
+        .is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

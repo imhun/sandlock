@@ -3957,6 +3957,69 @@ async fn test_chroot_overlay_writes_the_upper_and_not_the_lower() {
     let _ = fs::remove_dir_all(&layer);
 }
 
+/// The resolver's directory manifest is the fast path: a row the lower does
+/// not have proves the build read the sidecar instead of walking the image.
+#[tokio::test]
+async fn test_chroot_overlay_builds_the_skeleton_from_the_dir_manifest() {
+    let rootfs = build_test_rootfs("overlay-manifest");
+    fs::create_dir_all(rootfs.join("usr/local")).unwrap();
+    let layer = fresh_overlay_layer("overlay-manifest-layer");
+    fs::create_dir_all(layer.join("upper")).unwrap();
+    fs::create_dir_all(layer.join("work")).unwrap();
+
+    let entry = rootfs.parent().unwrap();
+    let manifest = entry.join(".dirs");
+    let mut bytes = b"sandlock-dirs-v1\n".to_vec();
+    for (depth, name) in [
+        (1u16, b"usr".as_slice()),
+        (2, b"local".as_slice()),
+        (1, b"manifest-extra".as_slice()),
+    ] {
+        bytes.extend_from_slice(&depth.to_le_bytes());
+        bytes.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(name);
+    }
+    fs::write(&manifest, bytes).unwrap();
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/")
+        .fs_write("/")
+        .rootfs_canonical(RootfsCanonical::Overlay)
+        .rootfs_layer(&layer)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "/usr/bin/rootfs-helper",
+            "write",
+            "/usr/local/manifest-only",
+            "hello",
+        ])
+        .await
+        .expect("the overlay sandbox must be creatable");
+
+    assert_eq!(result.code(), Some(0), "stderr={:?}", result.stderr_str());
+    assert!(
+        layer.join("upper/manifest-extra").is_dir(),
+        "the manifest row must have built the upper skeleton"
+    );
+    assert!(
+        layer.join("upper/usr/local/manifest-only").is_file(),
+        "a write must still land in the upper"
+    );
+    assert!(
+        !rootfs.join("usr/local/manifest-only").exists(),
+        "the lower must remain unchanged"
+    );
+
+    let _ = fs::remove_file(&manifest);
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&layer);
+}
+
 /// Metadata-changing syscalls also target the merged overlay, never the lower.
 #[tokio::test]
 async fn test_chroot_overlay_mkdir_targets_the_upper_and_not_the_lower() {
