@@ -787,7 +787,14 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 589 # 2026-10-16 (writable rootfs COW, the exec alias out of argv):
+core_integ = 590 # 2026-10-17 (writable rootfs COW, the fd spelling of chown):
+                 # 589 -> 590, +1 -- `test_chroot::test_chroot_cow_fchown_on_a_
+                 # branch_owned_file_is_softened`. The sandbox's uid map carries
+                 # one uid, so `fchown` to anything else is EINVAL from the
+                 # kernel; the path spelling was already a best-effort no-op for
+                 # a branch-owned file, and the fd spelling -- the one GNU tar
+                 # uses -- was not in the notify table at all.
+                 # 2026-10-16 (writable rootfs COW, the exec alias out of argv):
                  # 588 -> 589, +1 -- `test_chroot::test_chroot_cow_a_script_is_
                  # handed_its_own_canonical_path`. A staged `#!` script can only
                  # be named to the kernel through the read-only exec alias, and

@@ -2713,6 +2713,72 @@ async fn test_chroot_cow_owned_writes_never_land_on_the_lower() {
     let _ = fs::remove_dir_all(&storage);
 }
 
+/// `fchown` — the **fd** spelling of `chown` — is softened like `chown`.
+///
+/// The sandbox's uid map carries one uid, so a `chown` to anything else is
+/// EINVAL from the kernel. The path-based spelling is already a best-effort
+/// no-op for a file the branch owns (`handle_chown`), but the fd spelling was
+/// not in the notify table at all, so it went straight to the kernel — and that
+/// is the call GNU tar makes when it restores an archive's owners. Measured on
+/// the lane 2026-10-17: `chown 1001:1001` rc=0, `os.fchown(fd, 1001, 1001)`
+/// EINVAL, and `tar -xzf` of a tarball carrying foreign owners exits 2 because
+/// of it — which is what made `npm install -g @larksuite/cli`'s postinstall
+/// fail.
+#[tokio::test]
+async fn test_chroot_cow_fchown_on_a_branch_owned_file_is_softened() {
+    let rootfs = build_test_rootfs("cow-fchown");
+    fs::create_dir_all(rootfs.join("usr/local")).unwrap();
+    let storage = temp_dir("cow-fchown-layer");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .workdir(&rootfs)
+        .fs_storage(&storage)
+        .on_exit(BranchAction::Keep)
+        .on_error(BranchAction::Keep)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "echo hi > /usr/local/cow-f && fchown /usr/local/cow-f 1001 1001 && echo fchown-ok",
+        ])
+        .await
+        .expect("the chroot sandbox must be creatable (N14 S5: the real root is the only shape)");
+
+    assert_eq!(
+        result.stdout_str().unwrap_or_default(),
+        "fchown-ok",
+        "the fd spelling must be softened the way the path spelling is; \
+         stderr={:?} code={:?}",
+        result.stderr_str(),
+        result.code()
+    );
+    assert_eq!(result.code(), Some(0), "stderr={:?}", result.stderr_str());
+    assert!(
+        !rootfs.join("usr/local/cow-f").exists(),
+        "the lower gains nothing"
+    );
+    let branch_dir = fs::read_dir(&storage)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.is_dir())
+        .unwrap();
+    assert!(branch_dir.join("upper/usr/local/cow-f").is_file());
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&storage);
+}
+
 /// A `#!` script's path reaches the program in the **sandbox's** spelling.
 ///
 /// `realroot` mounts the branch's upper read-only at `/.u`, and that is the only

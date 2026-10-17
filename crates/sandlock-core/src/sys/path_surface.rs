@@ -77,6 +77,10 @@ pub(crate) const MEDIATED_PATH_SYSCALLS: &[&str] = &[
     "fchmodat",
     "fchmodat2",
     "fchownat",
+    // The fd spelling: GNU tar restores an archive's owners through it, and the
+    // chroot mediator softens it the same way it softens `chown`/`fchownat`
+    // (see `chroot::dispatch::handle_chroot_write`'s `SYS_fchown` arm).
+    "fchown",
     "truncate",
     "readlinkat",
     "getdents64",
@@ -379,6 +383,7 @@ pub(crate) const PURE_GATED_ELSEWHERE: &[(&str, &str)] = &[
     ("chown", "ownership/DAC only, no Landlock right: the sandbox owns nothing outside its workspace"),
     ("lchown", "ownership/DAC only, see chown"),
     ("fchownat", "ownership/DAC only, see chown"),
+    ("fchown", "ownership/DAC only, see chown; the fd spelling GNU tar uses"),
     ("fanotify_mark", "fanotify_init needs CAP_SYS_ADMIN in the initial userns (measured EPERM)"),
     ("move_mount", "blocklisted in every shape (2026-09-30); no Landlock right covers it"),
     ("fspick", "blocklisted in every shape (2026-09-30), see move_mount"),
@@ -469,7 +474,7 @@ pub(crate) const NON_PATH_SYSCALLS: &[&str] = &[
     "getsockopt", "clone", "fork", "vfork",
     "exit", "wait4", "kill", "uname",
     "fcntl", "flock", "fsync", "fdatasync",
-    "ftruncate", "fchmod", "fchown", "umask",
+    "ftruncate", "fchmod", "umask",
     "gettimeofday", "getrlimit", "getrusage", "sysinfo",
     "times", "getuid", "syslog", "getgid",
     "setuid", "setgid", "geteuid", "getegid",

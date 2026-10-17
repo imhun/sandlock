@@ -80,7 +80,33 @@ static int cmd_pwd(void) {
     return 1;
 }
 
-/* ── fork-pwd: the same `pwd`, in a forked child ────────────────── */
+/* ── fchown: the fd spelling of chown ───────────────────────────── */
+/*
+ * `fchown(fd, uid, gid)` on an open descriptor -- the spelling GNU tar uses
+ * when it restores an archive's owners, and the one a sandbox's uid mapping
+ * refuses with EINVAL unless the mediator softens it.
+ */
+static int cmd_fchown(int argc, char **argv) {
+    if (argc < 3) {
+        fprintf(stderr, "fchown: need <path> <uid> <gid>\n");
+        return 2;
+    }
+    int fd = open(argv[0], O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "fchown: open %s: %s\n", argv[0], strerror(errno));
+        return 1;
+    }
+    uid_t uid = (uid_t)strtoul(argv[1], NULL, 10);
+    gid_t gid = (gid_t)strtoul(argv[2], NULL, 10);
+    if (fchown(fd, uid, gid) < 0) {
+        fprintf(stderr, "fchown: %s: %s\n", argv[0], strerror(errno));
+        close(fd);
+        return 1;
+    }
+    close(fd);
+    return 0;
+}
+
 /* ── relay: exec this helper's `echo` with the paths it was handed ─ */
 /*
  * The `#!` shape a real CLI ships (`#!/usr/bin/env node`): the kernel hands the
@@ -1026,6 +1052,7 @@ static int dispatch(const char *cmd, int argc, char **argv) {
     if (strcmp(cmd, "pwd") == 0)            return cmd_pwd();
     if (strcmp(cmd, "fork-pwd") == 0)       return cmd_fork_pwd(argc, argv);
     if (strcmp(cmd, "relay") == 0)          return cmd_relay(argc, argv);
+    if (strcmp(cmd, "fchown") == 0)         return cmd_fchown(argc, argv);
     if (strcmp(cmd, "readlink") == 0)       return cmd_readlink(argc, argv);
     if (strcmp(cmd, "stat") == 0)           return cmd_stat(argc, argv);
     if (strcmp(cmd, "mkdir") == 0)          return cmd_mkdir(argc, argv);

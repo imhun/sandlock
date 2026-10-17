@@ -1079,7 +1079,13 @@ fn register_chroot_handlers(
     let mut write_nrs = vec![
         libc::SYS_unlinkat, libc::SYS_mkdirat, libc::SYS_renameat2,
         libc::SYS_symlinkat, libc::SYS_linkat, libc::SYS_fchmodat,
-        libc::SYS_fchownat, libc::SYS_truncate,
+        libc::SYS_fchownat,
+        // The fd spelling: GNU tar restores an archive's owners through it,
+        // and left to the kernel it answers EINVAL for a uid outside the
+        // sandbox's mapping even on a file the branch owns (see
+        // `handle_chroot_write`'s `SYS_fchown` arm).
+        libc::SYS_fchown,
+        libc::SYS_truncate,
     ];
     // glibc reaches `chmod`/`fchmodat(AT_SYMLINK_NOFOLLOW)` through
     // `fchmodat2`, and the filter traps it (`chroot_path_syscalls`), so the

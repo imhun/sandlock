@@ -281,6 +281,14 @@ pub(crate) fn chroot_path_syscalls() -> Vec<i64> {
         // blocklisting it would break `chmod` inside the sandbox.
         arch::SYS_FCHMODAT2,
         libc::SYS_fchownat,
+        // The fd spelling of `fchownat`, and the one GNU tar uses when it
+        // restores an archive's owners. Left to the kernel it answers EINVAL
+        // for a uid outside the sandbox's mapping -- even for a file the
+        // branch owns, where the path-based spelling is already a best-effort
+        // no-op (measured on the lane 2026-10-17: `chown 1001:1001` rc=0,
+        // `os.fchown(fd, 1001, 1001)` EINVAL, and `tar -xzf` of a tarball
+        // carrying foreign owners exits 2 because of it).
+        libc::SYS_fchown,
         libc::SYS_truncate,
         // N81: the *metadata* half of the stat family is deliberately absent
         // here. It is a gate, not a translation: with a root of the sandbox's

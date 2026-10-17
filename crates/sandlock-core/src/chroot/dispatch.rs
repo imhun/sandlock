@@ -2463,6 +2463,68 @@ pub(crate) async fn handle_chroot_write(
         );
     }
 
+    // `fchown(fd, uid, gid)` -- the fd spelling of `fchownat`, and the one GNU
+    // tar uses when it restores an archive's owners. Left to the kernel it
+    // answers EINVAL for a uid outside the sandbox's mapping, even on a file
+    // the branch owns, where the path-based spelling is already a best-effort
+    // no-op. Measured on the lane 2026-10-17: `chown 1001:1001` rc=0,
+    // `os.fchown(fd, 1001, 1001)` EINVAL, and `tar -xzf` of a tarball carrying
+    // foreign owners exits 2 because of it -- which is what made
+    // `npm install -g @larksuite/cli`'s postinstall fail.
+    if nr == libc::SYS_fchown {
+        let fd = notif.data.args[0] as i32;
+        // The descriptor names the file the same way a dirfd names a
+        // directory: the kernel renders its host path, and the reverse lookup
+        // turns that back into the sandbox's spelling (the branch's key when
+        // the file lives in its upper -- the F4 round made that the canonical
+        // answer).
+        let host_path = match std::fs::read_link(format!("/proc/{}/fd/{}", notif.pid, fd)) {
+            Ok(path) => path,
+            Err(err) => return NotifAction::Errno(err.raw_os_error().unwrap_or(libc::EBADF)),
+        };
+        let vp = match ctx.reported_path_virtual(notif.pid, &host_path) {
+            Some(vp) => vp,
+            None => return NotifAction::Errno(libc::EACCES),
+        };
+        // The branch keys its tree by the **lower** spelling: a descriptor on a
+        // file the sandbox staged renders `<upper>/<rel>`, which `matches`
+        // deliberately excludes, so the key handed to the branch has to be the
+        // rootfs spelling of the same name (the F4 round made that the reverse
+        // lookup's answer too).
+        let branch_key = match ctx
+            .cow_upper
+            .and_then(|upper| host_path.strip_prefix(upper).ok())
+        {
+            Some(rel) => ctx.root.join(rel),
+            None => host_path.clone(),
+        };
+        if ctx.write_hard_denied(&vp)
+            || (!ctx.can_write(&vp) && !cow_owns(cow_state, &branch_key).await)
+        {
+            return NotifAction::Errno(libc::EACCES);
+        }
+        let uid = notif.data.args[1] as u32;
+        let gid = notif.data.args[2] as u32;
+        {
+            let mut cs = cow_state.lock().await;
+            if let Some(cow) = cs.branch.as_mut() {
+                let s = branch_key.to_string_lossy();
+                if cow.matches(&s) {
+                    match cow.handle_chown(&s, uid, gid) {
+                        Ok(true) => return NotifAction::ReturnValue(0),
+                        Err(crate::error::BranchError::QuotaExceeded) => {
+                            return NotifAction::Errno(libc::ENOSPC)
+                        }
+                        // Owned and not staged: the mediator's own refusal,
+                        // never `chown` on the lower.
+                        _ => return NotifAction::Errno(libc::EPERM),
+                    }
+                }
+            }
+        }
+        return exec_on_host(|p| unsafe { libc::chown(p, uid, gid) }, &host_path);
+    }
+
     if nr == libc::SYS_truncate {
         let path = match read_path(notif, notif.data.args[0], notif_fd) {
             Some(p) => p,
