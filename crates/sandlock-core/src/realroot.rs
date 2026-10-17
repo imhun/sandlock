@@ -232,8 +232,17 @@ pub fn real_root(
     mounts: &[(PathBuf, PathBuf)],
     mount_ns_ready: bool,
     cow_upper: Option<&Path>,
+    overlay_layer: Option<&Path>,
+    overlay_landlock: Option<(&std::os::fd::OwnedFd, &crate::sandbox::Sandbox)>,
 ) -> Result<(), String> {
-    let outcome = build(root, mounts, mount_ns_ready, cow_upper);
+    let outcome = build(
+        root,
+        mounts,
+        mount_ns_ready,
+        cow_upper,
+        overlay_layer,
+        overlay_landlock,
+    );
     if let Err(ref e) = outcome {
         record_failure(e);
     }
@@ -245,6 +254,8 @@ fn build(
     mounts: &[(PathBuf, PathBuf)],
     mount_ns_ready: bool,
     cow_upper: Option<&Path>,
+    overlay_layer: Option<&Path>,
+    overlay_landlock: Option<(&std::os::fd::OwnedFd, &crate::sandbox::Sandbox)>,
 ) -> Result<(), String> {
     // 1. Our own mount namespace, owned by our own user namespace: every mount
     //    below is invisible to the host and dies with this process, and no
@@ -261,6 +272,45 @@ fn build(
     // 2. Nothing propagates into (or out of) the host's mount tree.
     mount(None, Path::new("/"), None, MS_REC | MS_PRIVATE, None)?;
     note("make-private");
+    // 2b. The overlay root is mounted over the rootfs path itself, before the
+    //     policy mounts, so those binds land in the merged view. The kernel
+    //     resolves lowerdir before attaching this mount; the lower inode and
+    //     bytes are never modified.
+    if let Some(layer) = overlay_layer {
+        let upper = layer.join("upper");
+        let work = layer.join("work");
+        validate_overlay_layer(root, layer, &upper, &work)?;
+        let lower = overlay_option_path("lower", root)?;
+        let upper = overlay_option_path("upper", &upper)?;
+        let work = overlay_option_path("work", &work)?;
+        let data = format!(
+            "lowerdir={lower},upperdir={upper},workdir={work},userxattr"
+        );
+        mount(
+            Some(Path::new("overlay")),
+            root,
+            Some("overlay"),
+            0,
+            Some(&data),
+        )
+        .map_err(|e| {
+            format!(
+                "overlay rootfs mount over {} with layer {}: {e}",
+                root.display(),
+                layer.display()
+            )
+        })?;
+        if let Some((ruleset, policy)) = overlay_landlock {
+            crate::landlock::add_overlay_root_rule(ruleset, root, policy)
+                .map_err(|e| format!("overlay root Landlock rule: {e}"))?;
+        }
+        note(&format!(
+            "overlay rootfs lower={} upper={} work={}",
+            root.display(),
+            layer.join("upper").display(),
+            layer.join("work").display()
+        ));
+    }
     // 3. The policy's mounts, inside the rootfs.
     for (virtual_path, host_path) in mounts {
         if !host_path.exists() {
@@ -326,6 +376,10 @@ fn build(
     //    relative-path exec answering ENOENT while absolute paths worked.
     mount(Some(root), root, None, MS_BIND | MS_REC, None)?;
     note("self-bind rootfs (recursive, carries the mounts)");
+    if let Some((ruleset, policy)) = overlay_landlock {
+        crate::landlock::add_overlay_root_rule(ruleset, root, policy)
+            .map_err(|e| format!("overlay self-bind Landlock rule: {e}"))?;
+    }
     // 5. pivot_root with the "." idiom (see pivot_root(2) NOTES): chdir to the
     //    new root first, pivot with both arguments ".", then detach the old
     //    root -- which leaves no reachable path back to the host filesystem.
@@ -357,6 +411,60 @@ fn build(
     chdir(Path::new("/"))?;
     note("chdir /");
     Ok(())
+}
+
+fn validate_overlay_layer(
+    root: &Path,
+    layer: &Path,
+    upper: &Path,
+    work: &Path,
+) -> Result<(), String> {
+    if !root.is_dir() {
+        return Err(format!(
+            "overlay lower is missing or not a directory: {}",
+            root.display()
+        ));
+    }
+    if !layer.is_dir() {
+        return Err(format!(
+            "overlay layer is missing or not a directory: {}",
+            layer.display()
+        ));
+    }
+    for (name, path) in [("upper", upper), ("work", work)] {
+        if !path.is_dir() {
+            return Err(format!(
+                "overlay {name} is missing or not a directory: {}",
+                path.display()
+            ));
+        }
+    }
+    let mut entries = std::fs::read_dir(work).map_err(|e| {
+        format!(
+            "overlay work is not readable: {}: {e}",
+            work.display()
+        )
+    })?;
+    if entries.next().is_some() {
+        return Err(format!(
+            "overlay work must be empty at mount time: {}",
+            work.display()
+        ));
+    }
+    Ok(())
+}
+
+fn overlay_option_path(role: &str, path: &Path) -> Result<String, String> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| format!("overlay {role} path is not valid UTF-8: {}", path.display()))?;
+    if value.contains(',') {
+        return Err(format!(
+            "overlay {role} path contains ',', which cannot be represented in mount options: {}",
+            path.display()
+        ));
+    }
+    Ok(value.to_string())
 }
 
 /// Give up `CAP_SYS_ADMIN`, keeping every other capability.

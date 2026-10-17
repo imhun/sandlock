@@ -451,6 +451,35 @@ fn default_control_socket() -> bool {
     true
 }
 
+/// How a writable image rootfs is presented to the sandbox.
+///
+/// `alias` is the historical seccomp-COW shape: the shared rootfs is the COW
+/// lower and the branch upper is exposed at `/.u`. `overlay` asks `realroot` to
+/// mount one kernel overlay over the rootfs, using `rootfs_layer/{upper,work}`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+pub enum RootfsCanonical {
+    #[default]
+    Alias,
+    Overlay,
+}
+
+impl RootfsCanonical {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Alias => "alias",
+            Self::Overlay => "overlay",
+        }
+    }
+}
+
+impl std::fmt::Display for RootfsCanonical {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Sandbox configuration.
 #[derive(Serialize, Deserialize)]
 pub struct Sandbox {
@@ -756,6 +785,16 @@ pub struct Sandbox {
     #[serde(default)]
     pub real_root: bool,
 
+    /// How the image rootfs is made writable. Kept out of serialized policy
+    /// shapes so the default alias document stays byte-for-byte unchanged.
+    #[serde(skip, default)]
+    pub rootfs_canonical: RootfsCanonical,
+
+    /// The named layer directory for [`RootfsCanonical::Overlay`]; its
+    /// `upper/` and `work/` children belong to this one sandbox.
+    #[serde(skip)]
+    pub rootfs_layer: Option<PathBuf>,
+
     /// Self-map the supervisor's own host uid to in-namespace uid 0 (see
     /// `SandboxBuilder::userns_self_map`): how a route-B slot restores
     /// "root inside the sandbox, host uid outside". Honoured by both writers
@@ -908,6 +947,8 @@ impl Clone for Sandbox {
             no_supervisor: self.no_supervisor,
             pid_ns: self.pid_ns,
             real_root: self.real_root,
+            rootfs_canonical: self.rootfs_canonical,
+            rootfs_layer: self.rootfs_layer.clone(),
             userns_self_map: self.userns_self_map,
             control_socket: self.control_socket,
             user: self.user,
@@ -965,9 +1006,72 @@ impl Sandbox {
 
     /// Validate cross-section invariants — checks that span multiple fields.
     ///
-    /// Currently a no-op; retained as an extension point and for API
-    /// stability. Idempotent: calling repeatedly is safe.
+    /// Idempotent: calling repeatedly is safe.
     pub fn validate(&self) -> Result<(), SandboxError> {
+        match self.rootfs_canonical {
+            RootfsCanonical::Alias => {
+                if self.rootfs_layer.is_some() {
+                    return Err(SandboxError::Invalid(
+                        "rootfs_layer is only valid with rootfs_canonical=overlay".into(),
+                    ));
+                }
+            }
+            RootfsCanonical::Overlay => {
+                if !self.real_root {
+                    return Err(SandboxError::Invalid(
+                        "rootfs_canonical=overlay requires real_root=true".into(),
+                    ));
+                }
+                let Some(root) = self.chroot.as_deref() else {
+                    return Err(SandboxError::Invalid(
+                        "rootfs_canonical=overlay requires a chroot (the lower image rootfs)"
+                            .into(),
+                    ));
+                };
+                if !root.is_dir() {
+                    return Err(SandboxError::Invalid(format!(
+                        "rootfs_canonical=overlay lower is missing or not a directory: {}",
+                        root.display()
+                    )));
+                }
+                let Some(layer) = self.rootfs_layer.as_deref() else {
+                    return Err(SandboxError::Invalid(
+                        "rootfs_canonical=overlay requires rootfs_layer".into(),
+                    ));
+                };
+                if !layer.is_dir() {
+                    return Err(SandboxError::Invalid(format!(
+                        "rootfs_canonical=overlay layer is missing or not a directory: {}",
+                        layer.display()
+                    )));
+                }
+                for (name, path) in [
+                    ("upper", layer.join("upper")),
+                    ("work", layer.join("work")),
+                ] {
+                    if !path.is_dir() {
+                        return Err(SandboxError::Invalid(format!(
+                            "rootfs_canonical=overlay {name} is missing or not a directory: {}",
+                            path.display()
+                        )));
+                    }
+                }
+                let work = layer.join("work");
+                let mut entries = std::fs::read_dir(&work).map_err(|e| {
+                    SandboxError::Invalid(format!(
+                        "rootfs_canonical=overlay work is not readable: {}: {e}",
+                        work.display()
+                    ))
+                })?;
+                if entries.next().is_some() {
+                    return Err(SandboxError::Invalid(format!(
+                        "rootfs_canonical=overlay work must be empty at mount time: {}",
+                        work.display()
+                    )));
+                }
+            }
+        }
+
         // S2.5 inbound port mapping needs the per-sandbox loopback netns so
         // the supervisor can own the host mapped port, and the seccomp
         // supervisor to intercept listen/accept/close. Without either, the
@@ -2384,7 +2488,10 @@ impl Sandbox {
             self.fs_readable.push(shared.upper_dir.clone());
             self.cow_upper = Some(shared.upper_dir.clone());
             None
-        } else if !no_supervisor && self.workdir.is_some() {
+        } else if !no_supervisor
+            && self.workdir.is_some()
+            && self.rootfs_canonical == RootfsCanonical::Alias
+        {
             let workdir = self.workdir.as_ref().unwrap().clone();
             let storage = self.fs_storage.clone();
             let max_disk = self.max_disk.map(|b| b.0).unwrap_or(0);
@@ -3246,6 +3353,7 @@ impl Sandbox {
                 net_bind_inject: resolved.features.net_bind_inject,
                 cow_enabled: resolved.features.cow,
                 chroot_root: chroot_root.clone(),
+                chroot_overlay: self.rootfs_canonical == RootfsCanonical::Overlay,
                 chroot_readable: self.fs_readable.clone(),
                 chroot_writable: self.fs_writable.clone(),
                 chroot_denied: self.fs_denied.clone(),

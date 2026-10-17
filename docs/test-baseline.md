@@ -787,7 +787,7 @@ core_lib_fup07 = 833 # FUP-07/FUP-10 (2026-09-07, A/B cleanup wave): 828 -> 833,
                # Started branches directly through the reader
                # (late_started_without_pending_is_recorded_for_teardown,
                # started_with_dropped_receiver_is_recorded_for_teardown).
-core_integ = 590 # 2026-10-17 (writable rootfs COW, the fd spelling of chown):
+core_integ = 595 # 2026-10-17 (overlayfs S1): +5 overlay/alias shape cases.
                  # 589 -> 590, +1 -- `test_chroot::test_chroot_cow_fchown_on_a_
                  # branch_owned_file_is_softened`. The sandbox's uid map carries
                  # one uid, so `fchown` to anything else is EINVAL from the
@@ -1650,7 +1650,7 @@ oci = 157     # ROOT-MODE: run via scripts/test-all.sh --oci-root as root.
               # 56 lib + 68 bin + 15 integration.rs + 2 reaper + 3 process
               # groups = 144).
 cli_build = 0 # workspace release build gate (no test binaries; 0 = build passed)
-python = 466  # 2026-10-14 (writable rootfs COW, task 1): 465 -> 466, +1 --
+python = 468  # 2026-10-17 (overlayfs S1): +2 FFI policy declaration/refusal cases.
               # `TestUnwiredFieldWarning::test_cow_discard_is_declared_handled`:
               # the new `cow_discard` policy field must not be reported as
               # unwired (verified falsifiable: removing it from

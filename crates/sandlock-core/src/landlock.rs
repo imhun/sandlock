@@ -189,6 +189,42 @@ fn add_path_rule(ruleset_fd: &OwnedFd, path: &Path, access: u64) -> Result<(), C
     Ok(())
 }
 
+/// Add the merged overlay root to a ruleset that was built before the mount.
+///
+/// The lower-root rule was opened before `realroot` attached the overlay, so it
+/// names the lower inode, not the merged root. Overlay exposes a new root inode
+/// to Landlock; these rules are added after the mount and before enforcement.
+pub(crate) fn add_overlay_root_rule(
+    ruleset_fd: &OwnedFd,
+    root: &Path,
+    policy: &Sandbox,
+) -> Result<(), SandlockError> {
+    let abi = abi_version().map_err(|e| {
+        SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
+    })?;
+    let fs_write_mask = write_access(abi) & compute_fs_mask(abi, &policy.protection_policy);
+    add_path_rule(ruleset_fd, root, READ_ACCESS).map_err(|e| {
+        SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
+    })?;
+    for path in &policy.fs_writable {
+        let host = root.join(path.strip_prefix("/").unwrap_or(path));
+        if host.exists() {
+            add_path_rule(ruleset_fd, &host, fs_write_mask).map_err(|e| {
+                SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
+            })?;
+        }
+    }
+    for path in &policy.fs_readable {
+        let host = root.join(path.strip_prefix("/").unwrap_or(path));
+        if host.exists() {
+            add_path_rule(ruleset_fd, &host, READ_ACCESS).map_err(|e| {
+                SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// Rights to grant a mount's host source, derived from what the policy
 /// declares for the mount *point* (the sandbox-side spelling).
 ///

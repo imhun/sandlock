@@ -963,6 +963,18 @@ class TestUnwiredFieldWarning:
             _policy(cow_discard=True).run(["echo", "ok"])
         assert [str(x.message) for x in w if "cow_discard" in str(x.message)] == []
 
+    def test_rootfs_canonical_fields_are_declared_handled(self):
+        """The S1 shape switch and layer travel through the FFI."""
+        assert "rootfs_canonical" in _NativePolicy._HANDLED_FIELDS
+        assert "rootfs_layer" in _NativePolicy._HANDLED_FIELDS
+
+    def test_an_unknown_rootfs_canonical_is_refused_by_name(self):
+        with pytest.raises(ValueError) as excinfo:
+            _policy(rootfs_canonical="copy")
+        assert str(excinfo.value) == (
+            "rootfs_canonical must be one of alias|overlay, got 'copy'"
+        )
+
 class TestDiskQuota:
     """Tests for max_disk quota enforcement via seccomp COW.
 

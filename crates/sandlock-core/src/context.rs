@@ -883,11 +883,22 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         };
         crate::realroot::note("real_root: begin");
         let mounts = crate::chroot::resolve::resolve_chroot_mounts(&sandbox.fs_mount);
+        let overlay_layer = if sandbox.rootfs_canonical
+            == crate::sandbox::RootfsCanonical::Overlay
+        {
+            sandbox.rootfs_layer.as_deref()
+        } else {
+            None
+        };
         if let Err(e) = crate::realroot::real_root(
             chroot_root,
             &mounts,
             pid_ns,
             sandbox.cow_upper.as_deref(),
+            overlay_layer,
+            prebuilt_ruleset
+                .as_ref()
+                .map(|ruleset| (ruleset, sandbox)),
         ) {
             fail!(format!("real root: {}", e));
         }

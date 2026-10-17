@@ -1,4 +1,4 @@
-use crate::sandbox::Sandbox;
+use crate::sandbox::{RootfsCanonical, Sandbox};
 
 /// Internal normalized view of a sandbox configuration.
 ///
@@ -169,7 +169,8 @@ impl SandboxFeatures {
             time_start: sandbox.time_start.is_some(),
             virtual_cpu_count: sandbox.num_cpus.is_some(),
             virtual_hostname: sandbox_name.is_some(),
-            cow: sandbox.workdir.is_some(),
+            cow: sandbox.workdir.is_some()
+                && sandbox.rootfs_canonical == RootfsCanonical::Alias,
             chroot: sandbox.chroot.is_some(),
             stat_metadata_mediated: stat_metadata_mediated(sandbox),
             fs_denies: !sandbox.fs_denied.is_empty(),

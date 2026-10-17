@@ -106,6 +106,9 @@ pub(crate) struct ChrootCtx<'a> {
     /// branch's own keying is still the lower-spelled host path the resolvers
     /// return.
     pub cow_upper: Option<&'a Path>,
+    /// The child's root is the overlay merge, not the lower directory named by
+    /// `root`.
+    pub overlay_root: bool,
 }
 
 impl<'a> ChrootCtx<'a> {
@@ -131,6 +134,7 @@ impl<'a> ChrootCtx<'a> {
             write_fds,
             pid_ns: policy.pid_ns.as_ref(),
             cow_upper: policy.cow_upper.as_deref(),
+            overlay_root: policy.chroot_overlay,
         }
     }
 
@@ -403,6 +407,12 @@ impl ChrootCtx<'_> {
             Ok(meta) => meta,
             Err(_) => return false,
         };
+        // An overlay child has a merged root inode, while `self.root` names the
+        // lower layer in the mediator's namespace. The inode comparison cannot
+        // match that shape even though the child is pivoted.
+        if is_overlay_root(pid) {
+            return true;
+        }
         let confining_root = match std::fs::metadata(self.root) {
             Ok(meta) => meta,
             Err(_) => return false,
@@ -448,6 +458,19 @@ impl ChrootCtx<'_> {
         self.host_to_virtual(reported)
             .or_else(|| self.reported_to_virtual(pid, reported))
     }
+}
+
+fn is_overlay_root(pid: u32) -> bool {
+    const OVERLAYFS_SUPER_MAGIC: i64 = 0x794c_7630;
+    let path = format!("/proc/{pid}/root");
+    let Ok(path) = CString::new(path) else {
+        return false;
+    };
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(path.as_ptr(), &mut stat) } != 0 {
+        return false;
+    }
+    stat.f_type == OVERLAYFS_SUPER_MAGIC
 }
 
 // ============================================================
@@ -1178,6 +1201,24 @@ pub(crate) async fn handle_chroot_open(
         Some(p) => p,
         None => return NotifAction::Continue,
     };
+
+    if ctx.overlay_root {
+        let Some(virtual_path) = build_virtual_path(notif, dirfd, &rel_path, ctx) else {
+            return NotifAction::Errno(libc::EACCES);
+        };
+        let virtual_path = PathBuf::from(virtual_path);
+        let is_write = (flags as i32 & (libc::O_WRONLY | libc::O_RDWR)) != 0;
+        if is_write {
+            if ctx.write_hard_denied(&virtual_path) || !ctx.can_write(&virtual_path) {
+                return NotifAction::Errno(libc::EACCES);
+            }
+        } else if !ctx.can_read(&virtual_path) {
+            return NotifAction::Errno(libc::EACCES);
+        }
+        // The kernel resolves the merged overlay view. Injecting a lower-path
+        // descriptor here would write through to the shared image.
+        return NotifAction::Continue;
+    }
 
     let honored = honorable_resolve_flags(resolve);
     if let Some(refusal) = enforce_resolve_flags(notif, dirfd, &rel_path, ctx, honored) {
@@ -1999,6 +2040,48 @@ pub(crate) async fn handle_chroot_write(
     ctx: &ChrootCtx<'_>,
 ) -> NotifAction {
     let nr = notif.data.nr as i64;
+
+    if ctx.overlay_root {
+        let paths: Vec<(i64, u64)> = match nr {
+            n if n == libc::SYS_unlinkat
+                || n == libc::SYS_mkdirat
+                || n == libc::SYS_fchmodat
+                || n == libc::SYS_fchownat
+                || n == crate::arch::SYS_FCHMODAT2 =>
+            {
+                vec![(notif.data.args[0] as i64, notif.data.args[1])]
+            }
+            n if n == libc::SYS_renameat2 => vec![
+                (notif.data.args[0] as i64, notif.data.args[1]),
+                (notif.data.args[2] as i64, notif.data.args[3]),
+            ],
+            n if n == libc::SYS_symlinkat => {
+                vec![(notif.data.args[2] as i64, notif.data.args[1])]
+            }
+            n if n == libc::SYS_linkat => vec![
+                (notif.data.args[0] as i64, notif.data.args[1]),
+                (notif.data.args[2] as i64, notif.data.args[3]),
+            ],
+            n if n == libc::SYS_truncate => {
+                vec![(libc::AT_FDCWD as i64, notif.data.args[0])]
+            }
+            n if n == libc::SYS_fchown => return NotifAction::Continue,
+            _ => vec![],
+        };
+        for (dirfd, path_ptr) in paths {
+            let Some(path) = read_path(notif, path_ptr, notif_fd) else {
+                return NotifAction::Errno(libc::EACCES);
+            };
+            let Some(virtual_path) = build_virtual_path(notif, dirfd, &path, ctx) else {
+                return NotifAction::Errno(libc::EACCES);
+            };
+            let virtual_path = PathBuf::from(virtual_path);
+            if ctx.write_hard_denied(&virtual_path) || !ctx.can_write(&virtual_path) {
+                return NotifAction::Errno(libc::EACCES);
+            }
+        }
+        return NotifAction::Continue;
+    }
 
     if nr == libc::SYS_unlinkat {
         // unlink(2) removes the link, never what it points at.
@@ -3853,6 +3936,7 @@ mod mount_ro_tests {
             // No branch in these policy-half tests: the resolver's COW fallback
             // stays off, which is what they are pinning.
             cow_upper: None,
+            overlay_root: false,
         }
     }
 

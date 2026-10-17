@@ -928,6 +928,10 @@ pub struct NotifPolicy {
     pub net_bind_inject: bool,
     pub cow_enabled: bool,
     pub chroot_root: Option<std::path::PathBuf>,
+    /// The chroot is an overlay merge mounted by `realroot`. Its merged inodes
+    /// are not the lower inode at `chroot_root`, so path handlers hand normal
+    /// opens/writes back to the kernel after applying the policy gates.
+    pub chroot_overlay: bool,
     /// Virtual paths allowed for reading under chroot (original user-specified paths).
     pub chroot_readable: Vec<std::path::PathBuf>,
     /// Virtual paths allowed for writing under chroot (original user-specified paths).

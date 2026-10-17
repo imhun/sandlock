@@ -461,6 +461,17 @@ class Sandbox:
     dropped again before the workload starts), and the container it runs in
     must not block the mount-family syscalls.  Defaults to ``False``."""
 
+    rootfs_canonical: str = "alias"
+    """How the image rootfs is made writable: ``alias`` (seccomp-COW plus the
+    read-only ``/.u`` exec alias) or ``overlay`` (one kernel overlay over the
+    rootfs).  The default preserves the existing alias shape byte-for-byte."""
+
+    rootfs_layer: str | None = None
+    """The named layer directory used by ``rootfs_canonical="overlay"``.
+
+    It must contain ``upper`` and an empty ``work`` directory.  ``None`` is
+    valid only for the default alias shape."""
+
     net_isolation: bool = False
     """Run the sandbox in its own network namespace (``CLONE_NEWNET`` after
     the user namespace): only loopback, brought up from inside the sandbox's
@@ -685,6 +696,15 @@ class Sandbox:
     """Callback run in each COW clone, receives clone_id as argument."""
 
     def __post_init__(self):
+        if self.rootfs_canonical not in ("alias", "overlay"):
+            raise ValueError(
+                "rootfs_canonical must be one of alias|overlay, "
+                f"got {self.rootfs_canonical!r}"
+            )
+        if self.rootfs_canonical == "alias" and self.rootfs_layer is not None:
+            raise ValueError("rootfs_layer is only valid with rootfs_canonical='overlay'")
+        if self.rootfs_canonical == "overlay" and not self.rootfs_layer:
+            raise ValueError("rootfs_canonical='overlay' requires rootfs_layer")
         # Validate name
         if self.name is not None:
             if not self.name:

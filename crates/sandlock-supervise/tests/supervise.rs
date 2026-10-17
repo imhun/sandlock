@@ -368,6 +368,12 @@ fn test_policy_roundtrip_covers_every_field() {
     // one parsed, applied, and read back equal. Any missing/un-landed field
     // makes the binary fail and name the field.
     let secret = write_secret("roundtrip");
+    let overlay = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tmp/supervise-overlay-example");
+    let _ = std::fs::remove_dir_all(&overlay);
+    std::fs::create_dir_all(overlay.join("lower")).expect("create example lower");
+    std::fs::create_dir_all(overlay.join("layer/upper")).expect("create example upper");
+    std::fs::create_dir_all(overlay.join("layer/work")).expect("create example work");
     let body = sandlock_supervise::policy::example_policy_json(&secret);
     let policy = write_policy("roundtrip", &body);
     let (_worker, server) = std::os::unix::net::UnixStream::pair().expect("control socketpair");
@@ -396,6 +402,7 @@ fn test_policy_roundtrip_covers_every_field() {
     );
     let _ = std::fs::remove_file(&policy);
     let _ = std::fs::remove_file(&secret);
+    let _ = std::fs::remove_dir_all(&overlay);
 }
 
 #[test]

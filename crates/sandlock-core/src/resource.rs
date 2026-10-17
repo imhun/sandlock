@@ -1113,6 +1113,7 @@ mod tests {
             net_bind_inject: false,
             cow_enabled: false,
             chroot_root: None,
+            chroot_overlay: false,
             chroot_readable: Vec::new(),
             chroot_writable: Vec::new(),
             chroot_denied: Vec::new(),

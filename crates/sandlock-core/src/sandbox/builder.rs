@@ -359,6 +359,27 @@ pub struct SandboxBuilder {
     #[cfg_attr(feature = "cli", arg(long = "real-root"))]
     pub real_root: bool,
 
+    /// Select the writable-rootfs canonical shape. `alias` is the historical
+    /// seccomp-COW plus `/.u` shape; `overlay` mounts one kernel overlay using
+    /// `rootfs_layer/{upper,work}`.
+    #[cfg_attr(
+        feature = "cli",
+        arg(
+            long = "rootfs-canonical",
+            value_enum,
+            default_value = "alias",
+            value_name = "alias|overlay"
+        )
+    )]
+    pub rootfs_canonical: RootfsCanonical,
+
+    /// The named layer directory for `rootfs_canonical=overlay`.
+    #[cfg_attr(feature = "cli", arg(long = "rootfs-layer", value_name = "PATH"))]
+    pub rootfs_layer: Option<PathBuf>,
+
+    #[cfg_attr(feature = "cli", clap(skip))]
+    rootfs_canonical_error: Option<String>,
+
     /// Self-map the confining process's own host uid to **in-namespace uid 0**
     /// (`0 -> euid`), so the workload is root inside its user namespace and
     /// its host uid outside -- the rootless-container pattern.
@@ -493,6 +514,9 @@ impl Default for SandboxBuilder {
             no_supervisor: false,
             pid_ns: false,
             real_root: false,
+            rootfs_canonical: RootfsCanonical::Alias,
+            rootfs_layer: None,
+            rootfs_canonical_error: None,
             userns_self_map: false,
             control_socket: true,
             user: None,
@@ -574,6 +598,9 @@ impl Clone for SandboxBuilder {
             no_supervisor: self.no_supervisor,
             pid_ns: self.pid_ns,
             real_root: self.real_root,
+            rootfs_canonical: self.rootfs_canonical,
+            rootfs_layer: self.rootfs_layer.clone(),
+            rootfs_canonical_error: self.rootfs_canonical_error.clone(),
             userns_self_map: self.userns_self_map,
             control_socket: self.control_socket,
             user: self.user,
@@ -1137,6 +1164,36 @@ impl SandboxBuilder {
         self
     }
 
+    /// Select the writable-rootfs shape; see [`RootfsCanonical`].
+    pub fn rootfs_canonical(mut self, shape: RootfsCanonical) -> Self {
+        self.rootfs_canonical = shape;
+        self.rootfs_canonical_error = None;
+        self
+    }
+
+    /// Parse the C ABI spelling. Invalid values are retained as a named build
+    /// error, because the opaque builder pointer has no Result channel.
+    pub fn rootfs_canonical_name(mut self, name: &str) -> Self {
+        match name {
+            "alias" => self.rootfs_canonical = RootfsCanonical::Alias,
+            "overlay" => self.rootfs_canonical = RootfsCanonical::Overlay,
+            _ => {
+                self.rootfs_canonical_error = Some(format!(
+                    "rootfs_canonical must be one of alias|overlay, got {name:?}"
+                ));
+                return self;
+            }
+        }
+        self.rootfs_canonical_error = None;
+        self
+    }
+
+    /// Set the named layer directory used by the overlay rootfs shape.
+    pub fn rootfs_layer(mut self, path: impl Into<PathBuf>) -> Self {
+        self.rootfs_layer = Some(path.into());
+        self
+    }
+
     /// Enable or disable the per-sandbox control socket. Defaults to `true`.
     /// When `false`, no runtime dir, pid file, or control-socket task is
     /// created — `sandlock ps` and `sandlock inspect` will not see this
@@ -1216,6 +1273,9 @@ impl SandboxBuilder {
     /// `Sandbox::validate` performs. Use this in tests that deliberately
     /// construct sandboxes violating cross-section invariants.
     pub fn build_unchecked(self) -> Result<Sandbox, SandboxError> {
+        if let Some(error) = self.rootfs_canonical_error.as_deref() {
+            return Err(SandboxError::Invalid(error.to_string()));
+        }
         validate_syscall_names(&self.extra_deny_syscalls)?;
         validate_allow_groups(&self.extra_allow_syscalls)?;
         validate_allow_deny_disjoint(&self.extra_allow_syscalls, &self.extra_deny_syscalls)?;
@@ -1565,6 +1625,8 @@ impl SandboxBuilder {
             no_supervisor: self.no_supervisor,
             pid_ns: self.pid_ns,
             real_root: self.real_root,
+            rootfs_canonical: self.rootfs_canonical,
+            rootfs_layer: self.rootfs_layer,
             userns_self_map: self.userns_self_map,
             control_socket: self.control_socket,
             user: self.user,

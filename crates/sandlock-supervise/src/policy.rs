@@ -42,6 +42,7 @@
 //! | `on_exit`/`on_error` | `[filesystem].on_exit/on_error` | `on_exit`/`on_error` | same |
 //! | `cow_discard` | not in profile | `cow_discard` | `cow_discard` |
 //! | `cow_layer_name` | not in profile | `cow_layer_name` | `cow_layer_name` |
+//! | `rootfs_canonical`/`rootfs_layer` | not in profile | same | same |
 //! | `allow_degraded`/`disable` | not in profile | `protection_policy` | same |
 //!
 //! Deliberately **not** wire fields (each would be rejected by name as
@@ -78,7 +79,8 @@ use std::time::SystemTime;
 use sandlock_core::http::HttpRule;
 use sandlock_core::profile::parse_mount_spec;
 use sandlock_core::sandbox::{
-    BindPorts, BranchAction, ByteSize, NetRule, RunAs, Sandbox, SandboxBuilder,
+    BindPorts, BranchAction, ByteSize, NetRule, RootfsCanonical, RunAs, Sandbox,
+    SandboxBuilder,
 };
 use sandlock_core::{Protection, ProtectionPolicy, ProtectionState};
 use serde::Deserialize;
@@ -146,6 +148,8 @@ pub const POLICY_FIELDS: &[&str] = &[
     "port_remap",
     "random_seed",
     "real_root",
+    "rootfs_canonical",
+    "rootfs_layer",
     "time_start",
     "uid",
     "workdir",
@@ -210,6 +214,10 @@ pub struct SupervisePolicy {
     /// `CAP_SYS_ADMIN` before the workload starts.
     #[serde(default)]
     pub real_root: bool,
+    /// Writable-rootfs shape; absent keeps the historical alias shape.
+    pub rootfs_canonical: Option<RootfsCanonical>,
+    /// Named overlay layer directory for `rootfs_canonical=overlay`.
+    pub rootfs_layer: Option<PathBuf>,
     pub net_isolation: bool,
     pub fd_inject_connect: bool,
     /// S2.5 bind injection: mapped ports are answered by replacing the
@@ -601,6 +609,12 @@ fn apply(parsed: &ParsedPolicy) -> Result<SandboxBuilder, String> {
     }
     if prov.contains("real_root") && p.real_root {
         b = b.real_root(true);
+    }
+    if let Some(shape) = p.rootfs_canonical {
+        b = b.rootfs_canonical(shape);
+    }
+    if let Some(layer) = &p.rootfs_layer {
+        b = b.rootfs_layer(layer.clone());
     }
     if prov.contains("net_isolation") && p.net_isolation {
         b = b.net_isolation(true);
@@ -1264,6 +1278,19 @@ fn verify(sandbox: &Sandbox, parsed: &ParsedPolicy) -> Result<(), String> {
     if prov.contains("real_root") {
         check!("real_root", &p.real_root, &sandbox.real_root);
     }
+    if prov.contains("rootfs_canonical") {
+        let expected = p
+            .rootfs_canonical
+            .expect("provided rootfs_canonical has a value");
+        if sandbox.rootfs_canonical != expected {
+            return Err(format!(
+                "policy field `rootfs_canonical` did not land: provided {expected:?}, \
+                 effective {:?}",
+                sandbox.rootfs_canonical
+            ));
+        }
+    }
+    check!("rootfs_layer", &p.rootfs_layer, &sandbox.rootfs_layer);
     if prov.contains("net_isolation") {
         check!("net_isolation", &p.net_isolation, &sandbox.net_isolation);
     }
@@ -1427,6 +1454,8 @@ fn verify(sandbox: &Sandbox, parsed: &ParsedPolicy) -> Result<(), String> {
 /// at an existing file (secrets resolve at build time).
 pub fn example_policy_json(secret_path: &Path) -> String {
     let secret = format!("file:{}", secret_path.display());
+    let overlay_example =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tmp/supervise-overlay-example");
     serde_json::json!({
         "fs_writable": ["/tmp/w"],
         "fs_readable": ["/usr/lib", "/etc"],
@@ -1477,6 +1506,8 @@ pub fn example_policy_json(secret_path: &Path) -> String {
         // field the example does not carry (measured: these three tests were
         // red from the realroot commit until this line existed).
         "real_root": true,
+        "rootfs_canonical": "overlay",
+        "rootfs_layer": overlay_example.join("layer").display().to_string(),
         "net_isolation": true,
         "fd_inject_connect": true,
         "port_mappings": {"50005": 8080},
@@ -1487,7 +1518,7 @@ pub fn example_policy_json(secret_path: &Path) -> String {
         "no_huge_pages": true,
         "no_coredump": true,
         "deterministic_dirs": true,
-        "chroot": "/jail",
+        "chroot": overlay_example.join("lower").display().to_string(),
         "fs_mount": ["/work:/host/work", "/data:/host/data:ro"],
         "clean_env": true,
         "env": {"SUPERVISE_TEST": "1"},
@@ -1553,6 +1584,11 @@ mod tests {
     #[test]
     fn full_field_policy_roundtrips() {
         let secret = write_secret("full");
+        let example = repo_tmp_dir().join("supervise-overlay-example");
+        let _ = std::fs::remove_dir_all(&example);
+        std::fs::create_dir_all(example.join("lower")).unwrap();
+        std::fs::create_dir_all(example.join("layer/upper")).unwrap();
+        std::fs::create_dir_all(example.join("layer/work")).unwrap();
         let json = example_policy_json(&secret);
         let parsed = parse(json.as_bytes()).expect("full-field policy parses");
         assert_eq!(
@@ -1596,6 +1632,7 @@ mod tests {
             ProtectionState::Disabled
         );
         let _ = std::fs::remove_file(&secret);
+        let _ = std::fs::remove_dir_all(&example);
     }
 
     #[test]

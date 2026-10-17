@@ -211,6 +211,40 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_cow_layer_name(
     Box::into_raw(Box::new(builder.cow_layer_name(name)))
 }
 
+/// Select the writable-rootfs canonical shape (`alias` or `overlay`).
+///
+/// # Safety
+/// `b` and `shape` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_rootfs_canonical(
+    b: *mut SandboxBuilder,
+    shape: *const c_char,
+) -> *mut SandboxBuilder {
+    if b.is_null() || shape.is_null() {
+        return b;
+    }
+    let shape = CStr::from_ptr(shape).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.rootfs_canonical_name(shape)))
+}
+
+/// Set the named layer directory for the overlay rootfs shape.
+///
+/// # Safety
+/// `b` and `path` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_rootfs_layer(
+    b: *mut SandboxBuilder,
+    path: *const c_char,
+) -> *mut SandboxBuilder {
+    if b.is_null() || path.is_null() {
+        return b;
+    }
+    let path = CStr::from_ptr(path).to_str().unwrap_or("");
+    let builder = *Box::from_raw(b);
+    Box::into_raw(Box::new(builder.rootfs_layer(path)))
+}
+
 /// # Safety
 /// `b` and `path` must be valid pointers.
 #[no_mangle]

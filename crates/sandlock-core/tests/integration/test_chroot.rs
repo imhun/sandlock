@@ -1,4 +1,4 @@
-use sandlock_core::sandbox::BranchAction;
+use sandlock_core::sandbox::{BranchAction, RootfsCanonical};
 #[allow(unused_imports)]
 use sandlock_core::{Sandbox};
 use std::fs;
@@ -145,6 +145,31 @@ fn build_test_rootfs(name: &str) -> PathBuf {
 
 fn cleanup_rootfs(rootfs: &PathBuf) {
     let _ = fs::remove_dir_all(rootfs);
+}
+
+/// A fresh overlay layer, including removal of the private `work/work`
+/// directory a previous mount leaves behind at mode 000.
+fn fresh_overlay_layer(name: &str) -> PathBuf {
+    let base = std::env::var_os("SANLOCK_OVERLAY_TEST_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            option_env!("CARGO_TARGET_TMPDIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+        });
+    let _ = fs::create_dir_all(&base);
+    let seq = SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let layer = base.join(format!(
+        "sandlock-test-chroot-{name}-{}-{seq}",
+        std::process::id()
+    ));
+    let stale_work = layer.join("work/work");
+    if stale_work.exists() {
+        let _ = fs::set_permissions(&stale_work, fs::Permissions::from_mode(0o755));
+    }
+    let _ = fs::remove_dir_all(&layer);
+    fs::create_dir_all(&layer).expect("create a fresh overlay layer");
+    layer
 }
 
 /// List / inside chroot shows rootfs contents (should see "usr", "tmp", "bin", "etc")
@@ -3838,6 +3863,198 @@ async fn test_chroot_cow_chdir_into_a_directory_the_branch_created() {
         branch_dir.join("upper/usr/local/cowcd/inner").is_dir(),
         "the relative mkdir must land in the directory the sandbox entered"
     );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&storage);
+}
+
+/// The overlay shape resolves a staged `#!` script by its canonical path.
+#[tokio::test]
+async fn test_chroot_overlay_hands_a_script_its_canonical_path() {
+    let rootfs = build_test_rootfs("overlay-script-path");
+    fs::create_dir_all(rootfs.join("usr/local/bin")).unwrap();
+    let layer = fresh_overlay_layer("overlay-script-layer");
+    fs::create_dir_all(layer.join("upper/usr/local/bin")).unwrap();
+    fs::create_dir_all(layer.join("work")).unwrap();
+    let script = layer.join("upper/usr/local/bin/cow-s");
+    fs::write(&script, "#!/usr/bin/rootfs-helper relay\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/")
+        .rootfs_canonical(RootfsCanonical::Overlay)
+        .rootfs_layer(&layer)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&["/usr/local/bin/cow-s"])
+        .await
+        .expect("the overlay sandbox must be creatable");
+
+    assert_eq!(
+        result.stdout_str().unwrap_or_default(),
+        "/usr/local/bin/cow-s",
+        "the interpreter must receive the canonical script path; stderr={:?} code={:?}",
+        result.stderr_str(),
+        result.code()
+    );
+    assert_eq!(result.code(), Some(0), "stderr={:?}", result.stderr_str());
+    assert!(
+        !rootfs.join("usr/local/bin/cow-s").exists(),
+        "the shared lower must remain unchanged"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&layer);
+}
+
+/// A write in overlay mode lands in `upper`, while the lower keeps its bytes.
+#[tokio::test]
+async fn test_chroot_overlay_writes_the_upper_and_not_the_lower() {
+    let rootfs = build_test_rootfs("overlay-write");
+    fs::create_dir_all(rootfs.join("usr/local")).unwrap();
+    let layer = fresh_overlay_layer("overlay-write-layer");
+    fs::create_dir_all(layer.join("upper")).unwrap();
+    fs::create_dir_all(layer.join("work")).unwrap();
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/")
+        .fs_write("/")
+        .rootfs_canonical(RootfsCanonical::Overlay)
+        .rootfs_layer(&layer)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&[
+            "/usr/bin/rootfs-helper",
+            "write",
+            "/usr/local/overlay-only",
+            "hello",
+        ])
+        .await
+        .expect("the overlay sandbox must be creatable");
+
+    assert_eq!(result.code(), Some(0), "stderr={:?}", result.stderr_str());
+    assert_eq!(result.stdout_str().unwrap_or_default(), "");
+    assert_eq!(result.stderr_str().unwrap_or_default(), "");
+    assert!(
+        !rootfs.join("usr/local/overlay-only").exists(),
+        "the shared lower must remain unchanged"
+    );
+    assert_eq!(
+        fs::read_to_string(layer.join("upper/usr/local/overlay-only")).unwrap(),
+        "hello\n",
+        "the write must land in the overlay upper"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&layer);
+}
+
+/// Metadata-changing syscalls also target the merged overlay, never the lower.
+#[tokio::test]
+async fn test_chroot_overlay_mkdir_targets_the_upper_and_not_the_lower() {
+    let rootfs = build_test_rootfs("overlay-mkdir");
+    fs::create_dir_all(rootfs.join("usr/local")).unwrap();
+    let layer = fresh_overlay_layer("overlay-mkdir-layer");
+    fs::create_dir_all(layer.join("upper")).unwrap();
+    fs::create_dir_all(layer.join("work")).unwrap();
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/")
+        .fs_write("/")
+        .rootfs_canonical(RootfsCanonical::Overlay)
+        .rootfs_layer(&layer)
+        .build()
+        .unwrap();
+
+    let result = policy
+        .clone()
+        .run(&["/usr/bin/rootfs-helper", "mkdir", "/usr/local/overlay-dir"])
+        .await
+        .expect("the overlay sandbox must be creatable");
+
+    assert_eq!(result.code(), Some(0), "stderr={:?}", result.stderr_str());
+    assert!(
+        !rootfs.join("usr/local/overlay-dir").exists(),
+        "the shared lower must remain unchanged"
+    );
+    assert!(
+        layer.join("upper/usr/local/overlay-dir").is_dir(),
+        "mkdir must land in the overlay upper"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&layer);
+}
+
+/// The default alias shape keeps the read-only `/.u` view of its branch upper.
+#[tokio::test]
+async fn test_chroot_alias_default_keeps_the_exec_alias() {
+    let rootfs = build_test_rootfs("alias-default");
+    fs::create_dir_all(rootfs.join("usr/local")).unwrap();
+    fs::create_dir_all(rootfs.join(".u")).unwrap();
+    let storage = temp_dir("alias-default-layer");
+
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .fs_read("/")
+        .fs_write("/")
+        .workdir(&rootfs)
+        .fs_storage(&storage)
+        .cow_discard(true)
+        .on_exit(BranchAction::Keep)
+        .on_error(BranchAction::Keep)
+        .build()
+        .unwrap();
+
+    assert_eq!(policy.rootfs_canonical, RootfsCanonical::Alias);
+    assert_eq!(policy.rootfs_layer, None);
+    let result = policy
+        .clone()
+        .run(&[
+            "rootfs-helper",
+            "sh",
+            "-c",
+            "write /usr/local/alias-live hello ; cat /.u/usr/local/alias-live",
+        ])
+        .await
+        .expect("the alias sandbox must be creatable");
+
+    assert_eq!(result.stdout_str().unwrap_or_default(), "hello");
+    assert_eq!(result.code(), Some(0), "stderr={:?}", result.stderr_str());
+    assert!(
+        !rootfs.join("usr/local/alias-live").exists(),
+        "the shared lower must remain unchanged"
+    );
+
+    cleanup_rootfs(&rootfs);
+    let _ = fs::remove_dir_all(&storage);
+}
+
+/// The default alias policy keeps its serialized field set unchanged.
+#[tokio::test]
+async fn test_alias_policy_serializes_no_overlay_fields() {
+    let rootfs = build_test_rootfs("alias-serialized");
+    let storage = temp_dir("alias-serialized-layer");
+    let policy = Sandbox::builder()
+        .chroot(&rootfs)
+        .workdir(&rootfs)
+        .fs_storage(&storage)
+        .cow_discard(true)
+        .build()
+        .unwrap();
+
+    let value = serde_json::to_value(policy).unwrap();
+    assert_eq!(value.get("rootfs_canonical"), None);
+    assert_eq!(value.get("rootfs_layer"), None);
 
     cleanup_rootfs(&rootfs);
     let _ = fs::remove_dir_all(&storage);

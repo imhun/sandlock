@@ -650,6 +650,12 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     if let Some(ref path) = pb.chroot { builder = builder.chroot(path); }
     if let Some(user) = pb.user { builder = builder.user(user.uid, user.gid); }
     if let Some(ref path) = pb.workdir { builder = builder.workdir(path); }
+    if pb.rootfs_canonical != sandlock_core::sandbox::RootfsCanonical::Alias {
+        builder = builder.rootfs_canonical(pb.rootfs_canonical);
+    }
+    if let Some(ref path) = pb.rootfs_layer {
+        builder = builder.rootfs_layer(path);
+    }
     if let Some(ref path) = pb.cwd { builder = builder.cwd(path); }
     if let Some(ref path) = pb.fs_storage { builder = builder.fs_storage(path); }
     if !pb.extra_allow_syscalls.is_empty() { builder = builder.extra_allow_syscalls(pb.extra_allow_syscalls.clone()); }
@@ -724,7 +730,9 @@ async fn run_command(args: RunArgs) -> Result<i32> {
     if let Some(ref img) = args.image {
         let rootfs = sandlock_core::image::extract(img, None).await?;
         builder = builder.chroot(&rootfs).fs_read("/");
-        if pb.workdir.is_none() {
+        if pb.workdir.is_none()
+            && pb.rootfs_canonical == sandlock_core::sandbox::RootfsCanonical::Alias
+        {
             builder = builder.workdir(&rootfs);
         }
         if args.cmd.is_empty() {
