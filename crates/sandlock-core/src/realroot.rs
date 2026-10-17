@@ -281,6 +281,7 @@ fn build(
         let work = layer.join("work");
         validate_overlay_layer(root, layer, &upper, &work)?;
         build_overlay_dir_skeleton(root, &upper)?;
+        restore_overlay_whiteouts(layer)?;
         let lower = overlay_option_path("lower", root)?;
         let upper = overlay_option_path("upper", &upper)?;
         let work = overlay_option_path("work", &work)?;
@@ -515,6 +516,142 @@ const DIR_MANIFEST_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// miss, never a reason to fail: the walk simply runs.
 const OVERLAY_SKELETON_MARKER_NAME: &str = ".skeleton-ready";
 const OVERLAY_SKELETON_MARKER_HEADER: &str = "sandlock-skeleton-v1";
+
+/// Snapshot/migration sidecar written by
+/// `gateway_common/overlay_whiteouts.py`: NUL-separated paths relative to
+/// `upper`, each one a char 0/0 the archive could not carry.
+const OVERLAY_WHITEOUTS_NAME: &str = "whiteouts";
+const OVERLAY_WHITEOUTS_HEADER: &[u8] = b"sandlock-whiteouts-v1\n";
+
+fn is_safe_relative(path: &Path) -> bool {
+    use std::path::Component;
+
+    let mut saw = false;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => saw = true,
+            _ => return false,
+        }
+    }
+    saw
+}
+
+/// Rebuild the char 0/0 whiteouts a snapshot/migration payload could not carry.
+///
+/// Runs as the sandbox's user-namespace root, which is the one identity that
+/// may `mknod` a 0/0 whiteout without host privilege (measured in the design's
+/// whiteout prototype). Every component is walked with `O_NOFOLLOW`, so a
+/// restored upper cannot steer a whiteout through a symlink. A failed rebuild
+/// fails the start: silently losing a whiteout would resurrect a deleted file.
+fn restore_overlay_whiteouts(layer: &Path) -> Result<(), String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let manifest = layer.join(OVERLAY_WHITEOUTS_NAME);
+    let data = match std::fs::read(&manifest) {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "overlay whiteouts {}: {e}",
+                manifest.display()
+            ))
+        }
+    };
+    let body = data.strip_prefix(OVERLAY_WHITEOUTS_HEADER).ok_or_else(|| {
+        format!("overlay whiteouts {}: bad header", manifest.display())
+    })?;
+    let upper = layer.join("upper");
+    let upper_root = open_overlay_dir(&upper).map_err(|e| {
+        format!("overlay whiteouts upper {}: {e}", upper.display())
+    })?;
+    for raw in body.split(|byte| *byte == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let relative = Path::new(std::ffi::OsStr::from_bytes(raw));
+        if !is_safe_relative(relative) {
+            return Err(format!(
+                "overlay whiteouts {}: unsafe path {:?}",
+                manifest.display(),
+                relative
+            ));
+        }
+        let components: Vec<_> = relative
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(name) => Some(name),
+                _ => None,
+            })
+            .collect();
+        let Some((last, parents)) = components.split_last() else {
+            continue;
+        };
+        let mut parent = upper_root.as_raw_fd();
+        let mut opened: Vec<std::fs::File> = Vec::new();
+        let mut missing = false;
+        for component in parents {
+            let name = std::ffi::CString::new(component.as_bytes()).map_err(|_| {
+                format!("overlay whiteouts {}: NUL in a path", manifest.display())
+            })?;
+            let fd = unsafe {
+                libc::openat(parent, name.as_ptr(), OVERLAY_DIR_FLAGS)
+            };
+            if fd < 0 {
+                missing = true;
+                break;
+            }
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            parent = file.as_raw_fd();
+            opened.push(file);
+        }
+        if missing {
+            return Err(format!(
+                "overlay whiteouts {}: parent of {:?} is missing",
+                manifest.display(),
+                relative
+            ));
+        }
+        let name = std::ffi::CString::new(last.as_bytes()).map_err(|_| {
+            format!("overlay whiteouts {}: NUL in a path", manifest.display())
+        })?;
+        let mut info: libc::stat = unsafe { std::mem::zeroed() };
+        let exists = unsafe {
+            libc::fstatat(
+                parent,
+                name.as_ptr(),
+                &mut info,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0;
+        if exists {
+            if info.st_mode & libc::S_IFMT == libc::S_IFCHR && info.st_rdev == 0 {
+                continue;
+            }
+            // A real entry now lives there: the manifest is stale for this
+            // path and the entry must win.
+            continue;
+        }
+        if unsafe {
+            libc::mknodat(
+                parent,
+                name.as_ptr(),
+                libc::S_IFCHR | 0o600,
+                0,
+            )
+        } != 0
+        {
+            return Err(format!(
+                "overlay whiteouts {}: cannot create {:?}: {}",
+                manifest.display(),
+                relative,
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    let _ = std::fs::remove_file(&manifest);
+    Ok(())
+}
 
 fn overlay_manifest_identity(lower: &Path) -> (u64, i128) {
     use std::os::unix::fs::MetadataExt;
@@ -1070,6 +1207,39 @@ mod tests {
 
         std::fs::write(root.join(".skeleton-ready"), "not a marker\n").unwrap();
         assert!(!overlay_skeleton_is_current(&lower, &upper));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_whiteout_manifest_skips_a_real_entry_and_is_removed() {
+        let root = scratch("whiteouts-real");
+        std::fs::create_dir_all(root.join("upper/dir")).unwrap();
+        std::fs::write(root.join("upper/dir/kept"), b"x").unwrap();
+        let mut data = OVERLAY_WHITEOUTS_HEADER.to_vec();
+        data.extend_from_slice(b"dir/kept\0");
+        std::fs::write(root.join("whiteouts"), data).unwrap();
+
+        restore_overlay_whiteouts(&root).unwrap();
+        assert!(!root.join("whiteouts").exists());
+        assert_eq!(
+            std::fs::read(root.join("upper/dir/kept")).unwrap(),
+            b"x"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_whiteout_path_that_escapes_and_a_missing_parent_are_refused() {
+        let root = scratch("whiteouts-bad");
+        let mut escape = OVERLAY_WHITEOUTS_HEADER.to_vec();
+        escape.extend_from_slice(b"../escape\0");
+        std::fs::write(root.join("whiteouts"), escape).unwrap();
+        assert!(restore_overlay_whiteouts(&root).is_err());
+
+        let mut missing = OVERLAY_WHITEOUTS_HEADER.to_vec();
+        missing.extend_from_slice(b"missing/child\0");
+        std::fs::write(root.join("whiteouts"), missing).unwrap();
+        assert!(restore_overlay_whiteouts(&root).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
