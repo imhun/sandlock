@@ -137,6 +137,15 @@ impl DirtyDirs {
 /// already worth watching.
 pub const MAX_WRITE_FDS: usize = 4096;
 
+/// How many path-size watches one sandbox may hold.
+///
+/// These are opened by the mediator for overlay/workspace opens, where the
+/// kernel owns the sandbox's descriptor and no fd can be injected. One
+/// `O_PATH` descriptor per distinct file is cheap, but a sandbox that opens
+/// thousands of files for writing must not keep thousands of fds alive; past
+/// this the ordinary directory scan is the backstop.
+pub const MAX_SIZE_WATCHES: usize = 128;
+
 /// Which of a sandbox's open descriptors are **for writing**, and to what.
 ///
 /// The mediator already opens every file the sandbox opens -- it is the
@@ -197,6 +206,8 @@ pub struct WriteFds {
     /// The last entry count and cap the worker sent, with the counters it
     /// arrived at.
     entry_budget: Mutex<Option<EntryBudget>>,
+    /// Allocator for the synthetic keys of [`WriteFds::register_size`].
+    next_size_key: std::sync::atomic::AtomicI32,
 }
 
 /// One `update_entry_limit` from the worker, as a baseline.
@@ -227,10 +238,38 @@ fn held_offset(held: &std::os::fd::OwnedFd) -> Option<u64> {
         .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
+/// The size of a file the mediator holds open (O_PATH is enough).
+fn held_size(held: &std::os::fd::OwnedFd) -> Option<u64> {
+    use std::os::fd::AsRawFd;
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(held.as_raw_fd(), &mut stat) } != 0 {
+        return None;
+    }
+    Some(stat.st_size as u64)
+}
+
+/// The inode a held descriptor names, for replacing a stale path watch.
+fn held_identity(held: &std::os::fd::OwnedFd) -> Option<(u64, u64)> {
+    use std::os::fd::AsRawFd;
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(held.as_raw_fd(), &mut stat) } != 0 {
+        return None;
+    }
+    Some((stat.st_dev as u64, stat.st_ino as u64))
+}
+
 /// One watched descriptor: what it names and where it started.
 #[derive(Debug, Clone)]
 pub struct WriteFd {
     pub path: PathBuf,
+    /// The path the size watch's `still_names_path` check must resolve.
+    ///
+    /// `path` stays the **host** path: it is the accounting identity, so two
+    /// processes opening the same file fold into one number. For a size watch
+    /// the path the mediator can actually see is
+    /// `/proc/<host-pid>/root/<virtual>`; that lives here and never takes part
+    /// in the per-file sum.
+    pub identity_path: Option<PathBuf>,
     /// The file's size at the instant the mediator opened it (`lseek(SEEK_END)`
     /// on the descriptor it is about to inject, so O_TRUNC is already
     /// applied). Growth is measured from here, which is what makes a
@@ -264,6 +303,15 @@ pub struct WriteFd {
     /// a file it is still writing: the process-wide limit is the largest of
     /// the grants its live descriptors hold.
     pub cap: u64,
+    /// Whether this entry watches the file's **size** through the mediator's
+    /// own `O_PATH` descriptor, instead of a sandbox descriptor's offset.
+    ///
+    /// The overlay and workspace open paths let the kernel create the
+    /// descriptor, so there is no `(pid, fd)` to inject or read. The mediator
+    /// opens the host object itself (O_PATH, no read permission needed) and
+    /// the append pump stats it; the size is the same writer's-eye number the
+    /// injected descriptor would have given.
+    pub size_watch: bool,
 }
 
 impl PartialEq for WriteFd {
@@ -271,9 +319,11 @@ impl PartialEq for WriteFd {
     /// the same file by construction, so it is left out of the comparison.
     fn eq(&self, other: &Self) -> bool {
         self.path == other.path
+            && self.identity_path == other.identity_path
             && self.baseline == other.baseline
             && self.observed == other.observed
             && self.cap == other.cap
+            && self.size_watch == other.size_watch
     }
 }
 
@@ -289,6 +339,7 @@ impl WriteFds {
             entries_created: std::sync::atomic::AtomicU64::new(0),
             entries_removed: std::sync::atomic::AtomicU64::new(0),
             entry_budget: Mutex::new(None),
+            next_size_key: std::sync::atomic::AtomicI32::new(-1),
         }
     }
 
@@ -431,12 +482,85 @@ impl WriteFds {
             (pid, fd),
             WriteFd {
                 path: host_path.to_path_buf(),
+                identity_path: None,
                 baseline,
                 observed: baseline,
                 held,
                 cap,
+                size_watch: false,
             },
         );
+    }
+
+    /// Record a file whose size the append pump should read itself.
+    ///
+    /// For an overlay rootfs or a workspace path the kernel performs the open,
+    /// so there is no child fd to inject and no `(pid, fd)` that will survive a
+    /// redirect. The mediator opens the host object with `O_PATH` and hands it
+    /// here; the append pump fstats it each tick. The key is synthetic -- a
+    /// negative fd under pid 0 -- because the map's real keys are sandbox
+    /// descriptors and this entry deliberately has none.
+    pub fn register_size(
+        &self,
+        host_path: &Path,
+        identity_path: &Path,
+        baseline: u64,
+        held: std::sync::Arc<std::os::fd::OwnedFd>,
+    ) {
+        let mut inner = self.lock();
+        if let Some(identity) = held_identity(&held) {
+            // The same path can be unlinked and recreated while an old watch
+            // still holds the old inode. Keep the watch only while it names
+            // the file that is there now.
+            inner.retain(|_, entry| {
+                !(entry.size_watch
+                    && entry.path == host_path
+                    && entry
+                        .held
+                        .as_ref()
+                        .and_then(|held| held_identity(held.as_ref()))
+                        != Some(identity))
+            });
+        }
+        let size_watches = inner.values().filter(|entry| entry.size_watch).count();
+        if size_watches >= MAX_SIZE_WATCHES {
+            return;
+        }
+        // A reopen of the same file (the common log shape) must not accumulate
+        // one descriptor per open. The path is the identity here; a replaced
+        // inode is caught by the pump and dropped before the next registration.
+        if inner
+            .values()
+            .any(|entry| entry.size_watch && entry.path == host_path)
+        {
+            return;
+        }
+        let key = self
+            .next_size_key
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        inner.insert(
+            (0, key),
+            WriteFd {
+                path: host_path.to_path_buf(),
+                identity_path: Some(identity_path.to_path_buf()),
+                baseline,
+                observed: baseline,
+                held: Some(held),
+                cap: 0,
+                size_watch: true,
+            },
+        );
+        if std::env::var("SANLOCK_EVENT_TRACE")
+            .map(|value| value.trim() == "1")
+            .unwrap_or(false)
+        {
+            eprintln!(
+                "sandlock-supervise: size watch registered path={} entries={} key={}",
+                identity_path.display(),
+                inner.len(),
+                key
+            );
+        }
     }
 
     /// Record where a descriptor's offset is now (called by the watch).
@@ -600,16 +724,24 @@ impl WriteFds {
     ///
     /// Returns the largest offset seen, for callers that only want the number.
     pub fn flush_held(&self) -> u64 {
-        let held: Vec<(i32, i32, Arc<std::os::fd::OwnedFd>)> = self
+        let held: Vec<(i32, i32, Arc<std::os::fd::OwnedFd>, bool)> = self
             .lock()
             .iter()
             .filter_map(|((entry_pid, fd), entry)| {
-                entry.held.clone().map(|held| (*entry_pid, *fd, held))
+                entry
+                    .held
+                    .clone()
+                    .map(|held| (*entry_pid, *fd, held, entry.size_watch))
             })
             .collect();
         let mut best = 0;
-        for (entry_pid, fd, held) in held {
-            if let Some(offset) = held_offset(&held) {
+        for (entry_pid, fd, held, size_watch) in held {
+            let seen = if size_watch {
+                held_size(&held)
+            } else {
+                held_offset(&held)
+            };
+            if let Some(offset) = seen {
                 self.observe(entry_pid, fd, offset);
                 best = best.max(offset);
             }
@@ -968,5 +1100,76 @@ mod tests {
             .find(|(k, _)| *k == (11, 0))
             .expect("watched");
         assert_eq!(first.1.baseline, 7);
+    }
+
+    fn temp_file(name: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "sandlock-size-watch-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, b"x").unwrap();
+        path
+    }
+
+    fn open_held(path: &Path) -> std::sync::Arc<std::os::fd::OwnedFd> {
+        std::sync::Arc::new(std::os::fd::OwnedFd::from(
+            std::fs::File::open(path).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn size_watches_use_synthetic_keys_and_one_entry_per_path() {
+        let one = temp_file("one.log");
+        let two = temp_file("two.log");
+        let watch = WriteFds::new();
+        watch.register_size(&one, &one, 1, open_held(&one));
+        watch.register_size(&one, &one, 1, open_held(&one));
+        watch.register_size(&two, &two, 0, open_held(&two));
+
+        let entries = watch.snapshot();
+        assert_eq!(entries.len(), 2, "a reopen of the same path reuses its watch");
+        let mut keys: Vec<(i32, i32)> = entries.iter().map(|(key, _)| *key).collect();
+        keys.sort();
+        assert_eq!(keys, vec![(0, -2), (0, -1)]);
+        assert!(entries.iter().all(|(_, entry)| entry.size_watch));
+    }
+
+    #[test]
+    fn flushing_a_size_watch_counts_the_growth_not_the_size() {
+        let path = temp_file("grow.log");
+        let watch = WriteFds::new();
+        watch.register_size(&path, &path, 1, open_held(&path));
+        std::fs::write(&path, b"0123456789").unwrap();
+
+        assert_eq!(watch.flush_held(), 10);
+        assert_eq!(watch.counters().0, 9, "10 bytes now, 1 was the baseline");
+    }
+
+    #[test]
+    fn a_recreated_path_replaces_the_stale_size_watch() {
+        let path = temp_file("replace.log");
+        let replacement = temp_file("replacement.log");
+        let watch = WriteFds::new();
+        watch.register_size(&path, &path, 1, open_held(&path));
+        std::fs::rename(&replacement, &path).unwrap();
+        watch.register_size(&path, &path, 0, open_held(&path));
+
+        let entries = watch.snapshot();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.baseline, 0, "the new inode's baseline wins");
+    }
+
+    #[test]
+    fn two_namespace_spellings_of_one_file_are_one_accounting_entry() {
+        let path = temp_file("shared.log");
+        let watch = WriteFds::new();
+        watch.register_size(&path, Path::new("/proc/1/root/shared.log"), 1, open_held(&path));
+        watch.register_size(&path, Path::new("/proc/2/root/shared.log"), 1, open_held(&path));
+        assert_eq!(watch.len(), 1, "the host path is the per-file accounting identity");
     }
 }

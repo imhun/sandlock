@@ -347,7 +347,14 @@
 # cut to zero (give up at once) the old pooled-thread shape failed 18 of 20
 # probe cycles on `PTRACE_SEIZE tid 68: Operation not permitted` while the
 # per-freeze thread passed the same shape in 6.2 s.
-core_lib = 967 # 2026-10-17 (overlay whiteout restore): 965 -> 967, +2 for
+core_lib = 973 # 2026-10-18 (overlay path-size watch): 967 -> 973, +6 for
+              # `size_watches_use_synthetic_keys_and_one_entry_per_path`,
+              # `flushing_a_size_watch_counts_the_growth_not_the_size`,
+              # `a_size_watch_reads_the_mediators_own_file_size`,
+              # `an_unresolvable_path_identity_keeps_a_size_watch`, and
+              # `a_recreated_path_replaces_the_stale_size_watch`, and
+              # `two_namespace_spellings_of_one_file_are_one_accounting_entry`.
+              # 2026-10-17 (overlay whiteout restore): 965 -> 967, +2 for
 # the manifest-skip and escape/missing-parent cases in realroot::tests.
 # 2026-10-17 (create-time skeleton prewarm): 964 -> 965, +1 for
 # the ready-marker expiry case in realroot::tests.

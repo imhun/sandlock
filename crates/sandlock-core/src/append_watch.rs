@@ -67,6 +67,32 @@ pub trait OffsetReader {
     fn read_offset_held(&self, _held: &std::os::fd::OwnedFd) -> Option<u64> {
         None
     }
+
+    /// The file's current **size**, for a path-size watch.
+    ///
+    /// Used where the kernel owns the sandbox's descriptor (overlay/workspace
+    /// opens). The mediator holds an `O_PATH` descriptor to the same inode;
+    /// `fstat` answers the writer's own view without reading data or waiting
+    /// for NFS writeback.
+    fn read_size_held(&self, _held: &std::os::fd::OwnedFd) -> Option<u64> {
+        None
+    }
+
+    /// Whether the path still names the inode the held descriptor names.
+    ///
+    /// A sandbox that unlinks and recreates a file must not keep the old
+    /// watch: its size would freeze at the old inode while the new file grows
+    /// unseen (and on NFS the held descriptor would keep the old inode alive).
+    /// ``None`` is "cannot tell" -- the writer exited and `/proc/<pid>/root`
+    /// is gone, while the held descriptor still names the file. Keep reading
+    /// it; the idle window releases it.
+    fn still_names_path(
+        &self,
+        _held: &std::os::fd::OwnedFd,
+        _path: &std::path::Path,
+    ) -> Option<bool> {
+        None
+    }
 }
 
 /// Reads `/proc/<pid>/fdinfo/<fd>` and parses its `pos:` line.
@@ -166,6 +192,32 @@ impl OffsetReader for ProcOffsetReader {
         let text = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).ok()?;
         parse_pos(&text)
     }
+
+    fn read_size_held(&self, held: &std::os::fd::OwnedFd) -> Option<u64> {
+        use std::os::fd::AsRawFd;
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(held.as_raw_fd(), &mut stat) } != 0 {
+            return None;
+        }
+        Some(stat.st_size as u64)
+    }
+
+    fn still_names_path(
+        &self,
+        held: &std::os::fd::OwnedFd,
+        path: &std::path::Path,
+    ) -> Option<bool> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let Ok(meta) = std::fs::metadata(path) else {
+            return None;
+        };
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(held.as_raw_fd(), &mut stat) } != 0 {
+            return None;
+        }
+        Some(meta.dev() == stat.st_dev && meta.ino() == stat.st_ino)
+    }
 }
 
 /// Whether a `/proc/<pid>/fd/<n>` target names the same path, allowing for the
@@ -210,7 +262,14 @@ pub struct AppendWatch {
     /// Highest growth seen per descriptor, so a descriptor that rewinds (or a
     /// file that is truncated underneath us) cannot lower the count.
     grown: HashMap<(i32, i32), u64>,
+    /// Consecutive ticks a path-size watch has not moved. The mediator holds
+    /// its `O_PATH` descriptor, so unlike a sandbox fd there is no close event
+    /// to observe; after the accounting grace window it is released.
+    idle: HashMap<(i32, i32), u32>,
 }
+
+/// 120 s at the default 100 ms pump interval, matching the directory grace.
+const SIZE_WATCH_IDLE_TICKS: u32 = 1200;
 
 impl AppendWatch {
     pub fn new() -> Self {
@@ -248,21 +307,41 @@ impl AppendWatch {
             // kept every byte of its space because the mediator held the last
             // reference, so the accounting never came down and the sandbox
             // could never write again after making room.
-            let (offset, keep_watching) = match reader.read_offset(key.0, key.1) {
-                Some(pos) => (Some(pos), true),
-                None => match reader.read_offset_by_path(key.0, &entry.path) {
+            let (offset, keep_watching) = if entry.size_watch {
+                // The kernel owns this open; there is no sandbox fd to ask.
+                // The mediator's own O_PATH descriptor names the same inode.
+                // If the path now names a different inode (unlink+recreate),
+                // let go: the old size would freeze and the NFS inode would
+                // stay alive.
+                match entry.held.as_ref() {
+                    Some(held)
+                        if reader.still_names_path(
+                            held,
+                            entry.identity_path.as_deref().unwrap_or(&entry.path),
+                        ) != Some(false) =>
+                    {
+                        (reader.read_size_held(held), true)
+                    }
+                    _ => (None, false),
+                }
+            } else {
+                match reader.read_offset(key.0, key.1) {
                     Some(pos) => (Some(pos), true),
-                    None => (
-                        entry
-                            .held
-                            .as_ref()
-                            .and_then(|held| reader.read_offset_held(held)),
-                        false,
-                    ),
-                },
+                    None => match reader.read_offset_by_path(key.0, &entry.path) {
+                        Some(pos) => (Some(pos), true),
+                        None => (
+                            entry
+                                .held
+                                .as_ref()
+                                .and_then(|held| reader.read_offset_held(held)),
+                            false,
+                        ),
+                    },
+                }
             };
             let Some(offset) = offset else {
                 watch.forget(key.0, key.1);
+                self.idle.remove(&key);
                 result.dropped += 1;
                 continue;
             };
@@ -277,6 +356,20 @@ impl AppendWatch {
             watch.observe(key.0, key.1, offset);
             let grown_now = offset.saturating_sub(entry.baseline);
             let previous = self.grown.get(&key).copied().unwrap_or(0);
+            if entry.size_watch {
+                if grown_now == previous {
+                    let idle = self.idle.entry(key).or_insert(0);
+                    *idle = idle.saturating_add(1);
+                    if *idle >= SIZE_WATCH_IDLE_TICKS {
+                        watch.forget(key.0, key.1);
+                        self.idle.remove(&key);
+                        result.dropped += 1;
+                        continue;
+                    }
+                } else {
+                    self.idle.remove(&key);
+                }
+            }
             let best = grown_now.max(previous);
             present.insert(key, best);
             let slot = now_by_path.entry(entry.path.clone()).or_insert(0);
@@ -316,6 +409,10 @@ mod tests {
         by_path: Mutex<Map<(i32, String), u64>>,
         /// `mediator fd -> offset`, for the copy the mediator holds.
         held: Mutex<Map<i32, u64>>,
+        /// `mediator fd -> file size`, for a path-size watch.
+        sizes: Mutex<Map<i32, u64>>,
+        /// `mediator fd -> whether the path still names that inode`.
+        same: Mutex<Map<i32, Option<bool>>>,
     }
 
     impl Fake {
@@ -332,6 +429,18 @@ mod tests {
 
         fn set_held(&self, fd: i32, offset: u64) {
             self.held.lock().unwrap().insert(fd, offset);
+        }
+
+        fn set_size(&self, fd: i32, size: u64) {
+            self.sizes.lock().unwrap().insert(fd, size);
+        }
+
+        fn set_same(&self, fd: i32, same: bool) {
+            self.same.lock().unwrap().insert(fd, Some(same));
+        }
+
+        fn set_unknown(&self, fd: i32) {
+            self.same.lock().unwrap().insert(fd, None);
         }
     }
 
@@ -351,6 +460,23 @@ mod tests {
         fn read_offset_held(&self, held: &std::os::fd::OwnedFd) -> Option<u64> {
             use std::os::fd::AsRawFd;
             self.held.lock().unwrap().get(&held.as_raw_fd()).copied()
+        }
+
+        fn read_size_held(&self, held: &std::os::fd::OwnedFd) -> Option<u64> {
+            use std::os::fd::AsRawFd;
+            self.sizes.lock().unwrap().get(&held.as_raw_fd()).copied()
+        }
+
+        fn still_names_path(
+            &self,
+            held: &std::os::fd::OwnedFd,
+            _path: &std::path::Path,
+        ) -> Option<bool> {
+            use std::os::fd::AsRawFd;
+            match self.same.lock().unwrap().get(&held.as_raw_fd()) {
+                Some(value) => *value,
+                None => Some(true),
+            }
         }
     }
 
@@ -409,6 +535,60 @@ mod tests {
         assert_eq!(sample.bytes, 7 * 1024 * 1024);
         assert_eq!(sample.watching, 1);
         assert_eq!(sample.dropped, 0);
+    }
+
+    #[test]
+    fn a_size_watch_reads_the_mediators_own_file_size() {
+        use std::os::fd::AsRawFd;
+
+        let holder = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let held = std::sync::Arc::new(std::os::fd::OwnedFd::from(holder));
+        let fd = held.as_raw_fd();
+        let watch = WriteFds::new();
+        watch.register_size(
+            std::path::Path::new("/tree/log"),
+            std::path::Path::new("/tree/log"),
+            100,
+            held,
+        );
+        let fake = Fake::default();
+        fake.set_size(fd, 160);
+
+        let mut watcher = AppendWatch::new();
+        assert_eq!(watcher.tick(&watch, &fake).bytes, 60);
+        fake.set_size(fd, 200);
+        assert_eq!(watcher.tick(&watch, &fake).bytes, 40);
+
+        // Unlink+recreate (or the sandbox closing the old inode) must release
+        // the mediator's descriptor, not keep reporting the old size.
+        fake.set_same(fd, false);
+        let sample = watcher.tick(&watch, &fake);
+        assert_eq!(sample.bytes, 0);
+        assert_eq!(sample.dropped, 1);
+    }
+
+    #[test]
+    fn an_unresolvable_path_identity_keeps_a_size_watch() {
+        use std::os::fd::AsRawFd;
+
+        let holder = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let held = std::sync::Arc::new(std::os::fd::OwnedFd::from(holder));
+        let fd = held.as_raw_fd();
+        let watch = WriteFds::new();
+        watch.register_size(
+            std::path::Path::new("/tree/log"),
+            std::path::Path::new("/tree/log"),
+            0,
+            held,
+        );
+        let fake = Fake::default();
+        fake.set_size(fd, 4096);
+        fake.set_unknown(fd);
+
+        let mut watcher = AppendWatch::new();
+        let sample = watcher.tick(&watch, &fake);
+        assert_eq!(sample.bytes, 4096);
+        assert_eq!(sample.dropped, 0, "the writer exited; the held fd still knows the size");
     }
 
     #[test]

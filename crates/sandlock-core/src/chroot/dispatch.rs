@@ -47,6 +47,7 @@
 
 use std::ffi::CString;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -546,6 +547,14 @@ fn settle_closed_writes(ctx: &ChrootCtx<'_>) {
     use crate::append_watch::OffsetReader;
     let reader = crate::append_watch::ProcOffsetReader;
     for ((pid, fd), entry) in ctx.write_fds.snapshot() {
+        // A path-size watch is the mediator's own O_PATH descriptor, not the
+        // sandbox's write fd: it cannot cause ETXTBSY and there is no child
+        // descriptor to settle. Dropping it here lost every watch registered
+        // by the previous command as soon as the next `dd`/script was exec'd
+        // (measured on the XFS lane 2026-10-18). It leaves on its idle window.
+        if entry.size_watch {
+            continue;
+        }
         if reader.read_offset(pid, fd).is_some() {
             continue;
         }
@@ -1207,6 +1216,19 @@ fn overlay_upper_rel(ctx: &ChrootCtx<'_>, host_path: &Path) -> Option<String> {
     Some(rel.to_string_lossy().into_owned())
 }
 
+/// The host pid behind a notification pid (the pid-namespace translation the
+/// append watch already needs).
+fn host_pid_of(ctx: &ChrootCtx<'_>, pid: u32) -> i32 {
+    match ctx.pid_ns {
+        Some(map) => map
+            .write()
+            .ok()
+            .and_then(|mut map| map.host_pid(pid))
+            .unwrap_or(pid as i32),
+        None => pid as i32,
+    }
+}
+
 fn overlay_upper_has(ctx: &ChrootCtx<'_>, rel: &str) -> bool {
     ctx.overlay_upper
         .is_some_and(|upper| crate::sys::fs::statat_in_root(upper, rel, false).is_ok())
@@ -1431,13 +1453,96 @@ pub(crate) async fn handle_chroot_open(
             // N25/L2c: an open that can change bytes or existence makes its
             // directory worth re-walking. The overlay used to return here
             // without this, so the incremental report saw nothing even with
-            // E2B_DISK_ENFORCE_DIRTY on. The append watch is not registered
-            // (the kernel owns this open); the dirty-dir re-walk carries the
-            // size, and the N31 entry cap is still checked/credited below.
+            // E2B_DISK_ENFORCE_DIRTY on. The N31 entry cap is still checked
+            // and credited below; the size watch is registered just after this
+            // mark (the kernel owns the open, so it watches the host inode
+            // rather than a sandbox descriptor).
             ctx.mark_dirty(&tree_path);
+            // The mediator lives in the sandbox's mount namespace: the host
+            // upper path is not a name it can open (measured on the XFS lane:
+            // workspace opens got a size watch, rootfs ones did not).
+            // `/proc/<host pid>/root/<virtual>` resolves through the child's
+            // own root, so it names the merged file -- the upper inode --
+            // without needing the host path in this namespace. It is also the
+            // only spelling that can answer "does this name exist?" here.
+            let host_pid = host_pid_of(ctx, notif.pid);
+            let watch_path =
+                PathBuf::from(format!("/proc/{host_pid}/root{}", virtual_path.display()));
+            // Overlay/workspace opens are performed by the kernel, so there is
+            // no child fd to inject into the append watch. The mediator can
+            // still open the same host inode with O_PATH and let the pump read
+            // its size each tick: that is the writer's own view, independent of
+            // NFS writeback, and needs no read permission on the file. New
+            // files do not exist yet and stay on the directory-ledger path.
+            if (flags as i32
+                & (libc::O_WRONLY
+                    | libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_TRUNC
+                    | libc::O_APPEND))
+                != 0
+            {
+                let trace = std::env::var("SANLOCK_EVENT_TRACE")
+                    .map(|value| value.trim() == "1")
+                    .unwrap_or(false);
+                match std::fs::metadata(&watch_path) {
+                    Ok(meta) if meta.is_file() => {
+                        let baseline = if (flags as i32 & libc::O_TRUNC) != 0 {
+                            0
+                        } else {
+                            meta.len()
+                        };
+                        match std::fs::OpenOptions::new()
+                            .read(true)
+                            .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+                            .open(&watch_path)
+                        {
+                            Ok(file) => {
+                                if trace {
+                                    eprintln!(
+                                        "sandlock-supervise: size watch path={} size={}",
+                                        watch_path.display(),
+                                        baseline
+                                    );
+                                }
+                                ctx.write_fds.register_size(
+                                    &tree_path,
+                                    &watch_path,
+                                    baseline,
+                                    std::sync::Arc::new(OwnedFd::from(file)),
+                                );
+                            }
+                            Err(error) => {
+                                if trace {
+                                    eprintln!(
+                                        "sandlock-supervise: size watch open failed path={} {error}",
+                                        watch_path.display()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        if trace {
+                            eprintln!(
+                                "sandlock-supervise: size watch skipped (not a file) path={}",
+                                watch_path.display()
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        if trace {
+                            eprintln!(
+                                "sandlock-supervise: size watch skipped (metadata {error}) path={}",
+                                watch_path.display()
+                            );
+                        }
+                    }
+                }
+            }
             let creating_entry = is_write
                 && (flags as i32 & (libc::O_CREAT | libc::O_TMPFILE)) != 0
-                && !tree_path.exists();
+                && !watch_path.exists();
             if creating_entry
                 && (ctx.write_fds.is_exhausted() || ctx.write_fds.entries_exhausted())
             {
