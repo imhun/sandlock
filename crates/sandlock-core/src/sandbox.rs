@@ -1045,10 +1045,8 @@ impl Sandbox {
                         layer.display()
                     )));
                 }
-                for (name, path) in [
-                    ("upper", layer.join("upper")),
-                    ("work", layer.join("work")),
-                ] {
+                let work = crate::realroot::overlay_work_path(layer);
+                for (name, path) in [("upper", layer.join("upper")), ("work", work.clone())] {
                     if !path.is_dir() {
                         return Err(SandboxError::Invalid(format!(
                             "rootfs_canonical=overlay {name} is missing or not a directory: {}",
@@ -1056,7 +1054,6 @@ impl Sandbox {
                         )));
                     }
                 }
-                let work = layer.join("work");
                 let mut entries = std::fs::read_dir(&work).map_err(|e| {
                     SandboxError::Invalid(format!(
                         "rootfs_canonical=overlay work is not readable: {}: {e}",

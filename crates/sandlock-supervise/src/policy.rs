@@ -1588,7 +1588,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&example);
         std::fs::create_dir_all(example.join("lower")).unwrap();
         std::fs::create_dir_all(example.join("layer/upper")).unwrap();
-        std::fs::create_dir_all(example.join("layer/work")).unwrap();
+        std::fs::create_dir_all(example.join(".sandlock-overlay-work")).unwrap();
         let json = example_policy_json(&secret);
         let parsed = parse(json.as_bytes()).expect("full-field policy parses");
         assert_eq!(

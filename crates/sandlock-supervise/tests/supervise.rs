@@ -373,7 +373,8 @@ fn test_policy_roundtrip_covers_every_field() {
     let _ = std::fs::remove_dir_all(&overlay);
     std::fs::create_dir_all(overlay.join("lower")).expect("create example lower");
     std::fs::create_dir_all(overlay.join("layer/upper")).expect("create example upper");
-    std::fs::create_dir_all(overlay.join("layer/work")).expect("create example work");
+    std::fs::create_dir_all(overlay.join(".sandlock-overlay-work"))
+        .expect("create example work");
     let body = sandlock_supervise::policy::example_policy_json(&secret);
     let policy = write_policy("roundtrip", &body);
     let (_worker, server) = std::os::unix::net::UnixStream::pair().expect("control socketpair");
@@ -2101,7 +2102,7 @@ fn test_overlay_dirty_dirs_reports_the_upper_directory() {
     let rootfs = chroot_rootfs(&workdir);
     let layer = workdir.join("layer");
     std::fs::create_dir_all(layer.join("upper")).expect("create upper");
-    std::fs::create_dir_all(layer.join("work")).expect("create work");
+    std::fs::create_dir_all(workdir.join(".sandlock-overlay-work")).expect("create work");
     // The host's /tmp bind is deliberately absent: the write has to land in
     // the image's /tmp, which the overlay owns.
     let mut mounts = chroot_mounts();

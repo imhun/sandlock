@@ -347,7 +347,11 @@
 # cut to zero (give up at once) the old pooled-thread shape failed 18 of 20
 # probe cycles on `PTRACE_SEIZE tid 68: Operation not permitted` while the
 # per-freeze thread passed the same shape in 6.2 s.
-core_lib = 973 # 2026-10-18 (overlay path-size watch): 967 -> 973, +6 for
+core_lib = 974 # 2026-10-18 (overlay workdir rename): 973 -> 974, +1 for
+              # `overlay_work_prefers_the_sibling_and_reads_the_legacy_path`
+              # (realroot::tests). A tree created before the rename keeps
+              # `layer/work`; the sibling wins once a create materializes it.
+              # 2026-10-18 (overlay path-size watch): 967 -> 973, +6 for
               # `size_watches_use_synthetic_keys_and_one_entry_per_path`,
               # `flushing_a_size_watch_counts_the_growth_not_the_size`,
               # `a_size_watch_reads_the_mediators_own_file_size`,

@@ -224,6 +224,28 @@ pub fn enter_guest_cwd(path: &Path) -> Result<(), String> {
 /// name.
 pub const EXEC_ALIAS_DIR: &str = "/.u";
 
+/// Overlay's kernel scratch directory, a sibling of the layer (not inside it:
+/// templates, snapshots and migrations carry `layer/upper`, and the work
+/// directory must stay out of every archive).
+pub const OVERLAY_WORK_NAME: &str = ".sandlock-overlay-work";
+
+/// Where an overlay layer keeps its kernel scratch directory.
+///
+/// Trees created since 2026-10-18 carry it as [`OVERLAY_WORK_NAME`] beside the
+/// layer. A tree created before the rename still has `layer/work`; it keeps
+/// that spelling until a create path re-materializes it, because the hand-over
+/// already made the tree the sandbox's and the worker cannot chown a new
+/// directory at the first command.
+pub fn overlay_work_path(layer: &Path) -> PathBuf {
+    if let Some(parent) = layer.parent() {
+        let sibling = parent.join(OVERLAY_WORK_NAME);
+        if sibling.is_dir() {
+            return sibling;
+        }
+    }
+    layer.join("work")
+}
+
 /// `mount_ns_ready` says the calling process already lives in its own mount
 /// namespace — a PID-namespace sandbox gets one from the same `clone3` call
 /// that created it — so `build` only unshares for the other shapes.
@@ -278,16 +300,14 @@ fn build(
     //     bytes are never modified.
     if let Some(layer) = overlay_layer {
         let upper = layer.join("upper");
-        let work = layer.join("work");
+        let work = overlay_work_path(layer);
         validate_overlay_layer(root, layer, &upper, &work)?;
         build_overlay_dir_skeleton(root, &upper)?;
         restore_overlay_whiteouts(layer)?;
         let lower = overlay_option_path("lower", root)?;
-        let upper = overlay_option_path("upper", &upper)?;
-        let work = overlay_option_path("work", &work)?;
-        let data = format!(
-            "lowerdir={lower},upperdir={upper},workdir={work},userxattr"
-        );
+        let upper_opt = overlay_option_path("upper", &upper)?;
+        let work_opt = overlay_option_path("work", &work)?;
+        let data = format!("lowerdir={lower},upperdir={upper_opt},workdir={work_opt},userxattr");
         mount(
             Some(Path::new("overlay")),
             root,
@@ -310,7 +330,7 @@ fn build(
             "overlay rootfs lower={} upper={} work={}",
             root.display(),
             layer.join("upper").display(),
-            layer.join("work").display()
+            work.display()
         ));
     }
     // 3. The policy's mounts, inside the rootfs.
@@ -1097,6 +1117,23 @@ mod tests {
         assert_eq!(MS_REC, 16384);
         assert_eq!(MS_PRIVATE, 262144);
         assert_eq!(MNT_DETACH, 2);
+    }
+
+    #[test]
+    fn overlay_work_prefers_the_sibling_and_reads_the_legacy_path() {
+        let root = scratch("overlay-work-path");
+        let layer = root.join(".rootfs/layer");
+        std::fs::create_dir_all(&layer).unwrap();
+
+        // A tree created before the rename only has `layer/work`.
+        std::fs::create_dir_all(layer.join("work")).unwrap();
+        assert_eq!(overlay_work_path(&layer), layer.join("work"));
+
+        // Once a create path materializes the sibling, the sibling wins.
+        let sibling = root.join(".rootfs").join(OVERLAY_WORK_NAME);
+        std::fs::create_dir_all(&sibling).unwrap();
+        assert_eq!(overlay_work_path(&layer), sibling);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn manifest(rows: &[(u16, &[u8])]) -> Vec<u8> {

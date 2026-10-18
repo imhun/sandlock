@@ -159,15 +159,22 @@ fn fresh_overlay_layer(name: &str) -> PathBuf {
         });
     let _ = fs::create_dir_all(&base);
     let seq = SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let layer = base.join(format!(
+    let root = base.join(format!(
         "sandlock-test-chroot-{name}-{}-{seq}",
         std::process::id()
     ));
-    let stale_work = layer.join("work/work");
-    if stale_work.exists() {
-        let _ = fs::set_permissions(&stale_work, fs::Permissions::from_mode(0o755));
+    // The workdir is a sibling of the layer, so each case needs its own
+    // tree: a shared base would hand every case the same kernel scratch.
+    for stale_work in [
+        root.join("layer/work/work"),
+        root.join(".sandlock-overlay-work/work"),
+    ] {
+        if stale_work.exists() {
+            let _ = fs::set_permissions(&stale_work, fs::Permissions::from_mode(0o755));
+        }
     }
-    let _ = fs::remove_dir_all(&layer);
+    let _ = fs::remove_dir_all(&root);
+    let layer = root.join("layer");
     fs::create_dir_all(&layer).expect("create a fresh overlay layer");
     layer
 }
@@ -3875,7 +3882,7 @@ async fn test_chroot_overlay_hands_a_script_its_canonical_path() {
     fs::create_dir_all(rootfs.join("usr/local/bin")).unwrap();
     let layer = fresh_overlay_layer("overlay-script-layer");
     fs::create_dir_all(layer.join("upper/usr/local/bin")).unwrap();
-    fs::create_dir_all(layer.join("work")).unwrap();
+    fs::create_dir_all(layer.parent().unwrap().join(".sandlock-overlay-work")).unwrap();
     let script = layer.join("upper/usr/local/bin/cow-s");
     fs::write(&script, "#!/usr/bin/rootfs-helper relay\n").unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
@@ -3918,7 +3925,7 @@ async fn test_chroot_overlay_writes_the_upper_and_not_the_lower() {
     fs::create_dir_all(rootfs.join("usr/local")).unwrap();
     let layer = fresh_overlay_layer("overlay-write-layer");
     fs::create_dir_all(layer.join("upper")).unwrap();
-    fs::create_dir_all(layer.join("work")).unwrap();
+    fs::create_dir_all(layer.parent().unwrap().join(".sandlock-overlay-work")).unwrap();
 
     let policy = Sandbox::builder()
         .chroot(&rootfs)
@@ -3965,7 +3972,7 @@ async fn test_chroot_overlay_builds_the_skeleton_from_the_dir_manifest() {
     fs::create_dir_all(rootfs.join("usr/local")).unwrap();
     let layer = fresh_overlay_layer("overlay-manifest-layer");
     fs::create_dir_all(layer.join("upper")).unwrap();
-    fs::create_dir_all(layer.join("work")).unwrap();
+    fs::create_dir_all(layer.parent().unwrap().join(".sandlock-overlay-work")).unwrap();
 
     let entry = rootfs.parent().unwrap();
     let manifest = entry.join(".dirs");
@@ -4027,7 +4034,7 @@ async fn test_chroot_overlay_mkdir_targets_the_upper_and_not_the_lower() {
     fs::create_dir_all(rootfs.join("usr/local")).unwrap();
     let layer = fresh_overlay_layer("overlay-mkdir-layer");
     fs::create_dir_all(layer.join("upper")).unwrap();
-    fs::create_dir_all(layer.join("work")).unwrap();
+    fs::create_dir_all(layer.parent().unwrap().join(".sandlock-overlay-work")).unwrap();
 
     let policy = Sandbox::builder()
         .chroot(&rootfs)
@@ -4070,7 +4077,7 @@ async fn test_chroot_overlay_a_directory_created_in_the_rootfs_is_usable() {
     fs::create_dir_all(rootfs.join("usr/local")).unwrap();
     let layer = fresh_overlay_layer("overlay-newdir-layer");
     fs::create_dir_all(layer.join("upper")).unwrap();
-    fs::create_dir_all(layer.join("work")).unwrap();
+    fs::create_dir_all(layer.parent().unwrap().join(".sandlock-overlay-work")).unwrap();
 
     let policy = Sandbox::builder()
         .chroot(&rootfs)
